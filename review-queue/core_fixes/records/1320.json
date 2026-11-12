@@ -1,0 +1,102 @@
+{
+  "initial_inventory": {
+    "number": 1320,
+    "title": "sm70: Defer QPN4 scratch for eager profiled engines",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1320",
+    "isDraft": false,
+    "headRefOid": "9efdccd897c4a2192b42176c10928b117dbff659",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1320,
+    "title": "sm70: Defer QPN4 scratch for eager profiled engines",
+    "body": "## Purpose\n\nWhile fitting Qwen3.8-27B's full 262K context onto two 16 GB V100s, I found 255 MiB per card tied up in persistent QPN4 prefill scratch.\n\nQualified QPN4 layers use temporary dense scratch automatically for eager engines with normally profiled KV memory. Graph-enabled engines and engines with a fixed KV byte budget keep resident scratch. `qpn4_lazy_dense_workspace` defaults to automatic; `true` forces temporary scratch and `false` forces resident scratch.\n\nTemporary scratch is allocated inside the native M>1 prefill operation. M=1 decode uses no dense scratch. Availability is checked before weight conversion; the existing TurboMind fallback remains available if admission fails. This is an availability check, not a reservation against later fragmentation.\n\n## Test Plan\n\nRun `pytest tests/kernels/quantization/test_sm70_nvfp4_small_prefill.py` on SM70 and `pytest tests/quantization/test_sm70_nvfp4_kernel_selection.py`. Compare after-load allocation and branch-default throughput.\n\n## Acceleration and benchmark contract\n\n- Default enabled or opt-in: automatic for eager engines with normal KV profiling; resident scratch for graph-enabled engines and fixed KV budgets.\n- Required CLI options and environment switches: `--kernel-config '{\"sm70_nvfp4\":{\"qpn4_lazy_dense_workspace\":true}}'`; `false` forces resident scratch. No environment switch was added.\n- KV cache dtype used for the benchmark: `fp8_e4m3`.\n- Wheel SHA or source commit: source commit `9efdccd89`; no wheel.\n- PYTHONPATH, source overlays, or external native libraries: benchmark-only `upstream_probe_worker.ProbeWorker` on PYTHONPATH; native extensions reused from the pinned baseline build.\n- User-entry route-hit, speed, and output-quality evidence: the server selected `Qpn4NvFp4LinearKernel` and logged the M=1 decode path; captured greedy text matched at 30K and 120K.\n- Existing kernel/backend registry and capability-rejection reasons: QPN4 qualification and TurboMind fallback are unchanged.\n- Per-engine configuration and deprecated-variable compatibility: new `qpn4_lazy_dense_workspace` field uses `null` for automatic policy; no environment alias was added.\n- New/changed environment metadata and generated reference check: no environment variable changed; generated reference check passed.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: no new environment variable; applies only to existing qualified QPN4 layers.\n\n## Test Result\n\nAfter-load allocated memory, per card:\n\n| Workspace policy | Allocated bytes |\n|---|---:|\n| Resident | 10,129,392,128 |\n| Lazy | 9,862,005,248 |\n\nLazy allocation saves 255 MiB of persistent storage per card; prefill still allocates temporary dense scratch.\n\nThroughput: Qwen3.8-27B QUASAR NVFP4, TP2, dual V100 at 200 W/card; 30,063 cold prompt tokens, 128 generated tokens, three samples per state, prefix caching off. No sampled thermal-slowdown flags:\n\n| State | Prompt tok/s | Decode tok/s |\n|---|---:|---:|\n| Pinned upstream, before | 1587.6 | 17.31 |\n| Branch default | 1586.2 | 17.02 |\n| Pinned upstream, after | 1586.9 | 17.06 |\n\nThe native suite passed 121 SM70 numerical, graph-replay and admission/fallback cases, plus 34 kernel-selection and engine-policy cases. The generated environment reference check passed after rebase.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1320",
+    "isDraft": false,
+    "headRefName": "upstream/qpn4-lazy-dense-workspace",
+    "headRefOid": "9efdccd897c4a2192b42176c10928b117dbff659",
+    "baseRefName": "main",
+    "baseRefOid": "4d57473db67eb77a13018d179e4d95169e82044f",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "andrewleech/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "andrewleech"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "andrewleech"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1320,
+    "id": "PR_kwDORjYFXs8AAAABLfZ4Xg",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "9efdccd897c4a2192b42176c10928b117dbff659",
+    "title": "sm70: Defer QPN4 scratch for eager profiled engines",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1320",
+    "body": "## Purpose\n\nWhile fitting Qwen3.8-27B's full 262K context onto two 16 GB V100s, I found 255 MiB per card tied up in persistent QPN4 prefill scratch.\n\nQualified QPN4 layers use temporary dense scratch automatically for eager engines with normally profiled KV memory. Graph-enabled engines and engines with a fixed KV byte budget keep resident scratch. `qpn4_lazy_dense_workspace` defaults to automatic; `true` forces temporary scratch and `false` forces resident scratch.\n\nTemporary scratch is allocated inside the native M>1 prefill operation. M=1 decode uses no dense scratch. Availability is checked before weight conversion; the existing TurboMind fallback remains available if admission fails. This is an availability check, not a reservation against later fragmentation.\n\n## Test Plan\n\nRun `pytest tests/kernels/quantization/test_sm70_nvfp4_small_prefill.py` on SM70 and `pytest tests/quantization/test_sm70_nvfp4_kernel_selection.py`. Compare after-load allocation and branch-default throughput.\n\n## Acceleration and benchmark contract\n\n- Default enabled or opt-in: automatic for eager engines with normal KV profiling; resident scratch for graph-enabled engines and fixed KV budgets.\n- Required CLI options and environment switches: `--kernel-config '{\"sm70_nvfp4\":{\"qpn4_lazy_dense_workspace\":true}}'`; `false` forces resident scratch. No environment switch was added.\n- KV cache dtype used for the benchmark: `fp8_e4m3`.\n- Wheel SHA or source commit: source commit `9efdccd89`; no wheel.\n- PYTHONPATH, source overlays, or external native libraries: benchmark-only `upstream_probe_worker.ProbeWorker` on PYTHONPATH; native extensions reused from the pinned baseline build.\n- User-entry route-hit, speed, and output-quality evidence: the server selected `Qpn4NvFp4LinearKernel` and logged the M=1 decode path; captured greedy text matched at 30K and 120K.\n- Existing kernel/backend registry and capability-rejection reasons: QPN4 qualification and TurboMind fallback are unchanged.\n- Per-engine configuration and deprecated-variable compatibility: new `qpn4_lazy_dense_workspace` field uses `null` for automatic policy; no environment alias was added.\n- New/changed environment metadata and generated reference check: no environment variable changed; generated reference check passed.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: no new environment variable; applies only to existing qualified QPN4 layers.\n\n## Test Result\n\nAfter-load allocated memory, per card:\n\n| Workspace policy | Allocated bytes |\n|---|---:|\n| Resident | 10,129,392,128 |\n| Lazy | 9,862,005,248 |\n\nLazy allocation saves 255 MiB of persistent storage per card; prefill still allocates temporary dense scratch.\n\nThroughput: Qwen3.8-27B QUASAR NVFP4, TP2, dual V100 at 200 W/card; 30,063 cold prompt tokens, 128 generated tokens, three samples per state, prefix caching off. No sampled thermal-slowdown flags:\n\n| State | Prompt tok/s | Decode tok/s |\n|---|---:|---:|\n| Pinned upstream, before | 1587.6 | 17.31 |\n| Branch default | 1586.2 | 17.02 |\n| Pinned upstream, after | 1586.9 | 17.06 |\n\nThe native suite passed 121 SM70 numerical, graph-replay and admission/fallback cases, plus 34 kernel-selection and engine-policy cases. The generated environment reference check passed after rebase.\n",
+    "author": {
+      "login": "andrewleech"
+    },
+    "headRepository": {
+      "nameWithOwner": "andrewleech/1Cat-vLLM"
+    },
+    "headRefName": "upstream/qpn4-lazy-dense-workspace",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1320,
+    "title": "sm70: Defer QPN4 scratch for eager profiled engines",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1320",
+    "isDraft": false,
+    "headRefOid": "9efdccd897c4a2192b42176c10928b117dbff659",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "docs/design/sm70_linear_kernel_integration.md",
+      "tests/kernels/quantization/test_sm70_nvfp4_small_prefill.py",
+      "tests/quantization/test_sm70_nvfp4_kernel_selection.py",
+      "vllm/config/kernel.py",
+      "vllm/config/vllm.py",
+      "vllm/model_executor/kernels/linear/qpn/nvfp4.py",
+      "vllm/model_executor/kernels/linear/sm70_provider.py",
+      "vllm/model_executor/layers/quantization/sm70_turbomind.py"
+    ],
+    "diff_bytes": 28923,
+    "diff_sha256": "c1bb5ad0bc9582f20f8a174a8b387fb6782c123ef140b6bf2f3515d0e86659ee"
+  },
+  "full_tree_diff_proof": null
+}

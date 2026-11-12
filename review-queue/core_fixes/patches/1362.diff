@@ -1,0 +1,371 @@
+diff --git a/tests/model_executor/model_loader/test_direct_io.py b/tests/model_executor/model_loader/test_direct_io.py
+index 381a68cbf..bc99abde7 100644
+--- a/tests/model_executor/model_loader/test_direct_io.py
++++ b/tests/model_executor/model_loader/test_direct_io.py
+@@ -10,16 +10,19 @@ from torch import nn
+ 
+ from vllm.model_executor.model_loader import direct_io
+ from vllm.model_executor.model_loader.default_loader import (
++    _missing_module_filter,
+     _pipeline_stage_layer_range,
+ )
+ from vllm.model_executor.model_loader.direct_io import (
+     decoder_layer_filter,
+     direct_io_weights,
++    missing_module_filter,
+ )
+ from vllm.model_executor.model_loader.weight_utils import (
+     safetensors_weights_iterator,
+ )
+ from vllm.model_executor.models.interfaces import SupportsMultiModal
++from vllm.model_executor.models.utils import PPMissingLayer, StageMissingLayer
+ 
+ 
+ def _checkpoint(path) -> dict[str, torch.Tensor]:
+@@ -326,6 +329,112 @@ def test_ambiguous_stage_ranges_raise():
+         _pipeline_stage_layer_range(model)
+ 
+ 
++def test_missing_module_filter_matches_only_the_named_modules():
++    missing = missing_module_filter({"embed_tokens", "norm"}, {"lm_head"}, set())
++    # Multimodal (GLM-5.3), Llama-style and DeepSeek-V4 checkpoint layouts.
++    assert missing("lm_head.weight")
++    assert missing("lm_head.weight_scale")
++    assert missing("language_model.lm_head.weight")
++    assert missing("model.language_model.embed_tokens.weight")
++    assert missing("model.embed_tokens.weight")
++    assert missing("language_model.model.norm.weight")
++    assert missing("norm.weight")
++    # Decoder layers, MTP heads, vision towers and look-alike names stay.
++    assert not missing("model.language_model.layers.0.input_layernorm.weight")
++    assert not missing("model.layers.3.self_attn.o_proj.weight")
++    assert not missing("mtp.0.norm.weight")
++    assert not missing("model.visual.merger.norm.weight")
++    assert not missing("model.norm_out.weight")
++    assert not missing("embed.weight")
++
++
++def test_missing_module_filter_needs_a_module():
++    with pytest.raises(ValueError, match="at least one module"):
++        missing_module_filter(set(), set(), set())
++
++
++def test_missing_module_filter_matches_encoder_towers():
++    missing = missing_module_filter(set(), set(), {"visual"})
++    # GLM-5.3 / Qwen-VL layouts with and without the outer `model.`.
++    assert missing("model.visual.blocks.0.attn.qkv.weight")
++    assert missing("visual.merger.proj.weight")
++    assert not missing("model.language_model.layers.0.mlp.weight")
++    assert not missing("lm_head.weight")
++    assert not missing("model.visual_proj.weight")
++
++
++class _StageStack(_Stack):
++    def __init__(self, start: int, end: int, embedding: bool, last: bool):
++        super().__init__(start, end, 12)
++        self.embed_tokens = nn.Embedding(4, 2) if embedding else PPMissingLayer()
++        self.norm = nn.LayerNorm(2) if last else PPMissingLayer()
++
++
++class _StageLanguageModel(nn.Module):
++    def __init__(self, start: int, end: int, embedding: bool):
++        super().__init__()
++        last = end == 12
++        self.model = _StageStack(start, end, embedding, last)
++        self.lm_head = nn.Linear(2, 4) if last else PPMissingLayer()
++
++
++class _StageMultimodal(nn.Module, SupportsMultiModal):
++    def __init__(self, start: int, end: int, embedding: bool, tower: bool = True):
++        super().__init__()
++        tower_module = nn.Sequential(nn.LayerNorm(2))
++        self.visual = (
++            tower_module if tower else StageMissingLayer("vision_tower", tower_module)
++        )
++        self.language_model = _StageLanguageModel(start, end, embedding)
++
++    def get_language_model(self):
++        return self.language_model
++
++
++_EMBED = "model.language_model.embed_tokens.weight"
++_NORM = "model.language_model.norm.weight"
++_HEAD = "lm_head.weight"
++_TOWER = "model.visual.0.weight"
++
++
++@pytest.mark.parametrize(
++    "start,end,embedding,tower,skipped",
++    [
++        (0, 4, True, True, {_NORM, _HEAD}),
++        (4, 8, False, True, {_EMBED, _NORM, _HEAD}),
++        (8, 12, False, True, {_EMBED}),
++        # A last stage that keeps a replica of the embedding (DFlash drafts
++        # on GLM-5.3) reads it.
++        (8, 12, True, True, set()),
++        # Stages that do not run the encoder build no tower (Model Runner V2,
++        # or --limit-mm-per-prompt 0).
++        (4, 8, False, False, {_EMBED, _NORM, _HEAD, _TOWER}),
++        (0, 12, True, False, {_TOWER}),
++    ],
++    ids=[
++        "first",
++        "middle",
++        "last",
++        "last_with_embedding",
++        "middle_without_tower",
++        "single_stage_without_tower",
++    ],
++)
++def test_missing_module_filter_follows_the_stage(start, end, embedding, tower, skipped):
++    names = {
++        _EMBED,
++        _NORM,
++        _HEAD,
++        _TOWER,
++        "model.language_model.layers.5.mlp.weight",
++    }
++    missing = _missing_module_filter(_StageMultimodal(start, end, embedding, tower))
++    if missing is None:
++        assert skipped == set()
++    else:
++        assert {name for name in names if missing(name)} == skipped
++
++
+ @pytest.mark.parametrize("failure", [None, "storage", "dtype"])
+ def test_auto_direct_admission_preserves_checkpoint_bytes(
+     tmp_path, monkeypatch, failure
+diff --git a/vllm/config/load.py b/vllm/config/load.py
+index 53d0b7f1f..12079d621 100644
+--- a/vllm/config/load.py
++++ b/vllm/config/load.py
+@@ -83,9 +83,9 @@ class LoadConfig:
+     - "direct": Decoder-layer tensors, the bulk of a checkpoint, are read
+       with O_DIRECT into private buffers, past the page cache, so a checkpoint
+       larger than host RAM does not push other processes into swap. Under
+-      pipeline parallelism each stage reads only its own decoder layers. Other
+-      tensors stay memory-mapped, and their pages are released from the page
+-      cache once loaded.
++      pipeline parallelism a stage reads only its own decoder layers, and the
++      embedding, final norm and LM head only if it holds them. Other tensors
++      stay memory-mapped; their pages leave the page cache once loaded.
+     - "torchao": Weights are loaded in upfront and then reconstructed
+       into torchao tensor subclasses. This is used when the checkpoint
+       was quantized using torchao and saved using safetensors.
+diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
+index fd8cdf6ea..fd171dea5 100644
+--- a/vllm/model_executor/model_loader/default_loader.py
++++ b/vllm/model_executor/model_loader/default_loader.py
+@@ -16,7 +16,10 @@ from vllm.config.load import LoadConfig
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
+ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+-from vllm.model_executor.model_loader.direct_io import decoder_layer_filter
++from vllm.model_executor.model_loader.direct_io import (
++    decoder_layer_filter,
++    missing_module_filter,
++)
+ from vllm.model_executor.model_loader.ep_weight_filter import (
+     compute_local_expert_ids,
+ )
+@@ -53,17 +56,15 @@ def _decoder_root(model: nn.Module) -> nn.Module:
+     return model
+ 
+ 
+-def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
+-    """[start, end) of the decoder layers this pipeline stage holds, or None
+-    when it holds all of them. vLLM decoder stacks keep a full-length
+-    `layers` list with placeholders and record their range in
+-    start_layer/end_layer.
++def _partial_decoder_stacks(model: nn.Module) -> list[tuple[nn.Module, int, int]]:
++    """The decoder stacks that hold only part of their layers, each with its
++    [start, end). vLLM decoder stacks keep a full-length `layers` list with
++    placeholders and record their range in start_layer/end_layer.
+ 
+     Multimodal models are searched in their language model only: an encoder
+     tower built with make_layers carries its own pipeline range, which must
+-    not filter the language model's layers. Two different partial ranges
+-    are ambiguous and raise instead of skipping the wrong layers."""
+-    ranges = set()
++    not filter the language model's layers."""
++    stacks = []
+     for module in _decoder_root(model).modules():
+         start = getattr(module, "start_layer", None)
+         end = getattr(module, "end_layer", None)
+@@ -74,7 +75,15 @@ def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
+             and layers is not None
+             and not (start == 0 and end == len(layers))
+         ):
+-            ranges.add((start, end))
++            stacks.append((module, start, end))
++    return stacks
++
++
++def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
++    """[start, end) of the decoder layers this pipeline stage holds, or None
++    when it holds all of them. Two different partial ranges are ambiguous and
++    raise instead of skipping the wrong layers."""
++    ranges = {(start, end) for _, start, end in _partial_decoder_stacks(model)}
+     if len(ranges) > 1:
+         raise ValueError(
+             "Direct I/O loading found several pipeline-partial layer stacks "
+@@ -84,6 +93,47 @@ def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
+     return ranges.pop() if ranges else None
+ 
+ 
++def _missing_module_filter(model: nn.Module) -> Callable[[str], bool] | None:
++    """Predicate for the tensors of the modules around the decoder stack that
++    this pipeline stage leaves out, or None when it holds all of them:
++    PPMissingLayer stands for the embedding on every stage but the first, for
++    the final norm and the LM head on every stage but the last;
++    StageMissingLayer for an encoder tower on the stages that do not run it
++    (all of them when its modalities are disabled). The model drops such a
++    tensor only after the loader has read it and run it through weight
++    transforms (MXFP8 dequantization of a whole LM head on the CPU), so it is
++    skipped before it is read."""
++    from vllm.model_executor.models.utils import PPMissingLayer, StageMissingLayer
++
++    def missing_children(module: nn.Module) -> set[str]:
++        return {
++            name
++            for name, child in module.named_children()
++            if isinstance(child, (PPMissingLayer, StageMissingLayer))
++        }
++
++    stack_modules: set[str] = set()
++    for stack, _, _ in _partial_decoder_stacks(model):
++        stack_modules |= missing_children(stack)
++    language_model = _decoder_root(model)
++    language_model_modules = missing_children(language_model)
++    multimodal_modules = (
++        missing_children(model) if language_model is not model else set()
++    )
++    if not stack_modules and not language_model_modules and not multimodal_modules:
++        return None
++    logger.info(
++        "This pipeline stage skips the checkpoint tensors of the modules it "
++        "does not hold: decoder stack %s, language model %s, multimodal model %s",
++        sorted(stack_modules),
++        sorted(language_model_modules),
++        sorted(multimodal_modules),
++    )
++    return missing_module_filter(
++        stack_modules, language_model_modules, multimodal_modules
++    )
++
++
+ class DefaultModelLoader(BaseModelLoader):
+     """Model loader that can load different file types from disk."""
+ 
+@@ -394,10 +444,12 @@ class DefaultModelLoader(BaseModelLoader):
+         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+ 
+     def _skip_weight_for(self, model: nn.Module) -> Callable[[str], bool] | None:
+-        """The model's own skip predicate, plus, for direct I/O under pipeline
+-        parallelism, the decoder layers another stage owns. A memory-mapped
+-        shard only reads what a stage touches; direct I/O reads up front, so
+-        it must leave those tensors out itself."""
++        """The model's own skip predicate, plus, for mapped and direct loading
++        under pipeline parallelism, the tensors another stage owns: decoder
++        layers outside this stage's range and the modules around the stack it
++        leaves out. A memory-mapped shard only reads what a stage touches, but
++        the loader touches every tensor it hands out; direct I/O reads up
++        front. Either way the tensors are left out before they are read."""
+         from vllm.distributed import get_pp_group
+ 
+         skip_weight = getattr(model, "skip_checkpoint_weight", None)
+@@ -425,10 +477,16 @@ class DefaultModelLoader(BaseModelLoader):
+             return skip_weight
+         if layer_range is None:
+             return skip_weight
+-        other_stage = decoder_layer_filter(*layer_range)
+-        if skip_weight is None:
+-            return other_stage
+-        return lambda name: skip_weight(name) or other_stage(name)
++        skips = [
++            skip
++            for skip in (
++                skip_weight,
++                decoder_layer_filter(*layer_range),
++                _missing_module_filter(model),
++            )
++            if skip is not None
++        ]
++        return lambda name: any(skip(name) for skip in skips)
+ 
+     def get_all_weights(
+         self,
+diff --git a/vllm/model_executor/model_loader/direct_io.py b/vllm/model_executor/model_loader/direct_io.py
+index 80f0b687e..fd8f8c419 100644
+--- a/vllm/model_executor/model_loader/direct_io.py
++++ b/vllm/model_executor/model_loader/direct_io.py
+@@ -22,7 +22,7 @@ import json
+ import mmap
+ import os
+ import struct
+-from collections.abc import Callable, Generator
++from collections.abc import Callable, Collection, Generator
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
+@@ -59,12 +59,17 @@ _DTYPES = {
+     "BOOL": torch.bool,
+ }
+ 
+-# `<prefix>layers.<N>.` where <prefix> is a decoder stack whose N is the global
+-# layer index. MTP heads (`mtp.layers.N`) and vision towers number their own
+-# layers and are always read.
+-_DECODER_LAYER = re.compile(
+-    r"^(?:|model\.|model\.language_model\.|language_model\.model\.)layers\.(\d+)\."
+-)
++# Where checkpoints store the main decoder stack: `<prefix>layers.<N>.` with N
++# the global layer index, and `<prefix><module>.` for the modules around the
++# layers (embedding, final norm). MTP heads (`mtp.layers.N`) and vision towers
++# number their own layers, which the decoder layer filter never matches.
++_STACK_PREFIX = r"(?:|model\.|model\.language_model\.|language_model\.model\.)"
++# Where checkpoints store the language model's own modules (its LM head).
++_LANGUAGE_MODEL_PREFIX = r"(?:|language_model\.)"
++# Where checkpoints store the modules of a multimodal model beside its language
++# model (encoder towers, projectors): `model.visual.` or `visual.`.
++_MULTIMODAL_PREFIX = r"(?:|model\.)"
++_DECODER_LAYER = re.compile(rf"^{_STACK_PREFIX}layers\.(\d+)\.")
+ 
+ 
+ MADV_DONTNEED = 4
+@@ -93,6 +98,36 @@ def decoder_layer_filter(start: int, end: int) -> Callable[[str], bool]:
+     return outside
+ 
+ 
++def missing_module_filter(
++    stack_modules: Collection[str],
++    language_model_modules: Collection[str],
++    multimodal_modules: Collection[str],
++) -> Callable[[str], bool]:
++    """Return a predicate that is True for tensors of modules a pipeline stage
++    does not hold: *stack_modules* are children of the decoder stack (the
++    embedding, the final norm), *language_model_modules* children of the
++    language model (the LM head), *multimodal_modules* children of a
++    multimodal model (its encoder towers)."""
++    if not stack_modules and not language_model_modules and not multimodal_modules:
++        # The empty alternation would match every tensor.
++        raise ValueError("missing_module_filter needs at least one module name")
++    places = [
++        (_STACK_PREFIX, stack_modules),
++        (_LANGUAGE_MODEL_PREFIX, language_model_modules),
++        (_MULTIMODAL_PREFIX, multimodal_modules),
++    ]
++    pattern = re.compile(
++        "^(?:"
++        + "|".join(
++            rf"{prefix}(?:{'|'.join(map(re.escape, sorted(modules)))})\."
++            for prefix, modules in places
++            if modules
++        )
++        + ")"
++    )
++    return lambda name: pattern.match(name) is not None
++
++
+ def _read_header(fd: int) -> tuple[dict, int]:
+     head = os.pread(fd, 8, 0)
+     (header_len,) = struct.unpack("<Q", head)
