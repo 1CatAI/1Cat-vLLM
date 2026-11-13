@@ -2630,6 +2630,13 @@ class Scheduler(SchedulerInterface):
         if not cached_encoder_input_ids:
             return
 
+        # Steps scheduled ahead (async scheduling) may still be rejected and roll
+        # num_computed_tokens back, and their drafts re-gather embeddings from
+        # the confirmed position. Only confirmed tokens may release an input,
+        # or another request's admission evicts it first (#1485).
+        num_confirmed_tokens = (
+            request.num_computed_tokens - request.num_in_flight_tokens
+        )
         # Here, we use list(set) to avoid modifying the set while iterating
         # over it.
         for input_id in list(cached_encoder_input_ids):
@@ -2641,7 +2648,7 @@ class Scheduler(SchedulerInterface):
                 # we know we're done with the encoder input. Cross Attention
                 # KVs have been calculated and cached already.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
-            elif start_pos + num_tokens <= request.num_computed_tokens:
+            elif start_pos + num_tokens <= num_confirmed_tokens:
                 # The encoder output is already processed and stored
                 # in the decoder's KV cache.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
