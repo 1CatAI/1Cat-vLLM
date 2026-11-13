@@ -1906,3 +1906,39 @@ def test_streaming_call_completed_in_delta_after_skipped_empty_block(
         "get_current_weather"
     ]
     assert json.loads(extracted.tool_calls[0].function.arguments) == expected_arguments
+
+
+@pytest.mark.parametrize("empty_blocks", [1, 100, 600, 2000])
+@pytest.mark.parametrize("follows_call", [False, True])
+def test_streaming_many_empty_tool_blocks_in_one_delta(
+    qwen3_tool_parser, empty_blocks, follows_call
+):
+    """Speculative decoding or a buffered transport can close a block and
+    deliver a long burst of further empty blocks in one delta; skipping them
+    must not recurse once per block, and the content or call after them must
+    still arrive."""
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    tail = _WEATHER_CALL if follows_call else "Content after empty tools."
+    deltas = [
+        "<tool_call>",
+        "</tool_call>" + "<tool_call></tool_call>" * (empty_blocks - 1) + tail,
+    ]
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+
+    reconstructor = run_tool_extraction_streaming(
+        qwen3_tool_parser, deltas, request, assert_one_tool_per_delta=False
+    )
+
+    if follows_call:
+        assert reconstructor.other_content == ""
+        assert [call.function.name for call in reconstructor.tool_calls] == [
+            "get_current_weather"
+        ]
+        assert json.loads(reconstructor.tool_calls[0].function.arguments) == {
+            "city": "Dallas",
+            "state": "TX",
+        }
+    else:
+        assert reconstructor.other_content == tail
+        assert reconstructor.tool_calls == []
