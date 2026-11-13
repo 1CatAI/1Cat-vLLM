@@ -227,17 +227,35 @@ def _topk_topp_kernel(
                     write_pos = tl.where(outlier_mask, cumulative_pos, -1)
                     tl.store(BUFFER_ROW + write_pos, logits_blk, mask=outlier_mask)
 
-                # If no finite logits exist (all -inf), clamp min to
-                # max so the search converges to -inf (no masking).
-                min_logit = tl.minimum(min_logit, max_logit)
-
                 # Second passes: Ternary search for pivots
                 num_iters = 0
                 k_pivot = float("inf")
                 k_pivots_num = tl.zeros((), dtype=tl.uint32)
                 min_larger = float("inf")
                 num_min_larger = tl.zeros((), dtype=tl.uint32)
-                if num_outliers > k:
+                # With fewer than k logits above the smallest finite one, the
+                # k-th largest is that smallest logit (at most k finite logits,
+                # e.g. under a grammar mask, or its tie straddles k), and every
+                # finite logit survives. The whole-row search starts at the
+                # smallest logit and only probes pivots above it, so it would
+                # drop all of its copies. More than k outliers place the outlier
+                # search's start below the k-th largest, so only the whole-row
+                # search needs the count (the others keep 0 and, with more than
+                # k finite logits, a False condition).
+                num_min_logit = tl.zeros((), dtype=tl.uint32)
+                if num_outliers <= k:
+                    for i in range(0, NUM_TILES):
+                        offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                        logits_blk = tl.load(
+                            LOGITS_ROW + offs_n,
+                            mask=offs_n < VOCAB_SIZE,
+                            other=-float("inf"),
+                        )
+                        num_min_logit += tl.sum(logits_blk == min_logit)
+                topk_masks_nothing = num_finite_total - num_min_logit < k
+                if topk_masks_nothing:
+                    k_pivot = -float("inf")
+                elif num_outliers > k:
                     max_range = max_logit
                     min_range = outlier_pivot
                     search_range = tl.cast(num_outliers, tl.int32)
@@ -412,11 +430,11 @@ def _topk_topp_kernel(
                 needs_reference = num_keep < num_duplicate_logit
                 num_kept = tl.zeros((), dtype=tl.uint32)
 
-                # Top-k only path.  If there are fewer finite values
-                # than k (e.g. grammar mask), keep everything.
-                final_pivot = k_pivot if num_finite_total > k else -float("inf")
+                # Top-k only path. Rows that top-k leaves intact keep -inf;
+                # their top-p runs as standalone top-p below.
+                final_pivot = k_pivot
 
-                if TOPP_ENABLED and num_finite_total > k:
+                if TOPP_ENABLED and not topk_masks_nothing:
                     #### TOP-P SAMPLING AFTER TOP-K ####
                     p = tl.load(P + row_id)
                     if p < 1.0:
@@ -698,7 +716,7 @@ def _topk_topp_kernel(
                 max_sample = avg_logit + std_logit * 10.0
                 sum_exp_logits = 0.0
 
-                # First pass: compute max and min logits and sum_exp_logits
+                # First pass: compute max logit and sum_exp_logits
                 for i in range(0, NUM_TILES):
                     offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
                     mask_n = offs_n < VOCAB_SIZE
@@ -706,20 +724,10 @@ def _topk_topp_kernel(
                         LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
                     )
                     max_logit = tl.maximum(max_logit, tl.max(logits_blk))
-                    # Exclude -inf from min to keep binary search bounds
-                    # finite (avoids NaN pivots).
-                    finite_blk = tl.where(
-                        logits_blk > -float("inf"), logits_blk, float("inf")
-                    )
-                    min_logit = tl.minimum(min_logit, tl.min(finite_blk))
 
                     probs_blk = tl.exp(logits_blk - max_sample)
                     probs_blk = tl.where(mask_n, probs_blk, 0.0)
                     sum_exp_logits += tl.sum(probs_blk)
-
-                # If no finite logits exist (all -inf), clamp min to
-                # max so the search converges to -inf (no masking).
-                min_logit = tl.minimum(min_logit, max_logit)
 
                 idx = tl.cast(p * 200, tl.int32)
                 idx = tl.maximum(0, tl.minimum(idx, 199))
@@ -752,7 +760,10 @@ def _topk_topp_kernel(
                     tl.store(BUFFER_ROW + write_pos, probs_blk, mask=outlier_mask)
 
                 max_range = tl.exp(max_logit - max_sample) / sum_exp_logits
-                min_range = tl.exp(min_logit - max_sample) / sum_exp_logits
+                # Search down to probability 0, not to the smallest finite
+                # logit's probability: a nucleus that keeps that logit needs a
+                # pivot below it, which pivots above it can never satisfy.
+                min_range = 0.0
 
                 p_pivot = 1.0
                 num_iters = 0
@@ -1246,6 +1257,22 @@ def _keep_row_maxima(result: torch.Tensor, original: torch.Tensor) -> torch.Tens
     return result.scatter_(1, top, original.gather(1, top))
 
 
+def _compact_path_admitted(
+    logits: torch.Tensor, topk_enabled: bool, topp_enabled: bool
+) -> bool:
+    """Whether a batch takes the shortlist route instead of the pivot kernel."""
+    return (
+        not _NO_FENCE
+        and topk_enabled
+        and topp_enabled
+        and logits.shape[0] >= 2
+        and logits.shape[1] >= 32768
+        and logits.is_cuda
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability((7, 0))
+    )
+
+
 def apply_top_k_top_p_triton(
     logits: torch.Tensor,
     k: torch.Tensor | None,
@@ -1309,16 +1336,7 @@ def apply_top_k_top_p_triton(
     else:
         p_ptr = logits  # Dummy pointer (won't be read)
 
-    if (
-        not _NO_FENCE
-        and topk_enabled
-        and topp_enabled
-        and batch_size >= 2
-        and vocab_size >= 32768
-        and logits.is_cuda
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability((7, 0))
-    ):
+    if _compact_path_admitted(logits, topk_enabled, topp_enabled):
         compact = _apply_top_k_top_p_compact(logits, k_ptr, p_ptr, mask_value)
         if compact is not None:
             return compact

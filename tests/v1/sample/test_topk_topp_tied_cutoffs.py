@@ -9,6 +9,7 @@ import torch
 
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 from vllm.v1.sample.ops.topk_topp_triton import (
+    _compact_path_admitted,
     apply_top_k_top_p_triton,
     sort_topk_with_vocab_ties,
 )
@@ -52,6 +53,8 @@ def test_compact_fallback_bounds_full_vocabulary_sort_workspace(
     # MTP4 at C4 has 20 target rows. Uniform logits force the ambiguous tie
     # fallback, which previously sorted the entire expanded batch together.
     logits = torch.ones((rows, 248320), device="cuda")
+    if rows > 1 and not _compact_path_admitted(logits, True, True):
+        pytest.skip("the bounded dense workspace belongs to the compact route")
     k = torch.full((rows,), top_k, dtype=torch.int32, device="cuda")
     p = torch.full((rows,), top_p, device="cuda")
     expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
@@ -111,6 +114,38 @@ def test_standalone_topp_ties_and_graph_capture():
         captured = apply_top_k_top_p_triton(x.clone(), None, p)
     graph.replay()
     assert torch.equal(captured, expected)
+
+
+@pytest.mark.parametrize("vocab", [32768, 248320])
+@pytest.mark.parametrize("rest", [-float("inf"), 1.0])
+@pytest.mark.parametrize(
+    "top_k,top_p",
+    [(20, None), (20, 1.0), (20, 0.8), (50, 0.95), (None, 0.95), (None, 0.8)],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_pivot_kernel_cutoff_below_smallest_finite_logit(
+    monkeypatch, top_k, top_p, rest, vocab
+):
+    from vllm.v1.sample.ops import topk_topp_triton
+
+    # Pin the pivot kernel, the route of every device except the compact one.
+    monkeypatch.setattr(topk_topp_triton, "_compact_path_admitted", lambda *a: False)
+    # Rows 0-1: a tie at the smallest logit straddles k and the nucleus.
+    # Rows 2-3: grammar-style rows whose nucleus needs every allowed token.
+    # Both cutoffs lie below the smallest finite logit (rest is either the
+    # mask or the tied minimum); the searches only probed pivots above it
+    # and dropped every copy of that logit.
+    x = torch.full((4, vocab), rest, device="cuda")
+    x[:2, :24] = 1.0
+    x[:2, :2] = 2.0
+    x[2:, 100] = 5.0
+    x[2:, 200] = 3.0
+    x[2:, 300] = 2.5
+    k = None if top_k is None else torch.full((4,), top_k, device="cuda")
+    p = None if top_p is None else torch.full((4,), top_p, device="cuda")
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    actual = apply_top_k_top_p_triton(x.clone(), k, p)
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("use_top_k", [False, True])
