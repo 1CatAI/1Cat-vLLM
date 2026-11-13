@@ -119,17 +119,35 @@ def _warmup_cycle(
         d - p for d, p in zip(decode_block_counts, prefill_block_counts)
     ]
     req_ids = [f"_warmup_{tag}_{i}_" for i in range(num_reqs)]
-    next_block_id = 1
+    # A bounded state pool backs state groups with only IDs below
+    # ``device_state_blocks``; history groups use the IDs above it (#1490).
+    kv_cache_config = model_runner.kv_cache_config
+    state_blocks = getattr(kv_cache_config, "device_state_blocks", 0) or 0
+    state_group_ids = frozenset(
+        getattr(kv_cache_config, "device_state_group_ids", ()) or ()
+    )
+    next_block_id = max(1, state_blocks)
+    next_state_id = 0
 
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
+    def _alloc_blocks(num_blocks: int, group_id: int) -> list[int]:
+        nonlocal next_block_id, next_state_id
+        if state_blocks and group_id in state_group_ids:
+            # Warmup contents are discarded, so state IDs may repeat once the
+            # range is used up; they must only stay inside the state tensors.
+            ids = [
+                1 + (next_state_id + i) % (state_blocks - 1) for i in range(num_blocks)
+            ]
+            next_state_id += num_blocks
+            return ids
         return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
 
     def _new_requests(ids: list[str]) -> list[NewRequestData]:
         return [
             NewRequestData.from_request(
                 Request(req_id, prompt_token_ids, sampling_params, pooling_params),
-                block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+                block_ids=tuple(
+                    _alloc_blocks(n, g) for g, n in enumerate(prefill_block_counts)
+                ),
                 prefill_token_ids=prompt_token_ids,
             )
             for req_id in ids
@@ -168,7 +186,7 @@ def _warmup_cycle(
         new_block = any(decode_block_deltas)
         cached_req_data.new_block_ids = [
             (
-                tuple(_alloc_blocks(n) for n in decode_block_deltas)
+                tuple(_alloc_blocks(n, g) for g, n in enumerate(decode_block_deltas))
                 if new_block
                 else None
             )
