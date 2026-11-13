@@ -209,3 +209,54 @@ def test_reserved_block_count_matches_speculative_tail(spec, expected) -> None:
         )
         == expected
     )
+
+
+def test_warmup_keeps_state_groups_inside_a_bounded_state_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1490: a bounded host-KV state pool sizes the recurrent-state tensors to
+    # ``device_state_blocks``; warmup handed them sequential IDs past it.
+    state_blocks = 6
+    runner = SimpleNamespace(
+        num_speculative_steps=4,
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=256),
+        max_model_len=512,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=_mamba_spec("align")),
+                SimpleNamespace(kv_cache_spec=_full_attention_spec()),
+                SimpleNamespace(kv_cache_spec=_mamba_spec("align")),
+            ],
+            num_blocks=400,
+            device_state_blocks=state_blocks,
+            device_state_group_ids=(0, 2),
+        ),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=4),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        is_pooling_model=False,
+        is_last_pp_rank=True,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
+    )
+    executions: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    warmup_kernels(runner, executions.append, lambda *_: None)
+
+    groups: list[tuple[list[int], ...]] = [
+        req.block_ids for output in executions for req in output.scheduled_new_reqs
+    ]
+    groups += [
+        ids
+        for output in executions
+        for ids in output.scheduled_cached_reqs.new_block_ids
+        if ids is not None
+    ]
+    assert groups
+    for block_ids in groups:
+        for group_id, ids in enumerate(block_ids):
+            if group_id in (0, 2):
+                assert all(1 <= i < state_blocks for i in ids), ids
+            else:
+                assert all(state_blocks <= i < 400 for i in ids), ids
