@@ -425,7 +425,39 @@ class OpenAIServing(BeamSearchOnlineMixin):
     ) -> _T:
         """Wrap a `create_*` coroutine so that, if it raises or returns an
         ErrorResponse (i.e. the request never reached the engine), the KV
-        connector is notified to free any pinned remote-prefill blocks."""
+        connector is notified to free any pinned remote-prefill blocks.
+
+        The same window is used to roll back the multi-modal sender cache:
+        rendering writes items into it before the length checks, the sampling
+        parameter conversion and the parser adjustments run, so a request that
+        is rejected before reaching the engine would otherwise leave entries
+        the engine never held. The next request that uses the same image then
+        sends `data=None` and hits `MultiModalCacheMissError` in the engine.
+        Rolling back here means the first retry sends the data."""
+        # Rendering updates the sender cache before length checks, sampling
+        # parameter conversion and parser adjustments. Roll it back before a
+        # frontend rejection is returned, so the first retry sends the data.
+        with self.renderer.track_mm_cache_items() as mm_hashes:
+            rejected = True
+            try:
+                result = await self._with_kv_transfer_rejection_cleanup_impl(
+                    awaitable, request, raw_request
+                )
+                rejected = isinstance(result, ErrorResponse)
+                return result
+            finally:
+                if rejected and mm_hashes:
+                    await self.renderer.invalidate_mm_cache_items_async(mm_hashes)
+
+    async def _with_kv_transfer_rejection_cleanup_impl(
+        self,
+        awaitable: Awaitable[_T],
+        request: ChatCompletionRequest | CompletionRequest | ResponsesRequest,
+        raw_request: Request | None,
+    ) -> _T:
+        """KV-transfer half of `_with_kv_transfer_rejection_cleanup`: notify the
+        connector when a request that pinned remote-prefill blocks never
+        reached the engine."""
         kv_transfer_params = self.has_kv_connector and request.kv_transfer_params
         if not kv_transfer_params or not kv_transfer_params.get("do_remote_prefill"):
             return await awaitable
