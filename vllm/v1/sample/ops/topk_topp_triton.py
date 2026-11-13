@@ -1343,7 +1343,7 @@ def _apply_top_k_top_p_compact(
     mask_value: float,
     *,
     no_host_sync: bool = False,
-) -> torch.Tensor | None:
+) -> torch.Tensor:
     """Filter a bounded shortlist; retain reference handling at boundaries.
 
     A top-k cutoff keeps *all* equal logits, so a fixed-size shortlist is not
@@ -1557,11 +1557,9 @@ def apply_top_k_top_p_triton(
         and getattr(runtime, "no_host_sync", False)
     )
     if _compact_path_admitted(logits, topk_enabled, topp_enabled):
-        compact = _apply_top_k_top_p_compact(
+        return _apply_top_k_top_p_compact(
             logits, k_ptr, p_ptr, mask_value, no_host_sync=no_host_sync
         )
-        if compact is not None:
-            return compact
 
     # Graph callers cannot execute the non-compact Triton fence or allocate
     # runtime.buffers inside stream capture; fall back before buffer setup.
