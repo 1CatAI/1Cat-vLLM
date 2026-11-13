@@ -138,6 +138,11 @@ else:
 
 logger = init_logger(__name__)
 
+# Verified hybrid GDN prefix-cache geometry of the release recipes: 2048-token
+# pages and recurrent checkpoints, plus periodic checkpoints every 8192 tokens.
+_HYBRID_PREFIX_BLOCK_SIZE = 2048
+_HYBRID_PREFIX_RETENTION_INTERVAL = 8192
+
 
 def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
     requested_dtype: str,
@@ -540,7 +545,7 @@ class EngineArgs:
         CacheConfig.prefix_cache_retention_interval
     )
     mamba_tail_checkpoint: bool = CacheConfig.mamba_tail_checkpoint
-    partial_prefix_cache: bool = CacheConfig.partial_prefix_cache
+    partial_prefix_cache: bool | None = None
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -1196,7 +1201,8 @@ class EngineArgs:
             "--mamba-tail-checkpoint", **cache_kwargs["mamba_tail_checkpoint"]
         )
         cache_group.add_argument(
-            "--partial-prefix-cache", **cache_kwargs["partial_prefix_cache"]
+            "--partial-prefix-cache",
+            **{**cache_kwargs["partial_prefix_cache"], "default": None},
         )
         cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
@@ -1789,6 +1795,36 @@ class EngineArgs:
         )
         return SpeculativeConfig(**self.speculative_config)
 
+    def _apply_hybrid_prefix_cache_geometry(self) -> list[str]:
+        """Default hybrid GDN prefix caching to the verified release geometry.
+
+        The generic defaults (16-token pages, Mamba block = page) never produce
+        a reusable recurrent checkpoint on these models (#1422). Explicit
+        values are kept; the retention interval only replaces its default.
+        """
+        updates: list[str] = []
+        if self.block_size is None and self.mamba_block_size is None:
+            self.block_size = _HYBRID_PREFIX_BLOCK_SIZE
+            self.mamba_block_size = _HYBRID_PREFIX_BLOCK_SIZE
+            updates.append(f"block_size={self.block_size}")
+            updates.append(f"mamba_block_size={self.mamba_block_size}")
+        if self.partial_prefix_cache is None:
+            self.partial_prefix_cache = True
+            updates.append("partial_prefix_cache=True")
+        if (
+            self.prefix_cache_retention_interval
+            == CacheConfig.prefix_cache_retention_interval
+            # Only the verified geometry: elsewhere the interval might not be a
+            # multiple of the resolved alignment and would reject startup.
+            and self.block_size == _HYBRID_PREFIX_BLOCK_SIZE
+            and self.mamba_block_size == _HYBRID_PREFIX_BLOCK_SIZE
+        ):
+            self.prefix_cache_retention_interval = _HYBRID_PREFIX_RETENTION_INTERVAL
+            updates.append(
+                f"prefix_cache_retention_interval={self.prefix_cache_retention_interval}"
+            )
+        return updates
+
     def _maybe_apply_sm70_mtp_defaults(
         self,
         usage_context: UsageContext | None,
@@ -1833,6 +1869,12 @@ class EngineArgs:
         ):
             self.mamba_cache_mode = "align"
             profile_updates.append("mamba_cache_mode=align")
+        if (
+            self.enable_prefix_caching
+            and has_linear_attention
+            and self.mamba_cache_mode == "align"
+        ):
+            profile_updates.extend(self._apply_hybrid_prefix_cache_geometry())
 
         if self.speculative_config is None:
             enable_auto_mtp = (
@@ -2048,7 +2090,7 @@ class EngineArgs:
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
             mamba_tail_checkpoint=self.mamba_tail_checkpoint,
-            partial_prefix_cache=self.partial_prefix_cache,
+            partial_prefix_cache=bool(self.partial_prefix_cache),
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,

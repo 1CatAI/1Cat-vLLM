@@ -7,6 +7,7 @@ from math import lcm
 from typing import NamedTuple
 
 from vllm.config.cache import KVRetentionConfig
+from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -28,6 +29,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class KVCacheCoordinator(ABC):
@@ -630,6 +633,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # block cache hit yet.
         block_sizes = [group.spec.block_size for group in self.attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
+        if self.lcm_block_size > max(block_sizes):
+            # Not nested: every hit must span the whole LCM (#1422).
+            logger.warning(
+                "Prefix-cache block sizes %s do not divide each other, so a "
+                "cache hit needs a %d-token prefix. Pass --block-size and "
+                "--mamba-block-size explicitly (for example both 2048) to "
+                "reuse shorter prefixes.",
+                sorted(set(block_sizes)),
+                self.lcm_block_size,
+            )
 
         # Propagate the eagle bit to each manager (default to ``use_eagle=False``).
         for group in self.attention_groups:
