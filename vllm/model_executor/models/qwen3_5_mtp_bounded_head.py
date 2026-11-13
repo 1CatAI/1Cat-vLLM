@@ -32,9 +32,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 from vllm.model_executor.models.qwen3_5_mtp_refined_head import (
-    _finish,
     _score_id_keys,
-    _select_candidates,
+    _topk_merge,
+    _topk_stage,
 )
 from vllm.model_executor.models.qwen3_5_mtp_sm70_head import _mtp_head_shard_rows
 from vllm.platforms import current_platform
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 KEEP = 32
+_MAX_BOUNDED_ROWS = 40
 
 
 @triton.jit
@@ -63,13 +64,7 @@ def _input_norms(X, Norms, Width: tl.constexpr):
 
 
 @triton.jit
-def _upper_bounds(Coarse, Coeff, Norms, Upper, Vocab: tl.constexpr):
-    row, tile = tl.program_id(0), tl.program_id(1)
-    col = tile * 512 + tl.arange(0, 512)
-    coarse = tl.load(Coarse + row * Vocab + col, col < Vocab, 0).to(tl.float32)
-    coefficient = tl.load(Coeff + col * 2, col < Vocab, 0)
-    norm_sum = tl.load(Coeff + col * 2 + 1, col < Vocab, 0)
-    xnorm, subnorm = tl.load(Norms + row * 2), tl.load(Norms + row * 2 + 1)
+def _compute_upper_bound(coarse, coefficient, norm_sum, xnorm, subnorm):
     error = (
         xnorm * coefficient
         + subnorm * norm_sum
@@ -89,11 +84,90 @@ def _upper_bounds(Coarse, Coeff, Norms, Upper, Vocab: tl.constexpr):
         & (error == error)
         & (error != float("inf"))
     )
-    tl.store(
-        Upper + row * Vocab + col,
-        tl.where(valid, next_upper, float("inf")),
-        col < Vocab,
+    return tl.where(valid, next_upper, float("inf"))
+
+
+@triton.jit
+def _upper_bounds(Coarse, Coeff, Norms, Upper, Vocab: tl.constexpr):
+    row, tile = tl.program_id(0), tl.program_id(1)
+    col = tile * 512 + tl.arange(0, 512)
+    coarse = tl.load(Coarse + row * Vocab + col, col < Vocab, 0).to(tl.float32)
+    coefficient = tl.load(Coeff + col * 2, col < Vocab, 0)
+    norm_sum = tl.load(Coeff + col * 2 + 1, col < Vocab, 0)
+    xnorm, subnorm = tl.load(Norms + row * 2), tl.load(Norms + row * 2 + 1)
+    upper = _compute_upper_bound(coarse, coefficient, norm_sum, xnorm, subnorm)
+    tl.store(Upper + row * Vocab + col, upper, col < Vocab)
+
+
+@triton.jit
+def _upper_topk_tiles(
+    Coarse,
+    Coeff,
+    Norms,
+    Upper,
+    Scratch,
+    Vocab: tl.constexpr,
+    Tiles: tl.constexpr,
+    Keep: tl.constexpr,
+    Block: tl.constexpr,
+    WideIds: tl.constexpr,
+    StoreUpper: tl.constexpr,
+):
+    row, tile = tl.program_id(0), tl.program_id(1)
+    col = tile * Block + tl.arange(0, Block)
+    mask = col < Vocab
+    coarse = tl.load(Coarse + row * Vocab + col, mask, 0).to(tl.float32)
+    coefficient = tl.load(Coeff + col * 2, mask, 0)
+    norm_sum = tl.load(Coeff + col * 2 + 1, mask, 0)
+    xnorm, subnorm = tl.load(Norms + row * 2), tl.load(Norms + row * 2 + 1)
+    upper = _compute_upper_bound(coarse, coefficient, norm_sum, xnorm, subnorm)
+    if StoreUpper:
+        tl.store(Upper + row * Vocab + col, upper, mask)
+    values = tl.where(mask, upper, -float("inf"))
+    keys = _score_id_keys(values, col, WideIds)
+    sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
+    keys = tl.where(mask, keys, sentinel)
+    selected = tl.topk(keys, Keep)
+    lane = tl.arange(0, Keep)
+    tl.store(Scratch + row * Tiles * Keep + tile * Keep + lane, selected)
+
+
+@triton.jit
+def _finish_packet(
+    Ids,
+    Scores,
+    Coarse,
+    Coeff,
+    Norms,
+    Packet,
+    Vocab: tl.constexpr,
+    Keep: tl.constexpr,
+    Start: tl.constexpr,
+    Block: tl.constexpr,
+):
+    row = tl.program_id(0)
+    lane = tl.arange(0, Block)
+    score = tl.load(Scores + row * Keep + lane, lane < Keep, other=-float("inf")).to(
+        tl.float32
     )
+    ids = tl.load(Ids + row * Keep + lane, lane < Keep, other=2147483647)
+    nan = score != score
+    has_nan = tl.sum(nan.to(tl.int32), 0) > 0
+    best = tl.max(tl.where(nan, -float("inf"), score), 0)
+    winner = tl.where(has_nan, nan, score == best)
+    best_id = tl.min(tl.where(winner, ids, 2147483647), 0)
+    best = tl.where(has_nan, float("nan"), best)
+    last = tl.load(Ids + row * Keep + Keep - 1)
+    coarse = tl.load(Coarse + row * Vocab + last).to(tl.float32)
+    coefficient = tl.load(Coeff + last * 2)
+    norm_sum = tl.load(Coeff + last * 2 + 1)
+    xnorm, subnorm = tl.load(Norms + row * 2), tl.load(Norms + row * 2 + 1)
+    cutoff = _compute_upper_bound(coarse, coefficient, norm_sum, xnorm, subnorm).to(
+        tl.float32
+    )
+    tl.store(Packet + row * 3, best)
+    tl.store(Packet + row * 3 + 1, (best_id + Start).to(tl.float32))
+    tl.store(Packet + row * 3 + 2, cutoff)
 
 
 @triton.jit
@@ -208,8 +282,9 @@ def _prepare_proposal(weight, native_ops):
     return codes, scales, coefficients
 
 
-def _proposal(x, codes, scales, coefficients, native_policy=()):
+def _proposal(x, codes, scales, coefficients, native_policy=(), *, return_upper=True):
     rows, vocab = x.size(0), codes.numel() // x.size(1)
+    assert 32 <= vocab <= 2147483647
     coarse = torch.empty(rows, vocab, device=x.device, dtype=torch.float16)
     call_native(
         sm70_ops.fp8_qpn8_gemm_sm70_out,
@@ -220,41 +295,102 @@ def _proposal(x, codes, scales, coefficients, native_policy=()):
         scales,
         16,
         2,
-        False,
-        False,
+        True,
+        rows <= 16,
     )
     norms = torch.empty(rows, 2, device=x.device, dtype=torch.float32)
-    upper = torch.empty_like(coarse)
     _input_norms[(rows,)](x, norms, x.size(1), num_warps=8)
-    _upper_bounds[(rows, triton.cdiv(vocab, 512))](
-        coarse, coefficients, norms, upper, vocab, num_warps=4
+    upper = torch.empty_like(coarse) if return_upper else None
+    wide_ids = vocab > 65536
+    tile_block = 2048 if (KEEP <= 32 and vocab > 32768) else 1024
+    tiles = triton.cdiv(vocab, tile_block)
+    count = tiles * KEEP
+    scratch = torch.empty(
+        rows,
+        count,
+        device=x.device,
+        dtype=torch.int64 if wide_ids else torch.int32,
     )
-    ids = _select_candidates(upper)
-    return coarse, upper, ids
+    ids = torch.empty(rows, KEEP, device=x.device, dtype=torch.int32)
+    _upper_topk_tiles[(rows, tiles)](
+        coarse,
+        coefficients,
+        norms,
+        upper,
+        scratch,
+        vocab,
+        tiles,
+        KEEP,
+        tile_block,
+        wide_ids,
+        return_upper,
+        num_warps=8 if tile_block > 1024 else 4,
+    )
+    while count > 1024:
+        stages = triton.cdiv(count, 1024)
+        reduced = torch.empty(rows, stages * KEEP, device=x.device, dtype=scratch.dtype)
+        _topk_stage[(rows, stages)](
+            scratch, reduced, count, stages, KEEP, 1024, wide_ids, num_warps=4
+        )
+        scratch = reduced
+        count = stages * KEEP
+    merge_block = max(64, triton.next_power_of_2(count))
+    _topk_merge[(rows,)](
+        scratch,
+        ids,
+        count,
+        KEEP,
+        merge_block,
+        wide_ids,
+        num_warps=4 if merge_block <= 1024 else 8,
+    )
+    return coarse, norms, upper, ids
 
 
-def _bounded_pair(x, weight, codes, scales, coefficients, start, native_policy=()):
+def _bounded_pair(
+    x,
+    weight,
+    codes,
+    scales,
+    coefficients,
+    start,
+    native_policy=(),
+    *,
+    return_upper=True,
+):
     x = x.contiguous()
     rows, vocab = x.size(0), weight.size(0)
-    coarse, upper, ids = _proposal(x, codes, scales, coefficients, native_policy)
+    coarse, norms, upper, ids = _proposal(
+        x, codes, scales, coefficients, native_policy, return_upper=return_upper
+    )
     scores = torch.empty(rows, KEEP, device=x.device, dtype=torch.float16)
-    pairs = torch.empty(rows, 2, device=x.device, dtype=torch.float32)
-    torch.ops._C.sm70_fp16_candidate_scores_out(scores, x, weight, ids)
-    _finish[(rows,)](ids, scores, pairs, KEEP, start, KEEP, num_warps=1)
+    torch.ops._C.sm70_fp16_candidate_scores_out(scores, x, weight, ids, True)
     packet = torch.empty(rows, 3, device=x.device, dtype=torch.float32)
-    _candidate_packet[(rows,)](pairs, upper, ids, packet, vocab, KEEP, num_warps=1)
+    _finish_packet[(rows,)](
+        ids,
+        scores,
+        coarse,
+        coefficients,
+        norms,
+        packet,
+        vocab,
+        KEEP,
+        start,
+        KEEP,
+        num_warps=1,
+    )
     gathered = tensor_model_parallel_all_gather(packet, dim=-1)
     flags = torch.empty(rows, device=x.device, dtype=torch.int32)
-    global_pairs = torch.empty_like(pairs)
+    global_pairs = torch.empty((rows, 2), device=x.device, dtype=torch.float32)
     _certify[(rows,)](gathered, flags, global_pairs, gathered.size(1) // 3, num_warps=1)
     dense = torch.empty_like(coarse)
-    torch.ops._C.sm70_fp16_masked_head_out(dense, x, weight, flags)
+    torch.ops._C.sm70_fp16_masked_head_out(dense, x, weight, flags, True)
     tiles = triton.cdiv(vocab, 1024)
     wide_ids = vocab > 65536
     scratch = torch.empty(
         rows, tiles, device=x.device, dtype=torch.int64 if wide_ids else torch.int32
     )
-    output = torch.empty_like(pairs)
+    output = torch.empty_like(global_pairs)
     _masked_max_tiles[(rows, tiles)](
         dense, flags, scratch, vocab, tiles, wide_ids, num_warps=4
     )
@@ -275,9 +411,16 @@ def _bounded_pair(x, weight, codes, scales, coefficients, start, native_policy=(
 
 
 def _bounded_head(x, weight, codes, scales, coefficients, start, native_policy=None):
-    return _bounded_pair(x, weight, codes, scales, coefficients, start, native_policy)[
-        0
-    ]
+    return _bounded_pair(
+        x,
+        weight,
+        codes,
+        scales,
+        coefficients,
+        start,
+        native_policy,
+        return_upper=False,
+    )[0]
 
 
 def _bounded_head_fake(
@@ -331,7 +474,7 @@ class MTPBoundedTargetHead(nn.Module):
             bias is not None
             or hidden_states.ndim != 2
             or hidden_states.shape[1] != 5120
-            or not 1 <= hidden_states.shape[0] <= 8
+            or not 1 <= hidden_states.shape[0] <= _MAX_BOUNDED_ROWS
             or hidden_states.dtype != torch.float16
             or hidden_states.device != self.weight.device
         ):

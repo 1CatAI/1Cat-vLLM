@@ -108,6 +108,20 @@ _sm70_fp8_prefill_dense_workspaces: dict[tuple, torch.Tensor] = {}
 _sm70_fp8_qpn8_pp2_tp4_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
+def has_block_qpn8_codes(layer: torch.nn.Module) -> bool:
+    return hasattr(layer, "_sm70_block_fp8_qpn8_packed_codes")
+
+
+def layer_supports_direct_output(layer: torch.nn.Module) -> bool:
+    return bool(
+        (
+            getattr(layer, "sm70_fp8_qpn8", False)
+            and not getattr(layer, "sm70_fp8_qpn8_bmm", False)
+        )
+        or has_block_qpn8_codes(layer)
+    )
+
+
 def clear_sm70_fp8_workspaces() -> None:
     """Release process-global SM70 FP8 prefill and QPN8 workspaces."""
     sm70_layer_workspaces.workspace_pool(
@@ -323,11 +337,14 @@ def _missing_sm70_fp8_qpn8_ops() -> list[str]:
 
 def _get_sm70_fp8_prefill_exact_dense_workspace(
     weight: torch.Tensor,
+    min_elements: int = 0,
 ) -> torch.Tensor | None:
     device_index = weight.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    elements = max(_SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS, weight.numel())
+    elements = max(
+        _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS, weight.numel(), min_elements
+    )
     # Never replace a live allocation: prepared layers retain its raw pointer.
     cache_key = (
         (device_index, torch.float16)
@@ -928,9 +945,21 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
         logger.info_once("SM70 FP8 TurboMind W8A16 dense path enabled.")
         return
 
+    def supports_direct_output(self, layer: torch.nn.Module) -> bool:
+        return bool(
+            getattr(layer, "sm70_fp8_qpn8", False)
+            and not getattr(layer, "sm70_fp8_qpn8_bmm", False)
+        )
+
     def apply_weights(
-        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if output is not None and not self.supports_direct_output(layer):
+            raise ValueError("Output buffers require the SM70 FP8 QPN8 route")
         if getattr(layer, "sm70_fp8_qpn8", False):
             if x.dtype != torch.float16:
                 raise RuntimeError(
@@ -978,12 +1007,25 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
             x_2d = flatten_linear_input(x)
             if x_2d.stride(-1) != 1:
                 x_2d = x_2d.contiguous()
-            out_2d = torch.empty(
-                (x_2d.shape[0], layer.output_size_per_partition),
-                device=x.device,
-                dtype=x.dtype,
-            )
+            if output is not None:
+                expected_shape = (*x.shape[:-1], layer.output_size_per_partition)
+                if (
+                    output.shape != expected_shape
+                    or output.dtype != x.dtype
+                    or output.device != x.device
+                    or not output.is_contiguous()
+                ):
+                    raise ValueError("Invalid SM70 FP8 projection output buffer")
+                out_2d = output.reshape(x_2d.shape[0], layer.output_size_per_partition)
+            else:
+                out_2d = torch.empty(
+                    (x_2d.shape[0], layer.output_size_per_partition),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
             if x_2d.shape[0] == 0:
+                if output is not None:
+                    return output
                 return restore_linear_output(out_2d, x, layer.output_size_per_partition)
             torch.ops.vllm.sm70_fp8_qpn8_dispatch(
                 out_2d,
@@ -996,10 +1038,11 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                 bool(layer.sm70_fp8_qpn8_prefetch),
                 False,
             )
-            out = restore_linear_output(out_2d, x, layer.output_size_per_partition)
             if bias is not None:
-                out.add_(bias)
-            return out
+                out_2d.add_(bias)
+            if output is not None:
+                return output
+            return restore_linear_output(out_2d, x, layer.output_size_per_partition)
 
         if getattr(layer, "sm70_fp8_bmm", False):
             group_count = int(layer.sm70_fp8_bmm_groups)

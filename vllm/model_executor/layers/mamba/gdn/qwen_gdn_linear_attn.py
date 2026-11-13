@@ -2406,7 +2406,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # width no longer bounds the rows of a verification round.
                 max_query_len=(
                     self._replay_stride
-                    if self._spec_replay
+                    if getattr(self, "_spec_replay", False)
                     else spec_state_indices_tensor.size(-1)
                 ),
                 validate_data=False,
@@ -2844,10 +2844,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         elif output is None:
             proj_out, _ = self.out_proj(core_attn_out)
         else:
-            # The caller guards the bias-free, non-reducing SM70 FP8 route.
-            # Write the compiler-owned destination within the original opaque
-            # operator; do not publish a hidden allocator-owned intermediate.
-            proj_out = self.out_proj.scheme.apply_weights(
+            # The caller guards the bias-free, non-reducing direct-output
+            # route. Write the compiler-owned destination within the original
+            # opaque operator; do not publish a hidden allocator intermediate.
+            direct_target = getattr(self.out_proj, "scheme", None) or getattr(
+                self.out_proj, "quant_method", None
+            )
+            assert direct_target is not None
+            proj_out = direct_target.apply_weights(
                 self.out_proj, core_attn_out, output=output
             )
         self._gdn_profiler.end(
@@ -2873,23 +2877,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_tokens: int,
     ) -> torch.Tensor:
         layer_name = _encode_layer_name(self.prefix)
-        from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
-            CompressedTensorsW8A16Fp8,
+        direct_target = getattr(self.out_proj, "scheme", None) or getattr(
+            self.out_proj, "quant_method", None
         )
-
+        supports_direct = getattr(direct_target, "supports_direct_output", None)
         direct_write = bool(
             output is not None
-            and self.enable_sm70_dflash2_fused_gdn_verify
+            and current_platform.is_device_capability(70)
+            and (
+                getattr(self, "enable_sm70_dflash2_fused_gdn_verify", False)
+                or not torch.compiler.is_compiling()
+            )
             and num_tokens > 0
             and output.shape == (num_tokens, self.hidden_size)
             and output.dtype == torch.float16
             and output.is_contiguous()
+            and getattr(self, "output_projection_override", None) is None
             # This direct native write bypasses adapter-aware forward methods.
             and isinstance(self.out_proj, RowParallelLinear)
             and self.out_proj.bias is None
             and not self.out_proj.reduce_results
-            and getattr(self.out_proj, "sm70_fp8_qpn8", False)
-            and isinstance(self.out_proj.scheme, CompressedTensorsW8A16Fp8)
+            and callable(supports_direct)
+            and supports_direct(self.out_proj)
         )
         proj_out = self._compute_output_projection(
             core_attn_out, z, num_tokens, output if direct_write else None
@@ -3574,6 +3583,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> bool:
         return bool(
             self.enable_sm70_dflash2_fused_gdn_verify
+            and getattr(self, "verification_update", None) is None
+            and not getattr(self, "_spec_replay", False)
             and mixed_qkv is not None
             and attn_metadata.spec_sequence_masks is not None
             and attn_metadata.num_spec_decodes > 0
@@ -3610,7 +3621,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         value_heads = self.num_v_heads // self.tp_size
         channels = 2 * key_heads * self.head_k_dim + value_heads * self.head_v_dim
         return bool(
-            self.enable_sm70_dflash2_fused_gdn_verify
+            (
+                self.enable_sm70_dflash2_fused_gdn_verify
+                or getattr(self, "verification_update", None) is not None
+            )
             and current_platform.is_device_capability(70)
             and key_heads > 0
             and value_heads == 3 * key_heads
@@ -3631,7 +3645,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and metadata.spec_state_indices_tensor is not None
             and metadata.spec_state_indices_tensor.ndim == 2
             and metadata.spec_state_indices_tensor.shape[0] >= requests
-            and metadata.spec_state_indices_tensor.shape[1] == tokens // requests
+            and (
+                metadata.spec_state_indices_tensor.shape[1] == tokens // requests
+                or (
+                    getattr(self, "_spec_replay", False)
+                    and metadata.spec_state_indices_tensor.shape[1] == 1
+                )
+            )
             and metadata.spec_state_slot_selectors is not None
             and metadata.spec_state_slot_selectors.ndim == 1
             and metadata.spec_state_slot_selectors.numel() >= requests
@@ -3822,7 +3842,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(attn_metadata_raw, dict)
         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
-        if self._spec_replay and attn_metadata.num_decodes > 0:
+        spec_replay = getattr(self, "_spec_replay", False)
+        if spec_replay and attn_metadata.num_decodes > 0:
             self._commit_replayed_decodes(kv_cache[1], attn_metadata)
 
         mixed_qkv_decode_requested = (
@@ -3833,7 +3854,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv.is_contiguous()
                 or (
                     attn_metadata.spec_sequence_masks is not None
-                    and (mixed_qkv.shape[0] in (5, 20) or self._spec_replay)
+                    and (mixed_qkv.shape[0] in (5, 20) or spec_replay)
                     and mixed_qkv.stride(1) == 1
                     and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
                 )
@@ -3969,6 +3990,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_gate_zero,
             )
 
+            need_gating = getattr(self, "verification_update", None) is None
             mixed_qkv_spec, g, beta = conv_gate_zero(
                 mixed_qkv,
                 conv_state,
@@ -3981,8 +4003,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 b,
                 self.dt_bias,
                 core_attn_out,
+                compute_gating=need_gating,
             )
-            precomputed_gating = (g, beta)
+            precomputed_gating = (
+                (g, beta) if g is not None and beta is not None else None
+            )
             _log_runtime_route_once("SM70 DFlash2 conv/gating/zero route hit.")
         elif spec_sequence_masks is not None and not ddtree_tree_gdn_pure_spec:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
@@ -4002,7 +4027,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # width no longer bounds the rows of a verification round.
                 max_query_len=(
                     self._replay_stride
-                    if self._spec_replay
+                    if getattr(self, "_spec_replay", False)
                     else spec_state_indices_tensor.size(-1)
                 ),
                 validate_data=False,
@@ -4214,30 +4239,50 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state=ssm_state,
             attn_metadata=attn_metadata,
         )
+        has_native_verify = getattr(self, "verification_update", None) is not None
+        local_k_heads = self.num_k_heads // self.tp_size
+        local_v_heads = self.num_v_heads // self.tp_size
         use_sm70_mixed_qkv_verify = (
-            mixed_qkv_decode_requested
+            (mixed_qkv_decode_requested or has_native_verify)
             and not use_dflash2_packed_gdn_verify
             and spec_sequence_masks is not None
             and ddtree_parent_ids is None
             and attn_metadata.num_spec_decodes > 0
             and current_platform.is_device_capability(70)
-            and self.num_k_heads // self.tp_size == 4
-            and self.num_v_heads // self.tp_size == 12
             and self.head_k_dim == self.head_v_dim == 128
             and ssm_state.dtype == torch.float32
             and mixed_qkv_spec is not None
             and (
-                mixed_qkv_spec.is_contiguous()
-                or (
-                    (mixed_qkv_spec.shape[0] in (5, 20) or self._spec_replay)
+                (
+                    has_native_verify
+                    and mixed_qkv_spec.is_cuda
+                    and mixed_qkv_spec.dtype == torch.float16
+                    and local_k_heads > 0
+                    and local_v_heads % local_k_heads == 0
                     and mixed_qkv_spec.stride(1) == 1
                     and mixed_qkv_spec.stride(0) >= mixed_qkv_spec.shape[1]
+                    and mixed_qkv_spec.stride(0) % 2 == 0
+                    and 1
+                    <= mixed_qkv_spec.shape[0]
+                    <= attn_metadata.num_spec_decodes * 8
                 )
-            )
-            and (
-                1 < mixed_qkv_spec.shape[0] <= 16
-                or mixed_qkv_spec.shape[0] == 20
-                or (self._spec_replay and mixed_qkv_spec.stride(1) == 1)
+                or (
+                    local_k_heads == 4
+                    and local_v_heads == 12
+                    and (
+                        mixed_qkv_spec.is_contiguous()
+                        or (
+                            (mixed_qkv_spec.shape[0] in (5, 20) or spec_replay)
+                            and mixed_qkv_spec.stride(1) == 1
+                            and mixed_qkv_spec.stride(0) >= mixed_qkv_spec.shape[1]
+                        )
+                    )
+                    and (
+                        1 < mixed_qkv_spec.shape[0] <= 16
+                        or mixed_qkv_spec.shape[0] == 20
+                        or (spec_replay and mixed_qkv_spec.stride(1) == 1)
+                    )
+                )
             )
         )
         if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
@@ -4400,7 +4445,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 direct_verify_out = bool(
                     spec_rows_are_batch
                     and num_actual_tokens == mixed_qkv_spec.shape[0]
-                    and (num_actual_tokens in (5, 20) or self._spec_replay)
+                    and (
+                        has_native_verify or num_actual_tokens in (5, 20) or spec_replay
+                    )
                     and core_attn_out.is_contiguous()
                     and core_attn_out.dtype == mixed_qkv_spec.dtype
                 )
@@ -4419,12 +4466,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         spec_query_start_loc,
                         spec_state_indices_tensor,
                         spec_state_slot_selectors,
-                        replay=self._spec_replay_args() if self._spec_replay else None,
+                        replay=self._spec_replay_args() if spec_replay else None,
                     )
                     if self.verification_update is not None
                     else None
                 )
-                if verified is None and self._spec_replay:
+                if verified is None and spec_replay:
                     raise RuntimeError(
                         "GDN speculative replay: the CUDA verifier rejected "
                         f"{mixed_qkv_spec.shape[0]} rows (requests="
@@ -4466,7 +4513,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     "SM70 mixed-QKV fused GDN target-verification route hit."
                 )
             else:
-                if self._spec_replay:
+                if spec_replay:
                     raise RuntimeError(
                         "GDN speculative replay requires the mixed-QKV verifier."
                     )
@@ -5344,6 +5391,7 @@ def qwen_gdn_attention_core_spec_commit(
                 conv_gate_zero,
             )
 
+            need_gating = getattr(self, "verification_update", None) is None
             mixed_qkv_spec, g, beta = conv_gate_zero(
                 mixed_qkv,
                 conv_state,
@@ -5356,8 +5404,11 @@ def qwen_gdn_attention_core_spec_commit(
                 b,
                 self.dt_bias,
                 core_attn_out,
+                compute_gating=need_gating,
             )
-            precomputed_gating = (g, beta)
+            precomputed_gating = (
+                (g, beta) if g is not None and beta is not None else None
+            )
             _log_runtime_route_once("SM70 DFlash2 conv/gating/zero route hit.")
         else:
             mixed_qkv_spec = convolve_decode(
@@ -5373,11 +5424,52 @@ def qwen_gdn_attention_core_spec_commit(
                 # width no longer bounds the rows of a verification round.
                 max_query_len=(
                     self._replay_stride
-                    if self._spec_replay
+                    if getattr(self, "_spec_replay", False)
                     else spec_state_indices_tensor.size(-1)
                 ),
                 validate_data=False,
             )
+        if getattr(self, "verification_update", None) is not None:
+            direct_verify_out = bool(
+                core_attn_out.is_contiguous()
+                and core_attn_out.dtype == mixed_qkv_spec.dtype
+                and core_attn_out.shape[0] >= mixed_qkv_spec.shape[0]
+            )
+            verified = self.verification_update(
+                self.A_log,
+                self.dt_bias,
+                attn_metadata.num_spec_decodes,
+                mixed_qkv_spec,
+                a,
+                b,
+                ssm_state,
+                core_attn_out,
+                mixed_qkv_spec.shape[0],
+                direct_verify_out,
+                spec_query_start_loc,
+                spec_state_indices_tensor,
+                spec_state_slot_selectors,
+                replay=(
+                    self._spec_replay_args()
+                    if getattr(self, "_spec_replay", False)
+                    else None
+                ),
+            )
+            if verified is None and getattr(self, "_spec_replay", False):
+                raise RuntimeError(
+                    "GDN speculative replay: the CUDA verifier rejected "
+                    f"{mixed_qkv_spec.shape[0]} rows (requests="
+                    f"{attn_metadata.num_spec_decodes}, dtype="
+                    f"{mixed_qkv_spec.dtype}, strides={mixed_qkv_spec.stride()}, "
+                    f"state={ssm_state.dtype})."
+                )
+            if verified is not None:
+                if not direct_verify_out:
+                    core_attn_out[: mixed_qkv_spec.shape[0]] = verified[0].squeeze(0)
+                _sm70_dump_gdn_core_tensor(
+                    "core_out", layer_name, core_attn_out, metadata_source
+                )
+                return core_attn_out
         if isinstance(self, QwenGatedDeltaNetAttention) and (
             self._can_use_dflash2_packed_gdn_verify(
                 mixed_qkv=mixed_qkv_spec,

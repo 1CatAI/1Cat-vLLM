@@ -43,6 +43,7 @@ def _conv_gate_zero_kernel(
     BLOCK_TOKENS: tl.constexpr,
     NP2_STATE: tl.constexpr,
     CHANNEL_TILE: tl.constexpr,
+    COMPUTE_GATING: tl.constexpr = True,
 ):
     request = tl.program_id(0)
     feature = tl.program_id(1) * CHANNEL_TILE + tl.arange(0, CHANNEL_TILE)
@@ -55,19 +56,20 @@ def _conv_gate_zero_kernel(
         0,
         (token[:, None] < TOKENS) & (feature[None, :] < VALUE_WIDTH),
     )
-    if tl.program_id(1) < TOKENS:
-        head = tl.arange(0, BLOCK_HEADS)
-        mask = head < HEADS
-        offset = (request * TOKENS + tl.program_id(1)) * HEADS + head
-        a_log = tl.load(ALog + head, mask=mask, other=0)
-        a = tl.load(A + offset, mask=mask, other=0)
-        b = tl.load(B + offset, mask=mask, other=0)
-        bias = tl.load(Bias + head, mask=mask, other=0)
-        x = a.to(tl.float32) + bias.to(tl.float32)
-        softplus = tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x)
-        g = -tl.exp(a_log.to(tl.float32)) * softplus
-        tl.store(G + offset, g, mask=mask)
-        tl.store(Beta + offset, tl.sigmoid(b.to(tl.float32)), mask=mask)
+    if COMPUTE_GATING:  # noqa: SIM102
+        if tl.program_id(1) < TOKENS:
+            head = tl.arange(0, BLOCK_HEADS)
+            mask = head < HEADS
+            offset = (request * TOKENS + tl.program_id(1)) * HEADS + head
+            a_log = tl.load(ALog + head, mask=mask, other=0)
+            a = tl.load(A + offset, mask=mask, other=0)
+            b = tl.load(B + offset, mask=mask, other=0)
+            bias = tl.load(Bias + head, mask=mask, other=0)
+            x = a.to(tl.float32) + bias.to(tl.float32)
+            softplus = tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x)
+            g = -tl.exp(a_log.to(tl.float32)) * softplus
+            tl.store(G + offset, g, mask=mask)
+            tl.store(Beta + offset, tl.sigmoid(b.to(tl.float32)), mask=mask)
     # Inline the existing convolution body, including accepted-history offset,
     # in-place QKV writes, and state-layout strides. Delta is a separate launch.
     _causal_conv1d_update_kernel(
@@ -125,6 +127,8 @@ def conv_gate_zero(
     core_out,
     channel_tile=64,
     num_warps=2,
+    *,
+    compute_gating: bool = True,
 ):
     """Dispatch proves a complete verifier batch and its state layouts."""
     rows = qkv.shape[0]
@@ -148,9 +152,15 @@ def conv_gate_zero(
     assert cu.shape == (batch + 1,) and accepted.is_contiguous() and cu.is_contiguous()
     # Match causal_conv1d_update: speculative history uses width-1 plus
     # tokens-1 entries even when the physical cache has a longer stride.
-    g = torch.empty((1, rows, heads), dtype=torch.float32, device=qkv.device)
-    beta = torch.empty_like(g)
-    _conv_gate_zero_kernel[(batch, max(tokens, triton.cdiv(channels, channel_tile)))](
+    if compute_gating:
+        g = torch.empty((1, rows, heads), dtype=torch.float32, device=qkv.device)
+        beta = torch.empty_like(g)
+        grid_y = max(tokens, triton.cdiv(channels, channel_tile))
+    else:
+        g = None
+        beta = None
+        grid_y = triton.cdiv(channels, channel_tile)
+    _conv_gate_zero_kernel[(batch, grid_y)](
         qkv,
         weight,
         state,
@@ -179,6 +189,7 @@ def conv_gate_zero(
         triton.next_power_of_2(tokens),
         triton.next_power_of_2(tokens + 2),
         channel_tile,
+        COMPUTE_GATING=compute_gating,
         num_warps=num_warps,
     )
     return qkv, g, beta

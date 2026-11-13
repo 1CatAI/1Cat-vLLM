@@ -102,12 +102,12 @@ __global__ void mtp_moe_fp16_tile_kernel(const half* x, const void* w,
 // tiles into shared memory; the first ROWS threads keep the original sequential
 // FP32 FMA order per output row, so the result is bit-identical to the
 // one-thread-per-row kernel it replaces.
-template <int ROWS, int BK, int NT, bool Packed = false>
+template <int kN, int ROWS, int BK, int NT, bool Packed = false>
 __global__ __launch_bounds__(NT, 1) void mtp_moe_fp16_m1_w13_staged_kernel(
     const half* __restrict__ x, const void* __restrict__ w,
     const int32_t* __restrict__ ids, const int32_t* __restrict__ padded,
     half* __restrict__ y) {
-  constexpr int kN = 320, kK = 2560, PAD = BK + 8;
+  constexpr int kK = 2560, PAD = BK + 8;
   constexpr int VEC = ROWS * BK / 8;        // uint4 per stage
   constexpr int PER = (VEC + NT - 1) / NT;  // uint4 per thread per stage
   constexpr int STAGES = kK / BK;
@@ -193,7 +193,12 @@ void mtp_moe_fp16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
   TORCH_CHECK(weights.dim() == 2 && weights.size(1) == 10 &&
                   weights.size(0) >= 1 && weights.size(0) <= 80,
               "MTP FP16 MoE requires M1..80, topk=10");
-  const int m = weights.size(0), n = down ? 2560 : 320, k = down ? 160 : 2560;
+  const int m = weights.size(0);
+  const int inter =
+      down ? static_cast<int>(w.size(2)) : static_cast<int>(w.size(1) / 2);
+  TORCH_CHECK(inter == 160 || inter == 320 || inter == 640,
+              "Invalid MTP FP16 MoE shard width");
+  const int n = down ? 2560 : 2 * inter, k = down ? inter : 2560;
   TORCH_CHECK(w.sizes() == at::IntArrayRef({512, n, k}) &&
                   x.sizes() == at::IntArrayRef({down ? m * 10 : m, k}) &&
                   out.sizes() == at::IntArrayRef({m, 10, n}) &&
@@ -209,15 +214,27 @@ void mtp_moe_fp16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
   const auto* tp = weights.data_ptr<float>();
   const auto* pp = padded.data_ptr<int32_t>();
   auto* op = reinterpret_cast<half*>(out.data_ptr());
-  if (down) {
-    mtp_moe_fp16_tile_kernel<2560, 160, 64, 64, true>
-        <<<dim3(40, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
-  } else if (m == 1) {
-    mtp_moe_fp16_m1_w13_staged_kernel<40, 128, 320>
-        <<<dim3(8, 10), 320, 0, stream>>>(xp, wp, ip, pp, op);
+  auto dispatch_shard = [&](auto inter_tag) {
+    constexpr int kInter = decltype(inter_tag)::value;
+    constexpr int kW13N = 2 * kInter;
+    if (down) {
+      mtp_moe_fp16_tile_kernel<2560, kInter, 64, 64, true>
+          <<<dim3(40, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
+    } else if (m == 1) {
+      mtp_moe_fp16_m1_w13_staged_kernel<kW13N, 40, 128, 320>
+          <<<dim3(kW13N / 40, 10), 320, 0, stream>>>(xp, wp, ip, pp, op);
+    } else {
+      mtp_moe_fp16_tile_kernel<kW13N, 2560, 32, 128, false>
+          <<<dim3(kW13N / 32, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp,
+                                                         op);
+    }
+  };
+  if (inter == 160) {
+    dispatch_shard(std::integral_constant<int, 160>{});
+  } else if (inter == 320) {
+    dispatch_shard(std::integral_constant<int, 320>{});
   } else {
-    mtp_moe_fp16_tile_kernel<320, 2560, 32, 128, false>
-        <<<dim3(10, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
+    dispatch_shard(std::integral_constant<int, 640>{});
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -242,7 +259,12 @@ void mtp_moe_bf16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
   TORCH_CHECK(weights.dim() == 2 && weights.size(1) == 10 &&
                   weights.size(0) >= 1 && weights.size(0) <= 80,
               "MTP BF16 MoE requires M1..80, topk=10");
-  const int m = weights.size(0), n = down ? 2560 : 320, k = down ? 160 : 2560;
+  const int m = weights.size(0);
+  const int inter =
+      down ? static_cast<int>(w.size(2)) : static_cast<int>(w.size(1) / 2);
+  TORCH_CHECK(inter == 160 || inter == 320 || inter == 640,
+              "Invalid MTP BF16 MoE shard width");
+  const int n = down ? 2560 : 2 * inter, k = down ? inter : 2560;
   TORCH_CHECK(w.sizes() == at::IntArrayRef({512, n, k}) &&
                   x.sizes() == at::IntArrayRef({down ? m * 10 : m, k}) &&
                   out.sizes() == at::IntArrayRef({m, 10, n}) &&
@@ -258,12 +280,24 @@ void mtp_moe_bf16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
   const auto* tp = weights.data_ptr<float>();
   const auto* pp = padded.data_ptr<int32_t>();
   auto* op = reinterpret_cast<half*>(out.data_ptr());
-  if (down) {
-    mtp_moe_fp16_tile_kernel<2560, 160, 64, 64, true, false, true>
-        <<<dim3(40, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
+  auto dispatch_bf16_shard = [&](auto inter_tag) {
+    constexpr int kInter = decltype(inter_tag)::value;
+    constexpr int kW13N = 2 * kInter;
+    if (down) {
+      mtp_moe_fp16_tile_kernel<2560, kInter, 64, 64, true, false, true>
+          <<<dim3(40, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
+    } else {
+      mtp_moe_fp16_tile_kernel<kW13N, 2560, 32, 128, false, false, true>
+          <<<dim3(kW13N / 32, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp,
+                                                         op);
+    }
+  };
+  if (inter == 160) {
+    dispatch_bf16_shard(std::integral_constant<int, 160>{});
+  } else if (inter == 320) {
+    dispatch_bf16_shard(std::integral_constant<int, 320>{});
   } else {
-    mtp_moe_fp16_tile_kernel<320, 2560, 32, 128, false, false, true>
-        <<<dim3(10, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
+    dispatch_bf16_shard(std::integral_constant<int, 640>{});
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -307,7 +341,7 @@ void mtp_moe_u13_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
     mtp_moe_fp16_tile_kernel<2560, 160, 64, 64, true, true>
         <<<dim3(40, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
   } else if (m == 1) {
-    mtp_moe_fp16_m1_w13_staged_kernel<40, 128, 320, true>
+    mtp_moe_fp16_m1_w13_staged_kernel<320, 40, 128, 320, true>
         <<<dim3(8, 10), 320, 0, stream>>>(xp, wp, ip, pp, op);
   } else {
     mtp_moe_fp16_tile_kernel<320, 2560, 32, 128, false, true>

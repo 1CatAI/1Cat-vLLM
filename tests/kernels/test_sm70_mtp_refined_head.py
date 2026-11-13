@@ -85,13 +85,14 @@ def test_wider_draft_shortlist_preserves_original_weight_scores(rows):
     )
 
 
-def test_refined_head_rerank_ties_and_replay():
+@pytest.mark.parametrize("rows", [8, 40])
+def test_refined_head_rerank_ties_and_replay(rows):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires SM70")
-    x = torch.zeros(8, 5120, device="cuda", dtype=torch.float16)
+    x = torch.zeros(rows, 5120, device="cuda", dtype=torch.float16)
     weight = torch.zeros(64, 5120, device="cuda", dtype=torch.float16)
     weight[:, 0] = torch.arange(64, device="cuda", dtype=torch.float16)
-    ids = torch.arange(31, -1, -1, device="cuda", dtype=torch.int32).expand(8, -1)
+    ids = torch.arange(31, -1, -1, device="cuda", dtype=torch.int32).expand(rows, -1)
     ids = ids.contiguous()
     _rerank_candidates(x, weight, ids, 62080)
     graph = torch.cuda.CUDAGraph()

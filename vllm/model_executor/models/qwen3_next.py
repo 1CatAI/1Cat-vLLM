@@ -414,7 +414,6 @@ class Qwen3NextAttention(nn.Module):
             )
             and model_config is not None
             and model_config.dtype == torch.float16
-            and model_config.quantization == "compressed-tensors"
             and config.model_type == "qwen3_5_text"
             and _is_dflash2_spec_config(get_current_vllm_config())
             and self.attn_output_gate

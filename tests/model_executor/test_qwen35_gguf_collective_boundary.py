@@ -14,8 +14,12 @@ from vllm.model_executor.models import qwen3_5 as model
     [
         ("gguf", 4, None, True, True),
         ("compressed-tensors", 4, None, True, True),
+        ("fp8", 4, None, True, True),
+        ("modelopt_fp4", 4, None, True, True),
+        (None, 4, None, True, True),
         ("gguf", 2, None, True, True),
         ("compressed-tensors", 2, None, True, True),
+        ("fp8", 2, None, True, True),
         ("gguf", 1, None, True, False),
         ("gguf", 4, True, True, False),
         ("gguf", 4, None, False, False),

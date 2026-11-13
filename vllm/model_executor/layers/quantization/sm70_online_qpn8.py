@@ -326,9 +326,22 @@ def maybe_apply_fused_hc(
     return block_out, injection_out
 
 
+def maybe_apply_online_qpn8_fused_silu(
+    layer: nn.Module,
+    x: torch.Tensor,
+) -> torch.Tensor | None:
+    """Run fused gated-SiLU on a prepared channel-QPN8 projection, or ``None``."""
+    from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+        apply_mtp_draft_qpn8_fused_silu,
+    )
+
+    return apply_mtp_draft_qpn8_fused_silu(layer, x)
+
+
 __all__ = [
     "_shape_config",
     "maybe_apply_fused_hc",
     "maybe_apply_online_qpn8",
+    "maybe_apply_online_qpn8_fused_silu",
     "maybe_prepare_online_qpn8",
 ]

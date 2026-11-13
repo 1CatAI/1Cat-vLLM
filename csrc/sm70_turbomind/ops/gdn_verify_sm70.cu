@@ -6,12 +6,10 @@
 // per-token state slots [N, S], num_accepted_tokens, fp32 state [slots, HV, V,
 // K] updated in place for every token, o [T, HV, V] fp16.
 //
-// The Triton kernel runs one program per (V-tile of 32, head): 48 programs per
-// rank at HV = 12, each walking the T tokens with global loads inside the loop.
-// Here a CTA owns 16 state rows (4 warps x 4 rows, each lane 4 K columns of a
-// row in registers): 96+ CTAs, every token's q/k/v and gate scalars are loaded
-// up front, so the T-step chain is register math plus warp reductions, and
-// per-token state stores are fire-and-forget float4s.
+// Each CTA cooperatively precomputes all T step Q/K L2 normalizations, gating
+// scalars, and V/replay slices into shared memory in parallel across warps
+// while initial state loads are in flight from HBM, keeping the serial T-step
+// recurrence free of global-memory stalls and low in register pressure.
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -56,6 +54,7 @@ struct P {
   const int* ckt;
   const int* cks;
 };
+
 __device__ __forceinline__ long long seq_floats(int H, int HV) {
   return (long long)TMAX * (H * KD + HV * KD + HV * 2);
 }
@@ -74,15 +73,27 @@ __device__ __forceinline__ void round_done(const P& p) {
   }
 }
 
+template <int TT, int CTA_ROWS, bool REPLAY>
+struct GdnVerifySmem {
+  alignas(16) float q[TT][KD];
+  alignas(16) float k[TT][KD];
+  alignas(16) float rk[REPLAY ? TMAX : 1][KD];
+  alignas(16) float v[TT][CTA_ROWS];
+  alignas(16) float rv[REPLAY ? TMAX : 1][CTA_ROWS];
+  float2 gb[TT];
+  float2 rgb[REPLAY ? TMAX : 1];
+};
+
 template <typename TA, typename TD, int WARPS, int ROWS, bool REPLAY, int TT>
-__global__ __launch_bounds__(WARPS * 32) void gdn_verify(P p, const TA* A_log,
-                                                         const TD* dt_bias) {
+__global__ __launch_bounds__(WARPS * 32, (WARPS <= 4 ? 8 : 4)) void gdn_verify(
+    P p, const TA* __restrict__ A_log, const TD* __restrict__ dt_bias) {
+  constexpr int CTA_ROWS = WARPS * ROWS;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int n = blockIdx.y / p.HV, hv = blockIdx.y % p.HV,
             h = hv / (p.HV / p.H);
   const int bos = p.cu[n], T = p.cu[n + 1] - bos;
   // Replay mode commits the previous round even without current tokens.
-  const int R0 = REPLAY ? p.rn[n] : 0;
+  const int R0 = REPLAY ? min(p.rn[n], TMAX) : 0;
   if (T <= 0 && R0 <= 0) {
     if (REPLAY && !p.rmap) round_done(p);
     return;
@@ -93,20 +104,25 @@ __global__ __launch_bounds__(WARPS * 32) void gdn_verify(P p, const TA* A_log,
     if (REPLAY && !p.rmap) round_done(p);
     return;
   }
-  const int row0 = blockIdx.x * (WARPS * ROWS) + warp * ROWS;
-  const int qo = h * KD + lane * 4, ko = p.H * KD + h * KD + lane * 4,
-            vo = 2 * p.H * KD + hv * KD + row0;
 
-  // ---- everything the T-step chain needs, issued before the state load lands
+  const int cta_row0 = blockIdx.x * CTA_ROWS;
+  const int row0 = cta_row0 + warp * ROWS;
+  const int qo = h * KD + lane * 4, ko = p.H * KD + h * KD + lane * 4,
+            cta_vo = 2 * p.H * KD + hv * KD + cta_row0;
+
+  // Issue state loads immediately so HBM latency overlaps with parallel
+  // Q/K/V/gate precompute across the CTA's warps.
   float4 st[ROWS];
 #pragma unroll
-  for (int j = 0; j < ROWS; ++j)
+  for (int j = 0; j < ROWS; ++j) {
     st[j] = __ldcg(
         reinterpret_cast<const float4*>(p.state + slot0 * p.s_state +
                                         ((long long)hv * KD + row0 + j) * KD) +
         lane);
-  // Replay: committed state + the previous round's first rn tokens = the
-  // round's initial state.
+  }
+
+  __shared__ GdnVerifySmem<TT, CTA_ROWS, REPLAY> smem;
+
   const unsigned side =
       !REPLAY ? 0u
               : (p.rmap ? (unsigned)(p.rmap[n] & 1) : (__ldcg(p.ctr) & 1u));
@@ -114,59 +130,112 @@ __global__ __launch_bounds__(WARPS * 32) void gdn_verify(P p, const TA* A_log,
   const int rs = REPLAY && p.rmap ? (p.rmap[n] >> 1) : n;
   float* cur =
       REPLAY ? p.rbuf + ((long long)side * p.nmax + rs) * SEQ : nullptr;
-  int R = 0;
-  float4 rkv[TT];
-  float rvv[TT][ROWS], rdc[TT], rbt[TT];
-  if (REPLAY) {
-    const float* prv = p.rbuf + ((long long)(side ^ 1u) * p.nmax + rs) * SEQ;
-    R = R0;
-#pragma unroll
-    for (int t = 0; t < TT; ++t) {
-      if (t < R) {
-        rkv[t] = __ldcg(
-            reinterpret_cast<const float4*>(prv + (t * p.H + h) * KD) + lane);
-#pragma unroll
-        for (int j = 0; j < ROWS; ++j)
-          rvv[t][j] =
-              __ldcg(prv + TMAX * p.H * KD + (t * p.HV + hv) * KD + row0 + j);
-        const float2 gb = __ldcg(
+  const float* prv =
+      REPLAY ? p.rbuf + ((long long)(side ^ 1u) * p.nmax + rs) * SEQ : nullptr;
+
+  if constexpr (REPLAY) {
+    for (int t = warp; t < R0; t += WARPS) {
+      const float4 rk4 = __ldg(
+          reinterpret_cast<const float4*>(prv + (t * p.H + h) * KD) + lane);
+      *reinterpret_cast<float4*>(&smem.rk[t][lane * 4]) = rk4;
+      if (lane < CTA_ROWS) {
+        smem.rv[t][lane] = __ldg(prv + TMAX * p.H * KD + (t * p.HV + hv) * KD +
+                                 cta_row0 + lane);
+      }
+      if (lane == 0) {
+        smem.rgb[t] = __ldg(
             reinterpret_cast<const float2*>(prv + TMAX * (p.H + p.HV) * KD) +
             t * p.HV + hv);
-        rdc[t] = gb.x, rbt[t] = gb.y;
       }
     }
   }
-  uint2 qr[TT], kr[TT];
-  float vr[TT][ROWS], ar[TT], br[TT];
-  const float Al = tof(A_log[hv]), dtb = tof(dt_bias[hv]);
-#pragma unroll
-  for (int t = 0; t < TT; ++t) {
-    if (t < T) {
+
+  const int Tc = min(T, TT);
+  if (Tc > 0) {
+    const float negA = -__expf(tof(A_log[hv]));
+    const float dtb = tof(dt_bias[hv]);
+    for (int t = warp; t < Tc; t += WARPS) {
       const half* row = p.qkv + (long long)(bos + t) * p.qkv_stride;
-      qr[t] = *reinterpret_cast<const uint2*>(row + qo);
-      kr[t] = *reinterpret_cast<const uint2*>(row + ko);
+      const uint2 qr = *reinterpret_cast<const uint2*>(row + qo);
+      const uint2 kr = *reinterpret_cast<const uint2*>(row + ko);
+      if (lane < CTA_ROWS) {
+        const float vf = __half2float(__ldg(row + cta_vo + lane));
+        smem.v[t][lane] = vf;
+        if constexpr (REPLAY) {
+          __stcg(cur + TMAX * p.H * KD + (t * p.HV + hv) * KD + cta_row0 + lane,
+                 vf);
+        }
+      }
+      float q[4], k[4];
+      {
+        const half2 q01 = *reinterpret_cast<const half2*>(&qr.x),
+                    q23 = *reinterpret_cast<const half2*>(&qr.y);
+        const half2 k01 = *reinterpret_cast<const half2*>(&kr.x),
+                    k23 = *reinterpret_cast<const half2*>(&kr.y);
+        q[0] = __low2float(q01), q[1] = __high2float(q01),
+        q[2] = __low2float(q23), q[3] = __high2float(q23);
+        k[0] = __low2float(k01), k[1] = __high2float(k01),
+        k[2] = __low2float(k23), k[3] = __high2float(k23);
+      }
+      float sq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+      float sk = k[0] * k[0] + k[1] * k[1] + k[2] * k[2] + k[3] * k[3];
 #pragma unroll
-      for (int j = 0; j < ROWS; ++j) vr[t][j] = __half2float(row[vo + j]);
-      ar[t] = __half2float(p.a[(bos + t) * p.lda + hv]);
-      br[t] = __half2float(p.b[(bos + t) * p.ldb + hv]);
+      for (int s = 16; s > 0; s >>= 1) {
+        sq += __shfl_xor_sync(0xffffffff, sq, s);
+        sk += __shfl_xor_sync(0xffffffff, sk, s);
+      }
+      const float rq = rsqrtf(sq + 1e-6f) * p.scale, rk = rsqrtf(sk + 1e-6f);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) q[e] *= rq, k[e] *= rk;
+      *reinterpret_cast<float4*>(&smem.q[t][lane * 4]) =
+          make_float4(q[0], q[1], q[2], q[3]);
+      *reinterpret_cast<float4*>(&smem.k[t][lane * 4]) =
+          make_float4(k[0], k[1], k[2], k[3]);
+
+      const float ar = __half2float(p.a[(bos + t) * p.lda + hv]);
+      const float br = __half2float(p.b[(bos + t) * p.ldb + hv]);
+      const float x = ar + dtb;
+      const float sp = x <= 20.f ? logf(1.f + __expf(x)) : x;
+      const float decay = __expf(negA * sp);
+      const float beta = 1.f / (1.f + __expf(-br));
+      if (lane == 0) {
+        smem.gb[t] = make_float2(decay, beta);
+      }
+      if constexpr (REPLAY) {
+        if (blockIdx.x == 0 && hv % (p.HV / p.H) == 0) {
+          __stcg(reinterpret_cast<float4*>(cur + (t * p.H + h) * KD) + lane,
+                 make_float4(k[0], k[1], k[2], k[3]));
+        }
+        if (blockIdx.x == 0 && lane == 0) {
+          __stcg(reinterpret_cast<float2*>(cur + TMAX * (p.H + p.HV) * KD) +
+                     t * p.HV + hv,
+                 make_float2(decay, beta));
+        }
+      }
     }
   }
+  __syncthreads();
+
   float hs[ROWS][4];
 #pragma unroll
-  for (int j = 0; j < ROWS; ++j)
-    hs[j][0] = st[j].x, hs[j][1] = st[j].y, hs[j][2] = st[j].z,
+  for (int j = 0; j < ROWS; ++j) {
+    hs[j][0] = st[j].x;
+    hs[j][1] = st[j].y;
+    hs[j][2] = st[j].z;
     hs[j][3] = st[j].w;
-  const float negA = -__expf(Al);
-  if (REPLAY) {
-#pragma unroll
-    for (int t = 0; t < TT; ++t) {
-      if (t >= R) break;
-      const float k[4] = {rkv[t].x, rkv[t].y, rkv[t].z, rkv[t].w};
+  }
+
+  if constexpr (REPLAY) {
+    for (int t = 0; t < R0; ++t) {
+      const float4 rk4 =
+          *reinterpret_cast<const float4*>(&smem.rk[t][lane * 4]);
+      const float2 rgb = smem.rgb[t];
+      const float k[4] = {rk4.x, rk4.y, rk4.z, rk4.w};
       float d[ROWS];
 #pragma unroll
       for (int j = 0; j < ROWS; ++j) {
 #pragma unroll
-        for (int e = 0; e < 4; ++e) hs[j][e] *= rdc[t];
+        for (int e = 0; e < 4; ++e) hs[j][e] *= rgb.x;
         d[j] = hs[j][0] * k[0] + hs[j][1] * k[1] + hs[j][2] * k[2] +
                hs[j][3] * k[3];
       }
@@ -177,71 +246,33 @@ __global__ __launch_bounds__(WARPS * 32) void gdn_verify(P p, const TA* A_log,
           d[j] += __shfl_xor_sync(0xffffffff, d[j], s);
 #pragma unroll
       for (int j = 0; j < ROWS; ++j) {
-        const float u = (rvv[t][j] - d[j]) * rbt[t];
+        const float u = (smem.rv[t][warp * ROWS + j] - d[j]) * rgb.y;
 #pragma unroll
         for (int e = 0; e < 4; ++e) hs[j][e] += u * k[e];
       }
     }
-    if (R > 0) {
+    if (R0 > 0) {
 #pragma unroll
-      for (int j = 0; j < ROWS; ++j)
+      for (int j = 0; j < ROWS; ++j) {
         __stcg(reinterpret_cast<float4*>(p.state + slot0 * p.s_state +
                                          ((long long)hv * KD + row0 + j) * KD) +
                    lane,
                make_float4(hs[j][0], hs[j][1], hs[j][2], hs[j][3]));
+      }
     }
   }
 
-#pragma unroll
-  for (int t = 0; t < TT; ++t) {
-    if (t >= T) break;
-    float q[4], k[4];
-    {
-      const half2 q01 = *reinterpret_cast<const half2*>(&qr[t].x),
-                  q23 = *reinterpret_cast<const half2*>(&qr[t].y);
-      const half2 k01 = *reinterpret_cast<const half2*>(&kr[t].x),
-                  k23 = *reinterpret_cast<const half2*>(&kr[t].y);
-      q[0] = __low2float(q01), q[1] = __high2float(q01),
-      q[2] = __low2float(q23), q[3] = __high2float(q23);
-      k[0] = __low2float(k01), k[1] = __high2float(k01),
-      k[2] = __low2float(k23), k[3] = __high2float(k23);
-    }
-    float sq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
-    float sk = k[0] * k[0] + k[1] * k[1] + k[2] * k[2] + k[3] * k[3];
-#pragma unroll
-    for (int s = 16; s > 0; s >>= 1) {
-      sq += __shfl_xor_sync(0xffffffff, sq, s);
-      sk += __shfl_xor_sync(0xffffffff, sk, s);
-    }
-    const float rq = rsqrtf(sq + 1e-6f) * p.scale, rk = rsqrtf(sk + 1e-6f);
-#pragma unroll
-    for (int e = 0; e < 4; ++e) q[e] *= rq, k[e] *= rk;
-    const float x = ar[t] + dtb;
-    const float sp = x <= 20.f ? logf(1.f + __expf(x)) : x;
-    const float decay = __expf(negA * sp);
-    const float beta = 1.f / (1.f + __expf(-br[t]));
-    if (REPLAY) {
-      if (blockIdx.x == 0 && hv % (p.HV / p.H) == 0 && warp == 0)
-        __stcg(reinterpret_cast<float4*>(cur + (t * p.H + h) * KD) + lane,
-               make_float4(k[0], k[1], k[2], k[3]));
-      if (lane < ROWS) {
-        float mine = vr[t][0];
-#pragma unroll
-        for (int j = 1; j < ROWS; ++j)
-          if (lane == j) mine = vr[t][j];
-        __stcg(cur + TMAX * p.H * KD + (t * p.HV + hv) * KD + row0 + lane,
-               mine);
-      }
-      if (blockIdx.x == 0 && threadIdx.x == 0)
-        __stcg(reinterpret_cast<float2*>(cur + TMAX * (p.H + p.HV) * KD) +
-                   t * p.HV + hv,
-               make_float2(decay, beta));
-    }
+  for (int t = 0; t < Tc; ++t) {
+    const float4 q4 = *reinterpret_cast<const float4*>(&smem.q[t][lane * 4]);
+    const float4 k4 = *reinterpret_cast<const float4*>(&smem.k[t][lane * 4]);
+    const float2 gb = smem.gb[t];
+    const float q[4] = {q4.x, q4.y, q4.z, q4.w};
+    const float k[4] = {k4.x, k4.y, k4.z, k4.w};
     float d[ROWS];
 #pragma unroll
     for (int j = 0; j < ROWS; ++j) {
 #pragma unroll
-      for (int e = 0; e < 4; ++e) hs[j][e] *= decay;
+      for (int e = 0; e < 4; ++e) hs[j][e] *= gb.x;
       d[j] =
           hs[j][0] * k[0] + hs[j][1] * k[1] + hs[j][2] * k[2] + hs[j][3] * k[3];
     }
@@ -253,7 +284,7 @@ __global__ __launch_bounds__(WARPS * 32) void gdn_verify(P p, const TA* A_log,
     float ov[ROWS];
 #pragma unroll
     for (int j = 0; j < ROWS; ++j) {
-      const float u = (vr[t][j] - d[j]) * beta;
+      const float u = (smem.v[t][warp * ROWS + j] - d[j]) * gb.y;
 #pragma unroll
       for (int e = 0; e < 4; ++e) hs[j][e] += u * k[e];
       ov[j] =
@@ -369,13 +400,7 @@ void sm70_gdn_verify_out(torch::Tensor qkv, torch::Tensor a, torch::Tensor b,
       TORCH_CHECK(false, "A_log/dt_bias dtypes");
   };
   auto go2 = [&](auto wr, auto rp) {
-    if (tmax <= 1)
-      go3(wr, rp, std::integral_constant<int, 1>{});
-    else if (tmax <= 2)
-      go3(wr, rp, std::integral_constant<int, 2>{});
-    else if (tmax <= 4)
-      go3(wr, rp, std::integral_constant<int, 4>{});
-    else if (tmax <= 5)
+    if (tmax <= 5)
       go3(wr, rp, std::integral_constant<int, 5>{});
     else
       go3(wr, rp, std::integral_constant<int, 8>{});
@@ -386,15 +411,18 @@ void sm70_gdn_verify_out(torch::Tensor qkv, torch::Tensor a, torch::Tensor b,
     else
       go2(wr, std::false_type{});
   };
-  using I = std::integral_constant<int, 0>;
   switch (cfg) {
     case 1:
-      go(std::pair<std::integral_constant<int, 2>,
-                   std::integral_constant<int, 4>>{});
+      if (N == 1 && HV > 12) {
+        go(std::pair<std::integral_constant<int, 8>,
+                     std::integral_constant<int, 2>>{});
+      } else {
+        go(std::pair<std::integral_constant<int, 8>,
+                     std::integral_constant<int, 4>>{});
+      }
       break;
     default:
       TORCH_CHECK(false, "cfg");
   }
-  (void)I{};
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

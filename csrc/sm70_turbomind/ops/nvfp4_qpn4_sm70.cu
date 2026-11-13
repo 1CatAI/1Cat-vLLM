@@ -824,7 +824,7 @@ void nvfp4_qpn2_tm_dispatch_sm70_out(
   }
   // Keep the M-dependent route opaque to Dynamo's compiled token ranges.
   // Small M consumes independent compact scales and keeps the QPN2 fast path.
-  if (prescaled_scales && input.size(0) > 32) {
+  if (prescaled_scales && input.size(0) > 40) {
     auto full =
         gated_silu ? torch::empty({input.size(0), n}, input.options()) : out;
     nvfp4_gemm_sm70_prescaled_out(full, input, tm_weight, tm_scales,

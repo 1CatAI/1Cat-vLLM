@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 _CANDIDATES = 32
 _GLOBAL_DRAFT_CANDIDATES = 128
-_MAX_ROWS = 8
+_MAX_ROWS = 40
 
 
 def _draft_candidate_count(vocab: int) -> int:
@@ -81,6 +81,25 @@ def _topk_tiles(
     selected = tl.topk(keys, Keep)
     lane = tl.arange(0, Keep)
     tl.store(Scratch + row * Tiles * Keep + tile * Keep + lane, selected)
+
+
+@triton.jit
+def _topk_stage(
+    Src,
+    Dst,
+    Count: tl.constexpr,
+    Stages: tl.constexpr,
+    Keep: tl.constexpr,
+    Block: tl.constexpr,
+    WideIds: tl.constexpr,
+):
+    row, stage = tl.program_id(0), tl.program_id(1)
+    offsets = stage * Block + tl.arange(0, Block)
+    sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
+    keys = tl.load(Src + row * Count + offsets, offsets < Count, sentinel)
+    selected = tl.topk(keys, Keep)
+    lane = tl.arange(0, Keep)
+    tl.store(Dst + row * Stages * Keep + stage * Keep + lane, selected)
 
 
 @triton.jit
@@ -140,25 +159,45 @@ def _select_candidates(logits, keep=_CANDIDATES):
     rows, vocab = logits.shape
     assert 32 <= vocab <= 2147483647
     wide_ids = vocab > 65536
-    tiles = triton.cdiv(vocab, 1024)
+    tile_block = 2048 if (keep <= 32 and vocab > 32768) else 1024
+    tiles = triton.cdiv(vocab, tile_block)
+    count = tiles * keep
     scratch = torch.empty(
         rows,
-        tiles * keep,
+        count,
         device=logits.device,
         dtype=torch.int64 if wide_ids else torch.int32,
     )
     ids = torch.empty(rows, keep, device=logits.device, dtype=torch.int32)
     _topk_tiles[(rows, tiles)](
-        logits, scratch, vocab, tiles, keep, 1024, wide_ids, num_warps=4
+        logits,
+        scratch,
+        vocab,
+        tiles,
+        keep,
+        tile_block,
+        wide_ids,
+        num_warps=8 if tile_block > 1024 else 4,
     )
+    while count > 1024:
+        stages = triton.cdiv(count, 1024)
+        reduced = torch.empty(
+            rows, stages * keep, device=logits.device, dtype=scratch.dtype
+        )
+        _topk_stage[(rows, stages)](
+            scratch, reduced, count, stages, keep, 1024, wide_ids, num_warps=4
+        )
+        scratch = reduced
+        count = stages * keep
+    merge_block = max(64, triton.next_power_of_2(count))
     _topk_merge[(rows,)](
         scratch,
         ids,
-        tiles * keep,
+        count,
         keep,
-        triton.next_power_of_2(tiles * keep),
+        merge_block,
         wide_ids,
-        num_warps=8,
+        num_warps=4 if merge_block <= 1024 else 8,
     )
     return ids
 
@@ -168,7 +207,7 @@ def _rerank_candidates(x, weight, ids, start, reference_mma=False):
     scores = torch.empty(rows, keep, device=x.device, dtype=torch.float16)
     pairs = torch.empty(rows, 2, device=x.device, dtype=torch.float32)
     if reference_mma:
-        torch.ops._C.sm70_fp16_candidate_scores_out(scores, x, weight, ids)
+        torch.ops._C.sm70_fp16_candidate_scores_out(scores, x, weight, ids, True)
     else:
         _rerank[(rows, keep)](
             x, weight, ids, scores, x.shape[1], keep, 8192, num_warps=8
@@ -193,6 +232,7 @@ def _refined_head(
     logits = torch.empty(
         x.shape[0], weight.shape[0], device=x.device, dtype=torch.float16
     )
+    split_k = 8 if (x.shape[0] <= 16 and (x.shape[1] // 16) % 8 == 0) else 16
     call_native(
         sm70_ops.nvfp4_qpn2_gemm_sm70_out,
         native_policy,
@@ -201,7 +241,7 @@ def _refined_head(
         codes,
         scales,
         global_scale,
-        16,
+        split_k,
         2,
     )
     return _rerank_candidates(
@@ -277,6 +317,12 @@ class MTPRefinedHead(nn.Module):
             packed[begin : begin + 512] = flat[:, ::2] | (flat[:, 1::2] << 4)
             raw_scales[begin : begin + 512] = scale
         codes, scales = torch.ops._C.nvfp4_qpn2_prepare_sm70(packed, raw_scales)
+        if (
+            hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
+            and rows % 32 == 0
+            and width % 64 == 0
+        ):
+            codes, scales = torch.ops._C.nvfp4_qpn2_bundle_sm70(codes, scales)
         self.register_buffer("codes", codes, persistent=False)
         self.register_buffer("scales", scales, persistent=False)
         logger.info_once(

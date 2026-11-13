@@ -301,6 +301,10 @@ def apply_runtime_defaults(cfg, defaults, phase: str, *, is_sm70: bool):
             # every admitted shard. The pass checks the active communicator;
             # explicit typed/legacy overrides keep their normal precedence.
             defaults.setdefault("VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION", "1")
+            # Keep M=1..B draft graphs independent of verifier query width so
+            # single-request draft steps run at exact M=1 instead of M=q and
+            # concurrent draft steps capture up to max_num_seqs.
+            defaults.setdefault("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "1")
         _configure_sm70_glm5_dflash_tp4_push_allreduce(
             *args, is_sm70=is_sm70, defaults=defaults
         )

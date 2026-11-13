@@ -51,12 +51,19 @@ def _get_sm70_mtp_moe_decode_config(
             "num_warps": 4,
             "num_stages": 3,
         }
-    if (E, N, K, topk) == (512, 160, 2560, 10) and 1 <= M <= _SM70_MTP_MOE_MAX_M:
-        # Qwen3.8-Flash-Next TP4 keeps the BF16 MTP expert weights and shards
-        # the checkpoint-global I640 expert width to I160 per rank. M5 is the
-        # first proposer pass over the verifier window; M1 covers its three
-        # autoregressive continuation passes. Concurrent requests multiply
-        # both (M5c and Mc); the exact kernel computes every route alike.
+    if (
+        E == 512
+        and N in (160, 320, 640)
+        and K == 2560
+        and topk == 10
+        and 1 <= M <= _SM70_MTP_MOE_MAX_M
+    ):
+        # Qwen3.8-Flash-Next TP1/TP2/TP4 keeps the BF16/FP16 MTP expert weights
+        # and shards the checkpoint-global I640 expert width to I640/I320/I160
+        # per rank. M5 is the first proposer pass over the verifier window; M1
+        # covers its three autoregressive continuation passes. Concurrent
+        # requests multiply both (M5c and Mc); the exact kernel computes every
+        # route alike.
         return {
             "BLOCK_SIZE_M": 2,
             "BLOCK_SIZE_N": 128,

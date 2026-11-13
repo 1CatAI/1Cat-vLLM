@@ -727,12 +727,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &sm70_dflash2_fp16_dispatch_out);
   ops.def(
       "sm70_fp16_candidate_scores_out(Tensor(a!) scores, Tensor input, "
-      "Tensor weight, Tensor ids) -> ()");
+      "Tensor weight, Tensor ids, bool tiled_multirow=False) -> ()");
   ops.impl("sm70_fp16_candidate_scores_out", torch::kCUDA,
            &sm70_fp16_candidate_scores_out);
   ops.def(
       "sm70_fp16_masked_head_out(Tensor(a!) scores, Tensor input, "
-      "Tensor weight, Tensor certified) -> ()");
+      "Tensor weight, Tensor certified, bool tiled_multirow=False) -> ()");
   ops.impl("sm70_fp16_masked_head_out", torch::kCUDA,
            &sm70_fp16_masked_head_out);
   ops.def("sm70_fp16_head_vocab_revision() -> int",

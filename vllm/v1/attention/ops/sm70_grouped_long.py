@@ -32,7 +32,7 @@ BUILTIN_OP = "sm70_grouped_long_fwd"
 # route was qualified with. The source digest names that layout so a rebuilt
 # kernel cannot silently inherit the workspace identity of a different one.
 BUILTIN_SOURCE_SHA256 = (
-    "ba703fad0906d23d4cb121385e70fa5447320572f4206687f6997963ba089b23"
+    "ec65f7f1b0e40efb3b36f6deb1eaaf83bad5ab2c3f5c874a88205cab67111218"
 )
 # Every B1 verifier tail width uses the long-context graph contract at this
 # capacity; q1 additionally has the compact scalar tail.

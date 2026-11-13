@@ -205,9 +205,11 @@ void sm70_dflash2_fp16_dispatch_out(torch::Tensor output, torch::Tensor input,
                                     torch::Tensor packed, torch::Tensor weight,
                                     int64_t tile, int64_t warps);
 void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
-                                    torch::Tensor weight, torch::Tensor ids);
+                                    torch::Tensor weight, torch::Tensor ids,
+                                    bool tiled_multirow = false);
 void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
-                               torch::Tensor weight, torch::Tensor certified);
+                               torch::Tensor weight, torch::Tensor certified,
+                               bool tiled_multirow = false);
 
 std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
                                                  torch::Tensor scales);

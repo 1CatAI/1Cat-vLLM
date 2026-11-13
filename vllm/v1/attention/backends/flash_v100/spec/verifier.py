@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NamedTuple
 
 import torch
@@ -21,6 +21,7 @@ from vllm.v1.attention.kv_codecs import (
     KVCodec,
     resolve_kv_codec,
 )
+from vllm.v1.attention.ops.sm70_e4m3_decode import wrap_e4m3_decode_attention
 from vllm.v1.attention.ops.sm70_grouped import (
     grouped_e4m3_fp32_allowed,
     grouped_fp16_fp32_reason,
@@ -134,7 +135,11 @@ def per_kv_head_views(
 class VerificationExecutor:
     def __init__(self, config: VerificationConfig, ops: VerificationOps):
         self.config = config
-        self.ops = ops
+        self.ops = replace(
+            ops,
+            xqa=wrap_e4m3_decode_attention(ops.xqa),
+            decode=wrap_e4m3_decode_attention(ops.decode),
+        )
         self.grouped_admission = GroupedAdmission(
             config.kv_cache_dtype,
             getattr(config.policy, "use_smallq_decode_xqa", False),

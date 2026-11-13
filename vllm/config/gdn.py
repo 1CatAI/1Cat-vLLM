@@ -284,10 +284,19 @@ def resolve_gdn_config(vllm_config) -> GdnConfig:
     policy = getattr(kernel, "gdn", None)
     if policy is None:
         policy = GdnConfig()
-    policy.resolve(
-        additional_config=getattr(vllm_config, "additional_config", None),
-        native_verify=bool(getattr(kernel, "sm70_gdn_verify", False)),
-    )
+    if not policy.resolved:
+        from vllm.config.kernel import KernelConfig
+
+        mtp_native_verify = KernelConfig.mtp_native_gdn_verify(
+            getattr(vllm_config, "model_config", None),
+            getattr(vllm_config, "speculative_config", None),
+            getattr(vllm_config, "parallel_config", None),
+        )
+        policy.resolve(
+            additional_config=getattr(vllm_config, "additional_config", None),
+            native_verify=bool(getattr(kernel, "sm70_gdn_verify", False))
+            or mtp_native_verify,
+        )
     return policy
 
 

@@ -635,6 +635,24 @@ class Fp8LinearMethod(LinearMethodBase):
             return (weight.to(dtype) * scales.view(-1, 1)).contiguous()
         return (weight.to(dtype) * scales).contiguous()
 
+    def supports_direct_output(self, layer: torch.nn.Module) -> bool:
+        check = getattr(self.fp8_linear, "supports_direct_output", None)
+        return bool(callable(check) and check(layer))
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if output is not None:
+            if not self.supports_direct_output(layer):
+                raise ValueError("Direct output buffer is not supported for layer")
+            fp8_linear: Any = self.fp8_linear
+            return fp8_linear.apply_weights(layer, x, bias, output=output)
+        return self.apply(layer, x, bias)
+
     def apply(
         self,
         layer: torch.nn.Module,

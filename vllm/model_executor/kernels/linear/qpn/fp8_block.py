@@ -42,9 +42,117 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 
-# Block-scale QPN8 GEMM supports M up to this bound; larger M uses a fallback.
+# Block-scale QPN8 single-tile GEMM bound; M=9..40 uses native two-phase/chunked
+# QPN8 when the optional second TurboMind layout is omitted.
 _QPN8_MAX_M = 8
+_QPN8_BATCH_NATIVE_MAX_M = 40
+_turbomind_headroom_cache: dict[tuple[int, int], bool] = {}
 logger = init_logger(__name__)
+
+
+def _qpn8_native_linear_write(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    fallback_weight: torch.Tensor | None = None,
+    fallback_scales: torch.Tensor | None = None,
+    fallback_k_ld: int = 0,
+    fallback_q_ld: int = 0,
+    native_policy: list[str] | None = None,
+) -> None:
+    # The M decision stays inside the opaque op: a compiled graph covers a
+    # dynamic M range, so a Python branch traced at small M would be reused
+    # for prefill.
+    k_dim, n_dim = codes.shape
+    if x.shape[0] == 0:
+        return
+    if x.shape[0] <= _QPN8_MAX_M:
+        call_native(
+            sm70_ops.fp8_qpn8_gemm_sm70_out,
+            native_policy,
+            out,
+            x,
+            codes,
+            group_scales,
+            split_k,
+            accumulator_chains,
+            True,
+            prefetch_codes,
+        )
+        return
+    if fallback_weight is not None:
+        call_native(
+            sm70_ops.fp8_gemm_sm70_out,
+            native_policy,
+            out,
+            x,
+            fallback_weight,
+            fallback_scales,
+            128,
+            fallback_k_ld,
+            fallback_q_ld,
+            False,
+        )
+        return
+    if x.shape[0] <= _QPN8_BATCH_NATIVE_MAX_M and current_platform.is_device_capability(
+        70
+    ):
+        if (
+            split_k in (12, 16)
+            and accumulator_chains == 2
+            and not prefetch_codes
+            and k_dim % (16 * split_k) == 0
+            and n_dim % 128 == 0
+            and hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out")
+        ):
+            torch.ops._C.fp8_qpn8_block_native_sm70_out(
+                out,
+                x,
+                codes,
+                group_scales,
+                split_k,
+                0,
+                False,
+                False,
+            )
+            return
+        if (
+            split_k in (4, 8, 12, 16, 32)
+            and accumulator_chains in (1, 2)
+            and (split_k != 12 or (accumulator_chains == 2 and not prefetch_codes))
+            and k_dim % (16 * split_k) == 0
+            and n_dim % 128 == 0
+        ):
+            for row in range(0, x.shape[0], _QPN8_MAX_M):
+                end = min(row + _QPN8_MAX_M, x.shape[0])
+                call_native(
+                    sm70_ops.fp8_qpn8_gemm_sm70_out,
+                    native_policy,
+                    out[row:end],
+                    x[row:end],
+                    codes,
+                    group_scales,
+                    split_k,
+                    accumulator_chains,
+                    True,
+                    prefetch_codes,
+                )
+            return
+    dense = torch.empty((k_dim * n_dim,), dtype=torch.float16, device=x.device)
+    call_native(
+        sm70_ops.fp8_qpn8_prefill_sm70_out,
+        native_policy,
+        out,
+        dense.data_ptr(),
+        x,
+        codes,
+        group_scales,
+        False,
+    )
 
 
 @custom_op(
@@ -68,16 +176,92 @@ def _qpn8_native_linear(
     fallback_q_ld: int = 0,
     native_policy: list[str] | None = None,
 ) -> torch.Tensor:
-    # The M decision stays inside the opaque op: a compiled graph covers a
-    # dynamic M range, so a Python branch traced at small M would be reused
-    # for prefill.
+    out = x.new_empty((x.shape[0], codes.shape[1]))
+    _qpn8_native_linear_write(
+        out,
+        x,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        fallback_weight,
+        fallback_scales,
+        fallback_k_ld,
+        fallback_q_ld,
+        native_policy,
+    )
+    return out
+
+
+@custom_op(
+    "sm70_fp8::qpn8_native_linear_out",
+    mutates_args=("out",),
+    schema="(Tensor(a!) out, Tensor x, Tensor codes, Tensor group_scales, "
+    "int split_k, int accumulator_chains, bool prefetch_codes, "
+    "Tensor? fallback_weight=None, Tensor? fallback_scales=None, "
+    "int fallback_k_ld=0, int fallback_q_ld=0, "
+    "str[]? native_policy=None) -> ()",
+)
+def _qpn8_native_linear_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    fallback_weight: torch.Tensor | None = None,
+    fallback_scales: torch.Tensor | None = None,
+    fallback_k_ld: int = 0,
+    fallback_q_ld: int = 0,
+    native_policy: list[str] | None = None,
+) -> None:
+    _qpn8_native_linear_write(
+        out,
+        x,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        fallback_weight,
+        fallback_scales,
+        fallback_k_ld,
+        fallback_q_ld,
+        native_policy,
+    )
+
+
+@custom_op(
+    "sm70_fp8::qpn8_native_gated_silu",
+    mutates_args=(),
+    schema="(Tensor x, Tensor codes, Tensor group_scales, int split_k, "
+    "int accumulator_chains, bool prefetch_codes, Tensor? fallback_weight=None, "
+    "Tensor? fallback_scales=None, int fallback_k_ld=0, int fallback_q_ld=0, "
+    "str[]? native_policy=None) -> Tensor",
+)
+def _qpn8_native_gated_silu(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    fallback_weight: torch.Tensor | None = None,
+    fallback_scales: torch.Tensor | None = None,
+    fallback_k_ld: int = 0,
+    fallback_q_ld: int = 0,
+    native_policy: list[str] | None = None,
+) -> torch.Tensor:
     k_dim, n_dim = codes.shape
-    out = x.new_empty((x.shape[0], n_dim))
+    hidden = n_dim // 2
+    out = x.new_empty((x.shape[0], hidden))
     if x.shape[0] == 0:
         return out
     if x.shape[0] <= _QPN8_MAX_M:
         call_native(
-            sm70_ops.fp8_qpn8_gemm_sm70_out,
+            sm70_ops.fp8_qpn8_gated_pair_sm70_out,
             native_policy,
             out,
             x,
@@ -89,11 +273,31 @@ def _qpn8_native_linear(
             prefetch_codes,
         )
         return out
+    if (
+        x.shape[0] <= _QPN8_BATCH_NATIVE_MAX_M
+        and split_k == 8
+        and k_dim % 128 == 0
+        and n_dim % 256 == 0
+        and current_platform.is_device_capability(70)
+        and hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out")
+    ):
+        torch.ops._C.fp8_qpn8_block_native_sm70_out(
+            out,
+            x,
+            codes,
+            group_scales,
+            8,
+            0,
+            False,
+            True,
+        )
+        return out
     if fallback_weight is not None:
+        gate_up = x.new_empty((x.shape[0], n_dim))
         call_native(
             sm70_ops.fp8_gemm_sm70_out,
             native_policy,
-            out,
+            gate_up,
             x,
             fallback_weight,
             fallback_scales,
@@ -102,6 +306,7 @@ def _qpn8_native_linear(
             fallback_q_ld,
             False,
         )
+        torch.ops._C.silu_and_mul(out, gate_up)
         return out
     dense = torch.empty((k_dim * n_dim,), dtype=torch.float16, device=x.device)
     call_native(
@@ -112,9 +317,26 @@ def _qpn8_native_linear(
         x,
         codes,
         group_scales,
-        False,
+        True,
     )
     return out
+
+
+@_qpn8_native_gated_silu.register_fake
+def _qpn8_native_gated_silu_fake(
+    x,
+    codes,
+    group_scales,
+    split_k,
+    accumulator_chains,
+    prefetch_codes,
+    fallback_weight=None,
+    fallback_scales=None,
+    fallback_k_ld=0,
+    fallback_q_ld=0,
+    native_policy=None,
+):
+    return x.new_empty((x.shape[0], codes.shape[1] // 2))
 
 
 @_qpn8_native_linear.register_fake
@@ -132,6 +354,24 @@ def _qpn8_native_linear_fake(
     native_policy=None,
 ):
     return x.new_empty((x.shape[0], codes.shape[1]))
+
+
+@_qpn8_native_linear_out.register_fake
+def _qpn8_native_linear_out_fake(
+    out,
+    x,
+    codes,
+    group_scales,
+    split_k,
+    accumulator_chains,
+    prefetch_codes,
+    fallback_weight=None,
+    fallback_scales=None,
+    fallback_k_ld=0,
+    fallback_q_ld=0,
+    native_policy=None,
+):
+    return None
 
 
 class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
@@ -201,7 +441,7 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         self.policy.native.resolve("fp8")
         self.native_ops = NativeBindings(self.policy.native.values)
 
-    def _keep_volta_turbomind_copy(self) -> bool:
+    def _keep_volta_turbomind_copy(self, device: torch.device | None = None) -> bool:
         explicit = self.policy.block_qpn8_volta_turbomind_prefill
         if explicit is not None:
             return explicit
@@ -210,7 +450,33 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             return True
         spec = engine.speculative_config
         verify_rows = 1 + (spec.num_speculative_tokens if spec is not None else 0)
-        return engine.scheduler_config.max_num_seqs * verify_rows > _QPN8_MAX_M
+        if engine.scheduler_config.max_num_seqs * verify_rows <= _QPN8_MAX_M:
+            return False
+        if device is not None and device.type == "cuda":
+            dev_idx = (
+                device.index
+                if device.index is not None
+                else torch.accelerator.current_device_index()
+            )
+            key = (id(engine), dev_idx)
+            fits = _turbomind_headroom_cache.get(key)
+            if fits is None:
+                free_bytes, _ = torch.cuda.mem_get_info(dev_idx)
+                # Raw checkpoint weights are already resident on GPU when the
+                # first layer converts; require >=18 GiB free before duplicating
+                # an entire large block-FP8 checkpoint on 32 GiB Volta shards.
+                fits = free_bytes >= 18 * 1024**3
+                _turbomind_headroom_cache[key] = fits
+                if not fits:
+                    logger.info_once(
+                        "Skipping optional Volta TurboMind block-FP8 prefill "
+                        "copy due to memory headroom (%.2f GiB free); M=9..40 "
+                        "uses native block QPN8 and larger M uses prefill "
+                        "scratch.",
+                        free_bytes / 1024**3,
+                    )
+            return fits
+        return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         weight = layer.weight.data
@@ -242,7 +508,7 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         if (
             capability is not None
             and capability.to_int() in (70, 72)
-            and self._keep_volta_turbomind_copy()
+            and self._keep_volta_turbomind_copy(codes.device)
         ):
             packed, scales, metadata = self.native_ops.fp8_sm70_prepare(
                 weight, block_scales, 128, False
@@ -264,11 +530,20 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             )
         else:
             logger.info_once(
-                "Block FP8 QPN8 native GEMM supports M=1..8; larger M uses the "
+                "Block FP8 QPN8 native GEMM supports M=1..40; larger M uses the "
                 "FP16 prefill, which needs no second copy of the weights."
             )
         layer._qpn8_out_features = n
         layer._qpn8_cfg = _sm70_fp8_qpn8_config(k_dim, n_dim, False)
+        if (
+            self._is_sm70_gated_silu_layer(layer)
+            and bool(self.policy.gated_silu)
+            and n_dim % 256 == 0
+            and k_dim % 128 == 0
+            and hasattr(torch.ops._C, "fp8_qpn8_gated_pair_sm70_out")
+        ):
+            layer._qpn8_gated_cfg = _sm70_fp8_qpn8_config(k_dim, n_dim, True)
+            layer.sm70_fp8_gated_silu = True
         layer.sm70_fp8_turbomind = True
         # The startup memory profile accounts for both packed layouts on
         # Volta. Raw checkpoint weights are no longer resident.
@@ -281,18 +556,53 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         # A/As machinery entirely (weight-only path, fp16 activations).
         raise RuntimeError("unreachable: QPN8 overrides apply_weights")
 
+    def supports_direct_output(self, layer: torch.nn.Module) -> bool:
+        return hasattr(layer, "_sm70_block_fp8_qpn8_packed_codes")
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         codes = layer._sm70_block_fp8_qpn8_packed_codes
         split_k, accumulator_chains, prefetch_codes = layer._qpn8_cfg
+        x_2d = flatten_linear_input(x, codes.shape[0]).contiguous()
+        if output is not None:
+            expected_shape = (*x.shape[:-1], layer._qpn8_out_features)
+            if (
+                output.shape != expected_shape
+                or output.dtype != x.dtype
+                or output.device != x.device
+                or not output.is_contiguous()
+            ):
+                raise ValueError(
+                    "Incompatible direct output tensor for SM70 block-FP8 QPN8."
+                )
+            out_2d = output.reshape(x_2d.shape[0], layer._qpn8_out_features)
+            self.native_ops.invoke(
+                torch.ops.sm70_fp8.qpn8_native_linear_out,
+                out_2d,
+                x_2d,
+                codes,
+                layer._sm70_block_fp8_qpn8_packed_scales,
+                split_k,
+                accumulator_chains,
+                prefetch_codes,
+                getattr(layer, "_sm70_block_fp8_turbomind_packed_weight", None),
+                getattr(layer, "_sm70_block_fp8_turbomind_packed_scales", None),
+                getattr(layer, "_qpn8_fallback_k_ld", 0),
+                getattr(layer, "_qpn8_fallback_q_ld", 0),
+                self.native_ops.arguments,
+            )
+            if bias is not None:
+                out_2d.add_(bias)
+            return output
         y = self.native_ops.invoke(
             torch.ops.sm70_fp8.qpn8_native_linear,
-            flatten_linear_input(x, codes.shape[0]).contiguous(),
+            x_2d,
             codes,
             layer._sm70_block_fp8_qpn8_packed_scales,
             split_k,
@@ -307,3 +617,26 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         if bias is not None:
             y = y + bias
         return restore_linear_output(y, x, layer._qpn8_out_features)
+
+    def apply_fused_silu_and_mul(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> torch.Tensor | None:
+        if not getattr(layer, "sm70_fp8_gated_silu", False):
+            return None
+        codes = layer._sm70_block_fp8_qpn8_packed_codes
+        split_k, accumulator_chains, prefetch_codes = layer._qpn8_gated_cfg
+        y = self.native_ops.invoke(
+            torch.ops.sm70_fp8.qpn8_native_gated_silu,
+            flatten_linear_input(x, codes.shape[0]).contiguous(),
+            codes,
+            layer._sm70_block_fp8_qpn8_packed_scales,
+            split_k,
+            accumulator_chains,
+            prefetch_codes,
+            getattr(layer, "_sm70_block_fp8_turbomind_packed_weight", None),
+            getattr(layer, "_sm70_block_fp8_turbomind_packed_scales", None),
+            getattr(layer, "_qpn8_fallback_k_ld", 0),
+            getattr(layer, "_qpn8_fallback_q_ld", 0),
+            self.native_ops.arguments,
+        )
+        return restore_linear_output(y, x, layer._qpn8_out_features // 2)

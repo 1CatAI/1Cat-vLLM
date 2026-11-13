@@ -105,7 +105,7 @@ def test_block_dispatch_chunked_policy_and_graph(rows, gated):
             assert workspace.isnan().all()
 
 
-@pytest.mark.parametrize("rows", [17, 24, 31, 32])
+@pytest.mark.parametrize("rows", [17, 24, 31, 32, 33, 40])
 @pytest.mark.parametrize("gated", [False, True])
 def test_block_dispatch_native_policy_and_graph(rows, gated):
     import vllm._C  # noqa: F401
@@ -329,7 +329,7 @@ def test_volta_medium_prefill_keeps_original_turbomind_output(default_vllm_confi
     torch.testing.assert_close(kernel.apply_weights(layer, x), expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("m", [9, 64, 512])
+@pytest.mark.parametrize("m", [9, 20, 40, 64, 512])
 def test_volta_without_turbomind_copy_keeps_one_layout(default_vllm_config, m):
     # A 32 GiB V100 pipeline stage of DeepSeek-V4 runs out of memory when every
     # block FP8 weight is held twice; without the copy, rows beyond M=8 take
@@ -405,3 +405,27 @@ def test_volta_turbomind_copy_follows_decode_rows(
         layer
     )
     assert hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight") == copy
+
+
+@pytest.mark.parametrize("m", [0, 1, 5, 8, 9, 20, 40, 64])
+@pytest.mark.parametrize("turbomind_copy", [True, False])
+def test_block_qpn8_fused_gated_silu_matches_reference(
+    default_vllm_config, m, turbomind_copy
+):
+    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
+        turbomind_copy
+    )
+    layer, reference = _layer(2048, 1024)
+    layer.prefix = "model.layers.0.mlp.gate_up_proj"
+    layer.output_partition_sizes = [1024, 1024]
+    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(2048, 1024))
+    kernel.process_weights_after_loading(layer)
+    assert getattr(layer, "sm70_fp8_gated_silu", False)
+    x = torch.randn(m, 1024, device="cuda", dtype=torch.float16) * 0.1
+    y = kernel.apply_fused_silu_and_mul(layer, x)
+    assert y is not None and y.shape == (m, 1024) and y.dtype == torch.float16
+    if m:
+        gate_up = x.float() @ reference.t()
+        gate, up = gate_up.chunk(2, dim=-1)
+        expected = torch.nn.functional.silu(gate) * up
+        assert ((y.float() - expected).norm() / expected.norm()).item() < 2e-3
