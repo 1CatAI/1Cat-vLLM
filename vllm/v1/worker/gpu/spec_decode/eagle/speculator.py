@@ -303,12 +303,13 @@ class EagleSpeculator(TargetSamplingHooks):
             return ()
 
         text_config = self.draft_model_config.hf_text_config
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         if not (
             self.draft_model_config.get_num_experts() == 512
             and int(getattr(text_config, "num_experts_per_tok", 0)) == 10
             and self.draft_model_config.get_hidden_size() == 2560
             and int(getattr(text_config, "moe_intermediate_size", 0)) == 640
-            and self.vllm_config.parallel_config.tensor_parallel_size == 4
+            and tp_size in (1, 2, 4)
         ):
             return ()
         self._sm70_mtp_moe_warmed = True

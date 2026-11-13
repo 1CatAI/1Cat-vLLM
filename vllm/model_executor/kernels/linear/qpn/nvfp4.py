@@ -232,15 +232,17 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                 sm70_nvfp4_native,  # noqa: F401
             )
 
-            workspace = _get_sm70_fp8_prefill_exact_dense_workspace(layer.weight)
             k = layer.input_size_per_partition
             n = (layer.weight.shape[0] + 31) // 32 * 32
+            workspace = _get_sm70_fp8_prefill_exact_dense_workspace(layer.weight)
+            if workspace is not None and workspace.numel() < k * n:
+                workspace = _get_sm70_fp8_prefill_exact_dense_workspace(
+                    layer.weight, k * n
+                )
             if workspace is not None and workspace.numel() >= k * n:
                 bundle_scales = (
-                    (
-                        (k, n) in {(5120, 8704), (4352, 5120)}
-                        or _bundled_down_layout(layer, self.config)
-                    )
+                    k % 64 == 0
+                    and n % 32 == 0
                     and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
                     and sm70_nvfp4_native._get_bundled_prefill_code_workspace(
                         layer.weight, workspace
@@ -254,7 +256,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                 layer.sm70_nvfp4_qpn2_output_size = n
                 layer.sm70_nvfp4_qpn2_gated_silu = self.config.gated_silu
                 layer.sm70_nvfp4_qpn2_split_k, layer.sm70_nvfp4_qpn2_nacc = (
-                    _qpn2_config(k, n, False)
+                    _qpn2_config(k, n, self.config.gated_silu)
                 )
                 layer.sm70_nvfp4_qpn2 = True
                 logger.info_once(
@@ -330,7 +332,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         gated = self.config.gated_silu
         k = layer.input_size_per_partition
         n = qpn2_output_size
-        split_k, nacc = _qpn2_config(k, n, False)
+        split_k, nacc = _qpn2_config(k, n, gated)
         if not qpn2_shared:
             layer.register_buffer("sm70_nvfp4_qpn2_codes", qpn2_codes, persistent=False)
         layer.register_buffer("sm70_nvfp4_qpn2_scales", qpn2_scales, persistent=False)
@@ -376,8 +378,21 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         layer.sm70_nvfp4_qpn2_prefill_min_m = self.config.policy.prefill_min_m
         self._release_checkpoint_parameters(layer)
 
-    def apply_weights(self, layer, x, bias=None):
-        return self.apply_qpn2(layer, x, bias, gated_silu=False)
+    def supports_direct_output(self, layer: Any) -> bool:
+        return bool(
+            getattr(layer, "sm70_nvfp4_qpn2", False)
+            and int(
+                getattr(
+                    layer,
+                    "sm70_nvfp4_qpn2_output_size",
+                    layer.output_size_per_partition,
+                )
+            )
+            == int(layer.output_size_per_partition)
+        )
+
+    def apply_weights(self, layer, x, bias=None, output=None):
+        return self.apply_qpn2(layer, x, bias, gated_silu=False, output=output)
 
     def apply_fused_silu_and_mul(self, layer, x):
         if not layer.sm70_nvfp4_qpn2_gated_silu:
@@ -391,6 +406,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         bias: torch.Tensor | None,
         *,
         gated_silu: bool,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Linear layers attach their prepared layout and tuning metadata during
         # loading; torch.nn.Module does not describe these dynamic fields.
@@ -408,10 +424,27 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         if gated_silu:
             logical_output_size //= 2
             kernel_output_size //= 2
-        out_2d = torch.empty(
-            (x_2d.shape[0], kernel_output_size), dtype=x.dtype, device=x.device
-        )
+        if output is not None:
+            expected_shape = (*x.shape[:-1], logical_output_size)
+            if (
+                gated_silu
+                or kernel_output_size != logical_output_size
+                or output.shape != expected_shape
+                or output.dtype != x.dtype
+                or output.device != x.device
+                or not output.is_contiguous()
+            ):
+                raise ValueError(
+                    "Incompatible direct output tensor for SM70 NVFP4 QPN2."
+                )
+            out_2d = output.reshape(x_2d.shape[0], kernel_output_size)
+        else:
+            out_2d = torch.empty(
+                (x_2d.shape[0], kernel_output_size), dtype=x.dtype, device=x.device
+            )
         if x_2d.shape[0] == 0:
+            if output is not None:
+                return output
             return out_2d[:, :logical_output_size].reshape(
                 *x.shape[:-1], logical_output_size
             )
@@ -515,6 +548,8 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             out_2d = out_2d[:, :logical_output_size]
         if bias is not None:
             out_2d.add_(bias)
+        if output is not None:
+            return output
         return out_2d.reshape(*x.shape[:-1], logical_output_size)
 
 

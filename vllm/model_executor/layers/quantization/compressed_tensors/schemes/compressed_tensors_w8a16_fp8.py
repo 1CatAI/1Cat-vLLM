@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from typing import Any
 
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
@@ -550,6 +551,17 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
 
         self.linear_kernel.process_weights_after_loading(layer)
 
+    def supports_direct_output(self, layer: torch.nn.Module) -> bool:
+        from vllm.model_executor.kernels.linear.qpn.fp8 import (
+            layer_supports_direct_output,
+        )
+
+        if layer_supports_direct_output(layer):
+            return True
+        kernel = getattr(self, "linear_kernel", None)
+        check = getattr(kernel, "supports_direct_output", None)
+        return bool(callable(check) and check(layer))
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -557,6 +569,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         bias: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm.model_executor.kernels.linear.qpn.fp8 import has_block_qpn8_codes
+
+        if has_block_qpn8_codes(layer):
+            linear_kernel: Any = self.linear_kernel
+            return linear_kernel.apply_weights(layer, x, bias, output=output)
         if output is not None and not getattr(layer, "sm70_fp8_turbomind", False):
             raise ValueError("Output buffers require the SM70 FP8 route")
         if getattr(layer, "sm70_fp8_fp16_dequant", False):

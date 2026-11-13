@@ -317,3 +317,46 @@ def test_channel_qpn8_accepts_k16_n32_alignment():
     torch.accelerator.synchronize()
     relative_l2 = (out.float() - reference.float()).norm() / reference.float().norm()
     assert float(relative_l2) < 5e-3
+
+
+def test_mtp_draft_qpn8_fc_and_fused_gated_silu(monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization import (
+        sm70_mtp_draft_qpn8 as draft_qpn8,
+    )
+
+    assert "fc" in draft_qpn8._SUFFIXES
+
+    layer = torch.nn.Module()
+    layer.prefix = "mtp.layers.0.mlp.gate_up_proj"
+    layer.weight = torch.nn.Parameter(
+        torch.zeros((128 * 128,), dtype=torch.uint8), requires_grad=False
+    )
+    layer.register_buffer(
+        "_sm70_mtp_draft_qpn8_scales",
+        torch.ones((1, 128), dtype=torch.float16),
+        persistent=False,
+    )
+    layer._sm70_mtp_draft_qpn8_shape = (128, 128)
+    layer._sm70_mtp_draft_qpn8_config = (16, 2, False)
+    layer._unquantized_fused_silu_and_mul = draft_qpn8.apply_mtp_draft_qpn8_fused_silu
+    setattr(layer, draft_qpn8._READY, True)
+
+    calls = []
+
+    def fake_ct_dispatch(
+        out, x, codes, scales, split_k, nacc, prefetch, gated_silu, policy=None
+    ):
+        calls.append((split_k, nacc, prefetch, gated_silu, tuple(out.shape)))
+        out.fill_(1.5)
+
+    monkeypatch.setattr(
+        torch.ops.vllm, "sm70_ct_fp8_qpn8_dispatch", fake_ct_dispatch, raising=False
+    )
+    x = torch.ones((2, 3, 128), dtype=torch.float16)
+    fused = UnquantizedLinearMethod().apply_fused_silu_and_mul(layer, x)
+    assert fused is not None and fused.shape == (2, 3, 64)
+    assert calls == [(8, 2, False, True, (6, 64))]
+
+    layer.prefix = "mtp.fc"
+    assert UnquantizedLinearMethod().apply_fused_silu_and_mul(layer, x) is None

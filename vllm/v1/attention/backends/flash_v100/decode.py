@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
 
@@ -31,6 +31,7 @@ from vllm.v1.attention.kv_codecs import (
     KVCodec,
     resolve_kv_codec,
 )
+from vllm.v1.attention.ops.sm70_e4m3_decode import wrap_e4m3_decode_attention
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
@@ -116,7 +117,11 @@ class DecodeExecutor:
 
     def __init__(self, config: DecodeConfig, ops: DecodeOps, workspace: V100Workspace):
         self.config = config
-        self.ops = ops
+        self.ops = replace(
+            ops,
+            paged=wrap_e4m3_decode_attention(ops.paged),
+            xqa=wrap_e4m3_decode_attention(ops.xqa),
+        )
         self.workspace = workspace
 
     def forward(self, request: DecodeRequest) -> torch.Tensor:

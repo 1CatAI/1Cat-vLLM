@@ -33,7 +33,12 @@ def _sm70_mtp_moe_fp16_shape_supported(
     m = weights.shape[0]
     if not 1 <= m <= _SM70_MTP_MOE_MAX_M:
         return False
-    n, k = (2560, 160) if weighted else (320, 2560)
+    if b.ndim != 3:
+        return False
+    inter = b.shape[2] if weighted else b.shape[1] // 2
+    if inter not in (160, 320, 640) or (not weighted and b.shape[1] != 2 * inter):
+        return False
+    n, k = (2560, inter) if weighted else (2 * inter, 2560)
     return (
         top_k == (1 if weighted else 10)
         and a.shape == (m * 10 if weighted else m, k)
@@ -102,7 +107,8 @@ def try_mtp_fp16_projection(
         and hasattr(torch.ops._C, "sm70_mtp_moe_fp16_out")
     ):
         logger.info_once(
-            "Using exact SM70 FP16 MTP MoE projections (M1..80, E512, H2560, I160)."
+            "Using exact SM70 FP16 MTP MoE projections (M1..80, E512, H2560, I%d).",
+            B.shape[2] if mul_routed_weight else B.shape[1] // 2,
         )
         torch.ops._C.sm70_mtp_moe_fp16_out(
             C,

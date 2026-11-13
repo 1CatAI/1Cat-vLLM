@@ -191,12 +191,22 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             self.kernel = init_nvfp4_linear_kernel()
         return self.kernel
 
+    def supports_direct_output(self, layer: Any) -> bool:
+        kernel = self._fallback_kernel()
+        check = getattr(kernel, "supports_direct_output", None)
+        return bool(callable(check) and check(layer))
+
     def apply_weights(
         self,
         layer: Any,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if output is not None:
+            return self._fallback_kernel().apply_weights(
+                layer=layer, x=x, bias=bias, output=output
+            )
         return self._fallback_kernel().apply_weights(layer=layer, x=x, bias=bias)
 
     def apply_fused_silu_and_mul(

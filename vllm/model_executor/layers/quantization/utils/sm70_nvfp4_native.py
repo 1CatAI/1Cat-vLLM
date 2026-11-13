@@ -104,7 +104,7 @@ def _dispatch(
             x.shape[0] <= 8
             and gated_silu
             and x.shape[1] == 5120
-            and out.shape[1] == 4352
+            and out.shape[1] in (4352, 8704)
         ):
             accumulator_chains = 1
         op = (
@@ -127,12 +127,14 @@ def _dispatch(
     k = x.shape[1]
     n = out.shape[1] * (2 if gated_silu else 1)
     workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+    if workspace is not None and workspace.numel() < k * n:
+        workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes, k * n)
     if workspace is None or workspace.numel() < k * n:
         raise RuntimeError("Native QPN2 prefill workspace is unavailable")
     device = codes.device.index
     assert device is not None
     scale_workspace = _scale_workspaces.get(device)
-    if scale_workspace is None:
+    if scale_workspace is None or scale_workspace.numel() < workspace.numel() // 16:
         scale_workspace = torch.empty(
             workspace.numel() // 16, dtype=torch.float16, device=codes.device
         )

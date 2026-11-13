@@ -445,6 +445,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
+    def apply_fused_silu_and_mul(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+    ) -> torch.Tensor | None:
+        hook = getattr(layer, "_unquantized_fused_silu_and_mul", None)
+        if hook is None:
+            return None
+        return hook(layer, x)
+
 
 class LinearBase(PluggableLayer):
     """Base linear layer.

@@ -31,9 +31,10 @@ def test_default_enabled(monkeypatch):
 
 
 @pytest.mark.parametrize("m", [0, 1, 2, 5, 10, 80, 81])
+@pytest.mark.parametrize("inter", [160, 320, 640])
 @pytest.mark.parametrize("down", [False, True])
-def test_shape_admission(m, down):
-    n, k = (2560, 160) if down else (320, 2560)
+def test_shape_admission(m, inter, down):
+    n, k = (2560, inter) if down else (2 * inter, 2560)
     x = torch.empty(m * 10 if down else m, k, device="meta", dtype=torch.float16)
     w = torch.empty(512, n, k, device="meta", dtype=torch.float16)
     y = torch.empty(m, 10, n, device="meta", dtype=torch.float16)

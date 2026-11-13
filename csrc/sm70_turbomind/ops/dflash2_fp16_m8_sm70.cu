@@ -165,7 +165,8 @@ __global__ void fp16_candidate_scores_sm70_kernel(
 }  // namespace
 
 void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
-                                    torch::Tensor weight, torch::Tensor ids) {
+                                    torch::Tensor weight, torch::Tensor ids,
+                                    bool tiled_multirow) {
   TORCH_CHECK(scores.is_cuda() && input.is_cuda() && weight.is_cuda() &&
               ids.is_cuda());
   TORCH_CHECK(
@@ -187,7 +188,7 @@ void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0);
   TORCH_CHECK(input.size(0) <= properties->maxGridSize[0]);
-  if (input.size(0) > 8) {
+  if (!tiled_multirow && input.size(0) > 8) {
     // cuBLAS can select a different accumulator schedule for larger batches.
     // Keep the candidate scores identical to the caller's dense projection.
     auto dense = at::mm(input, weight.t());
@@ -352,7 +353,8 @@ __global__ __launch_bounds__(32, 16) void fp16_masked_head_sm70_kernel(
 }  // namespace
 
 void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
-                               torch::Tensor weight, torch::Tensor certified) {
+                               torch::Tensor weight, torch::Tensor certified,
+                               bool tiled_multirow) {
   TORCH_CHECK(scores.is_cuda() && input.is_cuda() && weight.is_cuda() &&
               certified.is_cuda());
   TORCH_CHECK(input.dim() == 2 && input.size(0) >= 1 && input.size(1) == 5120);
@@ -373,7 +375,7 @@ void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0);
-  if (input.size(0) > 8) {
+  if (!tiled_multirow && input.size(0) > 8) {
     auto dense = at::mm(input, weight.t());
     at::where_out(scores, certified.eq(0).unsqueeze(1), dense, scores);
     return;

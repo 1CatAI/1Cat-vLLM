@@ -121,18 +121,21 @@ def apply(cfg, monkeypatch, capability=70):
 
 
 @pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("quant", [None, "fp8", "compressed-tensors"])
 @pytest.mark.parametrize("override", [None, False, True])
 def test_qualified_mtp_collective_default_preserves_overrides(
-    monkeypatch, tp, override
+    monkeypatch, tp, quant, override
 ):
     cfg = engine(tp=tp, spec="mtp")
     cfg.model_config.architectures = ["Qwen3_5ForConditionalGeneration"]
+    cfg.model_config.quantization = quant
     if override is not None:
         cfg.parallel_config.communication.gemma_rms_tp2 = override
+        cfg.compilation_config.runtime.split_draft_graphs = override
     apply(cfg, monkeypatch)
-    assert cfg.parallel_config.communication.value("gemma_rms_tp2") is (
-        True if override is None else override
-    )
+    expected = True if override is None else override
+    assert cfg.parallel_config.communication.value("gemma_rms_tp2") is expected
+    assert cfg.compilation_config.runtime.split_draft_graphs is expected
 
 
 def test_unqualified_model_keeps_collective_default(monkeypatch):

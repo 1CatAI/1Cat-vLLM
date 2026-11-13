@@ -172,8 +172,9 @@ def test_masked_dense_head_graph_replay(rows, vocab):
     assert bool((scores == 42).all())
 
 
+@pytest.mark.parametrize("rows", [5, 40])
 @pytest.mark.parametrize("vocab,ranks", [(62080, 4), (124160, 2)])
-def test_bounded_target_dynamic_fallback(monkeypatch, vocab, ranks):
+def test_bounded_target_dynamic_fallback(monkeypatch, rows, vocab, ranks):
     require_native()
     torch.manual_seed(68450)
     weight = torch.randn(vocab, 5120, device="cuda", dtype=torch.float16) * 0.02
@@ -183,7 +184,7 @@ def test_bounded_target_dynamic_fallback(monkeypatch, vocab, ranks):
         "tensor_model_parallel_all_gather",
         lambda packet, dim: torch.cat([packet] * ranks, dim=dim),
     )
-    x = weight[vocab - 33].expand(5, -1).contiguous()
+    x = weight[vocab - 33].expand(rows, -1).contiguous()
 
     def run():
         return bounded._bounded_pair(x, weight, codes, scales, coefficients, 0)
@@ -206,6 +207,12 @@ def test_bounded_target_dynamic_fallback(monkeypatch, vocab, ranks):
         reference = torch.nn.functional.linear(x, weight)
         assert torch.equal(pairs[:, 1].long(), reference.argmax(-1))
         assert not bool((torch.isfinite(reference) & (reference > upper)).any())
+        fused_pairs, fused_flags, fused_upper = bounded._bounded_pair(
+            x, weight, codes, scales, coefficients, 0, return_upper=False
+        )
+        assert fused_upper is None
+        assert torch.equal(fused_pairs.view(torch.int32), pairs.view(torch.int32))
+        assert torch.equal(fused_flags, flags)
         if scenario == "certified":
             assert bool((flags == 1).all())
         if scenario == "zero":

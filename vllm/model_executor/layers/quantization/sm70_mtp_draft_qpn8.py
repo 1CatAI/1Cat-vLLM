@@ -22,7 +22,7 @@ logger = init_logger(__name__)
 
 _MARK = "_sm70_mtp_draft_qpn8"
 _READY = "_sm70_mtp_draft_qpn8_ready"
-_SUFFIXES = frozenset({"qkv_proj", "o_proj", "gate_up_proj", "down_proj"})
+_SUFFIXES = frozenset({"fc", "qkv_proj", "o_proj", "gate_up_proj", "down_proj"})
 _REQUIRED_OPS = ("fp8_qpn8_prepare_sm70", "fp8_qpn8_dispatch_sm70_out")
 
 
@@ -82,6 +82,7 @@ def prepare_mtp_draft_qpn8(layer: nn.Module) -> bool:
     layer.register_buffer("_sm70_mtp_draft_qpn8_scales", scales, persistent=False)
     layer._sm70_mtp_draft_qpn8_shape = (n, k)
     layer._sm70_mtp_draft_qpn8_config = (split_k, nacc, prefetch)
+    layer._unquantized_fused_silu_and_mul = apply_mtp_draft_qpn8_fused_silu
     setattr(layer, _READY, True)
     logger.info_once(
         "SM70 MTP drafter projections use channel-QPN8 (FP16 weights released)."
@@ -113,3 +114,35 @@ def apply_mtp_draft_qpn8(
     if bias is not None:
         out.add_(bias)
     return out.reshape(*x.shape[:-1], n)
+
+
+def apply_mtp_draft_qpn8_fused_silu(
+    layer: nn.Module, x: torch.Tensor
+) -> torch.Tensor | None:
+    if not getattr(layer, _READY, False):
+        return None
+    if not getattr(layer, "prefix", "").endswith(".gate_up_proj"):
+        return None
+    if x.dtype != torch.float16:
+        return None
+    n, k = layer._sm70_mtp_draft_qpn8_shape
+    if n % 64 != 0 or k % 128 != 0:
+        return None
+    x_2d = x.reshape(-1, k)
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+    out_features = n // 2
+    out = x_2d.new_empty((x_2d.shape[0], out_features))
+    if x_2d.shape[0] == 0:
+        return out.reshape(*x.shape[:-1], out_features)
+    torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
+        out,
+        x_2d,
+        layer.weight,
+        layer._sm70_mtp_draft_qpn8_scales,
+        8,
+        2,
+        False,
+        True,
+    )
+    return out.reshape(*x.shape[:-1], out_features)

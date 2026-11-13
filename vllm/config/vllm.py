@@ -1729,7 +1729,12 @@ class VllmConfig:
         bind_moe_diagnostics(
             self.kernel_config, self.observability_config.runtime_trace
         )
-        self.kernel_config.resolve_gdn(self.model_config, self.additional_config)
+        self.kernel_config.resolve_gdn(
+            self.model_config,
+            self.additional_config,
+            self.speculative_config,
+            self.parallel_config,
+        )
         if self.speculative_config is not None:
             self.speculative_config.resolve_execution_policy()
 
