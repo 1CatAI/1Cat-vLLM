@@ -1093,6 +1093,9 @@ class Qwen3CoderToolParser(ToolParser):
         self.accumulated_text = ""
         self.json_started = False
         self.json_closed = False
+        # [L401 修复 2026-11-12] JSON 直出参数形态标记（body 是裸 JSON、
+        # 无 <parameter= 标签）：参数不进参数循环，靠 function_end 补差回收。
+        self._json_direct = False
         # Store accumulated parameters for type conversion
         self.accumulated_params = {}
         self.streaming_request = None
@@ -2099,6 +2102,29 @@ class Qwen3CoderToolParser(ToolParser):
         if end_index == -1:
             return None
         function_name = function_call_str[:end_index]
+        # [L401 修复 2026-11-12] JSON 直出参数形态：<function=Read>{"file_path":
+        # "..."}<\/function>（XML 头 + JSON 体、无 <parameter= 标签，Qwen3.5/
+        # OpenCode 混合方言）。header 截断可能残留 "<function=" 前缀（非流式
+        # _get_function_calls 的 regex 捕获组差异），先剥掉再判。
+        if function_name.startswith("<function="):
+            function_name = function_name[len("<function="):]
+        # body 首个非空白字符为 '{' ⇒ JSON 直出体：整体按 JSON 解析，成功即透传
+        # 完整 arguments。失败（截断/不完整）落回原 XML 扫描——旧路径会把 '{'
+        # 后内容静默丢弃 ⇒ L401 arguments 只剩 '{'。
+        body = function_call_str[end_index + 1 :].lstrip()
+        if body.startswith("{"):
+            try:
+                direct = json.loads(body)
+            except (TypeError, json.JSONDecodeError):
+                direct = None
+            if isinstance(direct, dict):
+                return ToolCall(
+                    type="function",
+                    function=FunctionCall(
+                        name=function_name,
+                        arguments=_u_json_dumps_safe(direct),
+                    ),
+                )
         param_config = find_tool_properties(self.tools, function_name)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
@@ -2906,6 +2932,7 @@ class Qwen3CoderToolParser(ToolParser):
                 self._partial_prefix = ""
                 self._pending_brace = False
                 self._func_dup_detected = False
+                self._json_direct = False
                 self._stream_last_fp = None
                 self._stream_partial_name = None
                 self._stream_partial_value = None
@@ -2928,6 +2955,7 @@ class Qwen3CoderToolParser(ToolParser):
                 self._partial_prefix = ""
                 self._pending_brace = False
                 self._func_dup_detected = False
+                self._json_direct = False
                 self._stream_last_fp = None
                 self._stream_partial_name = None
                 self._stream_partial_value = None
@@ -3162,6 +3190,17 @@ class Qwen3CoderToolParser(ToolParser):
 
         # We've sent header, now handle function body
         if self.in_function:
+            # [L401 修复 2026-11-12] JSON 直出形态探测：body 无 <parameter=
+            # 标签、以 '{' 开头 ⇒ 后续参数循环 param_starts=[] 空转，参数
+            # 只能靠 function_end 处的「full_json − streamed」补差回收。
+            # 此处提前置标记（标准 XML 形态有 parameter_prefix 恒 False）。
+            if not self.json_started and not self._json_direct:
+                _fs = tool_text.find(self.tool_call_prefix)
+                _he = tool_text.find(">", _fs + len(self.tool_call_prefix))
+                if (_he != -1
+                        and tool_text.find(self.parameter_prefix) == -1
+                        and tool_text[_he + 1:].lstrip().startswith("{")):
+                    self._json_direct = True
             # Always send opening brace first, regardless of whether
             # parameter_prefix is in the current delta. With speculative
             # decoding, a single delta may contain both the opening brace
@@ -3169,7 +3208,13 @@ class Qwen3CoderToolParser(ToolParser):
             # json_started from what was actually streamed.
             if not self.json_started:
                 self.json_started = True
-                if self._is_streaming_tool:
+                # [L401 修复 2026-11-12] JSON 直出形态不发裸 '{'：参数整体
+                # 留在 tool_text 里，由 function_end 处「full−streamed」补差
+                # 一次性回收（streamed 此刻仍为 '' ⇒ 补差=完整 JSON）。
+                # 发射裸 '{' 会撕裂同帧余文且与补差前缀不齐（L401 事故根因）。
+                if self._json_direct:
+                    self._pending_brace = False
+                elif self._is_streaming_tool:
                     # opt23: if a parameter tag is already in tool_text,
                     # defer "{" and combine it with the first param delta
                     # so CC-HAHA receives a parseable partial_json.
@@ -3200,6 +3245,12 @@ class Qwen3CoderToolParser(ToolParser):
                 self.tools, self.current_function_name or ""
             )
             param_starts = self._parameter_start_positions(tool_text, param_config)
+            # [L401 修复 2026-11-12] JSON 直出形态不走参数循环：参数统一由
+            # function_end 补差回收。混合形态（先 '{' 后 <parameter=）若仍进
+            # 循环会与补差重复发射 ⇒ 拼接非法 JSON。落回 XML 扫描由闭合帧的
+            # _parse_xml_function_call 兜底（json.loads 失败自动走参数扫描）。
+            if self._json_direct:
+                param_starts = []
 
             # opt23: detect model duplication of <function=...> within
             # the same tool_text.  Gated by env var — this is a streaming
@@ -3409,6 +3460,8 @@ class Qwen3CoderToolParser(ToolParser):
             _param_config = find_tool_properties(
                 self.tools, self.current_function_name or "",
             )
+            # [L401 修复 2026-11-12] JSON 直出形态禁 partial 流式（无
+            # <parameter= 起点可锚，param_starts 已被清空，此分支必空转）。
             _expected_total = len(_param_config) if _param_config else 0
             # [本地 2026-10-12] 锚条件通用化（为 Bash / WebFetch 开真流式）。
             # 原条件硬编码「file_path 已解析 且 已完成参数数>0 且 参数总数>1」——
@@ -3615,8 +3668,11 @@ class Qwen3CoderToolParser(ToolParser):
                 # remaining delta from the full parsed JSON minus what was
                 # already streamed, instead of emitting "}" as a bare
                 # punctuation delta that clients cannot parse.
+                # [L401 修复 2026-11-12] JSON 直出形态（_json_direct）同样
+                # 走补差：streamed 只有 '{'，修复后的 _parse_xml_function_call
+                # 给出完整 args ⇒ full−streamed 一次性补齐全部参数。
                 remaining = "}"
-                if self._is_streaming_tool:
+                if self._is_streaming_tool or self._json_direct:
                     if self.current_tool_index < len(self.prev_tool_call_arr):
                         full_json = self.prev_tool_call_arr[
                             self.current_tool_index
