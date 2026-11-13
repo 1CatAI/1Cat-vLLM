@@ -30,6 +30,16 @@ else:
 logger = init_logger(__name__)
 
 
+@torch.compiler.assume_constant_result
+def _compiled_device_capability(device_id: int | None) -> tuple[int, int] | None:
+    from vllm.platforms import current_platform
+
+    capability = current_platform.get_device_capability(
+        device_id=current_platform.resolve_device_id(device_id)
+    )
+    return None if capability is None else (capability.major, capability.minor)
+
+
 def in_wsl() -> bool:
     # Reference: https://github.com/microsoft/WSL/issues/4071
     return "microsoft" in " ".join(platform.uname()).lower()
@@ -321,6 +331,21 @@ class Platform:
         return None
 
     @classmethod
+    def _checked_device_capability(
+        cls, device_id: int | None
+    ) -> "DeviceCapability | None":
+        """The capability compared by the ``*_device_capability`` checks.
+
+        Model code calls these checks inside compiled regions, where the
+        platform's cached capability query cannot be traced. The capability
+        is static for a process, so compiled code reads it as a constant.
+        """
+        if torch.compiler.is_compiling():
+            value = _compiled_device_capability(device_id)
+            return None if value is None else DeviceCapability(*value)
+        return cls.get_device_capability(device_id=cls.resolve_device_id(device_id))
+
+    @classmethod
     def has_device_capability(
         cls,
         capability: tuple[int, int] | int,
@@ -335,9 +360,7 @@ class Platform:
         - An integer `<major><minor>`. (See
         [`DeviceCapability.to_int`][vllm.platforms.interface.DeviceCapability.to_int])
         """
-        current_capability = cls.get_device_capability(
-            device_id=cls.resolve_device_id(device_id)
-        )
+        current_capability = cls._checked_device_capability(device_id)
         if current_capability is None:
             return False
 
@@ -361,9 +384,7 @@ class Platform:
         - An integer `<major><minor>`. (See
         [`DeviceCapability.to_int`][vllm.platforms.interface.DeviceCapability.to_int])
         """
-        current_capability = cls.get_device_capability(
-            device_id=cls.resolve_device_id(device_id)
-        )
+        current_capability = cls._checked_device_capability(device_id)
         if current_capability is None:
             return False
 
@@ -382,9 +403,7 @@ class Platform:
         Returns True if the device capability is any <major>.x.
         Mirrors CUDA 13 'family' architecture semantics (e.g. 10.x, 11.x, 12.x).
         """
-        current_capability = cls.get_device_capability(
-            device_id=cls.resolve_device_id(device_id)
-        )
+        current_capability = cls._checked_device_capability(device_id)
         if current_capability is None:
             return False
         return (current_capability.to_int() // 10) == (capability // 10)
