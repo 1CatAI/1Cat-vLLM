@@ -38,7 +38,11 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_manager import (
+    KVCacheBlocks,
+    KVCacheManager,
+    KVPartialHitDriftError,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import is_lookahead_block_hashing_enabled
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -1496,17 +1500,27 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
-                )
+                # A stale partial-prefix hit surfaces here, from the redirect.
+                # Drop it and requeue: the request recomputes from scratch
+                # instead of failing, and popping before the requeue keeps the
+                # loop from spinning on the same request.
+                try:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    )
+                except KVPartialHitDriftError as e:
+                    self._recover_partial_hit_drift(e.request, e.entry)
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1802,6 +1816,28 @@ class Scheduler(SchedulerInterface):
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
+
+    def _recover_partial_hit_drift(self, request: Request, entry) -> None:
+        """Drop a stale partial-prefix hit and let the request recompute.
+
+        The drifter is on the waiting path, not RUNNING, so `_preempt_request`
+        does not apply (it asserts RUNNING). No private blocks were allocated
+        yet -- the lookup only attached the entry and appended its computed
+        blocks -- so freeing is safe and idempotent. Removing the entry keeps
+        the same hit from being taken twice, which bounds the loop: the next
+        `get_computed_blocks` misses.
+        """
+        cache = self.kv_cache_manager.partial_cache
+        if cache is not None:
+            cache.remove_entry(entry.key)
+        self.kv_cache_manager.free(request)
+        request.partial_prefix_entry = None
+        request.num_computed_tokens = 0
+        logger.warning(
+            "partial hit drift recovered (recompute): req=%s key=%s",
+            request.request_id,
+            entry.key,
+        )
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
