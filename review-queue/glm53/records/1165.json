@@ -1,0 +1,117 @@
+{
+  "initial_inventory": {
+    "number": 1165,
+    "title": "[Perf][SM70] GLM-5.3 KDA: Triton gated RMSNorm on the FP32 recurrent output",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1165",
+    "isDraft": true,
+    "headRefOid": "60dd820a7cba6a3388934e791ac72cbfe50606a1",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1165,
+    "title": "[Perf][SM70] GLM-5.3 KDA: Triton gated RMSNorm on the FP32 recurrent output",
+    "body": "## Purpose\n\nOn 4x V100 (GLM-5.3-Flash, TP4, MTP k=3, CUDA graphs) a torch-profiler capture of the decode step shows the KDA output norm (`FusedRMSNormGated`, sigmoid gate) running as eight separate eager kernels per layer: a reduce, rsqrt, two casts, the sigmoid, two multiplies and the output cast, about 25 us per layer in-graph, 34 layers per step. The cause is the dispatch, not the kernel: `custom_ops` defaults to `none`, so `CustomOp` takes `forward_native`, and the SM70 decode graph is not compiled, so the decomposition runs eagerly instead of being fused by Inductor.\n\n## Change\n\n`vllm/models/glm5next/nvidia/kda.py`: the SM70 branch that keeps the recurrent output in FP32 through the norm calls `self.o_norm.forward_cuda(...)` (the Triton `rms_norm_gated`) directly. Same inputs, same `out_dtype`; the Triton kernel does the same FP32 arithmetic and is bit-identical at the 1- and 4-token shapes, within one FP16 ulp at the padded 8-token graph shape. Nothing else changes; the non-SM70 branch is untouched.\n\nNo new environment variables, no new ops, no generic module touched.\n\n## Not a duplicate\n\nNo open or closed PR changes the KDA output norm dispatch (searched \"o_norm\", \"rms_norm_gated\", \"FusedRMSNormGated sm70\").\n\n## Test Plan\n\n- `tests/models/glm5next/test_sm70_kda.py::test_sm70_kda_output_norm_triton_matches_decomposed_bitwise` at 1/4/8 tokens: `forward_cuda` vs `forward_native` with `rtol=0, atol=0` on an FP32 `[1, T, 16, 128]` input with one row scaled by 300 (the overflow case the FP32 route exists for), FP64 oracle, gate mutation check; the test also asserts the CustomOp is not enabled under the default config, which is why the direct call exists.\n- In-graph microbench of both paths at 1 and 4 tokens.\n- E2E on 4x V100-SXM2-32GB with the model card's serve command (same build before and after): decode tok/s and greedy output on a 7-prompt set.\n\n## Test Result\n\n- In-graph microbench (V100, 16 heads x 128, FP32 input, FP16 gate and output): decomposed path 24.9 us at 1 token / 25.6 us at 4; Triton op 3.8 / 4.2 us. Outputs bit-identical at 1 and 4 tokens; at 8 tokens (the padded CUDA-graph shape the model actually runs the verify batch at) 2 of 16,384 elements differ by one FP16 ulp, from the kernel's reduction order.\n- Unit tests: `tests/models/glm5next/test_sm70_kda.py` 11 passed (the new test at 1/4/8 tokens plus the existing file) on a full SM70 CMake build of `main` 4e5357b59 + #1159 + this change (`tests/kernels/test_mhc_sm70_fp16.py` on the same build: 71 passed, 1 skipped).\n- E2E (4x V100-SXM2-32GB, GLM-5.3-Flash EXL3 via #1102, TP4, MTP k=3, FP8 KV, 131K, CUDA graphs, the model card's serve command; stack `main` ec60883ad + #1125 + #1159 + #1161 + #1102, same build before and after): decode 85.7 -> 90.6-90.9 tok/s (1 user, 512-token greedy responses, 3 runs each). Greedy output on a 7-prompt set: 3 prompts identical, 4 diverge after 135-390 characters, the one-ulp effect above under greedy decoding; same-code reruns are deterministic (7/7 identical).\n- pre-commit: ruff 0.14.0 format and check clean on the changed files.\n\nGates before review:\n\n- [x] Test against an independent oracle, failing under mutation\n- [x] ruff on the changed files\n- [x] Full wheel build (CMake path) and the test file above on it\n- [x] E2E on 4x V100, CUDA graphs on: load, greedy comparison, decode speed\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1165",
+    "isDraft": true,
+    "headRefName": "sm70-glm53-kda-onorm",
+    "headRefOid": "60dd820a7cba6a3388934e791ac72cbfe50606a1",
+    "baseRefName": "main",
+    "baseRefOid": "44276e9719831955f1d6c11679669940a0409ad1",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "rivetphilbot"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1165,
+    "id": "PR_kwDORjYFXs8AAAABHroqbQ",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "60dd820a7cba6a3388934e791ac72cbfe50606a1",
+    "title": "[Perf][SM70] GLM-5.3 KDA: Triton gated RMSNorm on the FP32 recurrent output",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1165",
+    "body": "## Purpose\n\nOn 4x V100 (GLM-5.3-Flash, TP4, MTP k=3, CUDA graphs) a torch-profiler capture of the decode step shows the KDA output norm (`FusedRMSNormGated`, sigmoid gate) running as eight separate eager kernels per layer: a reduce, rsqrt, two casts, the sigmoid, two multiplies and the output cast, about 25 us per layer in-graph, 34 layers per step. The cause is the dispatch, not the kernel: `custom_ops` defaults to `none`, so `CustomOp` takes `forward_native`, and the SM70 decode graph is not compiled, so the decomposition runs eagerly instead of being fused by Inductor.\n\n## Change\n\n`vllm/models/glm5next/nvidia/kda.py`: the SM70 branch that keeps the recurrent output in FP32 through the norm calls `self.o_norm.forward_cuda(...)` (the Triton `rms_norm_gated`) directly. Same inputs, same `out_dtype`; the Triton kernel does the same FP32 arithmetic and is bit-identical at the 1- and 4-token shapes, within one FP16 ulp at the padded 8-token graph shape. Nothing else changes; the non-SM70 branch is untouched.\n\nNo new environment variables, no new ops, no generic module touched.\n\n## Not a duplicate\n\nNo open or closed PR changes the KDA output norm dispatch (searched \"o_norm\", \"rms_norm_gated\", \"FusedRMSNormGated sm70\").\n\n## Test Plan\n\n- `tests/models/glm5next/test_sm70_kda.py::test_sm70_kda_output_norm_triton_matches_decomposed_bitwise` at 1/4/8 tokens: `forward_cuda` vs `forward_native` with `rtol=0, atol=0` on an FP32 `[1, T, 16, 128]` input with one row scaled by 300 (the overflow case the FP32 route exists for), FP64 oracle, gate mutation check; the test also asserts the CustomOp is not enabled under the default config, which is why the direct call exists.\n- In-graph microbench of both paths at 1 and 4 tokens.\n- E2E on 4x V100-SXM2-32GB with the model card's serve command (same build before and after): decode tok/s and greedy output on a 7-prompt set.\n\n## Test Result\n\n- In-graph microbench (V100, 16 heads x 128, FP32 input, FP16 gate and output): decomposed path 24.9 us at 1 token / 25.6 us at 4; Triton op 3.8 / 4.2 us. Outputs bit-identical at 1 and 4 tokens; at 8 tokens (the padded CUDA-graph shape the model actually runs the verify batch at) 2 of 16,384 elements differ by one FP16 ulp, from the kernel's reduction order.\n- Unit tests: `tests/models/glm5next/test_sm70_kda.py` 11 passed (the new test at 1/4/8 tokens plus the existing file) on a full SM70 CMake build of `main` 4e5357b59 + #1159 + this change (`tests/kernels/test_mhc_sm70_fp16.py` on the same build: 71 passed, 1 skipped).\n- E2E (4x V100-SXM2-32GB, GLM-5.3-Flash EXL3 via #1102, TP4, MTP k=3, FP8 KV, 131K, CUDA graphs, the model card's serve command; stack `main` ec60883ad + #1125 + #1159 + #1161 + #1102, same build before and after): decode 85.7 -> 90.6-90.9 tok/s (1 user, 512-token greedy responses, 3 runs each). Greedy output on a 7-prompt set: 3 prompts identical, 4 diverge after 135-390 characters, the one-ulp effect above under greedy decoding; same-code reruns are deterministic (7/7 identical).\n- pre-commit: ruff 0.14.0 format and check clean on the changed files.\n\nGates before review:\n\n- [x] Test against an independent oracle, failing under mutation\n- [x] ruff on the changed files\n- [x] Full wheel build (CMake path) and the test file above on it\n- [x] E2E on 4x V100, CUDA graphs on: load, greedy comparison, decode speed\n",
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRefName": "sm70-glm53-kda-onorm",
+    "comments": {
+      "totalCount": 2,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWvH5Wc="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABa3G8uw",
+          "author": {
+            "login": "rivetphilbot"
+          },
+          "body": "Per-pass measurement (same build, same generated text across configurations: 1,440 forward passes, 2.78 accepted tokens per pass, five varied 400-token prompts x2, counters from `/metrics`):\n\n| configuration | ms per forward pass |\n|---|---:|\n| #1165 + #1166 (defaults) | 32.81 |\n| #1165 with `VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8=0` | 32.97 |\n\nSo #1166 is worth about 0.16 ms per pass (0.5%) at the kernel level; the larger tok/s swing in the earlier A/B included a change in the generated text of the speed prompt (draft acceptance), which is why the greedy outputs were reported alongside. #1165's effect is in GPU kernel time: the profile's elementwise bucket dropped by about 1.3 ms per pass (4%). Under MTP, compare builds by milliseconds per pass rather than by one prompt's tok/s.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1165#issuecomment-6097583291",
+          "createdAt": "2026-10-10T12:39:38Z",
+          "updatedAt": "2026-10-10T12:39:38Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABa8flZw",
+          "author": {
+            "login": "rivetphilbot"
+          },
+          "body": "Correction to the per-pass numbers above: the build they were measured on also had an unpublished kernel (a small-N GEMV for the router and shared expert) active in both rows; its disable switch did not take effect, which we found afterwards. Re-measured on exactly the PR stack (`main` ec60883ad with #1125, #1159, #1161, #1166, #1165 cherry-picked and #1102 merged), built from a clean clone, same method (five varied 400-token prompts x2, 1,432 forward passes, identical generated text in both rows, 2.79 accepted tokens per pass):\n\n| Configuration | ms per pass |\n|---|---:|\n| #1165 + #1166 (defaults) | 32.47 |\n| #1165 with `VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8=0` | 32.57 |\n\nSo #1166 is worth about 0.10 ms per pass (0.3%), not 0.16 ms. The #1165 figure (elementwise time down about 1.3 ms per pass) came from a profile taken before that kernel was added and stands. The full stack decodes at 91.4-91.9 tok/s single-user on the speed prompt.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1165#issuecomment-6103229799",
+          "createdAt": "2026-10-10T23:16:46Z",
+          "updatedAt": "2026-10-10T23:16:46Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1165,
+    "title": "[Perf][SM70] GLM-5.3 KDA: Triton gated RMSNorm on the FP32 recurrent output",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1165",
+    "isDraft": true,
+    "headRefOid": "60dd820a7cba6a3388934e791ac72cbfe50606a1",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/models/glm5next/test_sm70_kda.py",
+      "vllm/models/glm5next/nvidia/kda.py"
+    ],
+    "diff_bytes": 4540,
+    "diff_sha256": "9b881a8b610c4cce502822fa796546ec05cc7805d18c1fa937ac44884efea0fc"
+  },
+  "full_tree_diff_proof": null
+}
