@@ -384,10 +384,18 @@ class KVCacheManager:
                     [self.block_pool.null_block] * first + entry.blocks[group_id]
                 )
         demand = {group_id: 1 for group_id, copy in enumerate(entry.copy_last) if copy}
-        if not self.block_pool.can_allocate_group_blocks(demand):
+        if not self._can_allocate(demand):
             return None
         request.partial_prefix_entry = entry
         return tuple(blocks), boundary
+
+    def _can_allocate(self, demand: dict[int, int]) -> bool:
+        # Partition quotas alone pass whenever the pool is not partitioned;
+        # an empty pool must skip optional copies, not raise (#1483).
+        num_blocks = sum(demand.values())
+        return num_blocks <= self.block_pool.get_num_free_blocks() and (
+            self.block_pool.can_allocate_group_blocks(demand)
+        )
 
     def _defer_release(self, blocks: list[KVCacheBlock]) -> None:
         # Async scheduling runs up to two steps ahead of the worker; the copy
@@ -440,10 +448,10 @@ class KVCacheManager:
             if len(sources) != len(managers):
                 continue
             demand = {g: len(blocks) for g, blocks in enumerate(sources)}
-            while not self.block_pool.can_allocate_group_blocks(demand):
+            while not self._can_allocate(demand):
                 if not cache.evict_one():
                     break
-            if not self.block_pool.can_allocate_group_blocks(demand):
+            if not self._can_allocate(demand):
                 continue
             targets: list[list[KVCacheBlock]] = []
             for group_id, group_sources in enumerate(sources):

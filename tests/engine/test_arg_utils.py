@@ -252,6 +252,7 @@ def _apply_sm70_defaults(
     max_num_seqs=None,
     max_num_batched_tokens=None,
     performance_mode="balanced",
+    **engine_kwargs,
 ):
     for key in (
         "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS",
@@ -275,6 +276,7 @@ def _apply_sm70_defaults(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         performance_mode=performance_mode,
+        **engine_kwargs,
     )
     args.speculative_config = speculative_config
     args._maybe_apply_sm70_mtp_defaults(
@@ -291,6 +293,56 @@ def test_sm70_serving_defaults_do_not_auto_enable_mtp(monkeypatch):
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
     assert args.compilation_config.cudagraph_capture_sizes is None
+
+
+def test_sm70_hybrid_prefix_cache_defaults_to_release_geometry(monkeypatch):
+    # #1422: the generic 16-token geometry never yields a reusable checkpoint.
+    args = _apply_sm70_defaults(monkeypatch)
+
+    assert args.block_size == 2048
+    assert args.mamba_block_size == 2048
+    assert args.partial_prefix_cache is True
+    assert args.prefix_cache_retention_interval == 8192
+
+
+def test_sm70_hybrid_prefix_cache_keeps_explicit_geometry(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        enable_prefix_caching=True,
+        block_size=2048,
+        mamba_block_size=8192,
+        partial_prefix_cache=False,
+    )
+
+    assert args.block_size == 2048
+    assert args.mamba_block_size == 8192
+    assert args.partial_prefix_cache is False
+    # The interval is only defaulted for the verified 2048/2048 geometry.
+    assert args.prefix_cache_retention_interval == 0
+
+
+def test_sm70_hybrid_prefix_cache_keeps_explicit_interval(monkeypatch):
+    args = _apply_sm70_defaults(monkeypatch, prefix_cache_retention_interval=4096)
+
+    assert args.block_size == 2048
+    assert args.prefix_cache_retention_interval == 4096
+
+
+def test_sm70_hybrid_prefix_cache_geometry_needs_prefix_caching(monkeypatch):
+    args = _apply_sm70_defaults(monkeypatch, enable_prefix_caching=False)
+
+    assert args.block_size is None
+    assert args.mamba_block_size is None
+    assert args.partial_prefix_cache is None
+
+
+def test_partial_prefix_cache_cli_is_tri_state():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    assert parser.parse_args([]).partial_prefix_cache is None
+    assert parser.parse_args(["--partial-prefix-cache"]).partial_prefix_cache
+    assert (
+        parser.parse_args(["--no-partial-prefix-cache"]).partial_prefix_cache is False
+    )
 
 
 def test_sm70_mtp_defaults_require_env_opt_in(monkeypatch):

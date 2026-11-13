@@ -734,6 +734,17 @@ class Platform:
             if indexer_align:
                 attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
             block_step = lcm(kernel_block_alignment_size, indexer_align or 1)
+            get_multiple = getattr(backend_cls, "get_hybrid_block_multiple", None)
+            hybrid_multiple = get_multiple() if get_multiple else None
+            if (
+                hybrid_multiple
+                and cache_config.mamba_cache_mode == "align"
+                and not getattr(cache_config, "user_specified_block_size", False)
+            ):
+                # The backend may later resize attention blocks per group; start
+                # on a block that keeps all groups on the Mamba prefix grid.
+                block_step = lcm(block_step, hybrid_multiple)
+                attn_block_size = block_step * cdiv(attn_block_size, block_step)
         while attention_page_bytes(attn_block_size) < mamba_page_size:
             attn_block_size += block_step
         if cache_config.mamba_cache_mode == "all":

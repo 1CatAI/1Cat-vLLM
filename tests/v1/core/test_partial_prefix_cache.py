@@ -163,3 +163,52 @@ def test_same_placeholder_tokens_with_another_image_do_not_hit():
         cache.lookup(None, tokens, 0, 5, None, 0, 2, [_image("second", 1, 3)]) is None
     )
     assert cache.lookup(None, tokens, 0, 5, None, 0, 2) is None
+
+
+def test_snapshot_is_skipped_when_the_pool_is_exhausted():
+    # #1483: an unpartitioned pool passes the partition-quota check, so the
+    # snapshot copy must also check aggregate free blocks instead of raising.
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float16
+    )
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        12, [], [KVCacheGroupSpec(["full"], full), KVCacheGroupSpec(["m"], mamba)]
+    )
+    cm = KVCacheManager(config, 1024, 16, partial_prefix_cache=True)
+    assert cm.partial_cache is not None
+    request = SimpleNamespace(
+        request_id="r",
+        num_preemptions=0,
+        is_finished=lambda: False,
+        all_token_ids=list(range(40)),
+        block_hashes=[BlockHash(bytes([i])) for i in range(2)],
+        cache_salt=None,
+        lora_request=None,
+        mm_features=[],
+    )
+    for manager in cm.coordinator.single_type_managers:
+        manager.allocate_new_blocks("r", 40, 40)
+    leftover = cm.block_pool.get_new_blocks(cm.block_pool.get_num_free_blocks())
+    cm._pending_snapshots.append((request, 40, 0))
+
+    cm._materialize_snapshots()
+
+    assert not cm.partial_cache.entries
+    assert not cm.take_block_copies()
+    cm.block_pool.free_blocks(leftover)

@@ -113,3 +113,52 @@ def test_hybrid_budget_uses_the_whole_physical_page(
     assert page(cache.block_size) >= state_bytes
     assert page(cache.block_size - KERNEL_BLOCK) < state_bytes
     assert cache.mamba_page_size_padded in (None, page(cache.block_size))
+
+
+class _GridBackend:
+    """Resizes attention blocks per group later, like Flash-V100."""
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [MultipleOf(16)]
+
+    @staticmethod
+    def get_hybrid_block_multiple():
+        return 64
+
+
+# #1422: an FP8 target with an FP16 DFlash draft resolved 1648 tokens; the draft
+# page cannot be halved to 824, so attention moved to 1664 and Mamba stayed at
+# 1648 (171392-token prefixes). Such backends now start align mode on 64.
+@pytest.mark.parametrize(
+    "mamba_tokens,backend,mode,expected",
+    [
+        (1640, _GridBackend, "align", 1664),
+        (1600, _GridBackend, "align", 1600),  # already a multiple of 64
+        (1640, _LooseBackend, "align", 1648),  # backends without the hook
+        (1640, _GridBackend, "none", 1648),  # no prefix grid without caching
+    ],
+)
+def test_hybrid_block_multiple_keeps_one_prefix_grid(
+    monkeypatch, mamba_tokens, backend, mode, expected
+) -> None:
+    config, model_cls = _vllm_config(mamba_tokens, 1)
+    config.cache_config.mamba_cache_mode = mode
+    monkeypatch.setattr(
+        ModelRegistry, "resolve_model_cls", lambda *args, **kwargs: (model_cls, "fake")
+    )
+
+    Platform._align_hybrid_block_size(config, backend)
+
+    assert config.cache_config.block_size == expected
+    if mode == "align":
+        assert config.cache_config.mamba_block_size == expected
+
+
+def test_page_sharing_backend_requests_the_grid_multiple() -> None:
+    from vllm.v1.attention.backend import AttentionBackend
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    assert AttentionBackend.get_hybrid_block_multiple() is None
+    backend = AttentionBackendEnum.FLASH_ATTN_V100.get_class()
+    assert backend.get_hybrid_block_multiple() == 64

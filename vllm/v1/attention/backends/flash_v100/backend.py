@@ -39,6 +39,14 @@ class FlashAttnV100Backend(TritonAttentionBackend):
             return [16]
         return TritonAttentionBackend.get_supported_kernel_block_sizes()
 
+    @staticmethod
+    def get_hybrid_block_multiple() -> int | None:
+        # _compact_sm70_hybrid_sliding_window_pages divides a higher-precision
+        # draft block by its page ratio (2x FP16 over 8-bit, 4x over FP32) and
+        # rounds attention alone up when the result is not a multiple of 16:
+        # 1648/1664 then leaves Mamba on another grid and nothing hits (#1422).
+        return 64
+
     @classmethod
     def supports_non_causal(cls) -> bool:
         # D-Flash uses non-causal decoder attention over the draft query

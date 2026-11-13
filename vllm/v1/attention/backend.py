@@ -71,6 +71,16 @@ class AttentionBackend(ABC):
         return [MultipleOf(1)]
 
     @staticmethod
+    def get_hybrid_block_multiple() -> int | None:
+        """Block multiple a hybrid ``align`` prefix grid needs, if any.
+
+        A backend that later resizes attention blocks per cache group (e.g. to
+        share one physical page with a draft cache of another dtype) returns
+        the multiple that keeps every resized group on the Mamba grid.
+        """
+        return None
+
+    @staticmethod
     @abstractmethod
     def get_name() -> str:
         raise NotImplementedError
