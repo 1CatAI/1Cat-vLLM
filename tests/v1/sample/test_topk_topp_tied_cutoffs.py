@@ -274,6 +274,11 @@ def test_compact_large_batch_matches_reference(rows, vocab):
 @pytest.mark.parametrize("direction", [-1, 0, 1])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_compact_top_p_rounding_boundary(direction):
+    from vllm.v1.sample.ops.topk_topp_triton import _apply_top_k_top_p_compact
+
+    # The rounding margin belongs to the compact route; the pivot kernel only
+    # sends split ties and failed pivot reconstructions to the reference.
+    # Call the route itself so the margin is checked on every device.
     torch.manual_seed(1528)
     x = torch.randn(16, 32768, device="cuda")
     k = torch.full((16,), 20, dtype=torch.int32, device="cuda")
@@ -285,7 +290,7 @@ def test_compact_top_p_rounding_boundary(direction):
     if direction:
         p = torch.nextafter(p, torch.full_like(p, float("inf") * direction))
     expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
-    actual = apply_top_k_top_p_triton(x.clone(), k, p)
+    actual = _apply_top_k_top_p_compact(x.clone(), k, p, -float("inf"))
     assert torch.equal(actual, expected)
 
 
