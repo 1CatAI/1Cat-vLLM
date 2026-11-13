@@ -1144,7 +1144,7 @@ def _apply_top_k_top_p_compact(
     k: torch.Tensor,
     p: torch.Tensor,
     mask_value: float,
-) -> torch.Tensor | None:
+) -> torch.Tensor:
     """Filter a bounded shortlist; retain reference handling at boundaries.
 
     A top-k cutoff keeps *all* equal logits, so a fixed-size shortlist is not
@@ -1337,9 +1337,7 @@ def apply_top_k_top_p_triton(
         p_ptr = logits  # Dummy pointer (won't be read)
 
     if _compact_path_admitted(logits, topk_enabled, topp_enabled):
-        compact = _apply_top_k_top_p_compact(logits, k_ptr, p_ptr, mask_value)
-        if compact is not None:
-            return compact
+        return _apply_top_k_top_p_compact(logits, k_ptr, p_ptr, mask_value)
 
     num_sm = num_compute_units(logits.device.index)
     NUM_PROGRAMS = min(num_sm, batch_size)
