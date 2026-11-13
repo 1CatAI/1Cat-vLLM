@@ -135,10 +135,13 @@ _FN_TAG_RE = re.compile(r"<function=([A-Za-z0-9_.\-]+)>")
 #   rm -f  <flag>   # 切回 coalesce（并发）
 #   curl -X POST :8000/v1/internal/reload -d '{}'
 #
+# 默认路径放 /tmp/cache/（tmpfs）：切换文件是纯运行态，不属于任何源码树，
+# 避免落入工作区被 git status / 清理误动。注意 /tmp 重启后清空 ⇒ 回到默认的并发模式。
+#
 # 先在函数内实时检查文件，热重载时也重新求值，双重保险。
 _TOOL_CALLS_STREAM_FLAG = os.environ.get(
     "VLLM_TOOL_CALLS_STREAM_FLAG",
-    "/home/zeaxion/myproject/1cat-vllm-v130/.tool_calls_streaming",
+    "/tmp/cache/.tool_calls_streaming",
 )
 
 
