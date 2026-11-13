@@ -42,7 +42,7 @@ from vllm.transformers_utils.config import maybe_register_config_serialize_by_va
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
-from vllm.v1.engine import EngineCoreRequest, PauseMode
+from vllm.v1.engine import EngineCoreRequest, FinishReason, PauseMode
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
@@ -172,6 +172,11 @@ class AsyncLLM(EngineClient):
             self.logger_manager.log_engine_initialized()
 
         self._client_count = client_count
+
+        # In-flight request id -> multi-modal items it sent without data
+        # because the frontend's sender cache said the engine had them. If such
+        # a request fails, those entries may have drifted and are dropped.
+        self._mm_shadow_hits: dict[str, list[str]] = {}
 
         self.output_handler: asyncio.Task | None = None
         try:
@@ -414,8 +419,23 @@ class AsyncLLM(EngineClient):
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
+        # Remember items sent without data (sender-cache hits), so they can be
+        # dropped from the sender cache if the engine fails the request.
+        if request.mm_features:
+            shadow_hits = [
+                feature.mm_hash or feature.identifier
+                for feature in request.mm_features
+                if feature.data is None
+            ]
+            if shadow_hits:
+                self._mm_shadow_hits[request.request_id] = shadow_hits
+
         # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+        try:
+            await self.engine_core.add_request_async(request)
+        except BaseException:
+            self._mm_shadow_hits.pop(request.request_id, None)
+            raise
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
@@ -670,6 +690,7 @@ class AsyncLLM(EngineClient):
         logger_ref = self._logger_ref
         renderer = self.renderer
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+        mm_shadow_hits = self._mm_shadow_hits
 
         async def output_handler():
             try:
@@ -677,6 +698,24 @@ class AsyncLLM(EngineClient):
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
+
+                    # 1b) Multi-modal sender cache drift: when the engine fails
+                    # a request that sent items without data, the engine may
+                    # not have had them (P0/P1 drift, see
+                    # MultiModalCacheMissError). Queue their removal from the
+                    # sender cache before the failure reaches the client; the
+                    # renderer executor runs it ahead of the retry's rendering,
+                    # so the retry sends the data again.
+                    if mm_shadow_hits:
+                        drifted: list[str] = []
+                        for output in outputs.outputs:
+                            if output.finish_reason is None:
+                                continue
+                            hits = mm_shadow_hits.pop(output.request_id, None)
+                            if hits and output.finish_reason == FinishReason.ERROR:
+                                drifted.extend(hits)
+                        if drifted:
+                            renderer.invalidate_mm_cache_items_async(drifted)
 
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None
@@ -733,6 +772,8 @@ class AsyncLLM(EngineClient):
             (request_id,) if isinstance(request_id, str) else as_list(request_id)
         )
         all_request_ids = self.output_processor.abort_requests(request_ids, internal)
+        for req_id in all_request_ids:
+            self._mm_shadow_hits.pop(req_id, None)
         await self.engine_core.abort_requests_async(all_request_ids)
 
         if self.log_requests:
