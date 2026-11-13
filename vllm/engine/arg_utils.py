@@ -142,6 +142,7 @@ logger = init_logger(__name__)
 # pages and recurrent checkpoints, plus periodic checkpoints every 8192 tokens.
 _HYBRID_PREFIX_BLOCK_SIZE = 2048
 _HYBRID_PREFIX_RETENTION_INTERVAL = 8192
+_UNSET_RETENTION_INTERVAL = -1
 
 
 def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
@@ -541,9 +542,9 @@ class EngineArgs:
     )
     block_size: int | None = None
     enable_prefix_caching: bool | None = None
-    prefix_cache_retention_interval: int | None = (
-        CacheConfig.prefix_cache_retention_interval
-    )
+    # _UNSET_RETENTION_INTERVAL marks "not given", so an explicit 0 (and the
+    # dense-admission None) survive the hybrid serving defaults.
+    prefix_cache_retention_interval: int | None = _UNSET_RETENTION_INTERVAL
     mamba_tail_checkpoint: bool = CacheConfig.mamba_tail_checkpoint
     partial_prefix_cache: bool | None = None
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
@@ -1195,7 +1196,10 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--prefix-cache-retention-interval",
-            **cache_kwargs["prefix_cache_retention_interval"],
+            **{
+                **cache_kwargs["prefix_cache_retention_interval"],
+                "default": _UNSET_RETENTION_INTERVAL,
+            },
         )
         cache_group.add_argument(
             "--mamba-tail-checkpoint", **cache_kwargs["mamba_tail_checkpoint"]
@@ -1812,8 +1816,11 @@ class EngineArgs:
             self.partial_prefix_cache = True
             updates.append("partial_prefix_cache=True")
         if (
-            self.prefix_cache_retention_interval
-            == CacheConfig.prefix_cache_retention_interval
+            self.prefix_cache_retention_interval == _UNSET_RETENTION_INTERVAL
+            # With authoritative host KV the device state pool is small:
+            # periodic checkpoints evicted other sessions' tail states and
+            # forced full re-prefills (64K x4: 28.9 -> 97.9 tok/s without them).
+            and not getattr(self.kernel_config, "qsa_host_kv", False)
             # Only the verified geometry: elsewhere the interval might not be a
             # multiple of the resolved alignment and would reject startup.
             and self.block_size == _HYBRID_PREFIX_BLOCK_SIZE
@@ -2088,7 +2095,11 @@ class EngineArgs:
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
-            prefix_cache_retention_interval=self.prefix_cache_retention_interval,
+            prefix_cache_retention_interval=(
+                CacheConfig.prefix_cache_retention_interval
+                if self.prefix_cache_retention_interval == _UNSET_RETENTION_INTERVAL
+                else self.prefix_cache_retention_interval
+            ),
             mamba_tail_checkpoint=self.mamba_tail_checkpoint,
             partial_prefix_cache=bool(self.partial_prefix_cache),
             calculate_kv_scales=self.calculate_kv_scales,

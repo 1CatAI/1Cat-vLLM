@@ -12,6 +12,7 @@ from pydantic import Field
 
 from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
 from vllm.engine.arg_utils import (
+    _UNSET_RETENTION_INTERVAL,
     EngineArgs,
     _expand_json_human_readable_numbers,
     contains_type,
@@ -252,6 +253,7 @@ def _apply_sm70_defaults(
     max_num_seqs=None,
     max_num_batched_tokens=None,
     performance_mode="balanced",
+    kernel_config=None,
     **engine_kwargs,
 ):
     for key in (
@@ -279,6 +281,8 @@ def _apply_sm70_defaults(
         **engine_kwargs,
     )
     args.speculative_config = speculative_config
+    if kernel_config is not None:
+        args.kernel_config = kernel_config
     args._maybe_apply_sm70_mtp_defaults(
         UsageContext.OPENAI_API_SERVER,
         _fake_qwen_hybrid_model_config(),
@@ -318,14 +322,38 @@ def test_sm70_hybrid_prefix_cache_keeps_explicit_geometry(monkeypatch):
     assert args.mamba_block_size == 8192
     assert args.partial_prefix_cache is False
     # The interval is only defaulted for the verified 2048/2048 geometry.
-    assert args.prefix_cache_retention_interval == 0
+    assert args.prefix_cache_retention_interval == _UNSET_RETENTION_INTERVAL
 
 
-def test_sm70_hybrid_prefix_cache_keeps_explicit_interval(monkeypatch):
-    args = _apply_sm70_defaults(monkeypatch, prefix_cache_retention_interval=4096)
+@pytest.mark.parametrize("interval", [0, 4096, None])
+def test_sm70_hybrid_prefix_cache_keeps_explicit_interval(monkeypatch, interval):
+    # An explicit 0 (no periodic checkpoints) or None (dense admission) is a
+    # choice, not "unset".
+    args = _apply_sm70_defaults(monkeypatch, prefix_cache_retention_interval=interval)
 
     assert args.block_size == 2048
-    assert args.prefix_cache_retention_interval == 4096
+    assert args.prefix_cache_retention_interval == interval
+
+
+def test_prefix_cache_retention_interval_cli_keeps_explicit_zero():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    assert (
+        parser.parse_args([]).prefix_cache_retention_interval
+        == _UNSET_RETENTION_INTERVAL
+    )
+    parsed = parser.parse_args(["--prefix-cache-retention-interval", "0"])
+    assert parsed.prefix_cache_retention_interval == 0
+
+
+def test_sm70_hybrid_prefix_cache_host_kv_keeps_tail_checkpoints(monkeypatch):
+    # Periodic checkpoints evicted other sessions' tail states from the small
+    # host-KV state pool (Flash-Next 64K x4: 28.9 -> 97.9 tok/s without them).
+    args = _apply_sm70_defaults(
+        monkeypatch, kernel_config=SimpleNamespace(qsa_host_kv=True)
+    )
+
+    assert args.block_size == 2048
+    assert args.prefix_cache_retention_interval == _UNSET_RETENTION_INTERVAL
 
 
 def test_sm70_hybrid_prefix_cache_geometry_needs_prefix_caching(monkeypatch):
