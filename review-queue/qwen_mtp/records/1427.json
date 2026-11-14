@@ -1,0 +1,114 @@
+{
+  "initial_inventory": {
+    "number": 1427,
+    "title": "[Perf][SM70] Qwen3.8 MTP: MRV2, shared verifier routes, no draft-step sync; 16 GB capacity",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1427",
+    "isDraft": true,
+    "headRefOid": "431a20ad8751d4c8e3e026c9c27fa5941e257612",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1427,
+    "title": "[Perf][SM70] Qwen3.8 MTP: MRV2, shared verifier routes, no draft-step sync; 16 GB capacity",
+    "body": "## Summary\n\nQwen3.8-27B native MTP was far slower than DFlash2 on SM70 (29 ms vs 13.6 ms per verify round on 4x V100-16GB) even though both verify a short causal window. Causes and fixes:\n\n- **Runner**: SM70 Qwen3.5/3.8 MTP ran on the V1 runner; only DFlash forced MRV2. It now defaults to MRV2, which carries the shared GDN/attention verifier metadata.\n- **Verifier routes**: the GDN packed verify / fused norm / split / qkv pack, Flash-V100 grouped small-query metadata and the NVFP4 QPN2 qualification were gated on `method == \"dflash\"` with 7 drafts. `sm70_mtp_verifier_qualified` admits the MTP target (1..7 drafts) to the target-side subset only (`SM70_MTP_VERIFIER_DEFAULTS`); drafter, selector and LM-head routes stay DFlash2-only. Each operator still checks its live shape.\n- **Draft-step host sync**: Eagle draft attention metadata had no CPU `seq_lens` bound, so the Flash-V100 builder synced `seq_lens` to the host before every draft step (~1.6 ms GPU idle per step). The speculator now passes an upper bound.\n- **Drafter weights**: the BF16 MTP decoder projections are requantized to channel QPN8 (`kernel_config.sm70_mtp_draft_qpn8`, default on) and use the target's QPN8 dispatch; FP16 copies are released.\n- **16 GB cards**: the duplicate FP8 batch TurboMind layout (~2.2 GiB/rank) is no longer prepared below 20 GiB per device; 33..128-row FP8 calls run as 32-row QPN8 blocks instead of dequantize + cuBLAS. KV 171,819 -> 412,910 tokens on 16 GB; DFlash7 c8 TTFT max 8.4 s -> 1.5 s.\n- **Warmup**: #1402's full-chunk profile requested prompt logprobs, gathering 0.5 GiB of full-vocabulary logits and OOMing 16 GB cards; long profiles skip them.\n- Optional hot-vocabulary QPN8 draft head (`kernel_config.sm70_draft_hot_vocab`, default off: 32K costs 10-20% acceptance, 131K saves only 0.2 ms).\n\n## Measurements (4x V100-SXM2-16GB TP4, HBM 877 MHz, Qwen3.8-27B NVFP4, greedy, same HTTP client)\n\nMTP4 c1 ms/round: 29.0 (main) -> 15.1, accepted tokens/round unchanged (gsm8k 4.2, mt-bench 3.7, zh-prose 3.3, humaneval 4.6). MTP4 prefill now equals DFlash7 (85K: 3,365 tok/s). DFlash7 c1 unchanged at 13.6 ms/round.\n\n| Workload | NInfer v0.2.1 TP4 QUASAR MTP4 | DFlash7 (this branch) | MTP4 (this branch) |\n|---|---|---|---|\n| Prefill 8K / 85K tok/s | 2,653 / 2,013 | 4,384 / 3,441 | 4,203 / 3,365 |\n| c1 gsm8k / humaneval tok/s | 370 / 392 | 463 / 529 | 282 / 307 |\n| c1 zh-prose tok/s | 278 | 246 | 216 |\n| c8 gsm8k / humaneval tok/s | 670 / 577 | 744 / 810 | 590 / 594 |\n| c8 zh-prose / mt-bench tok/s | 723 / 680 | 535 / 683 | 664 / 634 |\n\nGSM8K-200 greedy accuracy: 1.5.2 wheel DFlash7 96.5% / MTP4 96.0%; this branch DFlash7 96.0% / MTP4 96.5%; NInfer 96.5%.\n\n## Duplicate check\n\nNo open PR touches MTP runner selection, the Eagle draft seq_lens bound or the 16 GB batch layout (searched open PRs for \"MTP MRV2\" and \"seq_lens_cpu_upper_bound\").\n\n## Tests\n\n- `tests/quantization/test_sm70_batched_gemm_layouts.py`: 23 passed (new: device-capacity default, 33..128-row QPN8 blocks equal per-block launches and match an FP32 dense reference).\n- `tests/quantization/test_sm70_nvfp4_kernel_selection.py`: 15 passed (route snapshot regenerated: MTP cases now take QPN2).\n- `tests/v1/spec_decode/test_dflash_mrv2_config.py`, `tests/config/test_runtime_default_ownership.py`, `tests/v1/worker/test_gpu_warmup_blocks.py`, `tests/config/test_sm70_acceleration.py`: same 24 failures as origin/main c98a8d664 in this environment, no new failures.\n- End-to-end: the measurement matrix above plus GSM8K-200.\n\n## Known issues\n\n- DFlash7 at `--gpu-memory-utilization 0.90` on 16 GB can OOM in `combine_aux_hidden_states` (200 MiB) under c8 with 8K prompts, because the freed KV pool takes the remaining memory; 0.88 runs the full matrix.\n- Remaining MTP gap to NInfer at c1 (15.1 vs 11.5 ms/round) needs native work: TP4 all-reduce + Gemma RMSNorm for row counts that are not multiples of 8, fused GDN `in_proj_ba` for M2..7, QPN2 bandwidth (620-660 GB/s isolated).\n\nAI assistance (Claude) was used to write this change; the measurements were run on dx-54304.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1427",
+    "isDraft": true,
+    "headRefName": "claude/mtp-ninfer-opts",
+    "headRefOid": "431a20ad8751d4c8e3e026c9c27fa5941e257612",
+    "baseRefName": "main",
+    "baseRefOid": "c98a8d66482333eb8d8b87be72e8856445ac99ec",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1427,
+    "id": "PR_kwDORjYFXs8AAAABNwHnBw",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "431a20ad8751d4c8e3e026c9c27fa5941e257612",
+    "title": "[Perf][SM70] Qwen3.8 MTP: MRV2, shared verifier routes, no draft-step sync; 16 GB capacity",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1427",
+    "body": "## Summary\n\nQwen3.8-27B native MTP was far slower than DFlash2 on SM70 (29 ms vs 13.6 ms per verify round on 4x V100-16GB) even though both verify a short causal window. Causes and fixes:\n\n- **Runner**: SM70 Qwen3.5/3.8 MTP ran on the V1 runner; only DFlash forced MRV2. It now defaults to MRV2, which carries the shared GDN/attention verifier metadata.\n- **Verifier routes**: the GDN packed verify / fused norm / split / qkv pack, Flash-V100 grouped small-query metadata and the NVFP4 QPN2 qualification were gated on `method == \"dflash\"` with 7 drafts. `sm70_mtp_verifier_qualified` admits the MTP target (1..7 drafts) to the target-side subset only (`SM70_MTP_VERIFIER_DEFAULTS`); drafter, selector and LM-head routes stay DFlash2-only. Each operator still checks its live shape.\n- **Draft-step host sync**: Eagle draft attention metadata had no CPU `seq_lens` bound, so the Flash-V100 builder synced `seq_lens` to the host before every draft step (~1.6 ms GPU idle per step). The speculator now passes an upper bound.\n- **Drafter weights**: the BF16 MTP decoder projections are requantized to channel QPN8 (`kernel_config.sm70_mtp_draft_qpn8`, default on) and use the target's QPN8 dispatch; FP16 copies are released.\n- **16 GB cards**: the duplicate FP8 batch TurboMind layout (~2.2 GiB/rank) is no longer prepared below 20 GiB per device; 33..128-row FP8 calls run as 32-row QPN8 blocks instead of dequantize + cuBLAS. KV 171,819 -> 412,910 tokens on 16 GB; DFlash7 c8 TTFT max 8.4 s -> 1.5 s.\n- **Warmup**: #1402's full-chunk profile requested prompt logprobs, gathering 0.5 GiB of full-vocabulary logits and OOMing 16 GB cards; long profiles skip them.\n- Optional hot-vocabulary QPN8 draft head (`kernel_config.sm70_draft_hot_vocab`, default off: 32K costs 10-20% acceptance, 131K saves only 0.2 ms).\n\n## Measurements (4x V100-SXM2-16GB TP4, HBM 877 MHz, Qwen3.8-27B NVFP4, greedy, same HTTP client)\n\nMTP4 c1 ms/round: 29.0 (main) -> 15.1, accepted tokens/round unchanged (gsm8k 4.2, mt-bench 3.7, zh-prose 3.3, humaneval 4.6). MTP4 prefill now equals DFlash7 (85K: 3,365 tok/s). DFlash7 c1 unchanged at 13.6 ms/round.\n\n| Workload | NInfer v0.2.1 TP4 QUASAR MTP4 | DFlash7 (this branch) | MTP4 (this branch) |\n|---|---|---|---|\n| Prefill 8K / 85K tok/s | 2,653 / 2,013 | 4,384 / 3,441 | 4,203 / 3,365 |\n| c1 gsm8k / humaneval tok/s | 370 / 392 | 463 / 529 | 282 / 307 |\n| c1 zh-prose tok/s | 278 | 246 | 216 |\n| c8 gsm8k / humaneval tok/s | 670 / 577 | 744 / 810 | 590 / 594 |\n| c8 zh-prose / mt-bench tok/s | 723 / 680 | 535 / 683 | 664 / 634 |\n\nGSM8K-200 greedy accuracy: 1.5.2 wheel DFlash7 96.5% / MTP4 96.0%; this branch DFlash7 96.0% / MTP4 96.5%; NInfer 96.5%.\n\n## Duplicate check\n\nNo open PR touches MTP runner selection, the Eagle draft seq_lens bound or the 16 GB batch layout (searched open PRs for \"MTP MRV2\" and \"seq_lens_cpu_upper_bound\").\n\n## Tests\n\n- `tests/quantization/test_sm70_batched_gemm_layouts.py`: 23 passed (new: device-capacity default, 33..128-row QPN8 blocks equal per-block launches and match an FP32 dense reference).\n- `tests/quantization/test_sm70_nvfp4_kernel_selection.py`: 15 passed (route snapshot regenerated: MTP cases now take QPN2).\n- `tests/v1/spec_decode/test_dflash_mrv2_config.py`, `tests/config/test_runtime_default_ownership.py`, `tests/v1/worker/test_gpu_warmup_blocks.py`, `tests/config/test_sm70_acceleration.py`: same 24 failures as origin/main c98a8d664 in this environment, no new failures.\n- End-to-end: the measurement matrix above plus GSM8K-200.\n\n## Known issues\n\n- DFlash7 at `--gpu-memory-utilization 0.90` on 16 GB can OOM in `combine_aux_hidden_states` (200 MiB) under c8 with 8K prompts, because the freed KV pool takes the remaining memory; 0.88 runs the full matrix.\n- Remaining MTP gap to NInfer at c1 (15.1 vs 11.5 ms/round) needs native work: TP4 all-reduce + Gemma RMSNorm for row counts that are not multiples of 8, fused GDN `in_proj_ba` for M2..7, QPN2 bandwidth (620-660 GB/s isolated).\n\nAI assistance (Claude) was used to write this change; the measurements were run on dx-54304.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "claude/mtp-ninfer-opts",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1427,
+    "title": "[Perf][SM70] Qwen3.8 MTP: MRV2, shared verifier routes, no draft-step sync; 16 GB capacity",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1427",
+    "isDraft": true,
+    "headRefOid": "431a20ad8751d4c8e3e026c9c27fa5941e257612",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/quantization/data/sm70_nvfp4_routes.json",
+      "tests/quantization/test_sm70_batched_gemm_layouts.py",
+      "vllm/config/kernel.py",
+      "vllm/config/sm70_dflash2.py",
+      "vllm/config/vllm.py",
+      "vllm/model_executor/layers/linear.py",
+      "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+      "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py",
+      "vllm/model_executor/layers/quantization/sm70_gdn_ba_verify.py",
+      "vllm/model_executor/layers/quantization/sm70_mtp_draft_qpn8.py",
+      "vllm/model_executor/models/config.py",
+      "vllm/model_executor/models/qwen3_5_mtp.py",
+      "vllm/model_executor/models/qwen3_5_mtp_sm70_head.py",
+      "vllm/model_executor/models/runtime_defaults.py",
+      "vllm/platforms/runtime_defaults.py",
+      "vllm/v1/attention/backends/flash_v100/spec/builder.py",
+      "vllm/v1/worker/gpu/model_states/mamba_hybrid.py",
+      "vllm/v1/worker/gpu/spec_decode/__init__.py",
+      "vllm/v1/worker/gpu/spec_decode/eagle/speculator.py",
+      "vllm/v1/worker/gpu/warmup.py"
+    ],
+    "diff_bytes": 128070,
+    "diff_sha256": "8508c86aeed6b243509e39156837cea526f22cc7ca76fa965935f9f9a0638d5e"
+  },
+  "full_tree_diff_proof": null
+}

@@ -1,0 +1,120 @@
+{
+  "group": "qwen_mtp",
+  "title": "Qwen MTP, draft heads and GDN integration queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1427,
+      "title": "[Perf][SM70] Qwen3.8 MTP: MRV2, shared verifier routes, no draft-step sync; 16 GB capacity",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1427",
+      "head": "431a20ad8751d4c8e3e026c9c27fa5941e257612",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "8508c86aeed6b243509e39156837cea526f22cc7ca76fa965935f9f9a0638d5e",
+      "files": 20,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1218,
+      "title": "[Spec Decode][MRV2] Reduced draft vocabulary for MTP (backport of vllm#59740)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1218",
+      "head": "7308b33f9152762ee3a12928516d673411b92818",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "e7eced3c554d6e01dc1786d42ac48270347e14a61ec180a3bbea8887fb7fe840",
+      "files": 7,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 979,
+      "title": "[Model] Screen FP8 drafting with a private NVFP4 candidate head",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/979",
+      "head": "0a0dbe99f7536290bde1094ce0ecf9a720f13988",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "8b950181b940adb09827ec1880dc92d62e43614432cd0965757e577f8f3dde02",
+      "files": 8,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 953,
+      "title": "[Model] Extend DFlash2 QPN8 candidate heads to concurrent verification",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/953",
+      "head": "5a7c65327c5e5166155e6af18c8dddaaf45d7f03",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "58956311b71bc834dec5a239a47d50ccdd1075ecc074b3d6acc4c1686f253c05",
+      "files": 32,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 983,
+      "title": "[Core] Publish GDN speculative state from WY factors",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/983",
+      "head": "6dd4c56ba4482813034370a6f7f288673de435c6",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "cb8d1b5b51057366a816f4ef53a11a7339577e59b3bf0c107c0e45f0986c3cda",
+      "files": 12,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1301,
+      "title": "[Spec Decode] DFlash2: optionally shard the selector codebooks by vocabulary",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1301",
+      "head": "d8ed559e21705566f983c58dc5de0f361b63f3ac",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "096ace98d9cd8cb8b0864c89c03a59dea013dfba3688036fa1d3e1cb5eeeda4f",
+      "files": 4,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1345,
+      "title": "[Perf][SM70][Spec Decode] Grouped FP16 verify with several KV heads per rank",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1345",
+      "head": "c6ae9c5d7b2ebbb33d796e33083a7e36730aec6e",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "a9956dd0d0628931962497fa8faa46f7a98bcf7bcb0e68fbdb051adb66fec663",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 844,
+      "title": "[Kernel] Recover finite SM70 prefill score precision and tail peaks",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/844",
+      "head": "35b84b870571dcc030096a1ce3a1da6b27de599f",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "755a90cec0cfbab61e01b0f4a28710f850ad57ce51d4b65c53ee87b2b58ecbbb",
+      "files": 3,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 629,
+      "title": "[Core][SM70] Beat A800 C32 decode and recover 32K serving",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/629",
+      "head": "27e5f8e574ba7f46e755e66f94796d3438ea8867",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "719266d964c07a0d94ec1e6dc257d424fc127eb83c11c05afec4cf0b2a3b88e7",
+      "files": 6,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1261,
+      "title": "[Bugfix][LoRA] Support lm_head LoRA for Qwen3.5 with DFlash2 speculative decoding",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1261",
+      "head": "609b31a1b8dc74dcd3bdd0e56db79aa320540ee8",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "9cf5a11c30d52ca663ab7d6a13a903c94eff28a276e5243d1a0bb64fbc2ede30",
+      "files": 3,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "Validate combined draft vocabulary/head, GDN state publication and attention changes with the same weights, seed, sampling policy, C1/C8, 2K/long-context inputs and tuning settings. Component gains cannot establish <=10ms or unchanged acceptance. The historical14.8ms and ninfer11.5ms figures are not new measurements. Keep reduced-vocabulary and numerical changes unpromoted until paired output/acceptance and quality gates pass.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}

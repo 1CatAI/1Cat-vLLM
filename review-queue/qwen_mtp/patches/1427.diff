@@ -1,0 +1,4137 @@
+diff --git a/tests/quantization/data/sm70_nvfp4_routes.json b/tests/quantization/data/sm70_nvfp4_routes.json
+index a8299e53e..fbc7627ef 100644
+--- a/tests/quantization/data/sm70_nvfp4_routes.json
++++ b/tests/quantization/data/sm70_nvfp4_routes.json
+@@ -83,84 +83,6 @@
+     },
+     {
+       "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c1/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c1/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c4/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c4/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c8/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c8/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -214,7 +136,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c1/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -268,7 +190,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c4/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c4/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -322,7 +244,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c4/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c4/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -376,7 +298,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c8/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c8/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -430,7 +352,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c8/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp2/mtp/c8/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -484,163 +406,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/none/c1/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/none/c1/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/none/c4/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/none/c4/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/none/c8/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/none/c8/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c1/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c1/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c4/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c4/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c8/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c8/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c1/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -694,7 +460,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c1/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -748,7 +514,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c4/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c4/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -802,7 +568,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c4/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c4/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -856,7 +622,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c8/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c8/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -910,7 +676,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c8/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp2/dflash/c8/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -964,59 +730,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c1/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c1/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c4/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c4/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c8/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp4/none/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1029,7 +743,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c8/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp4/none/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1042,7 +756,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c1/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp4/none/c4/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1055,7 +769,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c1/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp4/none/c4/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1068,7 +782,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c4/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp4/none/c8/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1081,7 +795,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c4/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp4/none/c8/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1094,33 +808,115 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c8/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c8/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c1/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c4/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1174,7 +970,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c1/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c4/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1228,7 +1024,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c4/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c8/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1282,7 +1078,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c4/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp4/mtp/c8/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1336,7 +1132,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c8/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1390,7 +1186,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c8/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1444,85 +1240,223 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c1/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c4/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c1/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c4/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c4/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c4/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c8/q4096",
++      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c8/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c8/q8192",
++      "config": "27b_dflash2_nvfp4/float16/tp4/dflash/c8/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c1/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1535,7 +1469,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c1/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1548,7 +1482,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c4/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c4/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1561,7 +1495,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c4/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c4/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1574,7 +1508,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c8/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c8/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1587,7 +1521,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c8/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/none/c8/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -1600,7 +1534,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c1/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1654,7 +1588,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c1/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1708,7 +1642,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c4/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c4/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1762,7 +1696,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c4/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c4/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1816,7 +1750,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c8/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c8/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1870,7 +1804,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c8/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/mtp/c8/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -1924,85 +1858,1783 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c1/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c1/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c4/q4096",
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c4/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c4/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c8/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp2/dflash/c8/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c1/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c1/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c4/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c4/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c8/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/none/c8/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c1/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c1/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c4/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c4/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c8/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/mtp/c8/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c1/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c1/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c4/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c4/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c8/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e4m3/tp4/dflash/c8/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c1/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c1/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c4/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c4/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c8/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c8/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": false,
++        "shared": false,
++        "prefill": false,
++        "compact_scales": false,
++        "batch_prescale": false,
++        "gated_turbomind": false,
++        "dispatch": []
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c1/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c1/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c4/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c4/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c8/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c8/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c4/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c8/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c4/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c4/q8192",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
++      }
++    },
++    {
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c8/q4096",
++      "route": {
++        "prepared_layout": "nvfp4",
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
++        "compact_scales": false,
++        "batch_prescale": true,
++        "gated_turbomind": false,
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/none/c8/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c8/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
++        "qpn2": true,
++        "shared": true,
++        "prefill": true,
+         "compact_scales": false,
+-        "batch_prescale": false,
++        "batch_prescale": true,
+         "gated_turbomind": false,
+-        "dispatch": []
++        "dispatch": [
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 8,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 32,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 64,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          },
++          {
++            "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
++            "m": 1024,
++            "split_k": 16,
++            "nacc": 2,
++            "gated": false,
++            "prefill_min_m": 256
++          }
++        ]
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c1/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -2015,7 +3647,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c1/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -2028,7 +3660,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c4/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c4/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -2041,7 +3673,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c4/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c4/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -2054,7 +3686,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c8/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c8/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -2067,7 +3699,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/mtp/c8/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c8/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": false,
+@@ -2080,7 +3712,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c1/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c1/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -2134,7 +3766,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c1/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c1/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -2188,7 +3820,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c4/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c4/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -2242,7 +3874,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c4/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c4/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -2296,7 +3928,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c8/q4096",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c8/q4096",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -2350,7 +3982,7 @@
+       }
+     },
+     {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp2/dflash/c8/q8192",
++      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c8/q8192",
+       "route": {
+         "prepared_layout": "nvfp4",
+         "qpn2": true,
+@@ -2403,162 +4035,6 @@
+         ]
+       }
+     },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c1/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c1/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c4/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c4/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c8/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/none/c8/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c1/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c1/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c4/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c4/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c8/q4096",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+-    {
+-      "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/mtp/c8/q8192",
+-      "route": {
+-        "prepared_layout": "nvfp4",
+-        "qpn2": false,
+-        "shared": false,
+-        "prefill": false,
+-        "compact_scales": false,
+-        "batch_prescale": false,
+-        "gated_turbomind": false,
+-        "dispatch": []
+-      }
+-    },
+     {
+       "config": "27b_dflash2_nvfp4/fp8_e5m2/tp4/dflash/c1/q4096",
+       "route": {
+diff --git a/tests/quantization/test_sm70_batched_gemm_layouts.py b/tests/quantization/test_sm70_batched_gemm_layouts.py
+index ddeb28bda..710e72976 100644
+--- a/tests/quantization/test_sm70_batched_gemm_layouts.py
++++ b/tests/quantization/test_sm70_batched_gemm_layouts.py
+@@ -146,3 +146,63 @@ def test_batch_fp8_dispatch_matches_qpn8_and_replays(
+             assert torch.equal(actual, expected)
+         else:
+             torch.testing.assert_close(actual, expected, rtol=3e-3, atol=3e-3)
++
++
++@pytest.mark.parametrize(
++    ("device_gib", "expected"), [(16, "0"), (32, "1"), (None, "1")]
++)
++def test_batch_layouts_follow_device_capacity(monkeypatch, device_gib, expected):
++    for name in _SM70_BATCH_GEMM_DEFAULTS:
++        monkeypatch.delenv(name, raising=False)
++    defaults = make_policy_defaults()
++    _apply_sm70_batch_gemm_defaults(
++        is_sm70=True,
++        defaults=defaults,
++        device_bytes=None if device_gib is None else device_gib * 2**30,
++    )
++    assert defaults["VLLM_SM70_BATCH_GEMM_LAYOUTS"] == expected
++    # Only the duplicated layout follows capacity; tuning bounds do not.
++    for name, value in _SM70_BATCH_GEMM_DEFAULTS.items():
++        if name != "VLLM_SM70_BATCH_GEMM_LAYOUTS":
++            assert defaults[name] == value
++
++
++@pytest.mark.parametrize("m", [33, 40, 64, 128])
++@pytest.mark.parametrize("gated_silu", [False, True])
++def test_qpn8_dispatch_row_blocks_match_single_launches(m, gated_silu):
++    """Rows above 32 without a batch layout run as 32-row QPN8 launches and
++    equal launching each block on its own."""
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("SM70 CUDA required")
++    torch.manual_seed(20261109)
++    k, n = 5120, 1536
++    weight = torch.randn((n, k), device="cuda").mul_(0.25).to(torch.float8_e4m3fn)
++    scales = torch.full((n, 1), 0.125, device="cuda", dtype=torch.float32)
++    codes, q_scales = torch.ops._C.fp8_qpn8_prepare_sm70(weight, scales)
++    x = torch.randn((m, k), device="cuda", dtype=torch.float16).mul_(0.1)
++    width = n // 2 if gated_silu else n
++    actual = torch.empty((m, width), device="cuda", dtype=torch.float16)
++    torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
++        actual, x, codes, q_scales, 8, 2, False, gated_silu
++    )
++    workspace = torch.empty((k, n), device="cuda", dtype=torch.float16)
++    for begin in range(0, m, 32):
++        end = min(begin + 32, m)
++        expected = torch.empty((end - begin, width), device="cuda", dtype=torch.float16)
++        torch.ops._C.fp8_qpn8_dispatch_sm70_out(
++            expected,
++            workspace.data_ptr(),
++            x[begin:end],
++            codes,
++            q_scales,
++            8,
++            2,
++            False,
++            gated_silu,
++        )
++        torch.testing.assert_close(actual[begin:end], expected, rtol=0, atol=0)
++    dense = x.float() @ (weight.float() * scales).t()
++    if gated_silu:
++        gate, up = dense.chunk(2, dim=-1)
++        dense = torch.nn.functional.silu(gate) * up
++    torch.testing.assert_close(actual.float(), dense, rtol=2e-2, atol=2e-2)
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index fa6e979a2..c731d0d82 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -832,6 +832,12 @@ class KernelConfig:
+     per line). With ``sm70_draft_hot_vocab`` > 0, the draft keeps the first
+     that many ranked ids, each rank reading its own vocabulary shard."""
+ 
++    sm70_mtp_draft_qpn8: bool = True
++    """Requantize the Qwen3.5/3.8 native MTP drafter's decoder projections to
++    channel-QPN8 on SM70. Only draft proposals change; verification uses the
++    target's own weights. Measured on the 27B: 15.7 -> 15.1 ms per MTP4 round
++    with unchanged acceptance."""
++
+     sm70_draft_single_graph: bool = False
+     """Capture all MTP draft decode steps, including their slot mappings and
+     attention metadata, as one CUDA graph instead of one replay per step."""
+diff --git a/vllm/config/sm70_dflash2.py b/vllm/config/sm70_dflash2.py
+index 3d4c0f416..47b520dca 100644
+--- a/vllm/config/sm70_dflash2.py
++++ b/vllm/config/sm70_dflash2.py
+@@ -38,6 +38,26 @@ SM70_DFLASH2_VERIFIER_DEFAULTS = {
+     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
+ }
+ 
++# Target-side verifier routes measured on the Qwen3.8 native MTP contract
++# (q = 1 + drafts <= 8 rows per request). Drafter-, selector- and LM-head
++# routes stay DFlash2-only.
++SM70_MTP_VERIFIER_DEFAULTS = {
++    name: SM70_DFLASH2_VERIFIER_DEFAULTS[name]
++    for name in (
++        "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY",
++        "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT",
++        "VLLM_SM70_FP8_QPN8",
++        "VLLM_SM70_DFLASH2_VERIFY_FASTPATH",
++        "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA",
++        "VLLM_SM70_DFLASH2_FUSED_GDN_NORM",
++        "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT",
++        "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS",
++        "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS",
++        "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA",
++        "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA",
++    )
++}
++
+ SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS = {
+     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "1",
+     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "1",
+@@ -262,7 +282,16 @@ class Sm70DFlash2Config:
+     explicit_fields: tuple[str, ...] = Field(default=(), init=False, repr=False)
+     """Explicit configuration or legacy settings, used by mixed-format defaults."""
+ 
+-    def resolve(self, *, qualified: bool) -> None:
++    def resolve(self, *, qualified: bool, mtp_qualified: bool = False) -> None:
++        """``qualified`` admits the DFlash2 contract and all its verifier
++        defaults; ``mtp_qualified`` only the target-side MTP subset."""
++        table = (
++            SM70_DFLASH2_VERIFIER_DEFAULTS
++            if qualified
++            else SM70_MTP_VERIFIER_DEFAULTS
++            if mtp_qualified
++            else {}
++        )
+         variable = envs.environment_variables["VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER"]
+         if isinstance(variable, EnvVar):
+             variable.warn_if_deprecated()
+@@ -278,7 +307,7 @@ class Sm70DFlash2Config:
+                 else name
+                 if name in os.environ
+                 else "qualified_model"
+-                if qualified and name in SM70_DFLASH2_VERIFIER_DEFAULTS
++                if name in table
+                 else "default",
+             )
+             if (
+@@ -300,10 +329,8 @@ class Sm70DFlash2Config:
+                     )
+             if configured is None:
+                 configured = (
+-                    bool(int(SM70_DFLASH2_VERIFIER_DEFAULTS[name]))
+-                    if qualified
+-                    and name in SM70_DFLASH2_VERIFIER_DEFAULTS
+-                    and name not in os.environ
++                    bool(int(table[name]))
++                    if name in table and name not in os.environ
+                     else envs.environment_variables[name]()
+                 )
+             setattr(self, field, configured)
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 23ccd0b38..b3d174860 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -725,6 +725,12 @@ class VllmConfig:
+         if is_mrv2_dflash:
+             return True
+ 
++        # Qwen3.5/3.8 native MTP on SM70: the MRV2 speculator carries the
++        # shared GDN/attention verifier metadata, draft graphs and sampler
++        # paths the V1 proposer lacks (about 2x the c8 throughput).
++        if self._is_sm70_qwen3_5_mtp():
++            return True
++
+         if not self._is_default_v2_model_runner_model():
+             return False
+ 
+@@ -745,6 +751,24 @@ class VllmConfig:
+ 
+         return True
+ 
++    def _is_sm70_qwen3_5_mtp(self) -> bool:
++        spec = self.speculative_config
++        if spec is None or spec.method != "mtp" or self.model_config is None:
++            return False
++        architectures = set(getattr(self.model_config, "architectures", []) or [])
++        if not architectures & {
++            "Qwen3_5ForConditionalGeneration",
++            "Qwen3_5ForCausalLM",
++        }:
++            return False
++        from vllm.platforms import current_platform
++
++        try:
++            capability = current_platform.get_device_capability()
++        except Exception:
++            return False
++        return capability is not None and (capability.major, capability.minor) == (7, 0)
++
+     def _is_default_v2_model_runner_model(self) -> bool:
+         model_config = self.model_config
+         if model_config is None:
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index a8c24e06b..d0244018b 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -351,6 +351,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         if not prepare_dflash2_fp8_m8(layer):
+             prepare_dflash2_fp16_m8(layer)
+ 
++        from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
++            prepare_mtp_draft_qpn8,
++        )
++
++        if prepare_mtp_draft_qpn8(layer):
++            return
++
+         from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
+             maybe_prepare_online_qpn8,
+         )
+@@ -402,6 +409,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         draft_fp8 = apply_dflash2_fp8_m8(layer, x, bias)
+         if draft_fp8 is not None:
+             return draft_fp8
++        from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
++            apply_mtp_draft_qpn8,
++        )
++
++        mtp_qpn8 = apply_mtp_draft_qpn8(layer, x, bias)
++        if mtp_qpn8 is not None:
++            return mtp_qpn8
+         from vllm.model_executor.layers.quantization.sm70_dflash2_fp16 import (
+             apply_dflash2_fp16_m8,
+         )
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index bd898e583..e9d040da2 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -146,7 +146,7 @@ from vllm.v1.attention.backends.gdn_attn import (
+ )
+ from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+ from vllm.v1.attention.ops.gdn_state import GdnMetadataOverride
+-from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
++from vllm.v1.worker.gpu.spec_decode import uses_sm70_short_window_verifier
+ 
+ # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
+ # Availability is checked centrally via rocm_aiter_ops; the actual function
+@@ -544,7 +544,9 @@ def _sm70_qwen_gdn_spec_method(vllm_config: object) -> str | None:
+ 
+ 
+ def _is_dflash2_spec_config(vllm_config: object) -> bool:
+-    return uses_dflash_selector_engine(vllm_config)
++    # Short-window verifier contract shared by DFlash2 and native MTP; the
++    # historical name is kept for its callers.
++    return uses_sm70_short_window_verifier(vllm_config)
+ 
+ 
+ def _sm70_current_device_is_volta() -> bool:
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py
+index b1ad3a9c7..e80570c04 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py
+@@ -53,6 +53,10 @@ __all__ = ["CompressedTensorsW8A16Fp8"]
+ logger = init_logger(__name__)
+ 
+ 
++_QPN8_ROW_BLOCK = 32
++_QPN8_ROW_BLOCKS_MAX = 4 * _QPN8_ROW_BLOCK
++
++
+ def _sm70_ct_fp8_qpn8_dispatch(
+     out: torch.Tensor,
+     x: torch.Tensor,
+@@ -70,6 +74,28 @@ def _sm70_ct_fp8_qpn8_dispatch(
+     workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+     if workspace is None:
+         raise RuntimeError("SM70 channel-FP8 QPN8 prefill workspace is unavailable")
++    rows = x.shape[0]
++    if _QPN8_ROW_BLOCK < rows <= _QPN8_ROW_BLOCKS_MAX:
++        # Without the batch TurboMind copy, 33..128 rows would take the dense
++        # prefill route (FP16 dequantization plus cuBLAS, about five bytes of
++        # traffic per weight). Up to four 32-row QPN8 launches read the FP8
++        # codes once each and give each row the same per-row arithmetic.
++        for begin in range(0, rows, _QPN8_ROW_BLOCK):
++            end = min(begin + _QPN8_ROW_BLOCK, rows)
++            call_native(
++                sm70_ops.fp8_qpn8_dispatch_sm70_out,
++                native_policy,
++                out[begin:end],
++                workspace.data_ptr(),
++                x[begin:end],
++                codes,
++                scales,
++                split_k,
++                accumulator_chains,
++                prefetch_codes,
++                gated_silu,
++            )
++        return
+     call_native(
+         sm70_ops.fp8_qpn8_dispatch_sm70_out,
+         native_policy,
+diff --git a/vllm/model_executor/layers/quantization/sm70_gdn_ba_verify.py b/vllm/model_executor/layers/quantization/sm70_gdn_ba_verify.py
+index 3696fe6d3..03e299dc8 100644
+--- a/vllm/model_executor/layers/quantization/sm70_gdn_ba_verify.py
++++ b/vllm/model_executor/layers/quantization/sm70_gdn_ba_verify.py
+@@ -20,7 +20,7 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
+         or not getattr(qkvz, "sm70_fp8_qpn8", False)
+         or x.ndim != 2
+         or x.shape[1] != 5120
+-        or not 8 <= x.shape[0] <= 32
++        or not 2 <= x.shape[0] <= 32
+         or x.dtype != torch.float16
+         or not x.is_contiguous()
+         or qkvz.weight.shape != (5120, 4096)
+@@ -34,6 +34,21 @@ def apply_gdn_ba_verify(layer, x, outputs=None):
+     ):
+         return None
+     rows = x.shape[0]
++    if rows < 8:
++        # MTP verifies 1 + drafts < 8 rows. Below eight the native route
++        # splits into QPN8 plus a cuBLAS b/a GEMM and a copy; zero rows pad
++        # the block to the fused M8 launch, which reads the weights once.
++        padded = x.new_zeros((8, x.shape[1]))
++        padded[:rows] = x
++        fused = apply_gdn_ba_verify(layer, padded)
++        if fused is None:
++            return None
++        qkv, z, b, a = (part[:rows] for part in fused)
++        if outputs is None:
++            return qkv, z, b, a
++        for out, part in zip(outputs, (qkv, z, b, a)):
++            out.copy_(part)
++        return outputs
+     if outputs is None:
+         qkv = x.new_empty((rows, 2560))
+         z = x.new_empty((rows, 1536))
+diff --git a/vllm/model_executor/layers/quantization/sm70_mtp_draft_qpn8.py b/vllm/model_executor/layers/quantization/sm70_mtp_draft_qpn8.py
+new file mode 100644
+index 000000000..ade614e0b
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/sm70_mtp_draft_qpn8.py
+@@ -0,0 +1,116 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Channel-QPN8 projections for the SM70 Qwen3.5/3.8 native MTP drafter.
++
++The drafter's BF16 checkpoint layer runs as FP16 TurboMind GEMMs, re-reading
++every weight byte at each of its draft steps. Its four decoder projections
++have the target's local shapes, so they are requantized once to channel FP8
++and use the target's QPN8 dispatch (row blocks up to 128, then the shared
++dense prefill workspace). Only drafts change; verification is untouched.
++"""
++
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++from vllm.logger import init_logger
++from vllm.model_executor.utils import replace_parameter
++from vllm.platforms import current_platform
++
++logger = init_logger(__name__)
++
++_MARK = "_sm70_mtp_draft_qpn8"
++_READY = "_sm70_mtp_draft_qpn8_ready"
++_SUFFIXES = frozenset({"qkv_proj", "o_proj", "gate_up_proj", "down_proj"})
++_REQUIRED_OPS = ("fp8_qpn8_prepare_sm70", "fp8_qpn8_dispatch_sm70_out")
++
++
++def mark_mtp_draft_qpn8(model: nn.Module) -> int:
++    """Admit the drafter's unquantized decoder projections before loading."""
++    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++
++    count = 0
++    for module in model.modules():
++        if (
++            isinstance(module, LinearBase)
++            and isinstance(module.quant_method, UnquantizedLinearMethod)
++            and getattr(module, "prefix", "").rsplit(".", 1)[-1] in _SUFFIXES
++            and getattr(module, "bias", None) is None
++        ):
++            setattr(module, _MARK, True)
++            count += 1
++    return count
++
++
++@torch.no_grad()
++def prepare_mtp_draft_qpn8(layer: nn.Module) -> bool:
++    if getattr(layer, _READY, False):
++        return True
++    if not getattr(layer, _MARK, False):
++        return False
++    weight = getattr(layer, "weight", None)
++    if (
++        weight is None
++        or weight.dtype != torch.float16
++        or not weight.is_cuda
++        or weight.ndim != 2
++        or not current_platform.is_device_capability(70)
++        or any(not hasattr(torch.ops._C, name) for name in _REQUIRED_OPS)
++    ):
++        return False
++    n, k = (int(dim) for dim in weight.shape)
++    if n % 32 or k % 128:
++        return False
++    from vllm.model_executor.kernels.linear.qpn.fp8 import (
++        _get_sm70_fp8_prefill_exact_dense_workspace,
++    )
++    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
++        _SM70_CHANNEL_FP8_QPN8_CONFIGS,
++    )
++    from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
++        prepare_channel_qpn8_weight,
++    )
++
++    codes, scales = prepare_channel_qpn8_weight(weight)
++    if _get_sm70_fp8_prefill_exact_dense_workspace(codes) is None:
++        return False
++    split_k, nacc, prefetch = _SM70_CHANNEL_FP8_QPN8_CONFIGS.get(
++        (k, n), (8 if k % 256 else 16, 2, False)
++    )
++    replace_parameter(layer, "weight", codes)
++    layer.register_buffer("_sm70_mtp_draft_qpn8_scales", scales, persistent=False)
++    layer._sm70_mtp_draft_qpn8_shape = (n, k)
++    layer._sm70_mtp_draft_qpn8_config = (split_k, nacc, prefetch)
++    setattr(layer, _READY, True)
++    logger.info_once(
++        "SM70 MTP drafter projections use channel-QPN8 (FP16 weights released)."
++    )
++    return True
++
++
++def apply_mtp_draft_qpn8(
++    layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None
++) -> torch.Tensor | None:
++    if not getattr(layer, _READY, False):
++        return None
++    n, k = layer._sm70_mtp_draft_qpn8_shape
++    split_k, nacc, prefetch = layer._sm70_mtp_draft_qpn8_config
++    x_2d = x.reshape(-1, k)
++    if not x_2d.is_contiguous():
++        x_2d = x_2d.contiguous()
++    out = x_2d.new_empty((x_2d.shape[0], n))
++    torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
++        out,
++        x_2d,
++        layer.weight,
++        layer._sm70_mtp_draft_qpn8_scales,
++        split_k,
++        nacc,
++        prefetch,
++        False,
++    )
++    if bias is not None:
++        out.add_(bias)
++    return out.reshape(*x.shape[:-1], n)
++
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index 79aac717b..9baaefc6a 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -146,10 +146,15 @@ def sm70_dflash2_nvfp4_qualified(vllm_config: "VllmConfig") -> bool:
+     selector = (
+         int(dflash.get("selector_top_k", 0) or 0) if isinstance(dflash, Mapping) else 0
+     )
++    steps = int(getattr(spec, "num_speculative_tokens", 0) or 0)
++    method = getattr(spec, "method", None)
++    # Native MTP verifies through the same NVFP4 projections as DFlash2's
++    # target; only the drafter differs.
++    workload = (method == "dflash" and steps == 7 and selector == 16) or (
++        method == "mtp" and 1 <= steps <= 7
++    )
+     return bool(
+-        getattr(spec, "method", None) == "dflash"
+-        and int(getattr(spec, "num_speculative_tokens", 0) or 0) == 7
+-        and selector == 16
++        workload
+         and parallel.pipeline_parallel_size == 1
+         and not parallel.enable_dbo
+         and int(parallel.ubatch_size or 0) <= 1
+@@ -942,3 +947,36 @@ def sm70_dflash2_verifier_qualified(
+         and not getattr(parallel_config, "enable_dbo", False)
+         and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+     )
++
++
++def sm70_mtp_verifier_qualified(
++    model_config: Any,
++    speculative_config: Any,
++    parallel_config: Any,
++) -> bool:
++    """Admit the Qwen3.8 native MTP target to the shared verifier routes.
++
++    The same 27B geometry as the DFlash2 contract, verifying one to seven
++    drafts at a time. Only target-side routes are admitted; see
++    ``SM70_MTP_VERIFIER_DEFAULTS``.
++    """
++    import torch
++
++    if any(c is None for c in (model_config, speculative_config, parallel_config)):
++        return False
++    hf_text_config = getattr(model_config, "hf_text_config", None)
++    architectures = set(getattr(model_config, "architectures", ()) or ())
++    steps = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
++    return bool(
++        architectures & {"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"}
++        and getattr(model_config, "dtype", None) == torch.float16
++        and getattr(hf_text_config, "hidden_size", None) == 5120
++        and getattr(hf_text_config, "num_attention_heads", None) == 24
++        and getattr(hf_text_config, "num_key_value_heads", None) == 4
++        and getattr(hf_text_config, "head_dim", None) == 256
++        and getattr(speculative_config, "method", None) == "mtp"
++        and 1 <= steps <= 7
++        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
++        and not getattr(parallel_config, "enable_dbo", False)
++        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
++    )
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index 630900b8b..f350d57a7 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -531,6 +531,12 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        if vllm_config.kernel_config.sm70_mtp_draft_qpn8:
++            from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
++                mark_mtp_draft_qpn8,
++            )
++
++            mark_mtp_draft_qpn8(self.model)
+         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+             self.model.make_empty_intermediate_tensors
+         )
+@@ -588,12 +594,30 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
+     ) -> torch.Tensor | None:
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
++    def prepare_sm70_draft_head(self) -> None:
++        # Called by the Eagle loader after the target head is shared and
++        # before KV allocation, so the hot pack is resident before sizing.
++        hot = self.vllm_config.kernel_config.sm70_draft_hot_vocab
++        logger.info_once("SM70 MTP draft head preparation: hot vocabulary %d.", hot)
++        if hot <= 0 or getattr(self, "_sm70_draft_head", None) is not None:
++            return
++        from vllm.model_executor.models.qwen3_5_mtp_sm70_head import (
++            prepare_mtp_hot_qpn8_head,
++        )
++
++        self._sm70_draft_head = prepare_mtp_hot_qpn8_head(
++            self.lm_head,
++            hot,
++            self.vllm_config.kernel_config.sm70_draft_hot_vocab_ids,
++        )
++
+     def get_top_tokens(
+         self,
+         hidden_states: torch.Tensor,
+         spec_step_idx: int = 0,
+     ) -> torch.Tensor:
+-        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
++        head = getattr(self, "_sm70_draft_head", None) or self.lm_head
++        return self.logits_processor.get_top_tokens(head, hidden_states)
+ 
+     @staticmethod
+     def _draft_weight_name(name: str) -> str | None:
+diff --git a/vllm/model_executor/models/qwen3_5_mtp_sm70_head.py b/vllm/model_executor/models/qwen3_5_mtp_sm70_head.py
+new file mode 100644
+index 000000000..f1fe53bd5
+--- /dev/null
++++ b/vllm/model_executor/models/qwen3_5_mtp_sm70_head.py
+@@ -0,0 +1,195 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Draft-only hot-vocabulary QPN8 head for the shared Qwen3.5/3.8 LM head on SM70.
++
++Greedy MTP drafts pick their token among the most frequent vocabulary rows
++(FR-Spec). Each rank keeps the frequency-ranked ids of its own contiguous
++vocabulary shard, padded to the largest shard so all ranks run one GEMM width,
++and stores only those rows as a channel-QPN8 pack. Verification keeps the
++full target head, so a draft outside the shortlist costs acceptance, not
++correctness.
++"""
++
++from pathlib import Path
++
++import torch
++from torch import nn
++
++import vllm.envs as envs
++from vllm import _sm70_ops as ops
++from vllm.distributed import get_tp_group
++from vllm.logger import init_logger
++from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
++    prepare_channel_qpn8_weight,
++)
++from vllm.platforms import current_platform
++
++logger = init_logger(__name__)
++
++# The QPN8 GEMM admits 1..32 rows; MTP drafts one row per request.
++_MAX_ROWS = 32
++_DEFAULT_RANKING = (
++    Path(__file__).resolve().parents[2]
++    / "assets"
++    / "sm70_mtp_dynamic_vocab_qwen36_27b_tp4.pt"
++)
++
++
++def load_hot_ranking(path: str) -> torch.Tensor:
++    """Token ids, most frequent first: a .pt ranking asset, .npy, or one id per line."""
++    if path.endswith(".pt"):
++        value = torch.load(path, map_location="cpu", weights_only=True)
++        ranking = value["global_ranking"] if isinstance(value, dict) else value
++        return torch.as_tensor(ranking, dtype=torch.int64)
++    if path.endswith(".npy"):
++        import numpy as np
++
++        return torch.from_numpy(np.load(path).astype("int64"))
++    with open(path) as f:
++        return torch.tensor([int(line) for line in f if line.strip()])
++
++
++def shard_hot_ids(
++    ranking: torch.Tensor, count: int, world: int, rank: int, rows_per_rank: int
++) -> torch.Tensor:
++    """This rank's share of the ``count`` top-ranked ids, sorted and padded to the
++    largest shard's count rounded up to 32 by repeating its last id."""
++    hot = ranking[:count].long()
++    owner = hot // rows_per_rank
++    largest = int(torch.bincount(owner, minlength=world).max())
++    ids = hot[owner == rank].sort().values
++    width = largest + (-largest) % 32
++    if ids.numel() < width:
++        fill = ids[-1:] if ids.numel() else ids.new_full((1,), rank * rows_per_rank)
++        ids = torch.cat([ids, fill.expand(width - ids.numel())])
++    return ids
++
++
++@torch.no_grad()
++def _hot_rows(head: nn.Module, local_ids: torch.Tensor) -> torch.Tensor:
++    """FP16 rows of the shared head for these local vocabulary ids.
++
++    A dense FP16 head is indexed directly. A quantized head (e.g. the FP8
++    checkpoint head in its native kernel layout) is read through its own
++    method on identity blocks, so the rows equal what that kernel computes.
++    """
++    weight = head.weight
++    if weight.dtype == torch.float16 and weight.ndim == 2:
++        return weight[local_ids].contiguous()
++    hidden = head.embedding_dim
++    rows = torch.empty(
++        (local_ids.numel(), hidden), dtype=torch.float16, device=weight.device
++    )
++    for begin in range(0, hidden, 512):
++        end = min(begin + 512, hidden)
++        eye = torch.zeros((end - begin, hidden), dtype=torch.float16, device=weight.device)
++        eye[:, begin:end].fill_diagonal_(1.0)
++        block = head.quant_method.apply(head, eye)
++        rows[:, begin:end] = block[:, local_ids].t()
++        del block
++    return rows
++
++
++class MTPHotQPN8Head(nn.Module):
++    def __init__(self, head: nn.Module, ids: torch.Tensor):
++        super().__init__()
++        self.head = head
++        self.shard_indices = head.shard_indices
++        start = self.shard_indices.org_vocab_start_index
++        ids = ids.to(head.weight.device)
++        codes, scales = prepare_channel_qpn8_weight(_hot_rows(head, ids - start))
++        self.register_buffer("codes", codes, persistent=False)
++        self.register_buffer("scales", scales, persistent=False)
++        self.register_buffer("hot_ids", ids.to(torch.int32), persistent=False)
++
++    @property
++    def quant_method(self):
++        return self
++
++    @property
++    def weight(self):
++        return self.head.weight
++
++    def apply(self, layer, x, bias=None):
++        return self.head.quant_method.apply(self.head, x, bias)
++
++    def maybe_get_sm70_lm_head_top1_pair(self, hidden_states, bias=None):
++        """Local (value, global id) of the best hot row, or None to use the full head."""
++        if (
++            bias is not None
++            or hidden_states.ndim != 2
++            or hidden_states.dtype != torch.float16
++            or not 1 <= hidden_states.shape[0] <= _MAX_ROWS
++        ):
++            return None
++        rows = hidden_states.shape[0]
++        hot = self.hot_ids.numel()
++        logits = hidden_states.new_empty(rows, hot)
++        ops.fp8_qpn8_gemm_sm70_out(
++            logits, hidden_states.contiguous(), self.codes, self.scales, 8, 2, True, False
++        )
++        pairs = logits.new_empty((rows, 2), dtype=torch.float32)
++        partial = logits.new_empty((rows, (hot + 511) // 512, 2), dtype=torch.float32)
++        torch.ops._C.qwen38_mtp_local_top1_sm70_out(pairs, partial, logits, hot, 0)
++        pairs[:, 1] = self.hot_ids[pairs[:, 1].long()].float()
++        return pairs
++
++    def maybe_get_sm70_lm_head_top1(self, hidden_states, bias=None):
++        return None
++
++
++def prepare_mtp_hot_qpn8_head(
++    head: nn.Module, hot: int, ranking_path: str = ""
++) -> MTPHotQPN8Head | None:
++    weight = getattr(head, "weight", None)
++    shard = getattr(head, "shard_indices", None)
++    missing = [
++        name
++        for name in (
++            "fp8_qpn8_prepare_sm70",
++            "fp8_qpn8_gemm_sm70_out",
++            "qwen38_mtp_local_top1_sm70_out",
++        )
++        if not hasattr(torch.ops._C, name)
++    ]
++    reason = (
++        "disabled"
++        if hot <= 0
++        else "no dense weight"
++        if not isinstance(weight, torch.Tensor) or shard is None
++        else "batch invariant"
++        if envs.VLLM_BATCH_INVARIANT
++        else "not SM70"
++        if not current_platform.is_device_capability(70)
++        else f"weight on {weight.device}"
++        if not weight.is_cuda
++        else f"hidden size {getattr(head, 'embedding_dim', None)}"
++        if getattr(head, "embedding_dim", 0) % 16 or not hasattr(head, "quant_method")
++        else "added vocabulary"
++        if getattr(shard, "num_added_elements", 0)
++        else f"missing ops {missing}"
++        if missing
++        else None
++    )
++    if reason is not None:
++        if hot > 0:
++            logger.info_once("SM70 MTP hot draft head skipped: %s.", reason)
++        return None
++    group = get_tp_group()
++    rows = shard.org_vocab_end_index - shard.org_vocab_start_index
++    vocab = rows * group.world_size
++    if getattr(shard, "num_org_vocab_padding", 0):
++        logger.info_once("SM70 MTP hot draft head skipped: padded vocabulary shards.")
++        return None
++    path = ranking_path or str(_DEFAULT_RANKING)
++    ranking = load_hot_ranking(path)
++    ranking = ranking[(ranking >= 0) & (ranking < vocab)]
++    count = min(hot, ranking.numel())
++    ids = shard_hot_ids(ranking, count, group.world_size, group.rank_in_group, rows)
++    view = MTPHotQPN8Head(head, ids)
++    logger.info_once(
++        "SM70 MTP hot-vocabulary QPN8 draft head: %d ranked ids, %d rows per rank.",
++        count,
++        ids.numel(),
++    )
++    return view
+diff --git a/vllm/model_executor/models/runtime_defaults.py b/vllm/model_executor/models/runtime_defaults.py
+index 28bb45060..22e44141c 100644
+--- a/vllm/model_executor/models/runtime_defaults.py
++++ b/vllm/model_executor/models/runtime_defaults.py
+@@ -40,6 +40,18 @@ def _is_sm70_dflash2_verifier_contract(
+     )
+ 
+ 
++def _is_sm70_mtp_verifier_contract(
++    model_config: Any,
++    speculative_config: Any,
++    parallel_config: Any,
++) -> bool:
++    from vllm.model_executor.models.config import sm70_mtp_verifier_qualified
++
++    return sm70_mtp_verifier_qualified(
++        model_config, speculative_config, parallel_config
++    )
++
++
+ def _configure_sm70_dflash2_graph_cache(
+     model_config: Any,
+     speculative_config: Any,
+diff --git a/vllm/platforms/runtime_defaults.py b/vllm/platforms/runtime_defaults.py
+index f9b01d5c8..c60f41f78 100644
+--- a/vllm/platforms/runtime_defaults.py
++++ b/vllm/platforms/runtime_defaults.py
+@@ -100,12 +100,37 @@ def _any_participating_device_is_pre_ampere(cfg: VllmConfig) -> bool:
+     ) or _any_participating_device_is_capability(cfg, (7, 5))
+ 
+ 
+-def _apply_sm70_batch_gemm_defaults(*, is_sm70: bool, defaults) -> tuple[str, ...]:
++# Below this per-device capacity the second batch layout of each FP8 projection
++# (about 2.2 GiB per rank for the 27B at TP4) costs more KV capacity than its
++# M33..64 speed returns: a 16 GB card then admits only four short requests at
++# once. Those rows run as up to four 32-row QPN8 launches instead.
++_SM70_BATCH_LAYOUT_MIN_DEVICE_BYTES = 20 * 2**30
++
++
++def _min_participating_device_bytes(cfg: VllmConfig) -> int | None:
++    from vllm.platforms import current_platform
++
++    devices = _participating_cuda_device_ids(cfg)
++    try:
++        return min(current_platform.get_device_total_memory(d) for d in devices)
++    except Exception:
++        return None
++
++
++def _apply_sm70_batch_gemm_defaults(
++    *, is_sm70: bool, defaults, device_bytes: int | None = None
++) -> tuple[str, ...]:
+     """Enable shared SM70 batch operators without overriding explicit settings."""
+     if not is_sm70:
+         return ()
+     applied = []
+     for env_name, env_value in _SM70_BATCH_GEMM_DEFAULTS.items():
++        if (
++            env_name == "VLLM_SM70_BATCH_GEMM_LAYOUTS"
++            and device_bytes is not None
++            and device_bytes < _SM70_BATCH_LAYOUT_MIN_DEVICE_BYTES
++        ):
++            env_value = "0"
+         if env_name not in defaults:
+             defaults[env_name] = env_value
+             applied.append(env_name)
+@@ -265,17 +290,19 @@ def apply_runtime_policy_defaults(self):
+     from vllm.config.policy_defaults import PolicyDefaults
+     from vllm.model_executor.models.runtime_defaults import (
+         _is_sm70_dflash2_verifier_contract,
++        _is_sm70_mtp_verifier_contract,
+         _is_sm70_qwen38_decode_compile_contract,
+     )
+     from vllm.platforms import current_platform
+ 
+     defaults = PolicyDefaults(self)
++    is_sm70 = current_platform.is_cuda() and _any_participating_device_is_capability(
++        self, (7, 0)
++    )
+     for env_name in _apply_sm70_batch_gemm_defaults(
+-        is_sm70=(
+-            current_platform.is_cuda()
+-            and _any_participating_device_is_capability(self, (7, 0))
+-        ),
++        is_sm70=is_sm70,
+         defaults=defaults,
++        device_bytes=_min_participating_device_bytes(self) if is_sm70 else None,
+     ):
+         logger.info_once(
+             "Auto-setting %s=%s for SM70 batch GEMM. "
+@@ -514,14 +541,22 @@ def apply_runtime_policy_defaults(self):
+             )
+     if self.speculative_config is not None:
+         policy = self.speculative_config.sm70_dflash2
++        on_sm70 = current_platform.is_cuda() and (
++            _any_participating_device_is_capability(self, (7, 0))
++        )
+         policy.resolve(
+             qualified=(
+-                current_platform.is_cuda()
+-                and _any_participating_device_is_capability(self, (7, 0))
++                on_sm70
+                 and _is_sm70_dflash2_verifier_contract(
+                     self.model_config, self.speculative_config, self.parallel_config
+                 )
+-            )
++            ),
++            mtp_qualified=(
++                on_sm70
++                and _is_sm70_mtp_verifier_contract(
++                    self.model_config, self.speculative_config, self.parallel_config
++                )
++            ),
+         )
+         if (
+             self.model_config is not None
+diff --git a/vllm/v1/attention/backends/flash_v100/spec/builder.py b/vllm/v1/attention/backends/flash_v100/spec/builder.py
+index 0e75550b4..a3f828b6d 100644
+--- a/vllm/v1/attention/backends/flash_v100/spec/builder.py
++++ b/vllm/v1/attention/backends/flash_v100/spec/builder.py
+@@ -22,7 +22,10 @@ from vllm.v1.attention.backends.flash_v100.spec import (
+ )
+ from vllm.v1.attention.backends.flash_v100.spec.features import prepare_verification
+ from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import metadata_view
+-from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
++from vllm.v1.worker.gpu.spec_decode import (
++    uses_dflash_selector_engine,
++    uses_sm70_short_window_verifier,
++)
+ 
+ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
+ 
+@@ -96,14 +99,19 @@ def initialize_builder(self: Any, spec_config) -> None:
+         and get_dflash_model_draft_tokens(spec_config) == 7
+         and selector_engine
+     )
++    # Native MTP targets verify the same short causal windows as DFlash2.
++    mtp_target = bool(
++        getattr(spec_config, "method", None) == "mtp"
++        and not self._is_speculative_draft_model
++        and uses_sm70_short_window_verifier(self.vllm_config)
++    )
+     self._use_sm70_dflash2_fused_smallq_metadata = bool(
+         sm70_dflash2_enabled(
+             "fused_smallq_metadata", capture_sm70_dflash2_config(self.vllm_config)
+         )
+         and self.device.type == "cuda"
+         and current_platform.is_device_capability(70)
+-        and use_dflash
+-        and selector_engine
++        and ((use_dflash and selector_engine) or mtp_target)
+     )
+     if self._use_sm70_dflash2_fused_smallq_metadata:
+         logger.info_once("SM70 DFlash2 fused Flash-V100 small-query metadata active.")
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index 24683a031..80bc24bac 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -154,7 +154,7 @@ class MambaHybridModelState(DefaultModelState):
+         self._dflash2_gdn_group_descriptor: DFlash2GDNGroupDescriptor | None = None
+         self._dflash2_fused_gdn_metadata_logged = False
+         self._use_dflash2_grouped_smallq_metadata = bool(
+-            self._use_dflash2_common_gdn_metadata
++            self._use_common_gdn_metadata
+             and sm70_dflash2_enabled(
+                 "fused_smallq_metadata", capture_sm70_dflash2_config(vllm_config)
+             )
+diff --git a/vllm/v1/worker/gpu/spec_decode/__init__.py b/vllm/v1/worker/gpu/spec_decode/__init__.py
+index ee2569709..35c2e9124 100644
+--- a/vllm/v1/worker/gpu/spec_decode/__init__.py
++++ b/vllm/v1/worker/gpu/spec_decode/__init__.py
+@@ -30,6 +30,27 @@ def uses_dflash_selector_engine(vllm_config: object) -> bool:
+         return False
+ 
+ 
++def uses_sm70_short_window_verifier(vllm_config: object) -> bool:
++    """Return whether the target verifies a short causal draft window per request.
++
++    The DFlash2 selector engine and native MTP (one to seven drafts) share the
++    target-side contract: each speculative request carries at most eight query
++    rows, recurrent-state slots selected by the accepted length, and the same
++    GDN/attention metadata. Each fused operator still checks its live shape and
++    falls back on its own.
++    """
++    if uses_dflash_selector_engine(vllm_config):
++        return True
++    speculative_config = getattr(vllm_config, "speculative_config", None)
++    if getattr(speculative_config, "method", None) != "mtp":
++        return False
++    try:
++        steps = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
++    except (TypeError, ValueError):
++        return False
++    return 1 <= steps <= 7
++
++
+ def init_speculator(vllm_config: VllmConfig, device: torch.device):
+     speculative_config = vllm_config.speculative_config
+     assert speculative_config is not None
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py b/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py
+index f6c38ff60..104303365 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py
+@@ -134,6 +134,10 @@ class EagleSpeculator(TargetSamplingHooks):
+         self.arange = torch.arange(
+             self.max_num_reqs + 1, dtype=torch.int32, device="cpu"
+         )
++        self._draft_seq_lens_max_cpu = torch.full(
++            (self.max_num_reqs,), self.max_model_len, dtype=torch.int32
++        )
++        self._draft_seq_lens_cpu_upper_bound: torch.Tensor | None = None
+ 
+         self.supports_mm_inputs = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
+             self.draft_model_config
+@@ -675,6 +679,16 @@ class EagleSpeculator(TargetSamplingHooks):
+         query_start_loc_cpu = torch.clamp(
+             self.arange[: num_reqs_padded + 1], max=num_reqs
+         )
++        upper = getattr(self, "_draft_seq_lens_cpu_upper_bound", None)
++        if upper is None or upper.numel() < num_reqs:
++            # Capture and dummy runs: the longest sequence any request can reach.
++            upper = self._draft_seq_lens_max_cpu[:num_reqs_padded]
++        elif upper.numel() < num_reqs_padded:
++            upper = torch.cat(
++                [upper[:num_reqs], self._draft_seq_lens_max_cpu[num_reqs:num_reqs_padded]]
++            )
++        else:
++            upper = upper[:num_reqs_padded]
+         block_tables = [
+             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
+         ]
+@@ -693,6 +707,7 @@ class EagleSpeculator(TargetSamplingHooks):
+             block_tables=block_tables,
+             slot_mappings=slot_mappings,
+             kv_cache_config=self.kv_cache_config,
++            seq_lens_cpu_upper_bound=upper,
+         )
+         return attn_metadata
+ 
+@@ -798,6 +813,16 @@ class EagleSpeculator(TargetSamplingHooks):
+         num_tokens = input_batch.num_tokens_after_padding
+         num_reqs = input_batch.num_reqs
+         max_query_len = input_batch.num_scheduled_tokens.max()
++        # Draft steps advance each request by at most num_speculative_steps
++        # positions past the target step. A CPU upper bound lets the attention
++        # builders pick their routes without a device-to-host seq_lens sync,
++        # which stalled every draft step and broke single-graph capture.
++        upper = getattr(input_batch, "seq_lens_cpu_upper_bound", None)
++        self._draft_seq_lens_cpu_upper_bound = (
++            torch.clamp(upper + self.num_speculative_steps, max=self.max_model_len)
++            if isinstance(upper, torch.Tensor)
++            else None
++        )
+ 
+         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
+         # number of rejected tokens, we maintain the size of eagle's input_ids and
+diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
+index 7d34cdbb0..37b62eb87 100644
+--- a/vllm/v1/worker/gpu/warmup.py
++++ b/vllm/v1/worker/gpu/warmup.py
+@@ -273,6 +273,18 @@ def warmup_kernels(
+                 num_reqs = profile_reqs
+             if profile_reqs <= 0:
+                 continue
++            profile_params = sampling_params
++            if (
++                profile_params is not None
++                and profile_params.prompt_logprobs
++                and prompt_len > default_prompt_len
++            ):
++                # Prompt logprobs gather full-vocabulary logits per 1024-row
++                # chunk (about 0.5 GiB at a 248K vocabulary), which does not
++                # fit beside a 16 GB card's KV pool. The short profile already
++                # exercises that path; long profiles only warm the kernels.
++                profile_params = profile_params.clone()
++                profile_params.prompt_logprobs = None
+             _warmup_cycle(
+                 model_runner,
+                 worker_execute_model,
+@@ -280,7 +292,7 @@ def warmup_kernels(
+                 f"{profile_idx}",
+                 profile_reqs,
+                 prompt_len,
+-                sampling_params,
++                profile_params,
+                 pooling_params,
+                 block_count,
+                 kv_cache_specs,

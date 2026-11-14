@@ -1,0 +1,2701 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2228ca029e..65fffcd493 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -317,6 +317,7 @@ set(VLLM_EXT_SRC
+   "csrc/cuda_utils_kernels.cu"
+   "csrc/custom_all_reduce.cu"
+   "csrc/torch_bindings.cpp"
++  "csrc/ple_disk_rows.cpp"
+   "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
+ 
+ if(VLLM_GPU_LANG STREQUAL "CUDA")
+diff --git a/benchmarks/benchmark_sm70_qwen38_distribution.py b/benchmarks/benchmark_sm70_qwen38_distribution.py
+index 99e7226647..2bf2a616f6 100644
+--- a/benchmarks/benchmark_sm70_qwen38_distribution.py
++++ b/benchmarks/benchmark_sm70_qwen38_distribution.py
+@@ -115,7 +115,10 @@ def capture(args):
+         enable_prefix_caching=False,
+         language_model_only=True,
+         speculative_config=None,
+-        kernel_config={"ple_result_transport": args.transport},
++        kernel_config={
++            "ple_result_transport": args.transport,
++            "ple_disk_row_gather": not args.disable_ple_row_gather,
++        },
+         worker_extension_cls=(
+             "benchmarks.qwen38_distribution_probe.DistributionProbeWorkerExtension"
+         ),
+@@ -141,6 +144,7 @@ def capture(args):
+         "contract": "TP4 FP16 dense/KV, FP32 accum/state, disk mmap, no MTP",
+         "engine": {k: v for k, v in engine_config.items() if k != "kernel_config"},
+         "native_sha256": digest(Path(native.__file__)),
++        "worker_routes": llm.collective_rpc("get_sm70_acceleration_report"),
+         "captures": [],
+     }
+ 
+@@ -334,6 +338,8 @@ def compare(args):
+             )
+     noise = summarize_groups(noise_rows, ref["widths"]) if noise_rows else {}
+     result = {
++        "thresholds_enforced": args.precision_reduced,
++        "gate_mode": "precision_reduction" if args.precision_reduced else "record_only",
+         "distribution_passed": all(g["passed"] for g in groups.values()),
+         "default_noise_passed": (
+             all(g["passed"] for g in noise.values()) if noise else None
+@@ -345,7 +351,9 @@ def compare(args):
+     }
+     (args.output / "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
+     print(json.dumps(groups, indent=2))
+-    if not result["distribution_passed"] or result["default_noise_passed"] is False:
++    if args.precision_reduced and (
++        not result["distribution_passed"] or result["default_noise_passed"] is False
++    ):
+         raise SystemExit("Distribution thresholds exceeded")
+ 
+ 
+@@ -358,11 +366,17 @@ def compare(args):
+     parser.add_argument("--manifest", type=Path)
+     parser.add_argument("--output", type=Path)
+     parser.add_argument("--reference", type=Path)
++    parser.add_argument(
++        "--precision-reduced",
++        action="store_true",
++        help="Enforce distribution thresholds for a precision-reducing candidate",
++    )
+     parser.add_argument(
+         "--transport", choices=("auto", "cuda", "mapped"), default="auto"
+     )
+     parser.add_argument("--widths", default="1")
+     parser.add_argument("--repeats", type=int, default=1)
++    parser.add_argument("--disable-ple-row-gather", action="store_true")
+     parser.add_argument("--prefill-budget", type=int, default=8192)
+     parser.add_argument("--max-num-seqs", type=int)
+     parser.add_argument("--kv-cache-memory-bytes", type=int)
+diff --git a/benchmarks/benchmark_sm70_qwen38_quality.py b/benchmarks/benchmark_sm70_qwen38_quality.py
+index b1ea0e679a..79bbd9833a 100644
+--- a/benchmarks/benchmark_sm70_qwen38_quality.py
++++ b/benchmarks/benchmark_sm70_qwen38_quality.py
+@@ -15,14 +15,18 @@
+ import json
+ import os
+ import resource
++import shutil
+ import statistics
+ import subprocess
+ import sys
++import sysconfig
+ import tempfile
+ from pathlib import Path
+ 
+ import regex as re
+ 
++REQUEST_METRICS_ENABLED = True
++
+ 
+ def final_text(text):
+     if "</think>" in text:
+@@ -119,10 +123,84 @@ def health_failures(records):
+         if health["line_repetition"] >= 3:
+             reasons.append("repeated_final_answer_line")
+         if reasons:
+-            failures.append({"id": record["id"], "reasons": reasons})
++            failure = {"id": record["id"], "reasons": reasons}
++            if "seed" in record:
++                failure["seed"] = record["seed"]
++            failures.append(failure)
+     return failures
+ 
+ 
++def compare_quality(reference, candidate):
++    """Compare three-seed task and health counts under a frozen contract."""
++    for key in ("contract", "sampling", "suite_sha256", "quality_seed_bases"):
++        if reference[key] != candidate[key]:
++            raise ValueError(f"Quality arms differ in {key}")
++    if len(set(reference["quality_seed_bases"])) != 3:
++        raise ValueError("Quality admission requires three distinct seed bases")
++    arms = []
++    for report in (reference, candidate):
++        if not report["complete"] or not report["quality_evaluated"]:
++            raise ValueError("Quality arms must be complete")
++        indexed = {(r["id"], r["seed"]): r for r in report["quality"]}
++        if len(indexed) != len(report["quality"]):
++            raise ValueError("Duplicate case/seed records")
++        arms.append(indexed)
++    if not arms[0] or arms[0].keys() != arms[1].keys():
++        raise ValueError("Quality arms require the same case/seed records")
++    for key, baseline in arms[0].items():
++        tested = arms[1][key]
++        for field in ("category", "input_tokens", "prompt_token_sha256"):
++            if baseline[field] != tested[field]:
++                raise ValueError(f"Quality prefix differs in {field}: {key}")
++    for case_id in {key[0] for key in arms[0]}:
++        if sum(key[0] == case_id for key in arms[0]) != 3:
++            raise ValueError(f"Case requires three seeds: {case_id}")
++    needles = [
++        r["input_tokens"] for r in reference["quality"] if r["category"] == "needle"
++    ]
++    if not any(130000 <= n < 140000 for n in needles) or not any(
++        257000 <= n < 262144 for n in needles
++    ):
++        raise ValueError("Quality admission requires 128K and 258K needle inputs")
++    rows = []
++    for category in sorted({r["category"] for r in arms[0].values()}):
++        counts = []
++        for arm in arms:
++            records = [r for r in arm.values() if r["category"] == category]
++            failures = health_failures(records)
++            counts.append(
++                {
++                    "passed": sum(r["score"]["passed"] for r in records),
++                    "total": len(records),
++                    "unhealthy": len(failures),
++                    "reasons": {
++                        reason: sum(reason in f["reasons"] for f in failures)
++                        for reason in (
++                            "not_natural_eos",
++                            "empty_final_answer",
++                            "replacement_characters",
++                            "repeated_final_answer_line",
++                        )
++                    },
++                }
++            )
++        baseline, tested = counts
++        accepted = (
++            tested["passed"] >= baseline["passed"]
++            and tested["unhealthy"] <= baseline["unhealthy"]
++            and all(tested["reasons"][k] <= v for k, v in baseline["reasons"].items())
++        )
++        rows.append(
++            {
++                "category": category,
++                "reference": baseline,
++                "candidate": tested,
++                "passed": accepted,
++            }
++        )
++    return {"passed": all(r["passed"] for r in rows), "categories": rows}
++
++
+ def prompt_token_ids(case, tok):
+     prompt = case.get("prompt")
+     if case["category"] == "needle":
+@@ -155,7 +233,11 @@ def run(args):
+     out = args.output.parent
+     out.mkdir(parents=True, exist_ok=True)
+     model = str(args.model)
+-    suite = json.loads(args.cases.read_text())
++    suite = (
++        json.loads(args.cases.read_text())
++        if args.cases is not None
++        else {"sampling": {}, "cases": []}
++    )
+     import torch
+     from transformers import AutoTokenizer
+ 
+@@ -164,9 +246,12 @@ def run(args):
+     torch.backends.cuda.matmul.allow_fp16_accumulation = False
+     import vllm
+     from vllm import LLM, SamplingParams
++    from vllm.config.kernel import KernelConfig
+ 
+     report = {
+         "complete": False,
++        "instrumented": args.ple_phase_probe,
++        "speed_acceptance": not args.ple_phase_probe,
+         "runtime": vllm.__version__,
+         "runtime_path": vllm.__file__,
+         "torch": str(torch.__version__),
+@@ -175,7 +260,14 @@ def run(args):
+             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in Path(vllm.__file__).parent.glob("*.so")
+         },
+-        "suite_sha256": hashlib.sha256(args.cases.read_bytes()).hexdigest(),
++        "suite_sha256": hashlib.sha256(args.cases.read_bytes()).hexdigest()
++        if args.cases is not None
++        else None,
++        "quality_evaluated": not args.timing_only,
++        "quality_seed_base": args.quality_seed,
++        "quality_seed_bases": args.quality_seeds or [args.quality_seed],
++        "disabled_kernels": args.disable_kernel,
++        "quality_case_ids": args.case_id,
+         "sampling": suite["sampling"],
+         "contract": {
+             "model": model,
+@@ -198,6 +290,17 @@ def save():
+ 
+     save()
+     tok = AutoTokenizer.from_pretrained(model)
++    diagnostic = {}
++    if args.ple_phase_probe:
++        diagnostic["worker_extension_cls"] = (
++            "benchmarks.qwen38_ple_phase_probe.PlePhaseWorkerExtension"
++        )
++        os.chdir(out)
++    kernel_config = {"ple_result_transport": args.ple_result_transport}
++    if "ple_disk_row_gather" in KernelConfig.__dataclass_fields__:
++        kernel_config["ple_disk_row_gather"] = not args.disable_ple_row_gather
++    elif args.disable_ple_row_gather:
++        raise RuntimeError("Installed runtime lacks the requested PLE reader control")
+     llm = LLM(
+         model=model,
+         tensor_parallel_size=4,
+@@ -211,8 +314,9 @@ def save():
+         enable_prefix_caching=False,
+         language_model_only=True,
+         speculative_config=None,
+-        disable_log_stats=False,
+-        kernel_config={"ple_result_transport": args.ple_result_transport},
++        disable_log_stats=not REQUEST_METRICS_ENABLED,
++        **diagnostic,
++        kernel_config=kernel_config,
+     )
+     try:
+         cfg = llm.llm_engine.vllm_config
+@@ -225,63 +329,76 @@ def save():
+             "get_sm70_acceleration_report", timeout=30
+         )
+         save()
+-        chunk = tok.encode(
+-            "This fixed benchmark prompt is used to create a deterministic "
+-            "tokenized input for single-request decode measurement. ",
+-            add_special_tokens=False,
+-        )
+-        ids = (chunk * ((8192 + len(chunk) - 1) // len(chunk)))[:8192]
+-        llm.generate(
+-            [{"prompt_token_ids": ids}],
+-            SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
+-            use_tqdm=False,
+-        )
+-        for i in range(6):
+-            o = llm.generate(
++        if not args.quality_only:
++            chunk = tok.encode(
++                "This fixed benchmark prompt is used to create a deterministic "
++                "tokenized input for single-request decode measurement. ",
++                add_special_tokens=False,
++            )
++            ids = (chunk * ((8192 + len(chunk) - 1) // len(chunk)))[:8192]
++            llm.generate(
+                 [{"prompt_token_ids": ids}],
+-                SamplingParams(
+-                    temperature=0,
+-                    top_p=1,
+-                    top_k=-1,
+-                    seed=0,
+-                    max_tokens=513,
+-                    ignore_eos=True,
+-                ),
++                SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
+                 use_tqdm=False,
+-            )[0]
+-            report["timing"].append(metrics(o))
+-            save()
+-            print("TIMING", i, report["timing"][-1]["tpot_ms"], flush=True)
+-        for i, case in enumerate(suite["cases"]):
++            )
++            for i in range(args.timing_repeats):
++                o = llm.generate(
++                    [{"prompt_token_ids": ids}],
++                    SamplingParams(
++                        temperature=0,
++                        top_p=1,
++                        top_k=-1,
++                        seed=0,
++                        max_tokens=513,
++                        ignore_eos=True,
++                    ),
++                    use_tqdm=False,
++                )[0]
++                report["timing"].append(metrics(o))
++                save()
++                print("TIMING", i, report["timing"][-1]["tpot_ms"], flush=True)
++        for i, case in enumerate([] if args.timing_only else suite["cases"]):
++            if args.case_id and case["id"] not in args.case_id:
++                continue
+             prompt_ids = prompt_token_ids(case, tok)
+-            o = llm.generate(
+-                [{"prompt_token_ids": prompt_ids}],
+-                SamplingParams(
+-                    temperature=1, top_p=0.95, top_k=20, seed=4201 + i, max_tokens=4096
+-                ),
+-                use_tqdm=False,
+-            )[0]
+-            record = {
+-                "id": case["id"],
+-                "category": case["category"],
+-                "input_tokens": len(prompt_ids),
+-                "prompt_token_sha256": hashlib.sha256(
+-                    json.dumps(prompt_ids).encode()
+-                ).hexdigest(),
+-                **metrics(o),
+-            }
+-            text = final_text(record["text"])
+-            lines = [s.strip() for s in text.splitlines() if len(s.strip()) > 24]
+-            record["health"] = {
+-                "natural_eos": record["finish_reason"] == "stop",
+-                "nonempty_final": bool(text),
+-                "replacement_characters": text.count("\ufffd"),
+-                "line_repetition": max((lines.count(s) for s in set(lines)), default=0),
+-            }
+-            record["score"] = check(case, record["text"])
+-            report["quality"].append(record)
+-            save()
+-            print("QUALITY", case["id"], record["score"], record["health"], flush=True)
++            for seed_base in args.quality_seeds or [args.quality_seed]:
++                o = llm.generate(
++                    [{"prompt_token_ids": prompt_ids}],
++                    SamplingParams(
++                        temperature=1,
++                        top_p=0.95,
++                        top_k=20,
++                        seed=seed_base + i,
++                        max_tokens=4096,
++                    ),
++                    use_tqdm=False,
++                )[0]
++                record = {
++                    "id": case["id"],
++                    "category": case["category"],
++                    "seed": seed_base + i,
++                    "input_tokens": len(prompt_ids),
++                    "prompt_token_sha256": hashlib.sha256(
++                        json.dumps(prompt_ids).encode()
++                    ).hexdigest(),
++                    **metrics(o),
++                }
++                text = final_text(record["text"])
++                lines = [s.strip() for s in text.splitlines() if len(s.strip()) > 24]
++                record["health"] = {
++                    "natural_eos": record["finish_reason"] == "stop",
++                    "nonempty_final": bool(text),
++                    "replacement_characters": text.count("\ufffd"),
++                    "line_repetition": max(
++                        (lines.count(s) for s in set(lines)), default=0
++                    ),
++                }
++                record["score"] = check(case, record["text"])
++                report["quality"].append(record)
++                save()
++                print(
++                    "QUALITY", case["id"], record["score"], record["health"], flush=True
++                )
+         report["summary"] = {
+             category: {
+                 "passed": sum(
+@@ -293,35 +410,190 @@ def save():
+             }
+             for category in ("mbpp", "gsm8k", "chinese", "needle")
+         }
+-        report["median_tpot_ms"] = statistics.median(
+-            r["tpot_ms"] for r in report["timing"]
++        report["median_tpot_ms"] = (
++            statistics.median(r["tpot_ms"] for r in report["timing"])
++            if report["timing"]
++            else None
+         )
+         report["health_failures"] = health_failures(report["quality"])
+-        report["health_passed"] = not report["health_failures"]
++        report["health_passed"] = (
++            not report["health_failures"] if not args.timing_only else None
++        )
++        if args.ple_phase_probe:
++            report["ple_phases"] = llm.collective_rpc("ple_phase_records")
+         report["complete"] = True
++        report["health_triage_required"] = bool(report["health_failures"])
+         save()
+-        if not report["health_passed"]:
+-            raise SystemExit("Output health gate failed; see health_failures in report")
++        if report["health_passed"] is False and not args.quality_seeds:
++            raise SystemExit(
++                "Output anomaly requires three candidate and three baseline seeds; "
++                "see report"
++            )
+     finally:
+         llm.llm_engine.engine_core.shutdown()
+ 
+ 
+-if __name__ == "__main__":
++def compare_timing(reference, candidate, expected_saving_ms):
++    """Check the matched contract before calibrating an endpoint estimate."""
++    if reference.get("instrumented") or candidate.get("instrumented"):
++        raise ValueError("Instrumented runs cannot establish endpoint savings")
++    for key in ("runtime", "torch", "cuda", "source_native", "contract"):
++        if reference[key] != candidate[key]:
++            raise ValueError(f"Timing arms differ in {key}")
++    if not reference["complete"] or not candidate["complete"]:
++        raise ValueError("Timing arms must be complete")
++    baseline = reference["median_tpot_ms"]
++    observed = baseline - candidate["median_tpot_ms"]
++    error = abs(observed - expected_saving_ms) / expected_saving_ms
++    return {
++        "baseline_ms": baseline,
++        "candidate_ms": candidate["median_tpot_ms"],
++        "expected_saving_ms": expected_saving_ms,
++        "observed_saving_ms": observed,
++        "estimate_relative_error": error,
++        "calibration_required": error > 0.15,
++    }
++
++
++def preflight(args):
++    """Reject incomplete launch contracts before importing/loading the model."""
++    if sys.version_info[:2] != (3, 12):
++        raise RuntimeError("The frozen runtime requires Python 3.12")
++    header = Path(sysconfig.get_path("include")) / "Python.h"
++    if not header.is_file():
++        raise RuntimeError(f"Python development header is missing: {header}")
++    if not REQUEST_METRICS_ENABLED:
++        raise RuntimeError("Request metrics must be enabled")
++    tree = ast.parse(Path(__file__).read_text())
++    guard = ast.parse('if __name__ == "__main__": main()').body[0].test
++    if not any(
++        isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(guard)
++        for node in tree.body
++    ):
++        raise RuntimeError("The endpoint entry requires a spawn main guard")
++    if not (args.model / "config.json").is_file():
++        raise RuntimeError("Model config is missing")
++    index = args.model / "model.safetensors.index.json"
++    if not index.is_file():
++        raise RuntimeError("The sharded checkpoint index is missing")
++    shards = set(json.loads(index.read_text())["weight_map"].values())
++    missing = [name for name in sorted(shards) if not (args.model / name).is_file()]
++    if missing:
++        raise RuntimeError(f"Checkpoint shards missing: {missing[:3]}")
++    if not args.timing_only:
++        if args.cases is None or not args.cases.is_file():
++            raise RuntimeError("Quality mode requires the frozen cases JSON")
++        suite = json.loads(args.cases.read_text())
++        known = {case["id"] for case in suite["cases"]}
++        if set(args.case_id or []) - known:
++            raise RuntimeError("Unknown quality case IDs")
++    if args.output.exists():
++        raise RuntimeError("Refusing to overwrite a retained result")
++    free = shutil.disk_usage(args.output.parent).free
++    if free < args.min_free_gib * 1024**3:
++        raise RuntimeError(f"Insufficient disk: {free / 1024**3:.2f} GiB free")
++    consumers = subprocess.check_output(
++        [
++            "nvidia-smi",
++            "-i",
++            "0,1,2,3",
++            "--query-compute-apps=pid",
++            "--format=csv,noheader,nounits",
++        ],
++        text=True,
++    ).strip()
++    if consumers:
++        raise RuntimeError(f"GPU 0-3 occupied by PIDs: {consumers}")
++    return {
++        "python": sys.version,
++        "header": str(header),
++        "free_bytes": free,
++        "gpu_idle": True,
++        "request_metrics": True,
++        "spawn_guard": True,
++        "gpu_lock": "/tmp/gpu0-3.lock",
++    }
++
++
++def open_gpu_lock(inherited_fd=None, lock_path=Path("/tmp/gpu0-3.lock")):
++    """Keep a caller's reservation without releasing and racing to reacquire."""
++    lock = (
++        os.fdopen(os.dup(inherited_fd), "a")
++        if inherited_fd is not None
++        else lock_path.open("a")
++    )
++    try:
++        actual, expected = os.fstat(lock.fileno()), lock_path.stat()
++        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
++            raise RuntimeError("Inherited descriptor is not the required GPU lock")
++        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    except BaseException:
++        lock.close()
++        raise
++    return lock
++
++
++def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--model", type=Path, required=True)
+-    parser.add_argument("--cases", type=Path, required=True)
++    parser.add_argument("--cases", type=Path)
++    modes = parser.add_mutually_exclusive_group()
++    modes.add_argument("--timing-only", action="store_true")
++    modes.add_argument("--quality-only", action="store_true")
++    parser.add_argument("--quality-seed", type=int, default=4201)
++    parser.add_argument(
++        "--quality-seeds",
++        type=int,
++        nargs="+",
++        help="Run all seed bases with one loaded engine",
++    )
++    parser.add_argument("--disable-kernel", action="append", default=[])
++    parser.add_argument("--case-id", action="append")
+     parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--min-free-gib", type=float, default=8)
++    parser.add_argument("--gpu-lock-fd", type=int)
++    parser.add_argument("--runtime-cache", type=Path)
++    parser.add_argument("--ple-phase-probe", action="store_true")
++    parser.add_argument("--timing-repeats", type=int, default=6)
++    parser.add_argument("--reference-timing", type=Path)
++    parser.add_argument("--expected-saving-ms", type=float)
++    parser.add_argument("--disable-ple-row-gather", action="store_true")
+     parser.add_argument(
+         "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
+     )
+     args = parser.parse_args()
++    if args.quality_seeds is not None and (
++        len(args.quality_seeds) != 3 or len(set(args.quality_seeds)) != 3
++    ):
++        parser.error("--quality-seeds requires exactly three distinct seed bases")
++    if args.timing_repeats < 2:
++        parser.error("--timing-repeats must be at least 2")
++    if args.ple_phase_probe and args.reference_timing is not None:
++        parser.error("Instrumented phases cannot be endpoint speed acceptance")
++    if args.min_free_gib < 8:
++        parser.error("--min-free-gib must be at least 8")
++    if args.reference_timing is not None:
++        if args.quality_only:
++            parser.error("--reference-timing requires timing requests")
++        if args.expected_saving_ms is None or args.expected_saving_ms <= 0:
++            parser.error("--reference-timing requires positive --expected-saving-ms")
++        reference = json.loads(args.reference_timing.read_text())
++    else:
++        reference = None
++    args.model = args.model.resolve()
++    args.output = args.output.resolve()
++    args.output.parent.mkdir(parents=True, exist_ok=True)
+     # Resolve defaults in a fresh process, before importing the runtime.
+     for key in list(os.environ):
+         if key.startswith(
+             ("VLLM_", "TRITON_", "TORCHINDUCTOR_", "FLASH_QLA_", "ONECAT_", "SM70_")
+         ) or key in ("PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH"):
+             del os.environ[key]
+-    cache = args.output.parent / "runtime"
++    cache = (
++        args.runtime_cache.resolve()
++        if args.runtime_cache is not None
++        else args.output.parent / "runtime"
++    )
+     os.environ.update(
+         CUDA_VISIBLE_DEVICES="0,1,2,3",
+         CUDA_DEVICE_ORDER="PCI_BUS_ID",
+@@ -335,19 +607,42 @@ def save():
+         TORCHINDUCTOR_CACHE_DIR=str(cache / "inductor"),
+         TORCH_EXTENSIONS_DIR=str(cache / "extensions"),
+     )
+-    with open("/tmp/gpu0-3.lock", "a") as lock:
+-        fcntl.flock(lock, fcntl.LOCK_EX)
+-        import subprocess
+-
+-        if subprocess.check_output(
+-            [
+-                "nvidia-smi",
+-                "-i",
+-                "0,1,2,3",
+-                "--query-compute-apps=pid",
+-                "--format=csv,noheader,nounits",
+-            ],
+-            text=True,
+-        ).strip():
+-            raise SystemExit("GPU 0-3 have other consumers; gate not launched")
+-        run(args)
++    if args.disable_kernel:
++        os.environ["VLLM_DISABLED_KERNELS"] = ",".join(args.disable_kernel)
++    summary = {"complete": False, "output": str(args.output)}
++    summary_path = args.output.with_suffix(".summary.json")
++    try:
++        with open_gpu_lock(args.gpu_lock_fd):
++            summary["preflight"] = preflight(args)
++            run(args)
++            report = json.loads(args.output.read_text())
++            if reference is not None:
++                summary["estimate_comparison"] = compare_timing(
++                    reference, report, args.expected_saving_ms
++                )
++            summary.update(
++                complete=report["complete"],
++                median_tpot_ms=report["median_tpot_ms"],
++                quality_evaluated=report["quality_evaluated"],
++                health_triage_required=report["health_triage_required"],
++                cpu_row_readers=[
++                    rank["ple_disk_row_readers"]
++                    for rank in report["worker_routes"]
++                    if rank.get("ple_disk_row_readers")
++                ],
++                route_report=str(args.output),
++                instrumented=report["instrumented"],
++                speed_acceptance=report["speed_acceptance"],
++            )
++    except BaseException as error:
++        summary["error"] = f"{type(error).__name__}: {error}"
++        raise
++    finally:
++        summary_path.write_text(
++            json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
++        )
++        print("COMPLETION_SUMMARY", summary_path, flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/qwen38_ple_phase_probe.py b/benchmarks/qwen38_ple_phase_probe.py
+new file mode 100644
+index 0000000000..15b70ddeb4
+--- /dev/null
++++ b/benchmarks/qwen38_ple_phase_probe.py
+@@ -0,0 +1,152 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Research-only CPU timeline hooks, imported as a worker extension.
++
++Place this module in the benchmark package. It observes the installed PLE
++implementation without replacing its computation or IPC protocol. Results
++are buffered until shutdown/RPC; timings include Python hook overhead and
++must not be reported as uninstrumented TPOT.
++"""
++
++import functools
++import json
++import os
++import resource
++import threading
++import time
++from pathlib import Path
++
++from vllm.v1.ple_offload import connector, worker
++
++_records = []
++_sequence = 0
++_context = None
++_original_cpu_main = worker.PleOffloadWorker.proc_main
++
++
++def record(stage, start, end, metadata=None):
++    _records.append(
++        {
++            "stage": stage,
++            "start_ns": start,
++            "end_ns": end,
++            "sequence": _context,
++            "thread": threading.get_ident(),
++            "metadata": metadata,
++        }
++    )
++
++
++def observe(owner, name, stage):
++    original = getattr(owner, name)
++
++    @functools.wraps(original)
++    def observed(*args, **kwargs):
++        before = resource.getrusage(resource.RUSAGE_SELF)
++        start = time.perf_counter_ns()
++        try:
++            return original(*args, **kwargs)
++        finally:
++            end = time.perf_counter_ns()
++            after = resource.getrusage(resource.RUSAGE_SELF)
++            record(
++                stage,
++                start,
++                end,
++                {
++                    "major_faults": after.ru_majflt - before.ru_majflt,
++                    "minor_faults": after.ru_minflt - before.ru_minflt,
++                    "block_inputs": after.ru_inblock - before.ru_inblock,
++                },
++            )
++
++    setattr(owner, name, observed)
++
++
++class SocketProbe:
++    def __init__(self, socket):
++        self.socket = socket
++
++    def send(self, *args, **kwargs):
++        start = time.perf_counter_ns()
++        try:
++            return self.socket.send(*args, **kwargs)
++        finally:
++            record("publish_socket", start, time.perf_counter_ns())
++
++
++_original_process = connector.PleOffloadConnector._process_request
++
++
++@functools.wraps(_original_process)
++def process_request(self, pending, socket):
++    global _sequence, _context
++    _sequence += 1
++    _context = _sequence
++    start = time.perf_counter_ns()
++    try:
++        return _original_process(self, pending, SocketProbe(socket))
++    finally:
++        record(
++            "notifier_wait_and_publish",
++            start,
++            time.perf_counter_ns(),
++            {
++                "tokens": pending.request.num_tokens,
++                "requests": pending.request.num_reqs,
++            },
++        )
++        _context = None
++
++
++def cpu_profile_main(**kwargs):
++    from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpNGramEmbedding
++
++    observe(Qwen4ExpNGramEmbedding, "compute_ngram_ids", "key_compute")
++    observe(Qwen4ExpNGramEmbedding, "_gather_mapped_rows", "mmap_gather")
++    observe(Qwen4ExpNGramEmbedding, "_disk_embedding_lookup", "gather_and_stage")
++    observe(Qwen4ExpNGramEmbedding, "forward_impl", "lookup_forward")
++    observe(worker, "wait_host_resets", "previous_consumer_wait")
++    observe(worker, "publish_host_flag", "flag_publish")
++    original = worker.PleOffloadRunner._handle_requests
++
++    @functools.wraps(original)
++    def handle(self, requests):
++        global _sequence, _context
++        _sequence += 1
++        _context = _sequence
++        start = time.perf_counter_ns()
++        try:
++            return original(self, requests)
++        finally:
++            record(
++                "cpu_request",
++                start,
++                time.perf_counter_ns(),
++                [
++                    {
++                        "tokens": r.num_tokens,
++                        "requests": r.num_reqs,
++                        "dp_rank": r.dp_rank,
++                    }
++                    for r in requests
++                ],
++            )
++            _context = None
++
++    worker.PleOffloadRunner._handle_requests = handle
++    try:
++        return _original_cpu_main(**kwargs)
++    finally:
++        Path(f"ple-phases-cpu-{os.getpid()}.json").write_text(
++            json.dumps({"instrumented": True, "records": _records}) + "\n"
++        )
++
++
++connector.PleOffloadConnector._process_request = process_request
++worker.PleOffloadWorker.proc_main = staticmethod(cpu_profile_main)
++
++
++class PlePhaseWorkerExtension:
++    def ple_phase_records(self):
++        return {"instrumented": True, "rank": self.rank, "records": _records}
+diff --git a/csrc/ops.h b/csrc/ops.h
+index bf58cd452d..ddb663b1c9 100644
+--- a/csrc/ops.h
++++ b/csrc/ops.h
+@@ -928,6 +928,10 @@ void gguf_lattice_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
+                                        int64_t source_type, int64_t num_experts,
+                                        int64_t group_size);
+ 
++void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
++                        int64_t shard_size, int64_t num_rows, int64_t row_bytes,
++                        torch::Tensor out);
++
+ void gguf_lattice_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
+                                       torch::Tensor stats, int64_t source_type,
+                                       int64_t group_size);
+diff --git a/csrc/ple_disk_rows.cpp b/csrc/ple_disk_rows.cpp
+new file mode 100644
+index 0000000000..1765b91293
+--- /dev/null
++++ b/csrc/ple_disk_rows.cpp
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++#include <torch/all.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <vector>
++
++#ifdef __linux__
++  #include <sys/mman.h>
++  #include <unistd.h>
++#endif
++
++void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
++                        int64_t shard_size, int64_t num_rows, int64_t row_bytes,
++                        torch::Tensor out) {
++  TORCH_CHECK(ids.device().is_cpu() && pointers.device().is_cpu() &&
++                  out.device().is_cpu(),
++              "PLE disk gather requires CPU tensors");
++  TORCH_CHECK(ids.scalar_type() == at::kLong &&
++                  pointers.scalar_type() == at::kLong &&
++                  out.scalar_type() == at::kByte,
++              "PLE disk gather requires int64 IDs/pointers and uint8 output");
++  TORCH_CHECK(
++      ids.is_contiguous() && pointers.is_contiguous() && out.is_contiguous(),
++      "PLE disk gather requires contiguous tensors");
++  TORCH_CHECK(shard_size > 0 && num_rows > 0 && row_bytes > 0,
++              "PLE disk gather geometry must be positive");
++  TORCH_CHECK(
++      out.numel() / row_bytes == ids.numel() && out.numel() % row_bytes == 0,
++      "PLE disk gather output size mismatch");
++  const auto shards = num_rows / shard_size + (num_rows % shard_size != 0);
++  TORCH_CHECK(pointers.numel() == shards,
++              "PLE disk gather shard count mismatch");
++
++  const auto* indices = ids.data_ptr<int64_t>();
++  const auto* bases = pointers.data_ptr<int64_t>();
++  auto* destination = out.data_ptr<uint8_t>();
++  std::vector<const uint8_t*> sources;
++  sources.reserve(ids.numel());
++  std::vector<uintptr_t> pages;
++#ifdef __linux__
++  const auto system_page_size = sysconf(_SC_PAGE_SIZE);
++  TORCH_CHECK(system_page_size > 0,
++              "PLE disk gather cannot determine page size");
++  const auto page_size = static_cast<uintptr_t>(system_page_size);
++#endif
++  for (int64_t row = 0; row < ids.numel(); ++row) {
++    const auto index = indices[row];
++    TORCH_CHECK(index >= 0 && index < num_rows, "PLE disk row ID out of range");
++    const auto shard = index / shard_size;
++    const auto local = index % shard_size;
++    TORCH_CHECK(bases[shard] > 0, "PLE disk shard pointer is invalid");
++    TORCH_CHECK(static_cast<uint64_t>(local) <=
++                    std::numeric_limits<uintptr_t>::max() / row_bytes,
++                "PLE disk row offset overflow");
++    const auto offset = static_cast<uintptr_t>(local) * row_bytes;
++    const auto base = static_cast<uintptr_t>(bases[shard]);
++    TORCH_CHECK(
++        base <= std::numeric_limits<uintptr_t>::max() - offset &&
++            base + offset <= std::numeric_limits<uintptr_t>::max() - row_bytes,
++        "PLE disk row address overflow");
++    const auto address = base + offset;
++    sources.push_back(reinterpret_cast<const uint8_t*>(address));
++#ifdef __linux__
++    const auto last_page = (address + row_bytes - 1) / page_size * page_size;
++    for (auto page = address / page_size * page_size;; page += page_size) {
++      pages.push_back(page);
++      if (page == last_page) break;
++    }
++#endif
++  }
++
++#ifdef __linux__
++  // Only pages covering requested rows are considered. Never populate the
++  // whole table. Residency can change after this snapshot; memcpy remains
++  // the ordinary file-backed read if a page is subsequently reclaimed.
++  std::sort(pages.begin(), pages.end());
++  pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
++  for (const auto page : pages) {
++    unsigned char resident = 0;
++    const auto status =
++        mincore(reinterpret_cast<void*>(page), page_size, &resident);
++    TORCH_CHECK(status == 0 || errno != ENOMEM,
++                "PLE disk row page is not mapped");
++    if (status == 0 && !(resident & 1)) {
++      // Advice failure affects performance only, not byte selection/order.
++      madvise(reinterpret_cast<void*>(page), page_size, MADV_WILLNEED);
++    }
++  }
++#endif
++  for (size_t row = 0; row < sources.size(); ++row) {
++    std::memcpy(destination + row * row_bytes, sources[row], row_bytes);
++  }
++}
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index 0553ee58bb..b5d4a82dd8 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -48,6 +48,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
+            &get_cuda_view_from_cpu_tensor);
+ 
++  ops.def(
++      "ple_disk_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
++      "int num_rows, int row_bytes, Tensor(a!) out) -> ()");
++  ops.impl("ple_disk_gather_u8", torch::kCPU, &ple_disk_gather_u8);
++
+   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
+ #ifdef VLLM_REGISTER_BASIC_ACTIVATION_IN_C
+   // Compatibility path for local builds where _C_stable_libtorch is not
+diff --git a/docs/design/gguf_iq3xxs_joint_experts.md b/docs/design/gguf_iq3xxs_joint_experts.md
+new file mode 100644
+index 0000000000..296afdf28d
+--- /dev/null
++++ b/docs/design/gguf_iq3xxs_joint_experts.md
+@@ -0,0 +1,35 @@
++# IQ3_XXS joint expert gate/up on SM70
++
++Flash-Next IQ3_S checkpoints contain 17 IQ3_XXS gate/up expert layers alongside
++IQ3_S, IQ2_S and IQ4_XS. The existing original-block grouped gate/up operator
++supports IQ3_XXS, but the model preparation factory retained original rows only
++for IQ3_S and IQ2_S. Add IQ3_XXS to the same retention policy; no new decoder or
++operator is introduced.
++
++Local TP4 expert rows have N160/K2560/E512. Gate/up partition along N preserves
++complete source blocks along K. Each IQ3_XXS row contains 980 payload bytes plus
++four alignment bytes. Retaining both matrices for 17 layers costs
++2,740,715,520 additional bytes per rank (2.552 GiB), excluding allocator overhead.
++Canonical banks remain available for unsupported batches. TP4 is unchanged.
++
++## Operator policy
++
++The existing capability framework admits original M1/M5/M20 for IQ3_XXS and
++IQ3_S. IQ2_S M20 remains on canonical grouped GEMM. The opaque dispatch evaluates
++original token count before top-k expansion, preserving behavior across range
++compilation and full CUDA graphs. Missing retained storage and unsupported
++original batches continue to report their fallback reasons.
++
++## Validation
++
++An ordinary source-containing SM70 wheel with CUDA12.8, Torch2.10.0+cu128 and
++Python3.12 passes 33 CPU dispatch/bank/capability checks. Six GPU graph cases
++cover IQ3_XXS/IQ3_S/IQ2_S at M5/M20 with changed inputs and official GGUF
++dequantization as the numerical oracle. Tests preserve FP16 operands and FP32
++accumulation. No private shared library or preload is needed.
++
++Previously recorded independent actual-weight, cache-exceeding M5 pair timings
++are 75.269 µs canonical and 61.417 µs original blocks for IQ3_XXS. These measure
++one gate/up pair, not complete model rounds. Additional retention memory and
++request acceptance must be assessed separately in the TP4 model run. The matched
++model comparison uses the same memory budget for GGUF and NVFP4.
+diff --git a/docs/design/gguf_mixed_projection_output.md b/docs/design/gguf_mixed_projection_output.md
+new file mode 100644
+index 0000000000..d3ab7eee9f
+--- /dev/null
++++ b/docs/design/gguf_mixed_projection_output.md
+@@ -0,0 +1,56 @@
++# GGUF mixed projection output on SM70
++
++Mixed projections can use different canonical GGUF families while retaining
++checkpoint projection order. Previously each projection allocated an independent
++FP16 output, followed by concatenation. Existing affine, LUT4 and lattice GEMM
++operators accept an output row stride, so aligned column views can share one
++merged output allocation.
++
++The opaque `prepared_gguf_mixed_projection` operator chooses using actual M.
++M5 and M20 use direct column writes when every prepared output is aligned to
++32 columns and has no padding, active FP16 cache or BLAS policy. Other M retain
++the existing independent projection policy and concatenation. Padding or an
++unprepared projection retains the previous path and reports a capability reason.
++Bias and architecture input layout transformations keep their original order.
++No decoder, weight format, activation precision or accumulation policy changes.
++
++## Validation
++
++An ordinary source-containing wheel built for V100-SXM2-32GB with CUDA12.8,
++Torch2.10.0+cu128 and Python3.12 passes 10 focused mixed-output GPU checks: mixed affine/LUT4/
++lattice outputs at M5/M20/M32, padded fallback, compiled fullgraph calls,
++graph replay and contiguous outputs. Mixed output
++comparisons are bitwise against independent projection outputs. The existing
++original-block expert operators remain registered in the normal extension.
++
++The Flash-Next IQ3_S TP4 projection descriptors are:
++
++| Projection | Source types | Local N | K |
++|---|---|---|---|
++| GDN QKV + Z | Q6_K + Q4_K | 2560 + 1536 | 2560 |
++| Shared gate + up | Q4_K + IQ4_XS | 160 + 160 | 2560 |
++
++CUDA graph microbenchmarks alternate control/candidate order, use 64 warmup
++replays, then 12 alternating epochs of 128 replays each. Medians exclude the first
++two epochs. Each replay cycles distinct physical weight banks: six QKV/Z banks
++occupy 54,067,200 bytes; 39 shared gate/up banks occupy 18,969,600 bytes. Both
++exceed twice the V100 6 MiB L2. Outputs match bitwise.
++
++| Projection | M | Independent + concat (µs) | Direct output (µs) |
++|---|---:|---:|---:|
++| GDN QKV + Z | 5 | 43.395 | 34.532 |
++| GDN QKV + Z | 20 | 42.944 | 41.201 |
++| Shared gate + up | 5 | 31.734 | 29.311 |
++| Shared gate + up | 20 | 31.538 | 29.007 |
++
++A repeated single-bank QKV/Z M5 test measured 78.140 versus 35.008 µs. The gain
++shrinks with distinct weight banks; the single-bank result is not a model speed
++claim. Direct writes also change destination stride.
++
++A combined TP4 Flash-Next IQ3_S/FP16-MTP4 run completes eight natural requests of
++600 tokens with plausible text. It reports C1 verification-round mean 24.252 ms
++(I8192/O256) and C4 mean 49.728 ms (I128/O600). That run also enables IQ3_XXS
++original expert banks, so these absolute values do not isolate this change.
++Both use FP16 activations/KV, FP32 recurrent state and accumulation, FULL graphs,
++max length9216, max batch512, four sequences and memory utilization0.95.
++The scoped microbenchmark establishes the projection benefit.
+diff --git a/docs/design/ple_mapped_row_gather.md b/docs/design/ple_mapped_row_gather.md
+new file mode 100644
+index 0000000000..8be77614fa
+--- /dev/null
++++ b/docs/design/ple_mapped_row_gather.md
+@@ -0,0 +1,145 @@
++# Native CPU reads for disk-mapped PLE rows
++
++The C1 PLE phase trace identifies mmap gathering as the largest CPU lookup
++phase: median 1.610 ms across 1196 single-token requests. Key computation is
++0.144 ms; result fan-out and four flag publications take 0.089 ms. These are
++instrumented CPU intervals, not GPU critical-path wait measurements.
++
++The new CPU operator resolves every requested row, sorts and deduplicates
++only its covering pages, advises read-ahead for cold pages, then copies the
++original bytes directly into the result buffer. It retains all checkpoint
++shards as mmap. It never allocates a whole-table copy or prefaults the whole
++mapping. Existing page-release policy, output publication and consumer waits
++remain in their existing order. Dense weights, activations and accumulation
++precision are unaffected; existing quantized embedding bytes are unchanged.
++
++`MappedRowGatherKernel` lives in the PLE kernel framework and is selected by
++Linux/file-mapping/operator capability. Startup verifies actual mapped row
++bytes and records warm reference/candidate timings without consuming RNG.
++`KernelConfig.ple_disk_row_gather` defaults on; it is CPU I/O policy and does
++not change the compiled model hash. No environment variable, architecture,
++tensor-parallel, model-name or batch-width restriction is added. The native
++operator validates indices and output geometry before writing results.
++
++The normal `_C` extension ships the CPU registration. A missing operator or
++failed startup check retains the existing reader. Both whole-table output
++gather and cascade disk-tier reads consult the provider. CPU-reader admission
++is included in the offload-worker READY message and startup logs.
++
++Research-only real-row probes use 16 retained row sets, nine alternating
++repetitions, and byte comparisons. Cold arms evict only selected file pages;
++warm arms retain them. The table stays file-backed in both arms.
++
++| CPU lookup | Warm us/case | Cold us/case |
++| --- | ---: | ---: |
++| Serial ctypes row copies | 28.27 | 1446.62 |
++| Native cold-page advice and gather | 53.95 | 282.08 |
++
++The native research measurement includes creating its ID and output tensors;
++the production path writes the existing output directly. Cold controls
++average 16.69 major faults/case; native prefetch initiates I/O ahead of copies.
++All compared row bytes match. These numbers do not establish a model speedup.
++
++Fourteen research C++ correctness cases cover M=1/5/17/33, 17/160/8193-byte
++rows, shard/page boundaries, repeated IDs, buffer reuse and rejection of
++invalid or strided IDs. This CPU scheduling change preserves gathered bytes
++and numerical operations. Promotion requires installed-artifact byte checks
++and one matched C1 timing comparison; distribution and quality suites are
++reserved for changes to accumulation or numerical boundaries. UVA hot-row caching remains a separate
++follow-up: the current 8192-row trace simulation has only 14.5% all-row hits,
++so its miss path must be efficient as well.
++
++Before the C1 experiment, the projected critical-path saving is
++`1 lookup/token × 873.7515 us pre-copy wait × 0.80 lookup reduction × 0.9`
++= **0.629 ms/token**. The 80% reduction is rounded from the cold real-row
++measurement, not from warm startup timings. This projection caps credit at
++the observed pre-copy GPU wait; CPU service time is not added to GPU time.
++The historical trace and the current cache state may differ. Compare the
++observed saving against this estimate and investigate deviations over 15%.
++
++The maintained endpoint entry is
++`benchmarks/benchmark_sm70_qwen38_quality.py --timing-only`. It takes the GPU
++lock without blocking and fails before model loading on busy GPUs, insufficient
++disk, missing checkpoint files, Python/header mismatch, disabled request metrics,
++or an unguarded spawn entry. Every launch writes a completion summary, including
++failures. Normal quality mode retains anomaly reports; a single anomalous output
++requires three different seeds in both arms before a candidate-specific failure
++can be established. Existing health detection alone is not that comparison.
++
++The normal installed SM70 wheel passes all fourteen CPU dispatch tests without
++skips. The same retained real-row cold/warm test gives the following results;
++no private operator binding is used in this measurement.
++
++| Installed CPU lookup | Warm us/case | Cold us/case | Cold payload GB/s | Byte error |
++| --- | ---: | ---: | ---: | ---: |
++| Reference row copies | 29.97 | 1502.12 | 0.00170 | 0 |
++| Native selected-page gather | 62.21 | 292.52 | 0.00875 | 0 |
++
++Each case copies exactly 2560 payload bytes (16 × 160). Its covering-page
++footprint averages 68352 bytes, ranging from 65536 to 73728; neither is a
++measurement of physical storage traffic. Payload GB/s is the copied bytes
++divided by CPU elapsed time, not GPU DRAM bandwidth or SSD throughput. Cold
++reference major faults average 16.69 per case; prefetch queues I/O before
++copying in the candidate. The warm regression is retained explicitly and the
++C1 endpoint gate remains pending. The first endpoint attempt correctly failed
++before model loading because another task held the GPU lock.
++
++A queued pair may hold one reservation across both processes with an inherited
++file descriptor: `--gpu-lock-fd FD`. The entry verifies that it refers to the
++required lock and takes a nonblocking exclusive lock on that same open file
++description. The caller keeps its original descriptor open until both arms
++finish. This avoids a release/reacquire race while preserving the ordinary
++entry's fail-fast behavior and GPU-idle check. Normal launches need no option.
++
++The normal installed-artifact C1 pair completed with FP16 dense/KV, FP32 state,
++NVFP4 experts, TP4, CUDA graphs, disk ngrams, no MTP, 262144 startup capacity,
++8192 input tokens and 513 fixed-length output tokens. Both arms use the same
++wheel and six samples; only `ple_disk_row_gather` changes. The candidate's
++CPU-worker report selects `MappedRowGatherKernel` with a passing byte check;
++the control reports `disabled_by_policy`.
++
++| C1 pure decode | Median ms/token | Range ms/token |
++| --- | ---: | ---: |
++| Reference reader | 11.014752 | 10.932574–11.068880 |
++| Native reader | 10.869117 | 10.773957–10.975267 |
++
++The measured saving is **0.145635 ms/token (1.32%)**, against the pre-recorded
++0.629101 ms estimate: a **76.85% relative estimation error**. Sample ranges
++overlap; this is one matched installed-artifact comparison, not a guarantee
++for every prompt or cache state. Numerical operations are unchanged and all
++fourteen native byte tests pass; no distribution or task-quality campaign was
++run for this scheduling change under the graded policy.
++
++The estimate incorrectly applies a forced-cold CPU lookup ratio directly to
++an older GPU pre-copy wait. Startup's actual mapped-row warm sample already
++shows a different ratio: 156.90 us reference versus 77.30 us native for 64
++rows. Neither startup ratio nor forced-cold service time establishes the
++fraction of a normal decode's GPU wait that can be removed. A short observer
++run is pending to quantify per-request page faults and gather/staging time
++under the same repeated-input C1 contract before closing calibration.
++Future I/O estimates must retain cache-state and critical-path uncertainty;
++use 0.146 ms as this workload's measured benefit rather than 0.629 ms.
++
++Use `--ple-phase-probe` in the maintained endpoint entry for diagnostic phases
++and faults. Such reports set `instrumented=true` and `speed_acceptance=false`
++and cannot be compared as endpoint speed evidence. `--runtime-cache` permits
++reuse of the compatible compiled baseline graphs for this CPU-only policy;
++`--timing-repeats 2` limits the diagnostic cohort. Completion summaries keep
++compact CPU-reader decisions and link to the full route report.
++
++## Three-seed requalification and lookup calibration
++
++The updated admission contract requires matched three-seed task and health
++results for this PR, including 128K and 258048-token needles. Previous
++byte-preserving scheduling admission and single-seed evidence do not complete
++this requested requalification.
++
++A diagnostic control run records 1057 single-token CPU requests: only 45
++requests (4.26%) incur mmap major faults. Median mmap gather is 112.223 us,
++gather plus staging 188.567 us, key computation 105.974 us, previous-consumer
++wait 33.826 us, and complete CPU request 683.796 us. Four flag publications
++per request have a per-publication median of 8.483 us. These nested timings
++must not be summed. Python observation overhead is present; this instrumented
++run is not speed admission and does not establish GPU exposed wait. The
++previous 0.629-ms projection applied cold-page reduction to all requests;
++cache residency and overlap must be accounted for before further projection.
+diff --git a/docs/design/sm70_qwen38_distribution_acceptance.md b/docs/design/sm70_qwen38_distribution_acceptance.md
+index 1ed927fa08..4cbefe2e77 100644
+--- a/docs/design/sm70_qwen38_distribution_acceptance.md
++++ b/docs/design/sm70_qwen38_distribution_acceptance.md
+@@ -14,7 +14,27 @@ correctness bugs regardless of distribution scores.
+ Dense 8-bit experiments are a separate arm. Their speed is never credited to
+ FP16 fusion results, and default admission requires a separate owner decision.
+ 
+-## Initial distribution thresholds
++## FP16 fusion admission
++
++For unchanged activation and weight precision, reassociation and fusion use
++three admission conditions: on retained real activations, error against an
++independent FP64 oracle must not exceed the existing path; the frozen quality
++suite must run three distinct seeds in both arms, including 128K and
++258048-token needle cases, with no decrease in task passes or output health;
++and matched unprofiled C1 timing must improve. Report maximum absolute and
++relative L2 operator errors with the oracle materialization boundaries stated.
++Byte-preserving PLE transport changes retain the same arithmetic and must
++verify identical selected row bytes. KL, top-1 agreement and logit errors are
++recorded diagnostics, not vetoes for these FP16 changes.
++
++`--quality-only --quality-seeds 4201 5201 6201` evaluates all three seed bases
++with one engine load per arm. Actual sampling seeds retain each case index.
++The runner records all anomalies without stopping the three-seed campaign.
++The comparison checks matching prompts and category-wise task/health counts;
++existing baseline anomalies cannot conceal an increase in candidate cap,
++repetition, empty-answer or invalid-character counts.
++
++## Distribution thresholds for precision reductions only
+ 
+ Use natural-log KL, temperature 1, the complete valid vocabulary, and logits
+ before sampling processors, top-k, top-p or temperature scaling. For each
+@@ -23,8 +43,8 @@ from stable log-softmax. Report reverse KL as a diagnostic. Never compare
+ free-running continuations with different prefixes. Ignore padded vocabulary
+ entries using the tokenizer/model vocabulary contract, not probability cutoff.
+ 
+-Initial admission limits (all must pass, globally and in each language/task
+-stratum):
++For precision-reducing changes such as online QPN8, the initial limits
++remain unchanged (globally and in each language/task stratum):
+ 
+ | Metric | Initial limit |
+ | --- | ---: |
+@@ -74,13 +94,16 @@ from the diagnostic logit capture arm is an accepted performance result.
+ Run the fixed GSM8K, Chinese QA, needle and MBPP cases with the existing seeded
+ sampling recipe. Each stratum must score at least its matched default baseline.
+ Inspect repetition, invalid text, premature termination and unfinished thinking;
+-new candidate outputs that run to the token cap fail admission even if the
+-answer appears earlier. Record baseline cap failures separately. Keep counts,
++a single output that runs to the token cap or repeats is an anomaly to triage,
++not an admission veto. Repeat the affected prompt with three different seeds
++in both the candidate and baseline before attributing a regression to the
++candidate. Record all six outputs and baseline cap failures separately. Keep counts,
+ full outputs and reproducible checking code. This small suite is an admission
+ screen, not a claim about all model capabilities.
+ 
+ The quality runner records `health_passed` and per-case `health_failures`
+-separately from task scores, and exits unsuccessfully on an unhealthy output.
++separately from task scores, and exits unsuccessfully on an unhealthy single-seed output. Three-seed
++mode retains every output and requires matched baseline comparison instead.
+ Its automatic screen flags a missing natural EOS, an empty final answer, a
+ replacement character, or three occurrences of the same final-answer line
+ longer than 24 characters. Repeated-line flags require inspection; a clean
+@@ -92,9 +115,13 @@ TP, graph, KV/state dtype, prompts, sequence lengths, disk placement and
+ sampling contract in paired arms. Report decode separately from TTFT/prefill.
+ Use at least five steady-state C1 samples per arm; interleave matched samples
+ where feasible and report median, range and ratios, not a best run. C1 speed
+-and its single-step bottleneck determine performance admission. Before merging,
+-run one short C4 end-to-end smoke and check normal execution/output health.
+-Slower concurrent execution is not a rejection condition. Do not run dedicated
++and its single-step bottleneck determine performance admission. For scheduling
++changes that preserve numerical results bit for bit, an operator microbenchmark
++and one matched C1 timing comparison suffice; skip distribution, quality and
++acceptance-rate tests. Changes to accumulation order or numerical boundaries without precision
++reduction require the FP64, three-seed quality and C1 gates above; record
++teacher-forcing distribution metrics without applying the precision-reduction
++thresholds. Do not run dedicated
+ C2–C16 throughput, distribution or budget campaigns. Kernels must remain correct
+ at arbitrary supported batch widths, including M=5. Use shape capability and
+ measurement for admission, never a hardcoded batch-width fallback rule.
+@@ -106,6 +133,36 @@ accumulation/state. Initial component targets are 95 us per GDN layer,
+ 150 us per QSA layer and 0.45 ms for LM head plus sampling. These are planning
+ budgets, not measured results.
+ 
++## Iteration cost and expected benefit
++
++Before implementing a candidate, record calls per token from the existing
++trace, expected saving per call and `calls × saving × 0.88` as its projected
++endpoint benefit. The 0.88 correction applies to the retained step0-mapped trace (about
++12.6 ms/step), with auxiliary-stream overlap deducted before estimating savings;
++retain unprofiled measurements as such. Bundle changes projected below
++0.1 ms/token into a larger segment change. After endpoint measurement,
++compare predicted and observed savings; investigate relative deviations over
++15% and correct the estimate before proceeding.
++
++Use three measurement tiers. Develop operator candidates in independent Torch
++JIT extensions with ccache. Rotate real layer weights to keep L2 cold, capture
++CUDA graphs and report addressed weight bytes, measured DRAM bytes when
++available, GB/s, grid and numerical error. Then capture a real layer or segment
++to measure dependency gaps and actual fusion savings. Run the endpoint only
++when accumulated projected saving reaches 0.5 ms/token or a PR is ready to
++merge. Compile changed extensions incrementally during development; build a
++normal source-complete wheel for merge, not for every candidate.
++
++Keep the C1 endpoint entry in `benchmark_sm70_qwen38_quality.py`; use
++`--timing-only` for scheduling changes. It checks disk space, Python and headers,
++the GPU lock, idle GPUs, request metrics and spawn protection before loading. Use `--quality-only --case-id CASE --quality-seed BASE`
++for an affected prompt, keeping three distinct seed bases and both arms; this
++reuses the maintained entry and skips unrelated timing/quality requests.
++Every completion writes a compact summary, including failed launches. Preserve
++raw evidence and clean only owned obsolete caches/build products. While GPUs
++are occupied, develop the next eligible kernel on CPU rather than repeatedly
++polling long jobs. Batch independent code/log reads.
++
+ ## Current budget and required updates
+ 
+ The historic 13.05005 ms C1 control and the research transport below are from
+diff --git a/docs/design/sm70_v100_migration_control.md b/docs/design/sm70_v100_migration_control.md
+index 6f0627ad6b..01475184ce 100644
+--- a/docs/design/sm70_v100_migration_control.md
++++ b/docs/design/sm70_v100_migration_control.md
+@@ -49029,3 +49029,71 @@ but regressed every measured width. Neither variant is admitted. The next
+ structural prototype must remove synchronization/phase overhead or include a
+ larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
+ separate and disabled in these arms.
++
++## Concurrent DFlash2 head admission, 2026-10-05
++
++The QPN8 candidate head was limited to eight rows even when verification
++required M16-M64. The new admission uses the configured verifier width up to
++64 rows for FP32 rerank, retaining eight rows for the legacy FP16 reranker.
++Existing M16/M32 kernels provide the support search; final scores still use
++original head weights. No new runtime switch or C1 reduction is introduced.
++
++The cold-cache real-weight operator screen covers dense FP32 top-21 at
++M8/M16/M32/M64 on Gaussian inputs. Maximum selected logit error is 4.53e-6;
++maximum post-top-k/top-p probability error is 4.03e-7. This is a local
++operator check, not teacher-forcing qualification. Raw FP8 scores are not
++admitted as a replacement for final logits: their M16/M32 top-1 agreement
++was only 93.75% on this fixture. Keep the original-weight rerank.
++
++Operator timings suggest a useful concurrent gain; matched model timing,
++acceptance and clean wheel checks remain mandatory before promotion.
++
++The target sampler requests top-64. Extending buffer capacity alone did not
++activate that target route. The batched FP32 probe now admits top-64 and keeps
++an on-demand original-weight dense callback; C1 and legacy FP16 probes retain
++their previous route. The updated normal wheel passes 44 focused tests and
++release/dependency checks.
++
++However, the top-64 probe is **not qualified for promotion**. An identical-input
++FP32 dense comparison over 128 real target rounds (8056 positions) found two
++missing tokens in the top-k20/top-p0.95 sampling support. Top-1 agreed at every
++position, but maximum probability error was 0.0117282 and support KL was
++infinite. The Gaussian support screen had missed this failure. Larger batches
++must preserve the dense reference route until candidate coverage is repaired.
++
++A same-wheel target-only A/B, with the draft graph fixed, measured these complete
++rounds at 8K input (milliseconds; two surrounding controls averaged):
++
++| Concurrency | Dense target probe | Candidate target probe |
++| --- | ---: | ---: |
++| C1 | 14.835 | 14.832 |
++| C2 | 20.366 | 20.054 |
++| C4 | 27.973 | 27.739 |
++| C8 | 45.869 | 46.100 |
++
++These results are not accepted acceleration evidence. Original head weights
++remain the final-score source; raw QPN8 scores are used only for support search.
++The next operator screen uses retained real hidden states and wider candidate
++support rather than another Gaussian-only coverage test.
++
++The raw-probe failure above needs a correction: all global top-20 tokens were
++present at every one of the 8056 positions. The two apparent support misses
++are nucleus-boundary rounding cases. Reproducing the existing reference guard
++on CPU marks both for the unchanged dense callback (distance to top-p:
++5.96e-7 and 1.91e-6; guard margin: 1.22e-4). The first analysis omitted this
++fallback. GPU flag confirmation and the effective sampling comparison are
++pending; do not describe those raw-probe diagnostics as a demonstrated failure
++of the complete sampler. The measured C8 timing still requires investigation.
++
++GPU replay of the actual guard confirms both nucleus-boundary cases take the
++reference path. The effective sampling comparison has zero missing support,
++mean/p99/max KL 4.88e-10/3.88e-9/1.05e-8 and top-1 agreement100%, with maximum
++retained-logit error0.000816. This measures filtered sampling probabilities,
++not a full-vocabulary teacher-forcing KL. The maximum probability difference
++on retained support is7.22e-5. Keep the raw diagnostics alongside this result.
++
++A fresh32K service with max-num-seqs4 and the same688 KV blocks completes C4.
++The target-only same-wheel comparison measures C2 23.334→22.757ms and
++C4 32.938→32.698ms, averaging the surrounding dense controls. The larger
++8K C8 target route remains slower on its complete-round mean. Do not promote
++that shape based on its positive cold operator timing or median alone.
+diff --git a/tests/benchmarks/test_qwen38_distribution_probe.py b/tests/benchmarks/test_qwen38_distribution_probe.py
+index 788aa380e7..5c37b2460d 100644
+--- a/tests/benchmarks/test_qwen38_distribution_probe.py
++++ b/tests/benchmarks/test_qwen38_distribution_probe.py
+@@ -78,7 +78,10 @@ def test_worker_probe_tracks_request_mapping_and_rejects_wrong_input(tmp_path):
+         )
+ 
+ 
+-def test_default_repeat_noise_blocks_an_identical_candidate(tmp_path):
++@pytest.mark.parametrize("precision_reduced", [False, True])
++def test_distribution_thresholds_only_block_precision_reduction(
++    tmp_path, precision_reduced
++):
+     import json
+     from types import SimpleNamespace
+ 
+@@ -109,8 +112,15 @@ def test_default_repeat_noise_blocks_an_identical_candidate(tmp_path):
+             values = [1, 0, 0] if cohort["repeat"] == 1 else [0, 0, 0]
+             np.save(folder / "0000.npy", values)
+             (folder / "0000.json").write_text(json.dumps({"active_width": 1}))
+-    with pytest.raises(SystemExit, match="thresholds"):
+-        compare(SimpleNamespace(reference=reference, output=candidate))
++    args = SimpleNamespace(
++        reference=reference, output=candidate, precision_reduced=precision_reduced
++    )
++    if precision_reduced:
++        with pytest.raises(SystemExit, match="thresholds"):
++            compare(args)
++    else:
++        compare(args)
+     result = json.loads((candidate / "comparison.json").read_text())
+     assert result["distribution_passed"]
+     assert not result["default_noise_passed"]
++    assert result["thresholds_enforced"] == precision_reduced
+diff --git a/tests/benchmarks/test_qwen38_endpoint_preflight.py b/tests/benchmarks/test_qwen38_endpoint_preflight.py
+new file mode 100644
+index 0000000000..03320c010e
+--- /dev/null
++++ b/tests/benchmarks/test_qwen38_endpoint_preflight.py
+@@ -0,0 +1,134 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fail before any model import when the endpoint contract is incomplete."""
++
++import fcntl
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from benchmarks import benchmark_sm70_qwen38_quality as endpoint
++
++
++@pytest.fixture
++def launch(tmp_path, monkeypatch):
++    model = tmp_path / "model"
++    model.mkdir()
++    (model / "config.json").write_text("{}")
++    (model / "model.safetensors.index.json").write_text(
++        json.dumps({"weight_map": {"tensor": "weights.safetensors"}})
++    )
++    (model / "weights.safetensors").write_bytes(b"fixture")
++    include = tmp_path / "include"
++    include.mkdir()
++    (include / "Python.h").write_text("fixture")
++    monkeypatch.setattr(endpoint.sys, "version_info", (3, 12, 14))
++    monkeypatch.setattr(endpoint.sysconfig, "get_path", lambda _: str(include))
++    monkeypatch.setattr(
++        endpoint.shutil, "disk_usage", lambda _: SimpleNamespace(free=16 * 1024**3)
++    )
++    monkeypatch.setattr(endpoint.subprocess, "check_output", lambda *a, **kw: "")
++    return SimpleNamespace(
++        model=model,
++        output=tmp_path / "result.json",
++        min_free_gib=8,
++        timing_only=True,
++        cases=None,
++        case_id=None,
++    )
++
++
++def test_complete_contract_passes_without_model_import(launch):
++    report = endpoint.preflight(launch)
++    assert report["gpu_idle"] and report["spawn_guard"] and report["request_metrics"]
++
++
++@pytest.mark.parametrize("failure", ["header", "disk", "metrics", "gpu", "shard"])
++def test_launch_failures_are_detected_before_model_loading(
++    launch, monkeypatch, failure
++):
++    if failure == "header":
++        include = endpoint.sysconfig.get_path("include")
++        endpoint.Path(include, "Python.h").unlink()
++    elif failure == "disk":
++        monkeypatch.setattr(
++            endpoint.shutil, "disk_usage", lambda _: SimpleNamespace(free=1024)
++        )
++    elif failure == "metrics":
++        monkeypatch.setattr(endpoint, "REQUEST_METRICS_ENABLED", False)
++    elif failure == "gpu":
++        monkeypatch.setattr(
++            endpoint.subprocess, "check_output", lambda *a, **kw: "12345\n"
++        )
++    else:
++        (launch.model / "weights.safetensors").unlink()
++    with pytest.raises(RuntimeError):
++        endpoint.preflight(launch)
++
++
++def test_quality_cases_are_validated_before_loading(launch):
++    launch.timing_only = False
++    with pytest.raises(RuntimeError, match="frozen cases"):
++        endpoint.preflight(launch)
++
++
++def test_estimate_requires_matching_contract_and_marks_large_deviation():
++    baseline = {
++        "runtime": "fixture",
++        "torch": "fixture",
++        "cuda": "fixture",
++        "source_native": {"_C": "sha"},
++        "contract": {"tp": 4},
++        "complete": True,
++        "median_tpot_ms": 11.0,
++    }
++    candidate = {**baseline, "median_tpot_ms": 10.4}
++    assert not endpoint.compare_timing(baseline, candidate, 0.63)[
++        "calibration_required"
++    ]
++    candidate["median_tpot_ms"] = 10.9
++    assert endpoint.compare_timing(baseline, candidate, 0.63)["calibration_required"]
++    candidate["contract"] = {"tp": 2}
++    with pytest.raises(ValueError, match="contract"):
++        endpoint.compare_timing(baseline, candidate, 0.63)
++
++
++def test_unknown_triage_case_is_rejected_before_loading(launch):
++    launch.timing_only = False
++    launch.cases = launch.output.parent / "cases.json"
++    launch.cases.write_text(json.dumps({"cases": [{"id": "known"}]}))
++    launch.case_id = ["unknown"]
++    with pytest.raises(RuntimeError, match="Unknown quality case"):
++        endpoint.preflight(launch)
++
++
++def test_reserved_lock_is_reused_without_releasing_owner(tmp_path):
++    path = tmp_path / "gpu.lock"
++    with path.open("a") as owner:
++        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        with (
++            endpoint.open_gpu_lock(owner.fileno(), path),
++            pytest.raises(BlockingIOError),
++        ):
++            endpoint.open_gpu_lock(lock_path=path)
++        # Closing the duplicate must retain the original owner's reservation.
++        with pytest.raises(BlockingIOError):
++            endpoint.open_gpu_lock(lock_path=path)
++    with endpoint.open_gpu_lock(lock_path=path):
++        pass
++
++
++def test_inherited_descriptor_must_match_required_lock(tmp_path):
++    path = tmp_path / "gpu.lock"
++    path.touch()
++    with (
++        (tmp_path / "different.lock").open("a") as other,
++        pytest.raises(RuntimeError, match="required GPU lock"),
++    ):
++        endpoint.open_gpu_lock(other.fileno(), path)
++
++
++def test_instrumented_phases_cannot_establish_endpoint_savings():
++    with pytest.raises(ValueError, match="Instrumented"):
++        endpoint.compare_timing({"instrumented": True}, {}, 0.63)
+diff --git a/tests/benchmarks/test_qwen38_quality_health.py b/tests/benchmarks/test_qwen38_quality_health.py
+index b9e91a21da..faca5bfa90 100644
+--- a/tests/benchmarks/test_qwen38_quality_health.py
++++ b/tests/benchmarks/test_qwen38_quality_health.py
+@@ -2,7 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """A passing task score must not hide an unhealthy generation."""
+ 
+-from benchmarks.benchmark_sm70_qwen38_quality import health_failures
++import copy
++
++import pytest
++
++from benchmarks.benchmark_sm70_qwen38_quality import compare_quality, health_failures
+ 
+ 
+ def test_scored_code_at_token_limit_is_unhealthy():
+@@ -62,3 +66,65 @@ def test_empty_or_corrupt_final_answer_requires_review():
+         {"id": "empty-case", "reasons": ["empty_final_answer"]},
+         {"id": "corrupt-case", "reasons": ["replacement_characters"]},
+     ]
++
++
++def three_seed_report():
++    records = []
++    for case, category, length in (
++        ("code", "mbpp", 200),
++        ("needle-128", "needle", 131000),
++        ("needle-258", "needle", 258000),
++    ):
++        for seed in (4201, 5201, 6201):
++            records.append(
++                {
++                    "id": case,
++                    "category": category,
++                    "seed": seed,
++                    "input_tokens": length,
++                    "prompt_token_sha256": case,
++                    "score": {"passed": True},
++                    "health": {
++                        "natural_eos": True,
++                        "nonempty_final": True,
++                        "replacement_characters": 0,
++                        "line_repetition": 0,
++                    },
++                }
++            )
++    return {
++        "complete": True,
++        "quality_evaluated": True,
++        "contract": {},
++        "sampling": {},
++        "suite_sha256": "frozen",
++        "quality_seed_bases": [4201, 5201, 6201],
++        "quality": records,
++    }
++
++
++def test_three_seed_health_compares_against_baseline():
++    baseline = three_seed_report()
++    baseline["quality"][0]["health"]["natural_eos"] = False
++    candidate = copy.deepcopy(baseline)
++    assert compare_quality(baseline, candidate)["passed"]
++    candidate["quality"][1]["health"]["natural_eos"] = False
++    assert not compare_quality(baseline, candidate)["passed"]
++
++
++def test_three_seed_score_regression_is_rejected():
++    baseline = three_seed_report()
++    candidate = copy.deepcopy(baseline)
++    candidate["quality"][0]["score"]["passed"] = False
++    assert not compare_quality(baseline, candidate)["passed"]
++
++
++def test_quality_requires_matched_prefixes_and_long_needles():
++    baseline = three_seed_report()
++    candidate = copy.deepcopy(baseline)
++    candidate["quality"][0]["prompt_token_sha256"] = "changed"
++    with pytest.raises(ValueError, match="prefix differs"):
++        compare_quality(baseline, candidate)
++    baseline["quality"] = [r for r in baseline["quality"] if r["id"] != "needle-258"]
++    with pytest.raises(ValueError, match="128K and 258K"):
++        compare_quality(baseline, copy.deepcopy(baseline))
+diff --git a/tests/kernels/quantization/test_gguf_expert_gate_up_dispatch.py b/tests/kernels/quantization/test_gguf_expert_gate_up_dispatch.py
+index 72003122fb..e50890c94e 100644
+--- a/tests/kernels/quantization/test_gguf_expert_gate_up_dispatch.py
++++ b/tests/kernels/quantization/test_gguf_expert_gate_up_dispatch.py
+@@ -15,6 +15,10 @@
+ @pytest.mark.parametrize(
+     "source,m,expected",
+     [
++        (18, 1, "raw"),
++        (18, 5, "raw"),
++        (18, 20, "raw"),
++        (18, 512, "gemm"),
+         (21, 1, "raw"),
+         (21, 5, "raw"),
+         (21, 20, "raw"),
+@@ -62,7 +66,7 @@ def canonical(out, x, offsets, weights, *args):
+         16,
+         n,
+         top_k,
+-        [1, 5, 20] if source == 21 else [1, 5],
++        [1, 5, 20] if source in (18, 21) else [1, 5],
+         [],
+     )
+     assert calls == (["raw"] if expected == "raw" else ["gemm", "gemm"])
+@@ -107,7 +111,7 @@ def vector(out, *args):
+     assert calls == ["vector", "vector"]
+ 
+ 
+-@pytest.mark.parametrize("kind", [21, 22])
++@pytest.mark.parametrize("kind", [18, 21, 22])
+ @pytest.mark.parametrize("rank", range(4))
+ def test_expert_bank_retains_complete_tp_rows_and_counts_storage(
+     monkeypatch, kind, rank
+diff --git a/tests/kernels/quantization/test_gguf_expert_gate_up_graph.py b/tests/kernels/quantization/test_gguf_expert_gate_up_graph.py
+index f38ea263db..6f046144cc 100644
+--- a/tests/kernels/quantization/test_gguf_expert_gate_up_graph.py
++++ b/tests/kernels/quantization/test_gguf_expert_gate_up_graph.py
+@@ -11,7 +11,7 @@
+ from vllm.transformers_utils.gguf_tensor_reader import quant_size
+ 
+ 
+-@pytest.mark.parametrize("kind", [21, 22])
++@pytest.mark.parametrize("kind", [18, 21, 22])
+ @pytest.mark.parametrize("m", [5, 20])
+ def test_opaque_gate_up_dispatch_and_changed_input_graph(kind, m):
+     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+@@ -67,7 +67,7 @@ def run():
+             banks[0].group,
+             n,
+             top_k,
+-            [1, 5, 20] if kind == 21 else [1, 5],
++            [1, 5, 20] if kind in (18, 21) else [1, 5],
+             [],
+         )
+ 
+diff --git a/tests/kernels/quantization/test_gguf_mixed_direct_output.py b/tests/kernels/quantization/test_gguf_mixed_direct_output.py
+new file mode 100644
+index 0000000000..a420db5f84
+--- /dev/null
++++ b/tests/kernels/quantization/test_gguf_mixed_direct_output.py
+@@ -0,0 +1,71 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++from test_gguf_turbomind_bitplanes import source as bitplane_source
++from test_gguf_turbomind_model import source as model_source
++
++from vllm.model_executor.layers.quantization.gguf_turbomind import (
++    GGUFPreparedProjection,
++    apply_prepared_gguf_projections,
++    mixed_projection_capabilities,
++)
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++
++
++def source(t, n=64):
++    if t == 14:
++        return bitplane_source(t, n=n, k=512)
++    data = model_source(t, n=n, k=512)
++    return data[:, :288] if t == 12 else data
++
++
++@pytest.mark.parametrize("types", [(14, 12), (12, 23), (18, 20)])
++@pytest.mark.parametrize("m", [5, 20, 32])
++def test_mixed_output_matches_independent_projections_in_graph(types, m):
++    torch.manual_seed(20261005)
++    projections = torch.nn.ModuleList(
++        [
++            GGUFPreparedProjection(
++                torch.from_numpy(source(t, n=64)).cuda(), t, torch.float16, True, 8
++            )
++            for t in types
++        ]
++    )
++    assert all(c.reason is None for c in mixed_projection_capabilities(projections))
++    x = (torch.randn((1, m, 512), device="cuda") * 0.125).half()
++    expected = torch.cat([p(x) for p in projections], dim=-1)
++    actual = apply_prepared_gguf_projections(x, projections)
++    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++    assert actual.is_contiguous()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        captured = apply_prepared_gguf_projections(x, projections)
++    graph.replay()
++    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
++    compiled = torch.compile(
++        lambda x: apply_prepared_gguf_projections(x, projections),
++        backend="eager",
++        fullgraph=True,
++    )
++    torch.testing.assert_close(compiled(x), expected, rtol=0, atol=0)
++
++
++def test_padded_projection_preserves_fallback_and_reports_reason():
++    projections = torch.nn.ModuleList(
++        [
++            GGUFPreparedProjection(
++                torch.from_numpy(source(t, n=n)).cuda(), t, torch.float16, True, 8
++            )
++            for t, n in ((12, 40), (23, 64))
++        ]
++    )
++    capabilities = mixed_projection_capabilities(projections)
++    assert capabilities[0].reason == "mixed_output_has_padded_projection"
++    x = torch.randn((5, 512), device="cuda").half()
++    expected = torch.cat([p(x) for p in projections], dim=-1)
++    torch.testing.assert_close(
++        apply_prepared_gguf_projections(x, projections), expected, rtol=0, atol=0
++    )
+diff --git a/tests/kernels/quantization/test_gguf_mixed_output_fallback.py b/tests/kernels/quantization/test_gguf_mixed_output_fallback.py
+new file mode 100644
+index 0000000000..e8510d7fdf
+--- /dev/null
++++ b/tests/kernels/quantization/test_gguf_mixed_output_fallback.py
+@@ -0,0 +1,30 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch
++
++from vllm.model_executor.layers.quantization.gguf_turbomind import (
++    apply_prepared_gguf_projections,
++    mixed_projection_capabilities,
++)
++
++
++def test_uncanonicalized_format_keeps_original_projection_dispatch():
++    class Projection:
++        def __init__(self, source, kernel, offset):
++            self.source_type = source
++            self.kernel = kernel
++            self.offset = offset
++
++        def __call__(self, x):
++            return x + self.offset
++
++    # Q8_1 is absent from canonical family declarations. A mixed projection
++    # must retain its imported fallback rather than fail family classification.
++    projections = [Projection(12, object(), 1), Projection(9, None, -1)]
++    x = torch.arange(8, dtype=torch.float16).reshape(2, 4)
++    assert mixed_projection_capabilities(projections) == ()
++    expected = torch.cat((x + 1, x - 1), dim=-1)
++    torch.testing.assert_close(
++        apply_prepared_gguf_projections(x, projections), expected, rtol=0, atol=0
++    )
+diff --git a/tests/kernels/test_ple_disk_rows.py b/tests/kernels/test_ple_disk_rows.py
+new file mode 100644
+index 0000000000..96332f7483
+--- /dev/null
++++ b/tests/kernels/test_ple_disk_rows.py
+@@ -0,0 +1,83 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Check byte order and shard/page boundaries in the shipped CPU gather."""
++
++import mmap
++
++import pytest
++import torch
++
++import vllm._custom_ops  # noqa: F401 - load the shipped CPU registration
++
++pytestmark = pytest.mark.skipif(
++    not hasattr(torch.ops._C, "ple_disk_gather_u8"),
++    reason="requires the native CPU row gather",
++)
++
++
++@pytest.mark.parametrize("m", [1, 5, 17, 33])
++@pytest.mark.parametrize("row_bytes", [17, 160, 8193])
++def test_mapped_shards_preserve_bytes_and_repeated_ids(tmp_path, m, row_bytes):
++    shard_size, total = 97, 271
++    references, mapped, tensors = [], [], []
++    try:
++        for shard, count in enumerate((97, 97, 77)):
++            values = (
++                (torch.arange(count * row_bytes, dtype=torch.int64) * 11 + shard) % 256
++            ).to(torch.uint8)
++            path = tmp_path / f"shard-{shard}"
++            path.write_bytes(values.numpy().tobytes())
++            with path.open("rb") as source:
++                region = mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_COPY)
++            mapped.append(region)
++            tensor = torch.frombuffer(region, dtype=torch.uint8).reshape(
++                count, row_bytes
++            )
++            tensors.append(tensor)
++            references.append(values.reshape(count, row_bytes))
++        pointers = torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64)
++        ids = ((torch.arange(m * 16) * 41) % total).reshape(m, 16)
++        ids.reshape(-1)[:4] = torch.tensor([0, 96, 97, total - 1])
++        output = torch.empty((m, 16, row_bytes), dtype=torch.uint8)
++        torch.ops._C.ple_disk_gather_u8(
++            ids, pointers, shard_size, total, row_bytes, output
++        )
++        expected = torch.cat(references)[ids.reshape(-1)].reshape_as(output)
++        torch.testing.assert_close(output, expected, rtol=0, atol=0)
++        # Reuse the same buffers with different IDs; no stale cache/generation.
++        ids.fill_(total - 1)
++        torch.ops._C.ple_disk_gather_u8(
++            ids, pointers, shard_size, total, row_bytes, output
++        )
++        torch.testing.assert_close(
++            output, references[-1][-1].expand_as(output), rtol=0, atol=0
++        )
++    finally:
++        tensors.clear()
++        # Torch may retain the last local view until the function returns.
++        if "tensor" in locals():
++            del tensor
++        for region in mapped:
++            region.close()
++
++
++def test_invalid_rows_are_rejected_before_output_writes():
++    table = torch.arange(48, dtype=torch.uint8).reshape(3, 16)
++    pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
++    output = torch.full((2, 16), 123, dtype=torch.uint8)
++    for invalid in (-1, 3):
++        with pytest.raises(RuntimeError, match="row ID out of range"):
++            torch.ops._C.ple_disk_gather_u8(
++                torch.tensor([0, invalid]), pointers, 3, 3, 16, output
++            )
++        assert torch.all(output == 123)
++
++
++def test_strided_ids_do_not_silently_read_adjacent_storage():
++    table = torch.arange(64, dtype=torch.uint8).reshape(4, 16)
++    pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
++    ids = torch.arange(4)[::2]
++    with pytest.raises(RuntimeError, match="contiguous"):
++        torch.ops._C.ple_disk_gather_u8(
++            ids, pointers, 4, 4, 16, torch.empty((2, 16), dtype=torch.uint8)
++        )
+diff --git a/tests/model_executor/layers/test_sm70_lm_head.py b/tests/model_executor/layers/test_sm70_lm_head.py
+index 07d0674c97..1acc2e36f9 100644
+--- a/tests/model_executor/layers/test_sm70_lm_head.py
++++ b/tests/model_executor/layers/test_sm70_lm_head.py
+@@ -202,3 +202,57 @@ def test_disabled_lm_head_routes_prepare_nothing(monkeypatch) -> None:
+     assert not vocab_embedding.maybe_prepare_sm70_lm_head_top1(layer)
+     assert not hasattr(layer, "_sm70_f16_raw_top1_ready")
+     assert not hasattr(layer, "_sm70_f16_prepared")
++
++
++@pytest.mark.parametrize(
++    ("max_seqs", "expected"), [(1, 8), (2, 16), (4, 32), (8, 64), (16, 64)]
++)
++@pytest.mark.parametrize("method", ["dflash", "dflash2"])
++def test_qpn8_capacity_follows_dflash_verifier_width(
++    monkeypatch, max_seqs, expected, method
++):
++    config = SimpleNamespace(
++        speculative_config=SimpleNamespace(method=method, num_speculative_tokens=7),
++        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
++    )
++    monkeypatch.setattr(
++        vocab_embedding, "get_current_vllm_config_or_none", lambda: config
++    )
++    assert vocab_embedding._sm70_dflash2_qpn8_row_capacity() == expected
++
++
++@pytest.mark.parametrize("config", [None, SimpleNamespace(speculative_config=None)])
++def test_qpn8_unconfigured_capacity_retains_small_head(monkeypatch, config):
++    monkeypatch.setattr(
++        vocab_embedding, "get_current_vllm_config_or_none", lambda: config
++    )
++    assert vocab_embedding._sm70_dflash2_qpn8_row_capacity() == 8
++
++
++@pytest.mark.parametrize("rows,fp32", [(8, True), (16, False), (64, False)])
++def test_top64_rerank_retains_c1_and_legacy_dense_probe(monkeypatch, rows, fp32):
++    monkeypatch.setattr(
++        vocab_embedding, "_sm70_dflash2_qpn8_rerank_requested", lambda **kw: True
++    )
++    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (7, 0))
++    layer = SimpleNamespace(
++        _sm70_dflash2_qpn8_rerank_prepared=True,
++        _sm70_dflash2_fp32_logits=fp32,
++    )
++    assert (
++        vocab_embedding._maybe_sm70_dflash2_qpn8_rerank(
++            layer, _FakeCudaTensor((rows, 5120)), 64
++        )
++        is None
++    )
++
++
++def test_top64_rerank_output_has_contiguous_tp_layout():
++    layer = SimpleNamespace(
++        _sm70_dflash2_rerank_values_64=torch.empty(64, 64),
++        _sm70_dflash2_rerank_positions_64=torch.empty(64, 64, dtype=torch.int64),
++        _sm70_dflash2_rerank_ids_64=torch.empty(64, 64, dtype=torch.int64),
++    )
++    for rows in (16, 32, 64):
++        buffers = vocab_embedding._sm70_dflash2_rerank_output_buffers(layer, rows, 64)
++        assert all(x.shape == (rows, 64) and x.is_contiguous() for x in buffers)
+diff --git a/tests/v1/sample/test_dflash2_logits_reuse.py b/tests/v1/sample/test_dflash2_logits_reuse.py
+index e0b7d9e06d..5541f710ac 100644
+--- a/tests/v1/sample/test_dflash2_logits_reuse.py
++++ b/tests/v1/sample/test_dflash2_logits_reuse.py
+@@ -120,3 +120,44 @@ def get_sparse_draft_logits(self):
+     assert isinstance(result, sparse_rejection.DFlash2LogitsFallback)
+     assert result.logits is logits
+     fallback.assert_called_once()
++
++
++@pytest.mark.parametrize("scale,soft_cap", [(1.0, None), (0.5, 3.0)])
++def test_compact_candidate_fallback_projects_only_when_called(
++    monkeypatch, scale, soft_cap
++):
++    torch.manual_seed(64)
++    local = torch.randn(16, 128)
++    values, ids = local.topk(64)
++    project = Mock(side_effect=lambda *args, **kwargs: local.clone())
++    head = SimpleNamespace(
++        maybe_get_sm70_dflash2_top20=lambda *args: (values, ids),
++        quant_method=SimpleNamespace(apply=project),
++        weight=torch.empty(128, 4),
++        shard_indices=SimpleNamespace(num_org_vocab_padding=0, org_vocab_start_index=0),
++    )
++    monkeypatch.setattr(
++        logits_module, "get_tensor_model_parallel_world_size", lambda: 1
++    )
++    processor = LogitsProcessor(128, scale=scale, soft_cap=soft_cap)
++    gather = Mock(side_effect=lambda logits: logits)
++    monkeypatch.setattr(processor, "_gather_logits", gather)
++    hidden = torch.empty(16, 4)
++    expected = processor.forward(head, hidden)
++    project.reset_mock()
++    gather.reset_mock()
++
++    actual_ids, actual_values, fallback = (
++        processor.get_compact_target_probe_with_fallback(head, hidden, 64)
++    )
++    assert torch.equal(actual_ids, ids)
++    transformed = values
++    if soft_cap is not None:
++        transformed = torch.tanh(transformed / soft_cap) * soft_cap
++    assert torch.equal(actual_values, transformed * scale)
++    project.assert_not_called()
++    gather.assert_not_called()
++    assert fallback is not None
++    assert torch.equal(fallback(), expected)
++    project.assert_called_once_with(head, hidden, bias=None)
++    gather.assert_called_once()
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index 38ffbe5de7..69ef3a15fa 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -531,6 +531,12 @@ def resolve_sm70_rmsnorm_gated(self, *, qualified: bool) -> None:
+     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
+     ple_disk_release_pages: bool = False
+     """Release file-backed PLE mappings after gathers to reduce resident RAM."""
++    ple_disk_row_gather: bool = True
++    """Admit byte-preserving native CPU gathers for retained mapped PLE rows."""
++    ple_disk_row_readers: dict[str, Any] = Field(
++        default_factory=dict, init=False, repr=False
++    )
++    """Observed CPU row-reader admission and startup byte/performance checks."""
+     ple_disk_cascade_active: bool = Field(default=False, init=False)
+     """Resolved FP8 storage, dtype and pipeline capability admission."""
+     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
+@@ -573,6 +579,8 @@ def compute_hash(self) -> str:
+             "fused_fp16_aux_gemv_applicable",
+             "ple_disk_cascade_reason",
+             "ple_result_transports",
++            "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
++            "ple_disk_row_readers",
+             "qsa_auto_e4m3_reason",
+         }
+         if not self.sm70_skinny_moe_applicable:
+diff --git a/vllm/model_executor/kernels/ple/disk_rows.py b/vllm/model_executor/kernels/ple/disk_rows.py
+new file mode 100644
+index 0000000000..3b130b8e60
+--- /dev/null
++++ b/vllm/model_executor/kernels/ple/disk_rows.py
+@@ -0,0 +1,101 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Byte-preserving CPU gathers from retained file-backed embedding shards."""
++
++import ctypes
++import statistics
++import sys
++import time
++from collections.abc import Sequence
++
++import numpy as np
++import torch
++
++
++class MappedRowGatherKernel:
++    """Prefetch selected cold pages and gather into the caller's output."""
++
++    def __init__(
++        self, pointers: Sequence[int], shard_size: int, num_rows: int, row_bytes: int
++    ):
++        self.pointers = torch.tensor(pointers, dtype=torch.int64, device="cpu")
++        self.shard_size = shard_size
++        self.num_rows = num_rows
++        self.row_bytes = row_bytes
++        self.operator = torch.ops._C.ple_disk_gather_u8
++
++    def apply(self, ids: torch.Tensor, output: torch.Tensor) -> None:
++        self.operator(
++            ids, self.pointers, self.shard_size, self.num_rows, self.row_bytes, output
++        )
++
++    def qualify(self) -> dict:
++        count = min(64, self.num_rows)
++        values = [i * (self.num_rows - 1) // max(1, count - 1) for i in range(count)]
++        ids = torch.tensor(values, dtype=torch.int64, device="cpu")
++        output = torch.empty((count, self.row_bytes), dtype=torch.uint8, device="cpu")
++        bases = self.pointers.tolist()
++
++        def reference():
++            rows = np.empty((count, self.row_bytes), dtype=np.uint8)
++            for row, index in enumerate(values):
++                shard, local = divmod(index, self.shard_size)
++                ctypes.memmove(
++                    rows.ctypes.data + row * self.row_bytes,
++                    bases[shard] + local * self.row_bytes,
++                    self.row_bytes,
++                )
++            output.numpy()[:] = rows
++
++        reference()
++        expected = output.clone()
++        self.apply(ids, output)
++        torch.testing.assert_close(output, expected, rtol=0, atol=0)
++        timings: list[list[float]] = [[], []]
++        for repeat in range(9):
++            for arm in (0, 1) if repeat % 2 == 0 else (1, 0):
++                start = time.perf_counter_ns()
++                for _ in range(8):
++                    if arm:
++                        self.apply(ids, output)
++                    else:
++                        reference()
++                timings[arm].append((time.perf_counter_ns() - start) / 8000)
++        # These are explicitly warm startup timings. Cold I/O acceptance must
++        # additionally be measured in the model or with physical cold pages.
++        return {
++            "byte_check": True,
++            "warm_startup_us": [statistics.median(samples) for samples in timings],
++            "warm_samples_us": timings,
++        }
++
++
++def prepare_mapped_row_gather(
++    *,
++    pointers: Sequence[int],
++    shard_size: int,
++    num_rows: int,
++    row_bytes: int,
++    file_backed: bool,
++    enabled: bool,
++) -> tuple[MappedRowGatherKernel | None, dict]:
++    if not enabled:
++        return None, {"selected": None, "reason": "disabled_by_policy"}
++    if sys.platform != "linux" or not file_backed:
++        return None, {"selected": None, "reason": "linux_file_mapping_required"}
++    if not pointers or min(shard_size, num_rows, row_bytes, *pointers) <= 0:
++        return None, {"selected": None, "reason": "invalid_geometry"}
++    import vllm._custom_ops  # noqa: F401 - load the shipped registration
++
++    if not hasattr(torch.ops._C, "ple_disk_gather_u8"):
++        return None, {"selected": None, "reason": "native_operator_unavailable"}
++    kernel = MappedRowGatherKernel(pointers, shard_size, num_rows, row_bytes)
++    try:
++        measurement = kernel.qualify()
++    except (RuntimeError, AssertionError) as error:
++        return None, {
++            "selected": None,
++            "reason": "startup_check_failed",
++            "detail": str(error),
++        }
++    return kernel, {"selected": "MappedRowGatherKernel", **measurement}
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 6c56ebb7b6..583c31701a 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -720,6 +720,13 @@ def _get_topk_tokens_and_logits(
+         fallback = None
+         if local_logits is not None:
+             fallback = lambda: self._gather_cached_logits(local_logits)
++        elif compact_target_probe and retain_local_logits:
++            # A candidate projection has no dense logits to cache. Recompute
++            # original-weight scores only if the sampler needs its reference
++            # branch (for example, an unbounded cutoff tie).
++            fallback = lambda: self._gather_cached_logits(
++                lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
++            )
+         return top_indices.to(torch.int64), top_vals.float(), fallback
+ 
+     def _maybe_dump_top_token_margin(
+diff --git a/vllm/model_executor/layers/quantization/gguf.py b/vllm/model_executor/layers/quantization/gguf.py
+index c9a8ac61e4..89593b92c3 100644
+--- a/vllm/model_executor/layers/quantization/gguf.py
++++ b/vllm/model_executor/layers/quantization/gguf.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from collections.abc import Mapping
++from dataclasses import asdict
+ from types import MappingProxyType
+ from typing import TYPE_CHECKING, Any
+ 
+@@ -644,6 +645,7 @@ def process_weights_after_loading(self, layer: torch.nn.Module):
+         ):
+             qweight = layer.qweight
+             from vllm.model_executor.layers.quantization.gguf_turbomind import (
++                mixed_projection_capabilities,
+                 prepare_gguf_projections,
+             )
+ 
+@@ -670,6 +672,9 @@ def process_weights_after_loading(self, layer: torch.nn.Module):
+             self.native_admission["canonical_projections"] = [
+                 projection.admission() for projection in projections
+             ]
++            self.native_admission["mixed_projection_operators"] = [
++                asdict(c) for c in mixed_projection_capabilities(projections)
++            ]
+             if any(projection.kernel is not None for projection in projections):
+                 layer.gguf_tm_projections = torch.nn.ModuleList(projections)
+                 self.canonical_projections = layer.gguf_tm_projections
+@@ -794,8 +799,11 @@ def apply(
+         if self.layout is not None:
+             x = self.layout.input_to_gguf(x)
+         if self.canonical_projections:
+-            outputs = [projection(x) for projection in layer.gguf_tm_projections]
+-            out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
++            from vllm.model_executor.layers.quantization.gguf_turbomind import (
++                apply_prepared_gguf_projections,
++            )
++
++            out = apply_prepared_gguf_projections(x, layer.gguf_tm_projections)
+             if bias is not None:
+                 out.add_(bias)
+             return out
+diff --git a/vllm/model_executor/layers/quantization/gguf_turbomind.py b/vllm/model_executor/layers/quantization/gguf_turbomind.py
+index d6940aadeb..0a7ece322d 100644
+--- a/vllm/model_executor/layers/quantization/gguf_turbomind.py
++++ b/vllm/model_executor/layers/quantization/gguf_turbomind.py
+@@ -11,6 +11,7 @@
+ 
+ from vllm.model_executor.kernels.gguf import (
+     GGUFOperatorCapability,
++    decoder_family,
+     dense_fp16_cache_capabilities,
+ )
+ from vllm.model_executor.kernels.linear import (
+@@ -136,6 +137,180 @@ def _prepared_gguf_projection_fake(
+ )
+ 
+ 
++def _prepared_gguf_mixed_projection(
++    x: torch.Tensor,
++    codes: list[torch.Tensor],
++    stats: list[torch.Tensor],
++    caches: list[torch.Tensor | None],
++    descriptors: list[int],
++    cache_bands: list[int],
++    blas_bands: list[int],
++) -> torch.Tensor:
++    rows = x.reshape(-1, x.shape[-1]).contiguous()
++    specs = [descriptors[i : i + 9] for i in range(0, len(descriptors), 9)]
++    cache_offset = blas_offset = 0
++    policies = []
++    for spec in specs:
++        cache_count, blas_count = spec[-2:]
++        policies.append(
++            (
++                cache_bands[cache_offset : cache_offset + cache_count],
++                blas_bands[blas_offset : blas_offset + blas_count],
++            )
++        )
++        cache_offset += cache_count
++        blas_offset += blas_count
++    # Retain the calibrated per-projection policy outside measured target
++    # verification sizes. This decision must use actual M inside the op.
++    direct = rows.shape[0] in (5, 20) and all(
++        not _supports_band(rows.shape[0], cb) and not _supports_band(rows.shape[0], bb)
++        for cb, bb in policies
++    )
++    if not direct:
++        outputs = [
++            _prepared_gguf_projection(
++                x,
++                c,
++                s,
++                cache,
++                spec[0],
++                spec[1],
++                spec[2],
++                spec[3],
++                spec[4],
++                spec[5],
++                spec[6],
++                cb,
++                bb,
++            )
++            for c, s, cache, spec, (cb, bb) in zip(
++                codes, stats, caches, specs, policies
++            )
++        ]
++        return torch.cat(outputs, dim=-1)
++    total = sum(spec[6] for spec in specs)
++    output = torch.empty((rows.shape[0], total), dtype=x.dtype, device=x.device)
++    offset = 0
++    for c, s, spec in zip(codes, stats, specs):
++        family, decoder, group, k_ld, q_ld, output_size, logical_size = spec[:7]
++        destination = output[:, offset : offset + logical_size]
++        if family == 0:
++            torch.ops._C.gguf_affine_gemm_sm70_out(
++                destination, rows, c, s, decoder, k_ld, q_ld, group
++            )
++        elif family == 1:
++            torch.ops._C.gguf_lut4_gemm_sm70_out(
++                destination, rows, c, s, decoder, k_ld, q_ld, group
++            )
++        else:
++            torch.ops._C.gguf_lattice_gemm_sm70_out(
++                destination, rows, c, s, decoder, k_ld, q_ld, group
++            )
++        offset += logical_size
++    return output.reshape(*x.shape[:-1], total)
++
++
++def _prepared_gguf_mixed_projection_fake(
++    x: torch.Tensor,
++    codes: list[torch.Tensor],
++    stats: list[torch.Tensor],
++    caches: list[torch.Tensor | None],
++    descriptors: list[int],
++    cache_bands: list[int],
++    blas_bands: list[int],
++) -> torch.Tensor:
++    total = sum(descriptors[6::9])
++    return torch.empty((*x.shape[:-1], total), dtype=x.dtype, device=x.device)
++
++
++direct_register_custom_op(
++    op_name="prepared_gguf_mixed_projection",
++    op_func=_prepared_gguf_mixed_projection,
++    fake_impl=_prepared_gguf_mixed_projection_fake,
++)
++
++
++def mixed_projection_capabilities(projections):
++    """Declare output-view eligibility independently of quantization family."""
++    if len(projections) < 2 or any(p.kernel is None for p in projections):
++        # An imported fallback format may not have a canonical family at all.
++        # Its existing projection admission carries the rejection reason.
++        return ()
++    capabilities = []
++    for projection in projections:
++        reason = projection.rejection_reason
++        if projection.kernel is None:
++            reason = reason or "projection_not_prepared"
++        elif projection.output_padding:
++            reason = "mixed_output_has_padded_projection"
++        elif projection.logical_output_size % 32:
++            reason = "mixed_output_cuts_output_pack"
++        for m in (5, 20):
++            capabilities.append(
++                GGUFOperatorCapability(
++                    decoder_family(projection.source_type),
++                    quant_type_name(projection.source_type),
++                    "prepared_gguf_mixed_projection",
++                    True,
++                    min_m=m,
++                    max_m=m,
++                    reason=reason,
++                )
++            )
++    return tuple(capabilities)
++
++
++def apply_prepared_gguf_projections(x, projections):
++    capabilities = mixed_projection_capabilities(projections)
++    if not capabilities or any(c.reason is not None for c in capabilities):
++        outputs = [projection(x) for projection in projections]
++        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
++    codes: list[torch.Tensor] = []
++    stats: list[torch.Tensor] = []
++    caches: list[torch.Tensor | None] = []
++    descriptors: list[int] = []
++    cache_bands: list[int] = []
++    blas_bands: list[int] = []
++    for projection in projections:
++        kernel = projection.kernel
++        config = kernel.config
++        if isinstance(config, Sm70GgufAffineConfig):
++            family, decoder = 0, kernel.bits
++        elif isinstance(config, Sm70GgufLut4Config):
++            family, decoder = 1, kernel.lut_id
++        else:
++            family, decoder = 2, kernel.source_type
++        cb = _admitted_bands(projection.cache_capabilities)
++        bb = _admitted_bands(
++            tuple(
++                c
++                for c in getattr(kernel, "operator_capabilities", ())
++                if "blas" in c.operator
++            )
++        )
++        codes.append(projection.codes)
++        stats.append(projection.stats)
++        caches.append(projection.fp16_cache)
++        descriptors.extend(
++            (
++                family,
++                decoder,
++                config.group_size,
++                projection.gguf_tm_k_ld,
++                projection.gguf_tm_q_ld,
++                config.partition_weight_shape[1],
++                projection.logical_output_size,
++                len(cb),
++                len(bb),
++            )
++        )
++        cache_bands.extend(cb)
++        blas_bands.extend(bb)
++    return torch.ops.vllm.prepared_gguf_mixed_projection(
++        x, codes, stats, caches, descriptors, cache_bands, blas_bands
++    )
++
++
+ def _admitted_bands(capabilities):
+     return [
+         bound
+diff --git a/vllm/model_executor/layers/quantization/gguf_turbomind_moe.py b/vllm/model_executor/layers/quantization/gguf_turbomind_moe.py
+index c92ae23994..cce71d25f2 100644
+--- a/vllm/model_executor/layers/quantization/gguf_turbomind_moe.py
++++ b/vllm/model_executor/layers/quantization/gguf_turbomind_moe.py
+@@ -409,7 +409,7 @@ def load_expert(self, layer, param, weight, shard_id, expert_id):
+                 self.params_dtype,
+                 retain_raw=self.native_enabled
+                 and shard_id in ("w1", "w3")
+-                and self.weight_types[shard_id] in (21, 22),
++                and self.weight_types[shard_id] in (18, 21, 22),
+             )
+         self.builders[shard_id].add(
+             expert_id,
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index e01e1c2885..6b82ec1475 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -11,6 +11,7 @@
+ 
+ import vllm.envs as envs
+ from vllm import _sm70_ops as sm70_ops
++from vllm.config import get_current_vllm_config_or_none
+ from vllm.config.sm70_dflash2 import (
+     capture_sm70_dflash2_config,
+     sm70_dflash2_enabled,
+@@ -181,6 +182,42 @@ def _is_sm70_dflash2_qpn8_rerank_eligible(layer: torch.nn.Module) -> bool:
+     return True
+ 
+ 
++def _sm70_dflash2_qpn8_row_capacity() -> int:
++    config = get_current_vllm_config_or_none()
++    spec = getattr(config, "speculative_config", None)
++    scheduler = getattr(config, "scheduler_config", None)
++    if spec is None or spec.method not in ("dflash", "dflash2") or scheduler is None:
++        return _SM70_DFLASH2_QPN8_MAX_ROWS
++    verify_rows = scheduler.max_num_seqs * (spec.num_speculative_tokens + 1)
++    return min(64, max(_SM70_DFLASH2_QPN8_MAX_ROWS, verify_rows))
++
++
++def _sm70_dflash2_qpn8_candidate_logits(
++    layer: torch.nn.Module, x: torch.Tensor, out: torch.Tensor
++) -> None:
++    # Preserve the qualified C1 reduction. Wider batches use the existing
++    # channel-FP8 M16/M32 kernels; M64 needs two M32 calls, not a dense head.
++    chunk_rows = 32 if x.shape[1] % 256 == 0 else 16
++    for begin in range(0, x.shape[0], chunk_rows):
++        end = min(begin + chunk_rows, x.shape[0])
++        rows = end - begin
++        split_k, chains, fast_decoder = (
++            (_SM70_DFLASH2_QPN8_SPLIT_K, _SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS, False)
++            if rows <= 16
++            else (16, 2, True)
++        )
++        sm70_ops.fp8_qpn8_gemm_sm70_out(
++            out[begin:end],
++            x[begin:end],
++            layer._sm70_dflash2_qpn8_codes,
++            layer._sm70_dflash2_qpn8_scales,
++            split_k,
++            chains,
++            fast_decoder,
++            False,
++        )
++
++
+ @torch.inference_mode()
+ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
+     if getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
+@@ -214,7 +251,11 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
+     fp32_logits = _sm70_dflash2_option("fp32_logits", layer)
+     layer._sm70_dflash2_fp32_logits = fp32_logits
+     rerank_dtype = torch.float32 if fp32_logits else torch.float16
+-    max_rows = _SM70_DFLASH2_QPN8_MAX_ROWS
++    max_rows = (
++        getattr(layer, "_sm70_dflash2_qpn8_row_capacity", _SM70_DFLASH2_QPN8_MAX_ROWS)
++        if fp32_logits
++        else _SM70_DFLASH2_QPN8_MAX_ROWS
++    )
+     # Keep the accepted support density when a worker owns more vocabulary.
+     # A wider shard screens 64 candidates per original-sized vocabulary chunk,
+     # preserving every candidate that separate TP4 shards would have retained.
+@@ -289,7 +330,7 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
+     # [max_rows, 20] allocation for top-16 leaves a row stride of 20 and makes
+     # the result non-contiguous.  The TP all-gather requires contiguous inputs,
+     # and inserting a runtime contiguous() copy would add work to both graphs.
+-    for selector_k in (16, 20, 21):
++    for selector_k in (16, 20, 21, 64):
+         layer.register_buffer(
+             f"_sm70_dflash2_rerank_values_{selector_k}",
+             torch.empty((max_rows, selector_k), dtype=rerank_dtype, device=device),
+@@ -313,10 +354,11 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
+     layer._sm70_dflash2_qpn8_rerank_prepared = True
+     logger.info_once(
+         "SM70 DFlash2 QPN8 rerank layout prepared: %d vocabulary chunks, "
+-        "%d candidates (%s logits).",
++        "%d candidates (%s logits), capacity %d rows.",
+         len(groups),
+         candidates,
+         "FP32" if fp32_logits else "FP16",
++        max_rows,
+     )
+     return True
+ 
+@@ -339,6 +381,10 @@ def _sm70_dflash2_rerank_output_buffers(
+         values = layer._sm70_dflash2_rerank_values_21[:num_rows]
+         positions = layer._sm70_dflash2_rerank_positions_21[:num_rows]
+         ids = layer._sm70_dflash2_rerank_ids_21[:num_rows]
++    elif selector_k == 64:
++        values = layer._sm70_dflash2_rerank_values_64[:num_rows]
++        positions = layer._sm70_dflash2_rerank_positions_64[:num_rows]
++        ids = layer._sm70_dflash2_rerank_ids_64[:num_rows]
+     else:
+         raise ValueError(f"Unsupported DFlash2 rerank top-k: {selector_k}")
+     return values, positions, ids
+@@ -572,7 +618,7 @@ def _maybe_sm70_dflash2_qpn8_rerank(
+         return None
+     if not getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
+         return None
+-    if selector_k not in (16, 20, 21) or bias is not None:
++    if selector_k not in (16, 20, 21, 64) or bias is not None:
+         return None
+     if (
+         selector_k == 21
+@@ -587,7 +633,12 @@ def _maybe_sm70_dflash2_qpn8_rerank(
+ 
+     x_2d = x.reshape(-1, x.shape[-1])
+     num_rows = x_2d.size(0)
+-    if not 1 <= num_rows <= _SM70_DFLASH2_QPN8_MAX_ROWS:
++    if selector_k == 64 and (
++        num_rows <= 8 or not getattr(layer, "_sm70_dflash2_fp32_logits", False)
++    ):
++        # Preserve the C1 conditional sampler's existing dense probe/callback.
++        return None
++    if not 1 <= num_rows <= layer._sm70_dflash2_qpn8_logits.shape[0]:
+         return None
+     if not x_2d.is_contiguous():
+         x_2d = x_2d.contiguous()
+@@ -595,16 +646,7 @@ def _maybe_sm70_dflash2_qpn8_rerank(
+     qpn8_logits = layer._sm70_dflash2_qpn8_logits[:num_rows]
+     qpn8_values = layer._sm70_dflash2_qpn8_values[:num_rows]
+     qpn8_ids = layer._sm70_dflash2_qpn8_ids[:num_rows]
+-    sm70_ops.fp8_qpn8_gemm_sm70_out(
+-        qpn8_logits,
+-        x_2d,
+-        layer._sm70_dflash2_qpn8_codes,
+-        layer._sm70_dflash2_qpn8_scales,
+-        _SM70_DFLASH2_QPN8_SPLIT_K,
+-        _SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS,
+-        False,
+-        False,
+-    )
++    _sm70_dflash2_qpn8_candidate_logits(layer, x_2d, qpn8_logits)
+     # The exact FP16 rerank is permutation-invariant over this approximate
+     # support, so skip the unnecessary 64-element result sort. This keeps the
+     # official PyTorch multiblock selector while avoiding its final bitonic
+@@ -948,6 +990,7 @@ def __init__(
+     ):
+         super().__init__()
+         self._sm70_dflash2_policy = capture_sm70_dflash2_config()
++        self._sm70_dflash2_qpn8_row_capacity = _sm70_dflash2_qpn8_row_capacity()
+         self.prefix = prefix
+ 
+         # Keep the input dimensions.
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index 664d7bcf1b..29d2a4a5b5 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -27,6 +27,10 @@
+ from vllm.distributed import tensor_model_parallel_all_reduce
+ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
++from vllm.model_executor.kernels.ple.disk_rows import (
++    MappedRowGatherKernel,
++    prepare_mapped_row_gather,
++)
+ from vllm.model_executor.kernels.ple.ngram import (
+     SM70_PLE_NGRAM,
+     sm70_ple_ngram_ids,
+@@ -1143,6 +1147,7 @@ def __init__(
+         self._disk_shard_arrays: list[np.ndarray] = []
+         self._disk_shard_pointers: list[int] = []
+         self._disk_mapped_paths: set[str] = set()
++        self._disk_row_kernel: MappedRowGatherKernel | None = None
+         runtime = get_current_vllm_config_or_none()
+         self._release_disk_pages = bool(
+             getattr(
+@@ -1619,6 +1624,17 @@ def _gather_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
+         """
+         if any(shard is None for shard in self._disk_shards):
+             raise RuntimeError("PLE disk lookup started before every shard was loaded")
++        if self._disk_row_kernel is not None:
++            rows = torch.empty(
++                (flat_ids.size, self.head_dim), dtype=torch.uint8, device="cpu"
++            )
++            self._disk_row_kernel.apply(torch.from_numpy(flat_ids), rows)
++            if self._release_disk_pages:
++                for index in np.unique(flat_ids // self._disk_shard_size):
++                    shard = self._disk_shards[int(index)]
++                    assert shard is not None
++                    self._release_mapped_pages(shard)
++            return rows.numpy()
+         shard_size = self._disk_shard_size
+ 
+         # Decode moves only a few dozen rows. Per-shard NumPy dispatch and the
+@@ -1702,8 +1718,16 @@ def _disk_embedding_lookup(
+         flat_ids = ngram_ids.reshape(-1).numpy()
+         if flat_ids.size == 0:
+             return
+-        rows = self._gather_mapped_rows(flat_ids)
+-        output.view(torch.uint8).reshape(-1, self.head_dim).numpy()[:] = rows
++        if self._disk_row_kernel is not None:
++            self._disk_row_kernel.apply(ngram_ids, output.view(torch.uint8))
++            if self._release_disk_pages:
++                for index in np.unique(flat_ids // self._disk_shard_size):
++                    shard = self._disk_shards[int(index)]
++                    assert shard is not None
++                    self._release_mapped_pages(shard)
++        else:
++            rows = self._gather_mapped_rows(flat_ids)
++            output.view(torch.uint8).reshape(-1, self.head_dim).numpy()[:] = rows
+         if profile:
+             faults_after = resource.getrusage(resource.RUSAGE_SELF)
+             logger.info(
+@@ -1934,6 +1958,17 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+             self._disk_shard_pointers = [
+                 array.ctypes.data for array in self._disk_shard_arrays
+             ]
++            runtime = get_current_vllm_config()
++            self._disk_row_kernel, row_admission = prepare_mapped_row_gather(
++                pointers=self._disk_shard_pointers,
++                shard_size=self._disk_shard_size,
++                num_rows=self.ngram_embedding.org_vocab_size,
++                row_bytes=self.head_dim,
++                file_backed=bool(self._disk_mapped_paths),
++                enabled=runtime.kernel_config.ple_disk_row_gather,
++            )
++            runtime.kernel_config.ple_disk_row_readers[self.layer_name] = row_admission
++            logger.info("PLE mapped row-reader admission: %s", row_admission)
+             mapped_gib = (
+                 sum(
+                     shard.numel() * shard.element_size()
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 419b99aec0..d431bfe8ec 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -28,7 +28,7 @@
+ import threading
+ import time
+ from collections.abc import Iterable
+-from dataclasses import dataclass, replace
++from dataclasses import dataclass, field, replace
+ from multiprocessing.connection import Connection
+ from multiprocessing.reduction import ForkingPickler
+ from typing import Any, cast
+@@ -316,6 +316,7 @@ class PleOffloadWorkerHandle:
+     proc: Any
+     death_writer: Connection | None
+     ready_pipe_reader: Connection | None
++    row_readers: dict[str, Any] = field(default_factory=dict)
+ 
+     def close(self) -> None:
+         """Release all process resources. Safe to call more than once."""
+@@ -458,6 +459,7 @@ def wait_for_ready(handle: PleOffloadWorkerHandle) -> None:
+                 f"{message.get('error', 'unknown error')}"
+             )
+         layer_names = message["layer_names"]
++        handle.row_readers = message.get("row_readers", {})
+         logger.info(
+             "Worker ready - %d PleOffloadLayer(s): %s",
+             len(layer_names),
+@@ -530,6 +532,7 @@ def handle_signal(_signum: int, _frame: object) -> None:
+                 {
+                     "status": PleOffloadWorker.READY_STR,
+                     "layer_names": sorted(runner.layer_names),
++                    "row_readers": vllm_config.kernel_config.ple_disk_row_readers,
+                 }
+             )
+             ready_writer.close()
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index f8b8efb745..0271415b46 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -963,6 +963,11 @@ def get_sm70_acceleration_report(self) -> dict:
+ 
+         selections = self.vllm_config.kernel_config.linear_kernel_selections
+         transports = self.vllm_config.kernel_config.ple_result_transports
++        row_readers = (
++            self._ple_offload_worker_handle.row_readers
++            if self._ple_offload_worker_handle is not None
++            else {}
++        )
+         manager = getattr(self.model_runner, "cudagraph_manager", None)
+         mode = (
+             self.compilation_config.cudagraph_mode
+@@ -981,6 +986,7 @@ def get_sm70_acceleration_report(self) -> dict:
+                 self.vllm_config.kernel_config.collective_kernel_selections
+             ),
+             "ple_result_transports": transports,
++            "ple_disk_row_readers": row_readers,
+             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
+             "prepared_gguf_layers": loaded_gguf_layers(self.model_runner.model),
+             "sm70_preparations": loaded_sm70_preparations(self.model_runner.model),
