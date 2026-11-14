@@ -302,3 +302,122 @@ def test_m8_qkvz_is_bitwise_and_ba_matches_dense64(amplitude):
     torch.testing.assert_close(
         torch.cat((b, a), dim=1).double(), reference, atol=0.002, rtol=0.001
     )
+
+
+@pytest.mark.parametrize("rows", [2, 7, 8, 32])
+def test_verify_dispatch_forwards_the_bound_policy(monkeypatch, rows):
+    from vllm.model_executor.layers.quantization import sm70_gdn_ba_verify as ba
+
+    calls = []
+
+    def record(name):
+        def operation(*args, native_policy=()):
+            calls.append((name, args[6], native_policy))
+
+        return operation
+
+    for name in (
+        "fp8_qpn8_dispatch_ba_masked_sm70_out",
+        "fp8_qpn8_dispatch_ba_split_sm70_out",
+    ):
+        monkeypatch.setattr(ba.sm70_ops, name, record(name))
+    x = torch.zeros(rows, 5120, dtype=torch.float16)
+    empty = torch.empty(0)
+    ba._dispatch_gdn_ba_verify(
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        x,
+        empty,
+        empty,
+        empty,
+        ["sm70:1:token"],
+    )
+    expected = (
+        "fp8_qpn8_dispatch_ba_masked_sm70_out"
+        if rows < 8
+        else "fp8_qpn8_dispatch_ba_split_sm70_out"
+    )
+    # Masked below eight rows, the dense workspace stays unused, and the
+    # captured engine policy reaches the native operator.
+    assert calls == [(expected, 0, "sm70:1:token")]
+
+
+@pytest.mark.parametrize("rows", [2, 5, 8, 16, 32])
+def test_verify_dispatch_with_engine_policy_matches_raw_operator(rows):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 required")
+    from types import SimpleNamespace
+
+    from vllm import _sm70_ops as ops
+    from vllm.config import KernelConfig, set_current_vllm_config
+    from vllm.model_executor.layers.quantization import sm70_gdn_ba_verify as ba
+    from vllm.runtime_resources import release_runtime_resources
+
+    if not hasattr(torch.ops._C, "fp8_qpn8_dispatch_ba_masked_sm70_out"):
+        pytest.skip("requires the masked verify operator")
+    cfg = SimpleNamespace(kernel_config=KernelConfig(), lora_config=None)
+    cfg.kernel_config.capture_provider_inputs()
+    with set_current_vllm_config(cfg):
+        native = ba.bind_gdn_ba_verify_policy(cfg)
+    assert native is not None and native.owner is not None
+    torch.manual_seed(20261114)
+    x = torch.randn(rows, 5120, device="cuda", dtype=torch.float16) * 0.125
+    weight = (torch.randn(8192, 5120, device="cuda") * 0.01).to(torch.float8_e4m3fn)
+    codes, scales = ops.fp8_qpn8_prepare_sm70(
+        weight, torch.ones(8192, 1, device="cuda")
+    )
+    ba_weight = (torch.randn(48, 5120, device="cuda") * 0.01).half()
+
+    def outputs():
+        return (
+            x.new_empty(rows, 5120),
+            x.new_empty(rows, 3072),
+            x.new_empty(rows, 24),
+            x.new_empty(rows, 24),
+        )
+
+    raw, bound = outputs(), outputs()
+    raw_operation = (
+        torch.ops._C.fp8_qpn8_dispatch_ba_masked_sm70_out
+        if rows < 8
+        else torch.ops._C.fp8_qpn8_dispatch_ba_split_sm70_out
+    )
+    raw_operation(
+        *raw,
+        x.new_empty(rows, 8192),
+        x.new_empty(rows, 48),
+        0,
+        x,
+        codes,
+        scales,
+        ba_weight,
+    )
+    staging = (x.new_empty(rows, 8192), x.new_empty(rows, 48))
+
+    def run():
+        torch.ops.vllm.sm70_gdn_ba_verify_dispatch(
+            *bound, *staging, x, codes, scales, ba_weight, native.arguments
+        )
+
+    # An engine-bound policy token resolves in its runtime owner, which the
+    # engine activates around execution.
+    with native.owner.activate():
+        run()
+        torch.accelerator.synchronize()
+        for expected, actual in zip(raw, bound):
+            assert torch.equal(actual, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for tensor in bound:
+            tensor.zero_()
+        graph.replay()
+        torch.accelerator.synchronize()
+        for expected, actual in zip(raw, bound):
+            assert torch.equal(actual, expected)
+    graph.reset()
+    release_runtime_resources(cfg)
