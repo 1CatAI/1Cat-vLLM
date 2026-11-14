@@ -14,8 +14,13 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
 from vllm.platforms import current_platform
 
-if current_platform.get_device_capability() < (7, 0):
-    pytest.skip("INT8 Triton requires CUDA 7.0 or higher", allow_module_level=True)
+# Triton 3.6 has no MMA path below SM80, and its FMA fallback cannot promote
+# integer dot operands ("'arith.extf' op operand #0 must be floating-point-like").
+if not current_platform.has_device_capability(80):
+    pytest.skip(
+        "Triton limitation: int8 tl.dot does not compile on CUDA arch < 80",
+        allow_module_level=True,
+    )
 
 vllm_config = VllmConfig()
 
