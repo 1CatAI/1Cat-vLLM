@@ -33,7 +33,11 @@ def metadata(rows, width, **overrides):
 @pytest.mark.parametrize("heads", [12, 24])
 def test_admission_has_no_max_batch_binding(monkeypatch, rows, heads):
     monkeypatch.setenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "1")
-    monkeypatch.setattr(module.current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setattr(
+        module.current_platform,
+        "is_device_capability",
+        lambda capability, device_id=None: capability == 70,
+    )
     assert module._can_fuse_gdn_projection_split(
         metadata(rows, heads * 1024 // 3), metadata(rows, heads * 2)
     ) == (rows > 1)
@@ -53,7 +57,11 @@ def test_admission_has_no_max_batch_binding(monkeypatch, rows, heads):
 )
 def test_unsupported_input_falls_back(monkeypatch, change):
     monkeypatch.setenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "1")
-    monkeypatch.setattr(module.current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setattr(
+        module.current_platform,
+        "is_device_capability",
+        lambda capability, device_id=None: capability == 70,
+    )
     assert not module._can_fuse_gdn_projection_split(
         metadata(4, 4096, **change), metadata(4, 24)
     )
@@ -65,7 +73,9 @@ def test_off_and_non_sm70_fall_back(monkeypatch):
     assert not module._can_fuse_gdn_projection_split(q, ba)
     monkeypatch.setenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "1")
     monkeypatch.setattr(
-        module.current_platform, "is_device_capability", lambda _: False
+        module.current_platform,
+        "is_device_capability",
+        lambda capability, device_id=None: False,
     )
     assert not module._can_fuse_gdn_projection_split(q, ba)
 

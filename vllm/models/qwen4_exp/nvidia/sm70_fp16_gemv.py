@@ -32,14 +32,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
-@torch.compiler.assume_constant_result
-def _volta_device(device_id: int | None) -> bool:
-    # The GDN projection split runs inside the compiled backbone. Capability is
-    # static for the device of the traced tensors; tracing the platform's
-    # cached capability query fails the full-graph compile.
-    return current_platform.is_device_capability(70, device_id=device_id)
-
-
 class _GemvPlan(NamedTuple):
     block_k: int
     num_warps: int
@@ -169,7 +161,7 @@ def _can_fuse_gdn_projection_split(qkvz: torch.Tensor, ba: torch.Tensor) -> bool
         and qkvz.is_cuda
         and ba.is_cuda
         and qkvz.device == ba.device
-        and _volta_device(qkvz.device.index)
+        and current_platform.is_device_capability(70, device_id=qkvz.device.index)
     )
 
 

@@ -73,7 +73,9 @@ def test_norm_retains_its_policy_after_initialization_context_ends(monkeypatch):
     from vllm.model_executor.layers import layernorm
 
     monkeypatch.setattr(
-        norm_provider, "_sm70_gemma_long_prefill_available", lambda: True
+        norm_provider.current_platform,
+        "is_device_capability",
+        lambda capability, device_id=None: capability == 70,
     )
     monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
     cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
