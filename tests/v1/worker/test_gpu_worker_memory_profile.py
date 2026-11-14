@@ -11,6 +11,10 @@ import torch
 
 from vllm.config import CUDAGraphMode
 from vllm.config.execution_policy import GraphPolicy
+from vllm.distributed.device_communicators.cuda_wrapper import (
+    CUDA_LIMIT_STACK_SIZE,
+    CudaRTLibrary,
+)
 from vllm.platforms import current_platform
 from vllm.utils.mem_utils import MemorySnapshot
 from vllm.v1.core import kv_cache_utils
@@ -63,6 +67,17 @@ class _FakeRunner:
 
     def get_kv_cache_spec(self) -> dict:
         return {}
+
+
+class _StackGrowingRunner(_FakeRunner):
+    """The cold compile also launches a heavily spilling autotune candidate,
+    which grows the driver's per-thread stack limit, as Triton's autotuning
+    did on a Quadro RTX 8000 (1 KiB -> 10 KiB, 0.63 GiB of local memory)."""
+
+    def profile_run(self) -> None:
+        if self.calls == 0:
+            CudaRTLibrary().cudaDeviceSetLimit(CUDA_LIMIT_STACK_SIZE, 10240)
+        super().profile_run()
 
 
 @pytest.mark.parametrize(
@@ -153,3 +168,42 @@ def test_explicit_kv_bytes_profiles_once_and_skips_memory_estimation() -> None:
     )
     assert worker.determine_available_memory() == 128 * MiB
     assert calls == ["profile"]
+
+
+def test_cold_compile_stack_growth_is_not_charged(monkeypatch) -> None:
+    device = torch.device("cuda:0")
+    torch.accelerator.empty_cache()
+    cudart = CudaRTLibrary()
+    original = cudart.cudaDeviceGetLimit(CUDA_LIMIT_STACK_SIZE)
+    worker = Worker.__new__(Worker)
+    worker.use_v2_model_runner = False
+    worker.device = device
+    worker.init_snapshot = MemorySnapshot(device=device)
+    weights_bytes = 512 * MiB
+    weights = torch.empty(weights_bytes, dtype=torch.uint8, device=device)
+    worker.requested_memory = int(worker.init_snapshot.free_memory * 0.9)
+    worker.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
+    )
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.NONE,
+            cudagraph_capture_sizes=None,
+            runtime=GraphPolicy(estimate_graph_memory=False),
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        speculative_config=None,
+    )
+    worker.model_runner = _StackGrowingRunner(device, weights_bytes)
+    try:
+        worker.determine_available_memory()
+        restored = cudart.cudaDeviceGetLimit(CUDA_LIMIT_STACK_SIZE)
+    finally:
+        cudart.cudaDeviceSetLimit(CUDA_LIMIT_STACK_SIZE, original)
+    assert restored == original
+    # The grown local memory (>= 9 KiB for every thread the device can hold)
+    # is not charged as non-torch memory of the steady state.
+    props = torch.cuda.get_device_properties(device)
+    threads = props.multi_processor_count * props.max_threads_per_multi_processor
+    assert worker.non_torch_memory < threads * 4096
+    del weights

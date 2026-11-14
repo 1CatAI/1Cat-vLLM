@@ -25,6 +25,9 @@ logger = init_logger(__name__)
 
 cudaError_t = ctypes.c_int
 cudaMemcpyKind = ctypes.c_int
+cudaLimit = ctypes.c_int
+# cudaLimitStackSize, the per-thread stack (local memory) of device code.
+CUDA_LIMIT_STACK_SIZE = 0
 
 
 class cudaIpcMemHandle_t(ctypes.Structure):
@@ -46,6 +49,14 @@ class CudaRTLibrary:
         Function("cudaDeviceSynchronize", cudaError_t, []),
         # ​cudaError_t cudaDeviceReset ( void )
         Function("cudaDeviceReset", cudaError_t, []),
+        # cudaError_t cudaDeviceGetLimit ( size_t* pValue, cudaLimit limit )
+        Function(
+            "cudaDeviceGetLimit",
+            cudaError_t,
+            [ctypes.POINTER(ctypes.c_size_t), cudaLimit],
+        ),
+        # cudaError_t cudaDeviceSetLimit ( cudaLimit limit, size_t value )
+        Function("cudaDeviceSetLimit", cudaError_t, [cudaLimit, ctypes.c_size_t]),
         # const char* 	cudaGetErrorString ( cudaError_t error )
         Function("cudaGetErrorString", ctypes.c_char_p, [cudaError_t]),
         # ​cudaError_t 	cudaMalloc ( void** devPtr, size_t size )
@@ -85,6 +96,8 @@ class CudaRTLibrary:
         "cudaSetDevice": "hipSetDevice",
         "cudaDeviceSynchronize": "hipDeviceSynchronize",
         "cudaDeviceReset": "hipDeviceReset",
+        "cudaDeviceGetLimit": "hipDeviceGetLimit",
+        "cudaDeviceSetLimit": "hipDeviceSetLimit",
         "cudaGetErrorString": "hipGetErrorString",
         "cudaMalloc": "hipMalloc",
         "cudaFree": "hipFree",
@@ -153,6 +166,14 @@ class CudaRTLibrary:
 
     def cudaDeviceReset(self) -> None:
         self.CUDART_CHECK(self.funcs["cudaDeviceReset"]())
+
+    def cudaDeviceGetLimit(self, limit: int) -> int:
+        value = ctypes.c_size_t()
+        self.CUDART_CHECK(self.funcs["cudaDeviceGetLimit"](ctypes.byref(value), limit))
+        return value.value
+
+    def cudaDeviceSetLimit(self, limit: int, value: int) -> None:
+        self.CUDART_CHECK(self.funcs["cudaDeviceSetLimit"](limit, value))
 
     def cudaMalloc(self, size: int) -> ctypes.c_void_p:
         devPtr = ctypes.c_void_p()
