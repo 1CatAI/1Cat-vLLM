@@ -17,6 +17,7 @@ from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
     FlashInferCudnnNvFp4LinearKernel,
     FlashInferTrtllmNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.qpn.nvfp4 import TurboMindNvFp4LinearKernel
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_w4a4_mxfp4 as mxfp4_scheme,
 )
@@ -28,6 +29,11 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (  # noqa: E501
     CompressedTensorsW4A4Fp4,
+)
+from vllm.model_executor.models.config import (
+    sm70_nvfp4_down_qualified,
+    sm70_nvfp4_gate_up_qualified,
+    sm70_nvfp4_qpn4_qualified,
 )
 
 
@@ -120,65 +126,59 @@ def _make_sm70_tp4_nvfp4_down_layer() -> torch.nn.Module:
 def test_sm70_tp4_nvfp4_gate_up_match_is_shape_exact():
     layer = _make_sm70_tp4_nvfp4_gate_up_layer()
 
-    assert nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
+    assert sm70_nvfp4_gate_up_qualified(layer)
 
     layer.tp_size = 2
-    assert nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
+    assert sm70_nvfp4_gate_up_qualified(layer)
     layer.tp_size = 4
     layer.output_size_per_partition = 8703
-    assert not nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
+    assert not sm70_nvfp4_gate_up_qualified(layer)
     layer.output_size_per_partition = 8704
     layer.prefix = "model.language_model.layers.0.mlp.down_proj"
-    assert not nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
+    assert not sm70_nvfp4_gate_up_qualified(layer)
 
 
 def test_sm70_tp4_nvfp4_down_match_is_shape_exact():
     layer = _make_sm70_tp4_nvfp4_down_layer()
 
-    assert nvfp4_scheme._is_sm70_tp4_nvfp4_down(layer)
+    assert sm70_nvfp4_down_qualified(layer)
 
     layer.input_size_per_partition = 4351
-    assert not nvfp4_scheme._is_sm70_tp4_nvfp4_down(layer)
+    assert not sm70_nvfp4_down_qualified(layer)
     layer.input_size_per_partition = 4352
     layer.output_size_per_partition = 5119
-    assert not nvfp4_scheme._is_sm70_tp4_nvfp4_down(layer)
+    assert not sm70_nvfp4_down_qualified(layer)
 
 
-def test_sm70_nvfp4_qpn4_runtime_contract_is_single_sequence_no_mtp(
-    monkeypatch,
-):
+def test_sm70_nvfp4_qpn4_runtime_contract_is_single_sequence_no_mtp():
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_seqs=1),
         speculative_config=None,
     )
-    monkeypatch.setattr(
-        nvfp4_scheme,
-        "get_current_vllm_config",
-        lambda: config,
-    )
 
-    assert nvfp4_scheme._is_sm70_nvfp4_qpn4_runtime_contract()
+    assert sm70_nvfp4_qpn4_qualified(config)
 
     config.scheduler_config.max_num_seqs = 2
-    assert not nvfp4_scheme._is_sm70_nvfp4_qpn4_runtime_contract()
+    assert not sm70_nvfp4_qpn4_qualified(config)
     config.scheduler_config.max_num_seqs = 1
     config.speculative_config = object()
-    assert not nvfp4_scheme._is_sm70_nvfp4_qpn4_runtime_contract()
+    assert not sm70_nvfp4_qpn4_qualified(config)
 
 
 def test_nvfp4_scheme_delegates_fused_silu_only_for_prepared_layer(monkeypatch):
     scheme = CompressedTensorsW4A4Fp4()
+    # process_weights_after_loading selects this kernel on SM70; this test skips it.
+    scheme.kernel = object.__new__(TurboMindNvFp4LinearKernel)
     layer = torch.nn.Module()
     x = torch.ones((1, 4), dtype=torch.float16)
     expected = torch.full((1, 2), 7.0, dtype=torch.float16)
 
-    monkeypatch.setattr(nvfp4_scheme.sm70_tm, "has_prepared_linear", lambda _: True)
     monkeypatch.setattr(
         nvfp4_scheme.sm70_tm,
         "apply_prepared_fused_silu_and_mul",
-        lambda prepared_layer, prepared_x: expected
-        if prepared_layer is layer and prepared_x is x
-        else None,
+        lambda prepared_layer, prepared_x: (
+            expected if prepared_layer is layer and prepared_x is x else None
+        ),
     )
 
     assert scheme.apply_fused_silu_and_mul(layer, x) is expected

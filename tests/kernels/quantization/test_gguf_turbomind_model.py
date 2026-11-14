@@ -66,6 +66,8 @@ def test_prepared_dense_projection_uses_family_kernel_and_graph(weight_type):
 def linear_method(layout=None, output_sizes=(64, 64, 64, 64)):
     method = GGUFLinearMethod(GGUFConfig(), layout)
     layer = torch.nn.Module()
+    # LinearBase records its prefix; GGUF preparation scopes projection planes by it.
+    layer.prefix = "test.linear"
     layer.quant_method = method
     method.create_weights(
         layer, 512, list(output_sizes), 512, sum(output_sizes), torch.float16

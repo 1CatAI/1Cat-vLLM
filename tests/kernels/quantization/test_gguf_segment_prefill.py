@@ -60,13 +60,15 @@ def test_segment_storage_prefill_and_decode(source, k, n, minimum):
             return apply_prepared_gguf_projections(x, projections)
 
         compiled = torch.compile(run, backend="eager", fullgraph=True, dynamic=True)
-        for m in (minimum - 1, minimum, minimum + 1, minimum * 2 + 1, 8, 20, 33):
+        # The segment kernel takes 1-40 rows, and 41-64 rows in 20-row slices
+        # (#1242); 65 rows is the smallest M left on the calibrated GEMM route.
+        for m in (minimum - 1, minimum, minimum + 1, minimum * 2 + 1, 8, 20, 33, 65):
             x = (torch.randn(m, k, device="cuda") * 0.125).half()
             operator = (
                 "gguf_affine_blas_sm70_out"
                 if m >= minimum
                 else "gguf_dense_segments_sm70_out"
-                if m in (8, 20)
+                if m <= 64
                 else "gguf_affine_gemm_sm70_out"
             )
             with NativeDispatchTrace() as trace:

@@ -28,7 +28,16 @@ def packed_rows(weight_type, rows, k, seed):
         rng.standard_normal((rows, k // block))
         * 2.0 ** rng.integers(-14, 4, (rows, k // block))
     ).astype(np.float16)
-    data[..., :2] = d.view(np.uint8).reshape(rows, k // block, 2)
+    if weight_type == 29:
+        # IQ1_M has no leading FP16 scale: its four nibbles are the top bits
+        # of the four little-endian scale words at bytes 48-55 of the block.
+        bits = d.view(np.uint16)
+        for word in range(4):
+            nibble = ((bits >> (4 * word)) & 0xF).astype(np.uint8)
+            high = data[..., 49 + 2 * word]
+            data[..., 49 + 2 * word] = (high & 0x0F) | (nibble << 4)
+    else:
+        data[..., :2] = d.view(np.uint8).reshape(rows, k // block, 2)
     return data.reshape(rows, -1)
 
 
@@ -37,15 +46,14 @@ def packed_rows(weight_type, rows, k, seed):
 def test_lattice_storage_matches_host(weight_type, rows, k):
     data = packed_rows(weight_type, rows, k, weight_type * 1000 + k)
     codes, stats = transcode_lattice(data, weight_type).mma884_storage()
-    stats = stats.view({4: np.int32, 8: np.int64}[stats.itemsize])
+    # IQ1_M metadata is one FP16 group scale per 16-bit word.
+    stats = stats.view({2: np.int16, 4: np.int32, 8: np.int64}[stats.itemsize])
     actual_codes, actual_stats = dev.lattice_storage(
         torch.from_numpy(data).cuda(), weight_type
     )
     np.testing.assert_array_equal(actual_codes.cpu().numpy(), codes)
-    assert (
-        actual_stats.dtype
-        == {np.int32: torch.int32, np.int64: torch.int64}[stats.dtype.type]
-    )
+    signed = {np.int16: torch.int16, np.int32: torch.int32, np.int64: torch.int64}
+    assert actual_stats.dtype == signed[stats.dtype.type]
     np.testing.assert_array_equal(actual_stats.cpu().numpy(), stats)
 
 

@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.model_executor.layers import sm70_topk_gather
 from vllm.model_executor.layers.attention import attention as attention_module
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsKVCacheMethod,
@@ -35,7 +36,11 @@ def _set_platform(monkeypatch, capability=70, enabled=True, cuda=True):
             has_device_capability=lambda required: capability >= required,
         ),
     )
-    monkeypatch.setattr(attention_module.envs, "VLLM_SM70_FLASH_ATTN_V100", enabled)
+    monkeypatch.setattr(
+        attention_module,
+        "flash_v100_policy",
+        lambda: SimpleNamespace(enabled=enabled),
+    )
 
 
 @pytest.mark.parametrize("strategy", [None, "tensor", "attn_head"])
@@ -96,10 +101,10 @@ def test_compressed_subclass_cannot_bypass_scale_processing_guard(monkeypatch):
 def test_dflash2_dense_candidates_padding_tp_and_scaling(
     monkeypatch, world_size, softcap, quantized
 ):
-    monkeypatch.setattr(dflash2_module.envs, "VLLM_SM70_DFLASH2_QUANT_LM_HEAD", True)
-    monkeypatch.setattr(
-        dflash2_module, "get_tensor_model_parallel_world_size", lambda: world_size
-    )
+    for module in (dflash2_module, sm70_topk_gather):
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_world_size", lambda: world_size
+        )
     # Padded entries would win both rows if masking were omitted.
     local_logits = torch.tensor([[1, 4, 2, 99, 100], [5, 1, 3, 98, 99.0]])
     apply = Mock(return_value=local_logits.clone())
@@ -114,12 +119,18 @@ def test_dflash2_dense_candidates_padding_tp_and_scaling(
         shard_indices=SimpleNamespace(
             num_org_vocab_padding=2, org_vocab_start_index=10
         ),
+        num_embeddings_padded=64,
     )
     outer = SimpleNamespace(
         lm_head=lm_head,
         model=SimpleNamespace(candidate_selector=SimpleNamespace(top_k=2)),
         output_multiplier=0.5,
         final_logit_softcapping=softcap,
+        # Engine-owned DFlash2 policy; without the compact pair gather, values
+        # and ids take the two all-gathers checked below.
+        _sm70_dflash2_policy=SimpleNamespace(resolved=True, quant_lm_head=True),
+        _packed_topk_enabled=False,
+        _packed_topk_selections=None,
     )
     local_values, local_ids = torch.topk(local_logits[:, :3], 2, dim=-1)
     shard_scores = [local_logits[:, :3]]
@@ -163,11 +174,11 @@ def test_dflash2_dense_candidates_padding_tp_and_scaling(
         fast_path.assert_called_once_with(hidden, 2)
 
 
-def test_quantized_dflash2_head_keeps_explicit_opt_in(monkeypatch):
-    monkeypatch.setattr(dflash2_module.envs, "VLLM_SM70_DFLASH2_QUANT_LM_HEAD", False)
+def test_quantized_dflash2_head_keeps_explicit_opt_in():
     apply = Mock()
     outer = SimpleNamespace(
-        lm_head=SimpleNamespace(quant_method=SimpleNamespace(apply=apply))
+        lm_head=SimpleNamespace(quant_method=SimpleNamespace(apply=apply)),
+        _sm70_dflash2_policy=SimpleNamespace(resolved=True, quant_lm_head=False),
     )
     with pytest.raises(ValueError, match="VLLM_SM70_DFLASH2_QUANT_LM_HEAD=1"):
         dflash2_module.DFlash2Qwen3ForCausalLM.compute_candidates(
