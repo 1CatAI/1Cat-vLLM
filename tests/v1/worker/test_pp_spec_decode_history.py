@@ -68,17 +68,17 @@ def test_real_runner_keeps_each_requests_accepted_history(monkeypatch, num_reque
     import torch
 
     import vllm.v1.worker.gpu_model_runner as runner_module
-    from tests.v1.core.utils import create_requests, create_scheduler
+    from tests.v1.core.utils import (
+        create_requests,
+        create_scheduler,
+        pretend_gpus_without_capability,
+    )
     from vllm.config import DeviceConfig
     from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
-    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
     # CPU scheduler fixtures have no physical capability for simulated PP ranks.
-    monkeypatch.setattr(
-        "vllm.config.parallel.current_platform.get_device_capability",
-        lambda device_id=0: None,
-    )
+    pretend_gpus_without_capability(monkeypatch, 2)
     monkeypatch.setattr(
         runner_module,
         "get_pp_group",

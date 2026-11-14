@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -41,6 +42,9 @@ def test_runner_target_protocol_reuses_completed_projection(
     runner.sampler = object()
     runner._sm70_greedy_capability = False
     runner.lora_config = object()  # Graph admission is passed to the feature owner.
+    # No request of the batch has an active LoRA adapter (bb48f5d76 keeps
+    # LoRA batches on dense logits).
+    runner.lora_state = SimpleNamespace(lora_ids=np.zeros(1, dtype=np.int32))
 
     def project(hidden):
         calls.append("project")
@@ -79,6 +83,7 @@ def test_runner_target_protocol_reuses_completed_projection(
         seq_lens=torch.tensor([4]),
         cu_num_logits=torch.tensor([0, 2]),
         idx_mapping=torch.tensor([0]),
+        idx_mapping_np=np.array([0]),
     )
     constraints = (
         SimpleNamespace(structured_output_request_ids=["r"], grammar_bitmask=object())

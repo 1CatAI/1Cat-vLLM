@@ -28,6 +28,11 @@ def test_mtp_target_hooks_fall_back_to_normal_sampling() -> None:
     speculator = eagle_speculator.EagleSpeculator.__new__(
         eagle_speculator.EagleSpeculator
     )
+    # Argmax drafts without the opt-in SM70 compact target sampling (011a8ce1e).
+    speculator.draft_logits = None
+    speculator.vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(sm70_sparse_target_sampling=False)
+    )
     input_batch = SimpleNamespace()
     hidden_states = torch.ones(1, 4)
     assert speculator.prepare_target_context(input_batch, hidden_states, None) is None
@@ -164,11 +169,20 @@ def test_qwen4_exp_mtp_v2_unpacks_logits_and_feedback_hidden_states(
     assert actual_feedback_hidden is feedback_hidden
 
 
-def test_qwen4_exp_mtp_v2_uses_local_argmax_without_full_logits() -> None:
+@pytest.mark.parametrize("reduced_vocab", [False, True])
+def test_qwen4_exp_mtp_v2_uses_local_argmax_without_full_logits(
+    reduced_vocab: bool,
+) -> None:
     speculator = eagle_speculator.EagleSpeculator.__new__(
         eagle_speculator.EagleSpeculator
     )
     speculator.use_local_argmax_reduction = True
+    # With a draft_token_map the local argmax picks a column of the reduced
+    # head, which must map back to its target token id.
+    col_to_target = torch.arange(16) * 3
+    speculator.draft_vocab = (
+        SimpleNamespace(col_to_target=col_to_target) if reduced_vocab else None
+    )
 
     class DraftModel:
         def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -187,7 +201,10 @@ def test_qwen4_exp_mtp_v2_uses_local_argmax_without_full_logits() -> None:
         draft_logits=None,
     )
 
-    torch.testing.assert_close(top_tokens, torch.tensor([7, 11]))
+    expected = torch.tensor([7, 11])
+    if reduced_vocab:
+        expected = col_to_target[expected]
+    torch.testing.assert_close(top_tokens, expected)
 
 
 def test_qwen4_exp_mtp_v2_reuses_step_zero_qsa_indices() -> None:

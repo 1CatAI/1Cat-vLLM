@@ -387,6 +387,8 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.mixed_prefill_budget = MixedPrefillBudget(1, 0.0)
     # No speculative decoding, as __init__ derives without a speculative config.
     scheduler.use_lookahead_block_hashes = False
+    # DeepSeek-V4.1 PP look-ahead off, as __init__ sets it by default (9fbc11c6f).
+    scheduler.v41_ahead = False
 
     def free_request(req, delay_free_blocks=False):
         scheduler.finished_req_ids.add(req.request_id)
