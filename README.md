@@ -6,6 +6,8 @@
 
 # 1Cat-LLM
 
+**English** · [简体中文](README.zh-CN.md)
+
 ## Make Volta Fast Again
 
 ### Modern LLM inference for NVIDIA Tesla V100 / SM70
@@ -20,15 +22,7 @@ New **[GGUF support](#gguf-support)** brings a wider choice of community-quantiz
 
 **The rename is planned.** Repository links, release filenames and installation commands below retain their current names during the transition.
 
-> Recommended checkpoints:
->
-> Target: `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4`
->
-> MoE: `RadixArk/Qwen3.8-Flash-Next-NVFP4`
->
-> DFlash2 draft: `incoai/Qwen3.8-27B-DFlash2`
-
-<strong>4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s</strong>
+**Published release · [v1.5.3](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.3) · November 14, 2026**
 
 > Tesla V100 was released in 2017.
 >
@@ -46,19 +40,22 @@ Our goal is:
 
 > **Make modern models actually run fast on V100.**
 
-The recorded four-card Tesla V100 16GB demo runs **Qwen3.8-27B-NVFP4 + DFlash2** through 1Cat-vLLM at roughly:
+# Demo and v1.5.3 Benchmarks
 
-# ≈260 tokens/s
+**892 aggregate tok/s measured at 8K with eight concurrent requests** using Qwen3.8-27B NVFP4 with native MTP4. The v1.5.3 tests use **4× V100-SXM2 32GB** (NVLink, TP4) at 877 MHz memory and a 300 W limit. [v1.5.3 benchmark report](http://156.226.174.161:48152/1.5.3/)
 
-Demo: [4× V100 running Qwen3.8-27B-NVFP4-DFlash2](https://www.bilibili.com/video/BV1kstb6dEaF/)
+| v1.5.3 workload · temperature 0 | 27B DFlash2 | 27B MTP4 | Flash-Next MTP4 |
+| --- | --- | --- | --- |
+| 8K · C8 · measured aggregate tok/s | 479 | 892 | 408 |
+| 8K · C8 · estimated aggregate tok/s at 70% draft acceptance | 1,120 | 1,072 | 584 |
+| 64K · C4 · measured ms per decode step | 32.68 | 24.20 | 34.03 |
+| HumanEval · C1 · measured tok/s | 545 | 370 | 276 |
 
-> **≈260 tok/s is a real-machine demo headline, not a universal fixed decode rate.**
->
-> Every benchmark below retains its own hardware, model, context length, batch size, KV dtype, sampling policy, and speculative-decoding contract. Attention TFLOP/s, prefill tok/s, target-only decode tok/s, and speculative decode tok/s are not interchangeable metrics.
+HumanEval uses 20 prompts with natural stopping. C1, C4 and C8 denote one, four and eight concurrent requests.
 
-**Latest published release: [v1.5.1](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.1), October 3, 2026.** The release measurements below use **4× V100-SXM2 32GB**; they are a separate contract from the 16GB demo.
+The Bilibili walkthrough shows the earlier **v1.5.2** release. [Watch the demo](https://www.bilibili.com/video/BV1ouWy67Esz/)
 
-This README also covers merged development work through [main `b379775d`](https://github.com/1CatAI/1Cat-vLLM/commit/b379775dae6dc1cdda69b70777c6992ebebcb6db), October 5, 2026. The newer GGUF and mixed-load changes require a corresponding source/development build; they are not included merely by installing the v1.5.1 release wheel.
+The published wheel and Git tag resolve to [`cb97f379b`](https://github.com/1CatAI/1Cat-vLLM/commit/cb97f379b67eb9f5703709db961d9dabcdecbcff). See the [English release notes](https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.5.3/RELEASE_NOTES.en.md), [中文发布说明](https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.5.3/RELEASE_NOTES.zh-CN.md), and [release PR index](https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.5.3/PR_INDEX.md).
 
 ---
 
@@ -70,24 +67,44 @@ Keep the Python package and Flash-V100 extension from the same build. The origin
 Historical E5M2/FP16-partial performance results below keep their original
 configuration and are not speed claims for these precision defaults.
 
-## v1.5.1: Measured Release-to-Release Decode
+## v1.5.3 · Published-wheel Decode
 
-| Input / workload | v1.5.0 | v1.5.1 | Comparison |
-|---|---:|---:|---|
-| 4K · single request | 103.87 tok/s | **229.34 tok/s** | **+120.80%** |
-| 32K · single request | 49.04 tok/s | **201.18 tok/s** | **+310.24%** |
-| 128K · single request | No completed baseline | **171.43 tok/s** | No speedup calculated |
-| 32K · C4 common decode window | Not measured under the same contract | **445.45 aggregate tok/s** | New-version result only |
+**Hardware and build.** The release used 4× V100-SXM2 32GB (NVLink, TP4), 62 GB reported host RAM, ECC on, 877 MHz memory, up to 1530 MHz core, and a 300 W limit. The wheel is built from `cb97f379b` for CUDA 12.8. The three profiles use FP16 compute, up to eight scheduled sequences, a 4096-token prefill budget, and a 262144-token service limit. The 27B runs use the **Unsloth** NVFP4 checkpoint. Flash-Next uses NVFP4 with FP16 attention KV and host-backed FP8 E4M3 QSA history. See the launch profiles below for the KV and draft settings. The report identifies the 27B target family and pins the DFlash2 draft in the launch recipe. It does not publish the exact evaluated target revisions, synthetic prompt IDs, run repetitions, output cap, or complete non-greedy sampling settings. [Release notes](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.3) · [Detailed benchmark report](http://156.226.174.161:48152/1.5.3/#data)
 
-Speedup percentages are calculated from the displayed throughput values.
+**Measured synthetic decode.** Cells show **ms per engine step / reported aggregate tok/s** at temperature 0. This workload uses synthetic filler and a short question. Timings cover the decode window where all requests are generating and exclude prefill. Aggregate throughput is copied from the report's measured column. Its per-request column is a separate measurement and multiplying it by concurrency can give a different total. The report does not give raw event logs to reconcile those windows.
 
-**Single-request contract:** official wheels, the same 4× V100-SXM2-32GB / TP4, QUASAR 27B NVFP4 target, DFlash2 q7, FP16 compute/draft KV, E4M3 target KV, CUDA 12.8 / Torch 2.10, prefix caching, asynchronous scheduling and CUDA Graphs. Both versions use the 1.5.1 launch settings: 262144 maximum context, 8192-token prefill budget, four sequence slots, memory utilization 0.80, KV/Mamba blocks 2048/8192. Sampling is T=1, top-p=.95, top-k=20, seed=0, up to 256 output tokens with normal EOS. Each value is the median of three warm requests after one cold request, from one successful startup per version.
+| Input | Concurrent requests | 27B DFlash2 | 27B MTP4 | Flash-Next MTP4 |
+| --- | --- | --- | --- | --- |
+| 8K | 1 | 13.87 / 243 | 12.99 / 229 | 16.93 / 141 |
+| 8K | 2 | 17.33 / 338 | 15.23 / 329 | 25.92 / 180 |
+| 8K | 4 | 23.80 / 461 | 18.93 / 561 | 32.13 / 228 |
+| 8K | 8 | 42.23 / 479 | 28.39 / 892 | 51.90 / 408 |
+| 64K | 1 | 16.08 / 204 | 14.72 / 204 | 17.76 / 136 |
+| 64K | 2 | 21.68 / 264 | 17.70 / 315 | 27.85 / 181 |
+| 64K | 4 | 32.68 / 304 | 24.20 / 552 | 34.03 / 265 |
+| 64K | 8 | 59.76 / 322 | 38.61 / 720 | — |
 
-Pure decode excludes TTFT/prefill. At 32K, the old wheel reused 28,672 prefix tokens while the new wheel recomputed the prompt; both decoded with the same 32,768-token input context. This is a comparison under one shared deployment recipe, not each version's best possible tuning. The old 128K request did not finish within the 180-second test timeout.
+**Normalized estimates at 70% draft acceptance.** Cells show **per-request / aggregate tok/s** (C1 shows one value). The report divides 5.9 emitted tokens per DFlash2 q7 step or 3.8 per MTP4 step by measured step time, rounds the per-request rate, and multiplies by concurrency. These estimates assume the same acceptance across workloads and exclude prefill. A dash denotes a missing measurement. The report has no 64K temperature-1.0 rows or Flash-Next 64K C8 rows.
 
-**C4 contract:** fixed 32K synthetic inputs, 256 forced output tokens per request, T=.7 / top-p=.8 / top-k=20, fixed per-request seeds, one warmup cohort and three measured cohorts from one startup. Throughput counts returned token IDs only while all four requests are decoding. Forced-length timing is separate from natural-EOS quality testing.
+| Input | Profile | Temperature | C1 | C2 | C4 | C8 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8K | 27B DFlash2 | 0 | 426 | 340 / 680 | 248 / 992 | 140 / 1120 |
+| 8K | 27B DFlash2 | 0.6 | 403 | 325 / 650 | 241 / 964 | 138 / 1104 |
+| 8K | 27B DFlash2 | 1 | 401 | 324 / 648 | 241 / 964 | 138 / 1104 |
+| 8K | 27B MTP4 | 0 | 293 | 250 / 500 | 201 / 804 | 134 / 1072 |
+| 8K | 27B MTP4 | 0.6 | 242 | 212 / 424 | 175 / 700 | 120 / 960 |
+| 8K | 27B MTP4 | 1 | 243 | 212 / 424 | 175 / 700 | 122 / 976 |
+| 8K | Flash-Next MTP4 | 0 | 224 | 147 / 294 | 118 / 472 | 73 / 584 |
+| 8K | Flash-Next MTP4 | 0.6 | 186 | 133 / 266 | 111 / 444 | 75 / 600 |
+| 8K | Flash-Next MTP4 | 1 | 186 | 133 / 266 | 112 / 448 | 72 / 576 |
+| 64K | 27B DFlash2 | 0 | 367 | 272 / 544 | 181 / 724 | 99 / 792 |
+| 64K | 27B DFlash2 | 0.6 | 350 | 262 / 524 | 178 / 712 | 98 / 784 |
+| 64K | 27B MTP4 | 0 | 258 | 215 / 430 | 157 / 628 | 98 / 784 |
+| 64K | 27B MTP4 | 0.6 | 221 | 189 / 378 | 146 / 584 | 94 / 752 |
+| 64K | Flash-Next MTP4 | 0 | 214 | 136 / 272 | 112 / 448 | — |
+| 64K | Flash-Next MTP4 | 0.6 | 180 | 127 / 254 | 103 / 412 | — |
 
-Evidence and complete settings: [v1.5.1 release notes](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.1). These release checks include output-health spot checks, not a new broad dataset-quality campaign.
+Stock-clock v1.5.3 timings and the previous release's elevated-clock results use different hardware settings. The full report contains measured per-request rates, p90 step times, emitted tokens per step and TTFT for each available row. [Release notes](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.3) · [Detailed benchmark report](http://156.226.174.161:48152/1.5.3/#data)
 
 ## Long-Context Attention: 17.92 → 47.1 → ≈60.8 → ≈71 TFLOP/s
 
@@ -109,13 +126,30 @@ The later FP32 QK/PV record is **71.111 / 70.221 / 69.982 TFLOP/s** for TP4 / TP
 
 # 🚀 Real Model Benchmarks
 
-The table below preserves **complete-model / API / pure-decode / speculative-decode** measurements from their original PRs. They are historical evidence under separate contracts; the current published-wheel comparison is above.
+## v1.5.3 · Six Real Prompt Sets
+
+**Measured single-request tok/s / draft acceptance**, temperature 0, 20 prompts per set with natural stopping. The report also publishes C4 and temperature-0.6 throughput. C4 dataset timing includes requests ending at different times. The table reports generation speed on these prompts and accuracy is reported in the quality section below.
+
+| Prompt set | 27B DFlash2 | 27B MTP4 | Flash-Next MTP4 |
+| --- | --- | --- | --- |
+| HumanEval | 545 / 84% | 370 / 90% | 276 / 91% |
+| MBPP | 486 / 80% | 340 / 85% | 261 / 84% |
+| MATH500 | 473 / 76% | 336 / 82% | 255 / 82% |
+| GSM8K | 464 / 78% | 335 / 84% | 251 / 81% |
+| MT-Bench | 336 / 42% | 289 / 59% | 226 / 60% |
+| Chinese prose | 189 / 22% | 224 / 46% | 168 / 44% |
+
+Measured throughput depends on prompt mix. In the same release, DFlash2 led on the HumanEval subset while native MTP4 led on the Chinese prose subset. [Release notes](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.3) · [Detailed benchmark report](http://156.226.174.161:48152/1.5.3/#data)
+
+## Historical Model Measurements
+
+The table below preserves **complete-model / API / pure-decode / speculative-decode** measurements from their original PRs. They are historical evidence under separate contracts; the v1.5.3 wheel measurements are above.
 
 | Model | Hardware / Runtime | Workload | Measured result | Evidence / Status |
 |---|---|---|---:|---|
-| **Qwen3.6-27B-AWQ + MTP4** | 4× V100 · TP4 · E5M2 KV · Flash-V100 · CUDA Graph | 64K decode | **100.564 tok/s** | v1.2.2 Release · AL 4.981 / 99.52% |
-| **Qwen3.6-27B-AWQ + MTP4** | same | 128K decode | **85.258 tok/s** | v1.2.2 Release · +87.64% vs no-MTP |
-| **Qwen3.6-27B-AWQ + MTP4** | same · max 256K | 261,888 context decode | **49.772 tok/s** | v1.2.2 Release · AL 5.000 / 100% |
+| **Qwen3.6-27B-AWQ + MTP4** | 4× V100 · TP4 · E5M2 KV · Flash-V100 · CUDA Graph | 64K decode | **100.564 tok/s** | [v1.2.2 release](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.2.2) · AL 4.981 / 99.52% |
+| **Qwen3.6-27B-AWQ + MTP4** | same | 128K decode | **85.258 tok/s** | [v1.2.2 release](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.2.2) · +87.64% vs no-MTP |
+| **Qwen3.6-27B-AWQ + MTP4** | same · max 256K | 261,888 context decode | **49.772 tok/s** | [v1.2.2 release](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.2.2) · AL 5.000 / 100% |
 | **Qwen3.6-35B-A3B NVFP4** | 4× V100 · TP4 · mixed FP8 + W4A16_NVFP4 | 4096 / 1024 · no-MTP | **116.99 tok/s** | [#270](https://github.com/1CatAI/1Cat-vLLM/pull/270) |
 | **Qwen3.6-35B-A3B NVFP4 + MTP4** | same | matched MTP4 run | **174.76 tok/s** | [#270](https://github.com/1CatAI/1Cat-vLLM/pull/270) · 1.49× no-MTP |
 | **Qwen3.8-27B-NVFP4** | 4× V100 · TP4 · E4M3 KV · full CUDA Graph · no-MTP | exact 128K decode | **61.834 tok/s** | [#285](https://github.com/1CatAI/1Cat-vLLM/pull/285) · measured |
@@ -130,7 +164,7 @@ The table below preserves **complete-model / API / pure-decode / speculative-dec
 | **DeepSeek-V4-Flash** | **8× V100** · TP8 · FP8 dense + MXFP4 experts · CUDA Graph · no-spec | 1024 / 256 | **15.357 ms TPOT ≈ 65.1 tok/s** | [#181](https://github.com/1CatAI/1Cat-vLLM/pull/181) · accepted no-MTP baseline |
 | **DeepSeek-V4-Flash** | **8× V100** · PP2×TP4 · no-DSpark | combined quality-checked endpoint | **73.613–73.646 tok/s** | [#344](https://github.com/1CatAI/1Cat-vLLM/pull/344) |
 | **DeepSeek-V4-Flash** | same PP2×TP4 strict control | dataset-quality pair | **73.539 tok/s** | [#344](https://github.com/1CatAI/1Cat-vLLM/pull/344) · GSM8K 64/64 · HumanEval 29/32 |
-| **DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XXS + DSpark5** | **8× V100** · PP2×TP4 · MRV2 · FULL graphs | 32K prompt / 1024 · code · JSON · legal · prose | **200.5 · 206.6 · 116.5 · 90.1 tok/s decode** · 1,900 tok/s prefill (2,200 at 128K) | [#1370](https://github.com/1CatAI/1Cat-vLLM/pull/1370) (open) · community result · [raw data](https://github.com/ProprietaryLegal/Volta-sPLIt-DeepSeek-V4.1-Flash-1017-8xV100-SXM2-PP2xTP4/blob/main/docs/measurements.md) |
+| **DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XXS + DSpark5** | **8× V100** · PP2×TP4 · MRV2 · FULL graphs | 32K prompt / 1024 · code · JSON · legal · prose | **200.5 · 206.6 · 116.5 · 90.1 tok/s decode** · 1,900 tok/s prefill (2,200 at 128K) | [#1380](https://github.com/1CatAI/1Cat-vLLM/pull/1380) · merged documentation for a community result · [raw data](https://github.com/ProprietaryLegal/Volta-sPLIt-DeepSeek-V4.1-Flash-1017-8xV100-SXM2-PP2xTP4/blob/main/docs/measurements.md) |
 | **GLM-5.3-Flash-NVFP4** | 8× V100 · TP4/PP2 · E4M3 KV · no-MTP | 1K / 256 decode | **53.016 tok/s** | [#402](https://github.com/1CatAI/1Cat-vLLM/pull/402) · merged historical quality audit |
 
 ---
@@ -139,7 +173,21 @@ The table below preserves **complete-model / API / pure-decode / speculative-dec
 
 Raw `tok/s` alone can turn optimization into a benchmark game. 1Cat-LLM therefore records **real model throughput, dataset score, natural-stop health, output validity, and speculative acceptance** together.
 
-The retained DFlash2 coding/PPL gates below use their recorded historical configuration, including E5M2 KV where specified. They do not stand in for a new quality evaluation of the E4M3 release wheel, current main, or GGUF models.
+## v1.5.3 · Greedy Quality and Output Health
+
+The maintainers evaluated the same questions with greedy decoding against the original 27B BF16 model. The 40 coding cases use unit-test pass counts. Deltas and 95% confidence intervals are in percentage points versus 27B BF16, as reported. The public report provides aggregates and does not include per-item responses or the interval calculation.
+
+| Evaluation | 27B BF16 | 27B NVFP4 | Flash-Next NVFP4 |
+| --- | --- | --- | --- |
+| GSM8K · 300 | 285/300 (95.0%) | 290/300 (96.7%) · +1.7 [0.0, +3.7] | 289/300 (96.3%) · +1.3 [−1.3, +4.0] |
+| MMLU · 400 | 336/400 (84.0%) | 331/400 (82.8%) · −1.3 [−3.3, +0.8] | 349/400 (87.3%) · +3.3 [+0.5, +6.3] |
+| MBPP + HumanEval · 20 each | 21/40 (52.5%) | 21/40 (52.5%) · 0.0 | 20/40 (50.0%) · −2.5 [−7.5, 0.0] |
+
+- When 27B NVFP4 diverged from the 27B BF16 token choice in the reported audit, the BF16 preference margin had a median of **0.20 logprob** and the NVFP4 choice stayed in the BF16 top five. Flash-Next is a different model and the report compares it by task score.
+- The evaluated outputs recorded **zero garbled outputs or repetition loops**. Tested cached and cold outputs matched character for character. The report gives one aggregate 27B NVFP4 quality column and does not give separate DFlash2 and MTP4 scores.
+- Fresh Docker runs covered 45 API checks for 27B DFlash2 (including image inputs) and 38 for Flash-Next. In the separate 20-minute load tests, completion/cancellation counts were **2864/544** and **958/196**, respectively, with zero reported errors. [Release validation](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.3)
+
+The retained DFlash2 coding/PPL gates below use their recorded historical configuration, including E5M2 KV where specified. They record a separate historical quality protocol.
 
 ## Qwen3.8-27B-NVFP4 + DFlash2 — Practical 16K coding gate
 
@@ -233,7 +281,7 @@ Natural stops move from 72/80 to 70/80, so this remains an **optional precise-co
 | **Qwen3.6-35B-A3B NVFP4 + MTP4** | ShareGPT16 final-SHA workload | **120.096 tok/s pure decode** · **97.678 E2E output tok/s** · 241.973 prefill tok/s | [#270](https://github.com/1CatAI/1Cat-vLLM/pull/270) · merged |
 | **DeepSeek-V4-Flash · PP2×TP4** | GSM8K **64/64** · HumanEval **29/32** · LongBench **44.740** | **73.539 tok/s median** | [#344](https://github.com/1CatAI/1Cat-vLLM/pull/344) · strict quality control |
 | **DeepSeek-V4-Flash · PP2×TP4** | Combined route endpoint: GSM8K **62/64** · 0 invalid · coherent output | **73.613–73.646 tok/s** | [#344](https://github.com/1CatAI/1Cat-vLLM/pull/344) |
-| **DeepSeek-V4.1-Flash-1017 · PP2×TP4 · IQ2_XXS** | MMLU-Pro **79.9 %** (700) · HumanEval+ **147/164** plus · LegalBench **0.716** (22 tasks) · top-1 vs original **89.0 %** | **182.8 tok/s code decode at 128K** | [#1370](https://github.com/1CatAI/1Cat-vLLM/pull/1370) (open) · community result |
+| **DeepSeek-V4.1-Flash-1017 · PP2×TP4 · IQ2_XXS** | MMLU-Pro **79.9 %** (700) · HumanEval+ **147/164** plus · LegalBench **0.716** (22 tasks) · top-1 vs original **89.0 %** | **182.8 tok/s code decode at 128K** | [#1380](https://github.com/1CatAI/1Cat-vLLM/pull/1380) · historical community evaluation |
 | **GLM-5.3-Flash-NVFP4 · no-MTP** | Max reasoning: **6/8** tasks finish within 4096 output tokens; targeted low-reasoning code rerun **2/2** AST + execution | **53.016 tok/s decode** · **266.040 tok/s 1K prefill** | [#402](https://github.com/1CatAI/1Cat-vLLM/pull/402) · merged; historical quality matrix |
 
 ---
@@ -296,15 +344,41 @@ The repository contains multiple **real full-model DFlash2** throughput records:
 - production web prompt: **206.06 tok/s streaming decode**, 512 output tokens, 17.463 ms/engine round;
 - high-acceptance MBPP request: **251.60 tok/s**, acceptance length **4.686**, 328-token natural EOS, EvalPlus Base/Plus **1/1**;
 - adaptive lookup q16 repeated-context workload: **316.27 tok/s**, explicitly a special opt-in repeated-context contract;
-- the README headline remains **≈260 tok/s** from the real-machine demo.
+- the v1.5.3 release measures **545 tok/s** on 20 HumanEval prompts at temperature 0 with natural stopping. [v1.5.3 benchmark report](http://156.226.174.161:48152/1.5.3/#data)
 
-> **206, 251, 260, and 316 tok/s are not the same benchmark.**
->
-> DFlash2 throughput depends strongly on acceptance length, prompt repetition, q8/q16 verification width, context length, and task type.
+DFlash2 throughput depends on draft acceptance, prompt repetition, verification width, context length and task type.
 
 ---
 
 # 📏 Long Context Means More Than “It Fits in 256K”
+
+## v1.5.3 · Single-request Long Decode and Prefix Reuse
+
+**Measured step time (ms) / normalized decode tok/s** at temperature 0. The throughput column uses the same 70% acceptance assumption as above.
+
+| Input | 27B DFlash2 | 27B MTP4 | Flash-Next MTP4 |
+| --- | --- | --- | --- |
+| 1K | 13.54 / 436 | 12.62 / 301 | 16.47 / 231 |
+| 8K | 13.87 / 426 | 12.99 / 293 | 16.93 / 224 |
+| 32K | 14.77 / 399 | 13.76 / 276 | 17.05 / 223 |
+| 64K | 16.08 / 367 | 14.72 / 258 | 17.76 / 214 |
+| 128K | 18.51 / 319 | 16.29 / 233 | 19.08 / 199 |
+| 250K | 23.23 / 254 | 19.59 / 194 | 19.71 / 193 |
+
+**Measured TTFT in seconds** for cold input / full prefix hit / 200-token follow-up. The follow-up appends 200 input tokens to an existing conversation and reuses cached input and generated history.
+
+| Input | 27B DFlash2 | 27B MTP4 | Flash-Next MTP4 |
+| --- | --- | --- | --- |
+| 1K | 0.57 / 0.29 / 0.34 | 0.56 / 0.28 / 0.33 | 0.52 / 0.29 / 0.31 |
+| 8K | 1.81 / 0.49 / 0.54 | 1.81 / 0.48 / 0.56 | 1.50 / 0.40 / 0.53 |
+| 32K | 7.85 / 0.51 / 0.57 | 7.95 / 0.48 / 0.56 | 5.99 / 0.45 / 0.48 |
+| 64K | 17.37 / 0.43 / 0.61 | 17.64 / 0.40 / 0.61 | 12.49 / 0.52 / 0.51 |
+| 128K | 41.50 / 1.05 / 1.14 | 42.51 / 1.02 / 1.14 | 26.54 / 0.86 / 0.91 |
+| 250K | 106.68 / 1.58 / 1.75 | 110.56 / 1.60 / 1.74 | 61.40 / 2.79 / 4.58 |
+
+The 262144-token service limit is shared by prompt and generation. KV capacity determines how many long requests can be resident at the same time. [Release notes](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.3) · [Detailed benchmark report](http://156.226.174.161:48152/1.5.3/#data)
+
+## Historical Long-context Results
 
 For Qwen3.8-27B-NVFP4, [PR #285](https://github.com/1CatAI/1Cat-vLLM/pull/285) reports real TP4 full-model long-context decode:
 
@@ -333,6 +407,8 @@ PP2×TP4 quality-checked endpoint:
 
 | Area | PR / Contract | Control | 1Cat result | Gain |
 |---|---|---:|---:|---:|
+| DFlash2 q8 long verification | [#1505](https://github.com/1CatAI/1Cat-vLLM/pull/1505) · 64K / C4 · stock-clock pre-release A/B | 37.14 ms/step | **32.64 ms/step** | **12.1% lower** |
+| Native MTP4 · 27B QUASAR NVFP4 | [#1491](https://github.com/1CatAI/1Cat-vLLM/pull/1491) · source A/B · V100 TP4 · E4M3 KV · 65,536 input / 256 output · C1, cold prefix, median of 3 | 18.82 ms/step | **14.34 ms/step** | **23.8% lower** |
 | D256 long-prefill Attention | [#198](https://github.com/1CatAI/1Cat-vLLM/pull/198) · Q4096/KV64K · Hq6/Hkv1/D256 | 87.6001 ms | **50.4504 ms** | **1.74×** |
 | D256 long-prefill Attention | #198 · Q4096/KV8K | 11.1255 ms | **5.0542 ms** | **2.20×** |
 | 128-bit E5M2 XQA load | [#268](https://github.com/1CatAI/1Cat-vLLM/pull/268) · B16/17.8K operator | 0.743424 ms | **0.602112 ms** | **1.235×** |
@@ -769,7 +845,7 @@ The newer SM70 path combines batched FP4/FP8 projections, joint draft attention,
 | Longest output-update gap | 2.873 s | **0.310 s** |
 | First / second incoming TTFT | 14.287 / 20.631 s | **17.994 / 35.491 s** |
 
-These are medians of two warm measured runs after warmup, using the PR's two-NVLink-pair topology. Resident EOS is disabled to sustain the load; incoming requests complete naturally. **Shorter decoder stalls trade against longer incoming TTFT.** The 250 ms step target is a soft scheduler target, not a latency guarantee. This is merged development work after the v1.5.1 artifact.
+These are medians of two warm measured runs after warmup, using the PR's two-NVLink-pair topology. Resident EOS is disabled to sustain the load; incoming requests complete naturally. **Shorter decoder stalls trade against longer incoming TTFT.** The 250 ms step target is a soft scheduler target, not a latency guarantee. This is a historical merged PR run with its own scheduler recipe. The v1.5.3 test profile sets `--mixed-prefill-step-latency-ms 0`.
 
 Recent work also parallelizes compatible small-query draft attention ([#944](https://github.com/1CatAI/1Cat-vLLM/pull/944)) and reduces synchronization in TP4 all-reduce plus RMSNorm ([#957](https://github.com/1CatAI/1Cat-vLLM/pull/957)). Each keeps its measured precision, shape and topology limits; their small single-request gains are not advertised as a universal concurrency multiplier.
 
@@ -832,7 +908,7 @@ One retained **Flash-Next GSQ-RCO IQ3_S + FP16 MTP4** development composition re
 
 Evidence: [#940](https://github.com/1CatAI/1Cat-vLLM/pull/940) and [the complete workload record](docs/design/sm70_flashnext_gguf_mtp4_operator_routes.md). These use a named development build on **4× V100-SXM2-32GB / TP4**, direct NVLink ring edges, FP16 activation/KV, FP32 SSM state and FULL decode graphs. Fixed-length greedy timing ignores EOS and is repeated three times; four separate natural-EOS prompts match the original outputs. Longer timing trajectories differ across versions, and the **15–17 ms round goal remains open**.
 
-Adapter support, kernel admission and model-quality qualification are separate milestones. The dense and DFlash2 adapters have recorded loading/generation checks; the MoE adapter PR alone does not establish broad 35B quality or throughput. Consult the [GGUF controls](docs/design/gguf_v100_control.md) and each model's recorded gates. These additions postdate the v1.5.1 release wheel.
+Adapter support, kernel admission and model-quality qualification are separate milestones. The dense and DFlash2 adapters have recorded loading/generation checks; the MoE adapter PR alone does not establish broad 35B quality or throughput. Consult the [GGUF controls](docs/design/gguf_v100_control.md) and each model's recorded gates. Pair the tagged runtime with the model-specific GGUF configuration and quality evidence.
 
 ---
 
@@ -920,6 +996,29 @@ Strict quality control:
 GSM8K    : 64/64
 HumanEval: 29/32
 LongBench: 44.740
+```
+
+## DeepSeek-V4.1-Flash-1017 · Native PP4×TP4
+
+[#1482](https://github.com/1CatAI/1Cat-vLLM/pull/1482) validates the original FP8 32×32 dense / MXFP4 expert checkpoint with Engram and DSpark5 on **four Dell C4140 nodes**, each with four V100-SXM2 32GB GPUs and connected by InfiniBand. The release notes record a 1053 MHz GPU memory clock for this cluster. The source-built configuration allocates a **1,048,576-token** service window. The longest reported timed request is **512K**, with 23.65 ms per decode round and about 133 s TTFT. Native PP4 re-prefills requests because it runs with prefix caching disabled.
+
+| 1K prompt, temperature 0 | C1 | C2 | C4 | C8 | C16 | C32 | C64 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Measured ms per decode round | 19.3 | 19.7 | 24.8 | 35.1 | 49.5 | 77.5 | 135.7 |
+| Release report estimate, aggregate tok/s | 202 | 396 | 628 | 888 | 1264 | 1600 | 1856 |
+
+The estimate uses approximately 3.9 emitted tokens per DSpark round, with observed acceptance varying by case. The PR independently reports **1809 aggregate tok/s** at C64 / 1K and **249 tok/s** for a single HumanEval request. The PR also reports **297/300 GSM8K**, **349/400 MMLU**, **9/9 needle retrieval** across 16K/128K/512K, and **722 requests / zero errors** in its 20-minute soak. Concurrent and single-request outputs can differ at the token level on this configuration. These results come from the source-build PR validation. [PR measurements](https://github.com/1CatAI/1Cat-vLLM/pull/1482) · [Release launch report](http://156.226.174.161:48152/1.5.3/#launch)
+
+Build the native extension and prepare the checkpoint, Engram data and DSpark draft on each node as documented in the [C4140 handoff](benchmarks/deepseek_v41/native/HANDOFF.md). Copy the long-context YAML from the release report. Before launch, set the actual model paths, master address, node IPs, NCCL interfaces and CPU affinity for your cluster. The tagged [run_pp4.sh](benchmarks/deepseek_v41/native/run_pp4.sh) contains C4140-specific paths and addresses. Run the following on each node after adapting its launcher, starting ranks 3, 2, 1 and then 0 (the API node).
+
+```bash
+export V41_CONFIG="$HOME/v41/serve-native-pp4-long.yaml"
+export VLLM_V41_BATCH=1 VLLM_V41_WINDOW_RING=0 VLLM_V41_PP_MICRO=1 VLLM_V41_PP_AHEAD=1
+export VLLM_V41_LAZY_OUTPUT_IDS=1 VLLM_V41_PROPOSE_GRAPH=1 VLLM_V41_INDEX_SHARD=1
+export VLLM_V41_PREFILL_PIPELINE=1 VLLM_V41_HC_GEMM=1 VLLM_V41_LIVE_TABLE=1
+export VLLM_V41_FAST_READD=1 VLLM_V41_TOPP_NO_FENCE=1
+# Set RANK to the local node's PP rank (0 through 3).
+"$HOME/v41/run_pp4.sh" "${RANK:?Set the local pipeline rank}"
 ```
 
 ---
@@ -1026,172 +1125,188 @@ The conclusion is:
 
 # 📦 Installation
 
-Install the published [v1.5.1 release](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.1) into a clean environment. Download its wheel and `SHA256SUMS` from the same release.
+The [v1.5.3 release](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.3) ships a **Linux x86_64, CPython 3.12, CUDA 12.8** wheel and a Docker build bundle. Use an NVIDIA driver compatible with CUDA 12.8. The wheel pins PyTorch 2.10.0+cu128 and bundles the SM70 extensions. Use a CUDA 12.8 Toolkit with `nvcc` on `PATH` and a C++ compiler for JIT compilation. The FlashQLA GDN prefill route can use its bundled precompiled kernel when TileLang cannot find `nvcc`. The Docker build uses Ubuntu 24.04 and includes both compilers. [GDN fallback #1400](https://github.com/1CatAI/1Cat-vLLM/pull/1400)
 
-Published binary requirements:
+The wheel's bundled native libraries reference **GLIBC 2.38** and **GLIBCXX 3.4.30**. Use a host that provides those versions or build the Ubuntu 24.04 release image.
 
-```text
-Linux x86_64 · GLIBC >= 2.38 · GLIBCXX >= 3.4.21
-Python 3.12
-PyTorch 2.10.0 + CUDA 12.8 runtime dependencies
-CUDA 12.8 Toolkit + C++ compiler + ninja for remaining TileLang JIT
-SM70 / Tesla V100
-```
+## Hardware and Checkpoints
 
-The artifact is **`1cat_vllm-1.5.1-cp312-cp312-linux_x86_64.whl`**. It has not passed the manylinux container gate. Its standard CUDA Toolkit/compiler requirements remain even though the wheel bundles the SM70 extensions, Flash-V100, FlashQLA and launchers. The release was tested with driver 580.173.02 and recommends 570.124.06 or newer.
+| Profile or path | Hardware evidence | Checkpoint and scope |
+| --- | --- | --- |
+| 27B DFlash2 q7 | 4× V100-SXM2 32GB, NVLink, TP4 | [Unsloth Qwen3.8-27B NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) and [pinned DFlash2 draft](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2/tree/dedf8df68adfb1afeaf7b7480c0a0243108177b4) · release-wheel measurements |
+| Native 27B MTP4 | Same 4×32GB release setup | Unsloth 27B NVFP4 with built-in MTP · same-wheel measurements. QUASAR NVFP4 and FP8 at TP2/TP4 have separate [PR tests](https://github.com/1CatAI/1Cat-vLLM/pull/1491) |
+| Flash-Next MTP4 | 4× V100-SXM2 32GB, NVLink, TP4 | [RadixArk Flash-Next NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) is a project-listed checkpoint. The release recipe uses an MTP checkpoint directory and host-backed QSA KV |
+| DeepSeek-V4.1-Flash-1017 | 4× Dell C4140, 16× V100-SXM2 32GB in total, PP4×TP4 | [Original checkpoint](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017), native FP8/MXFP4, DSpark5 · source-build test in [#1482](https://github.com/1CatAI/1Cat-vLLM/pull/1482) |
+| Other model paths | Model- and topology-specific evidence | See the Qwen3.6 AWQ/NVFP4, Qwen3.8 FP8, GGUF, DeepSeek-V4 and GLM-5.3 sections. Turing SM75 has individual merged paths such as [GDN prefill](https://github.com/1CatAI/1Cat-vLLM/pull/1228) and an [FA2 build change](https://github.com/1CatAI/1Cat-vLLM/pull/1346). The published release matrix covers SM70 |
 
-With `uv` installed:
+The release recommends **at least 64 GB host RAM**. The v1.5.3 benchmark report records these startup and memory observations on its TP4 test host. The TP2 results come from separate source builds.
+
+| Measured resource | 27B DFlash2 | 27B MTP4 | Flash-Next MTP4 |
+| --- | ---: | ---: | ---: |
+| Per-GPU VRAM after start / peak | 27.2 / 28.6 GiB | 26.3 / 26.3 GiB | 29.9 / 30.6 GiB |
+| Reported KV capacity | 1,308,270 tokens | 1,598,295 tokens | 378,652 tokens with history in host RAM |
+| Host launch with a warm compile cache | 125 s | 114 s | 342 s |
+| Docker empty-cache launch / restart | 323 / 122 s | — | 624 / 343 s |
+
+[Release resource and startup measurements](http://156.226.174.161:48152/1.5.3/#data)
+
+## Wheel
+
+With `uv` and `curl` installed, download the wheel and checksum file from the same release.
 
 ```bash
-sha256sum --ignore-missing -c SHA256SUMS
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python \
-  ./1cat_vllm-1.5.1-cp312-cp312-linux_x86_64.whl
-source .venv/bin/activate
+release_base=https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.5.3
+wheel=1cat_vllm-1.5.3+cu128-cp312-cp312-linux_x86_64.whl
+curl -fL -o "$wheel" "$release_base/1cat_vllm-1.5.3%2Bcu128-cp312-cp312-linux_x86_64.whl" &&
+  curl -fLO "$release_base/SHA256SUMS" &&
+  sha256sum --ignore-missing -c SHA256SUMS &&
+  uv venv --python 3.12 .venv &&
+  uv pip install --python .venv/bin/python "./$wheel" &&
+  source .venv/bin/activate
 ```
 
-The installer resolves declared Python/Torch dependencies. Download target and draft weights separately. The release profile needs no private developer `.so`, source overlay or performance environment overrides; retain the standard Toolkit/JIT setup above.
-
-Verification:
+Check the installed build and visible GPU before starting a model.
 
 ```bash
 python - <<'PY'
-import sys
-import torch
-import vllm
-import flash_attn_v100
-from flash_attn_v100 import flash_attn_v100_cuda, paged_kv_utils
-from flash_attn_v100 import flash_attn_grouped_verify_max_query_tokens
+from importlib.metadata import version
 
-print("Python:", sys.version.split()[0])
-print("Torch:", torch.__version__)
-print("CUDA:", torch.version.cuda)
-print("GPU:", torch.cuda.get_device_name(0))
-print("Compute capability:", torch.cuda.get_device_capability(0))
-print("vLLM:", vllm.__version__)
-print("flash_attn_v100:", flash_attn_v100.__version__)
-print("DFlash2 grouped verify max Q:", flash_attn_grouped_verify_max_query_tokens())
-print("FlashAttention-V100: OK")
+import flash_attn_v100
+import torch
+
+print(version("1cat-vllm"), torch.__version__, torch.version.cuda)
+for i in range(torch.cuda.device_count()):
+    print(i, torch.cuda.get_device_name(i), torch.cuda.get_device_capability(i))
 PY
 ```
 
-This checks imports and visible hardware. Validate actual startup and requests using your model, topology and memory budget; it is not a performance test.
+The wheel SHA256 is `0558021651c41ab111609d121cef029c09224de4b6e6f8fd362754dfdd84990f`. The Docker bundle SHA256 is `2c8e43157735964eda8b7691f6cddf61efa06e1715b3dd6438eb252067ee3db1`. [Published checksums](https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.5.3/SHA256SUMS)
+
+## Docker and 1Cat Studio
+
+Docker requires a CUDA-compatible host driver and the NVIDIA Container Toolkit. The build contacts Ubuntu, PyPI, PyTorch and NVIDIA package sources. Mount model directories under `/models` using the names in the launch commands below. The Docker preset expects two directories for its selected model, including `Qwen3.8-27B-DFlash2` for `MODEL=27b` or `Qwen3.8-Flash-Next-mtp` for `MODEL=flashnext`. The bundle's `README-docker.en.md` documents mirrors and environment options.
+
+```bash
+archive=1cat-vllm-1.5.3-docker.tar.gz
+curl -fLO "https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.5.3/$archive" &&
+  curl -fLO https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.5.3/SHA256SUMS &&
+  sha256sum --ignore-missing -c SHA256SUMS &&
+  tar -xzf "$archive" &&
+  cd 1cat-vllm-1.5.3-docker &&
+  sha256sum -c SHA256SUMS &&
+  docker build -t 1cat/vllm-v100:1.5.3 .
+```
+
+```bash
+docker run -d --runtime=nvidia --gpus all --network host --ipc=host \
+  --ulimit memlock=-1 -e MODEL=27b -e HOST=127.0.0.1 -e PORT=8000 \
+  -v /data/models:/models:ro -v vllm-cache-1.5.3:/cache \
+  1cat/vllm-v100:1.5.3
+```
+
+Select `MODEL=flashnext` for the Flash-Next preset. The released Docker entrypoint exposes `VLLM_API_KEY`, `MAX_NUM_SEQS` and `MAX_MODEL_LEN` as environment options. In 1Cat Studio, install the **1.5.3** runtime and select it in the model configuration. For rollback, select the prior Studio runtime, reinstall its verified wheel in a separate environment, or restart with the prior Docker image and its matching cache volume. [Release deployment and rollback](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.3)
 
 ---
 
 # ▶ Qwen3.8-27B-NVFP4 + DFlash2
 
-## Example TP4 + E4M3 serving command
+## Example TP4 + E4M3 Serving Command
 
-The release wheel installs the V100 launcher and its versioned profile. Supply the target checkpoint path:
-
-```bash
-serve_qwen38_27b_nvfp4_v100.sh /models/Qwen3.8-27B-QUASAR-NVFP4
-```
-
-The profile pins TP4, FP16 compute/draft KV, FP8 E4M3 target KV, 256K context,
-`--max-num-batched-tokens 8192`, `--max-num-seqs 4`, and the 2048/8192 KV and
-Mamba block sizes. Append normal `vllm serve` options to override a release
-default. This profile is validated for four peer-connected V100-SXM2 32GB
-GPUs; other hardware and concurrency levels need a separate memory and speed
-check.
-
-The first launch downloads the pinned `incoai/Qwen3.8-27B-DFlash2` revision (about 3.85 GB of draft weights). To use an existing local draft:
+The explicit launch below follows the published DFlash2 profile, including image admission and the thinking default. Download the target and pinned draft to the two local model directories. The target uses E4M3 KV, and the draft uses `auto` with FP16 compute. DFlash2 proposes seven tokens and uses probabilistic draft sampling.
 
 ```bash
-serve_qwen38_27b_nvfp4_v100.sh /models/Qwen3.8-27B-QUASAR-NVFP4 \
-  --draft /models/Qwen3.8-27B-DFlash2
+vllm serve /models/Qwen3.8-27B-NVFP4 --served-model-name qwen3.8-27b-dflash2 \
+  --host 127.0.0.1 --port 8000 --tensor-parallel-size 4 --dtype half \
+  --kv-cache-dtype fp8_e4m3 --attention-backend FLASH_ATTN_V100 \
+  --max-model-len 262144 --max-num-batched-tokens 4096 --max-num-seqs 8 \
+  --gpu-memory-utilization 0.83 --enable-prefix-caching --partial-prefix-cache \
+  --mamba-cache-mode align --block-size 2048 --mamba-block-size 2048 \
+  --prefix-cache-retention-interval 8192 --mixed-prefill-step-latency-ms 0 \
+  --enable-prompt-tokens-details --limit-mm-per-prompt '{"video":0,"audio":0}' \
+  --trust-remote-code --seed 0 --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking":true}' \
+  --speculative-config '{"method":"dflash","model":"/models/Qwen3.8-27B-DFlash2","revision":"dedf8df68adfb1afeaf7b7480c0a0243108177b4","num_speculative_tokens":7,"kv_cache_dtype":"auto","attention_backend":"FLASH_ATTN_V100","draft_sample_method":"probabilistic","enforce_eager":false}'
 ```
 
-For the validated Qwen3.8 DFlash2 contract, runtime policy resolves the checkpoint-native draft geometry and the SM70 draft Attention backend.
-
-Representative automatic values:
-
-```text
-official draft block size = 8
-draft width               = 7
-selector Top-K            = 16
-release target KV         = FP8 E4M3
-release draft KV          = FP16
-draft attention backend   = FLASH_ATTN_V100
-verification fast paths   = automatic
-```
-
-Operators select compatible paths from the actual dtype, local head/projection layout, shape and execution policy. E4M3 grouped FP32 and long-context verification are part of the release recipe. Explicit E5M2 remains available for historical reproduction, but does not select the E4M3-specific acceleration paths. A changed TP degree, KV format or service capacity needs its own memory, speed and quality check.
-
-Inspect the installed configuration and the running server's report:
+The wheel's bundled helper uses the same core TP, KV, context and DFlash2 settings. It downloads the pinned draft when `--draft` is omitted. Its packaged defaults include a text-only multimodal limit and thinking disabled. Use the explicit command above to reproduce the release example's frontend settings. [Profile source](vllm/sm70_profiles/qwen38_27b_nvfp4_dflash2.json) · [Launcher source](scripts/serve_qwen38_27b_nvfp4_v100.sh)
 
 ```bash
+serve_qwen38_27b_nvfp4_v100.sh /models/Qwen3.8-27B-NVFP4 --port 8000
 python -m vllm.sm70_profiles show qwen38_27b_nvfp4_dflash2 --json
 curl --fail http://127.0.0.1:8000/v1/sm70/acceleration
 ```
 
-Supply the server's API-key authentication if enabled. The report distinguishes configured capabilities, and current main also reports loaded kernel instances and fallback reasons ([#802](https://github.com/1CatAI/1Cat-vLLM/pull/802)). A configured or prepared path is not proof that every request executed it; pair the report with worker route logs. See [the release profile guide](docs/serving/sm70_release_profile.md).
+The acceleration endpoint reports configured capabilities, loaded kernel instances and fallback reasons where available. Match runtime route logs to the request shape when checking which path ran. [Acceleration diagnostics](vllm/sm70_profiles/acceleration.py)
 
 ---
 
-## Historical DFlash2 release-path measurements
+# ▶ Qwen3.8-27B-NVFP4 + Native MTP4
 
-These retain the original pre-1.5.1 PR contracts. Use the release-to-release table above for the published v1.5.1 comparison.
+Use a 27B NVFP4 checkpoint with its MTP head. The release command selects four greedy draft tokens using the target checkpoint and takes the default hybrid prefix geometry from the runtime. The shared accelerated verifier selects a compatible route by local shard layout and dtype. [MTP runtime](https://github.com/1CatAI/1Cat-vLLM/pull/1491) · [Prefix defaults](https://github.com/1CatAI/1Cat-vLLM/pull/1492)
 
-| Contract | Result |
-|---|---:|
-| Complete DFlash2 round | **≈17.38 ms** |
-| 32K cold prefill | **≈4,039–4,069 tok/s** |
-| 64K pure prefill | **≈3,567 tok/s** |
-| 32K vs retained pre-closure DFlash2 | **+30.1%** |
-| 64K vs retained pre-closure DFlash2 | **+37.7%** |
-| Historical web-prompt streaming decode | **206.06 tok/s** |
-| High-acceptance MBPP request | **251.60 tok/s** |
-| Adaptive lookup q16 repeated-context | **316.27 tok/s** |
-| Structured API | **24/24 pass** |
-| Long alternating-prefix state | **5/5 pass** |
-| Target-only / DFlash2 WikiText PPL | **5.4993116 / 5.4993622** |
+```bash
+vllm serve /models/Qwen3.8-27B-NVFP4 --served-model-name qwen3.8-27b-mtp \
+  --host 127.0.0.1 --port 8000 --tensor-parallel-size 4 --dtype half \
+  --kv-cache-dtype fp8_e4m3 --attention-backend FLASH_ATTN_V100 \
+  --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.83 --enable-prefix-caching \
+  --mixed-prefill-step-latency-ms 0 --trust-remote-code \
+  --limit-mm-per-prompt '{"video":0,"audio":0}' --enable-prompt-tokens-details \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
+```
 
 ---
 
 # ▶ Flash-Next NVFP4 + MTP4
 
-The same release includes a separate Flash-Next launcher:
+The wheel launcher sets `--max-num-seqs 8`, FP16 attention KV, FP8 E4M3 QSA history in pinned host RAM and FP32 Mamba SSM state. It uses greedy MTP4 drafts. The example uses the target's own MTP layers, which are present in the RadixArk checkpoint. For the separate-draft release recipe, add `--draft /models/Qwen3.8-Flash-Next-mtp` and supply that compatible checkpoint directory. The release names this directory without identifying a public revision for it. [Launcher source](scripts/serve_flash_next_nvfp4_v100.sh) · [Checkpoint card](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) · [Release launch profiles](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.3)
 
 ```bash
-serve_flash_next_nvfp4_v100.sh /models/Qwen3.8-Flash-Next-NVFP4
+serve_flash_next_nvfp4_v100.sh /models/Qwen3.8-Flash-Next-NVFP4 \
+  --served-model-name qwen3.8-flash-next-nvfp4 --host 127.0.0.1 --port 8000 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+  --trust-remote-code --seed 0 --default-chat-template-kwargs '{"enable_thinking":false}'
 ```
 
-Its defaults are **TP4, FP16 compute/KV, MTP4, 262144 context with FP8 KV history in pinned host memory, 4096-token prefill, up to 8 sequences, memory utilization 0.89 and prefix caching** (the 1.5.2 release configuration). Pass `--draft /models/Qwen3.8-Flash-Next-mtp` to use a separate MTP checkpoint; without it, the MTP layers inside the model are used. It targets four peer-connected V100-SXM2-32GB GPUs with 64 GB or more host RAM.
+## OpenAI and Anthropic API Examples
 
-The release test machine had ample host RAM: Flash-Next PLE tables alone total approximately **47.68 GiB**, before model mappings, caches and process memory. Low-RAM operation was not qualified by that release test. Later main includes capability-based device/pinned-host/disk PLE placement and packed GGUF lookup; these have their own storage and model-validation conditions ([#806](https://github.com/1CatAI/1Cat-vLLM/pull/806), [#877](https://github.com/1CatAI/1Cat-vLLM/pull/877), [#885](https://github.com/1CatAI/1Cat-vLLM/pull/885)).
+Start one profile on port 8000. Set `model` to the `--served-model-name` used at launch. These examples target the 27B MTP4 command. When the server has `--api-key` configured, include `-H "Authorization: Bearer $VLLM_API_KEY"` and set the client-side variable to that key.
+
+```bash
+curl --fail http://127.0.0.1:8000/health
+curl --fail http://127.0.0.1:8000/v1/models
+curl --fail-with-body -sN http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b-mtp","messages":[{"role":"user","content":"Explain prefix caching in two sentences."}],"max_tokens":256,"temperature":0,"stream":true}'
+```
+
+```bash
+curl --fail-with-body -sN http://127.0.0.1:8000/v1/messages \
+  -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"qwen3.8-27b-mtp","messages":[{"role":"user","content":"Explain prefix caching in two sentences."}],"max_tokens":256,"temperature":0,"stream":true}'
+```
+
+The Anthropic-compatible Messages API includes `POST /v1/messages/count_tokens` and `HEAD` on both Messages paths for liveness. `GET /health` checks engine readiness. The release also updates `message_start`, measured cache usage, streaming tool calls and reasoning-token accounting. [Anthropic routes](vllm/entrypoints/anthropic/api_router.py) · [Cache accounting #1436](https://github.com/1CatAI/1Cat-vLLM/pull/1436) · [SSE #1440](https://github.com/1CatAI/1Cat-vLLM/pull/1440) · [Tool and reasoning usage #1443](https://github.com/1CatAI/1Cat-vLLM/pull/1443)
 
 ---
 
 # 🔨 Build From Source
 
-Clone:
+On Linux x86_64 with the CUDA 12.8 Toolkit, matching C++ build tools and `uv`, check out the release tag and target SM70. Use the same source revision for the Python runtime and bundled native extensions.
 
 ```bash
-git clone https://github.com/1CatAI/1Cat-vLLM.git
+git clone --branch v1.5.3 https://github.com/1CatAI/1Cat-vLLM.git
 cd 1Cat-vLLM
-```
-
-Set the bundled CUDA extensions' SM70 build targets:
-
-```bash
+uv venv --python 3.12 .venv
+source .venv/bin/activate
 export TORCH_CUDA_ARCH_LIST=7.0
 export CMAKE_CUDA_ARCHITECTURES=70
+uv pip install -e . --torch-backend=cu128
 ```
 
-Use this fork's source checkout with CUDA 12.8 and its [CUDA build dependencies](requirements/build/cuda.txt). The [source-build procedure](docs/getting_started/installation/gpu.cuda.inc.md) describes editable builds; its upstream prebuilt-wheel examples are not the 1Cat SM70 release. Keep the bundled Flash-V100 and other native extensions matched to the source revision.
-
-The two variables above are build-time inputs for a source build only. They
-are already fixed in the SM70 release-wheel build and are not needed after
-installing that wheel.
-
-When building with CUDA 12.8 for SM70, dependency metadata selects the CUDA
-12.8 PyTorch wheels matching the build interpreter and Linux architecture.
-The published SM70 release wheel still requires Python 3.12 on x86_64;
-building for another interpreter does not make that release wheel compatible.
-
-Because this project contains custom CUDA extensions, make sure the active compiler/toolkit matches the PyTorch CUDA ABI used by your environment.
+The architecture variables are build-time inputs. See the [CUDA build requirements](requirements/build/cuda.txt) and [source installation guide](docs/getting_started/installation/gpu.cuda.inc.md) for the existing-Torch workflow and build dependencies.
 
 ---
 
@@ -1229,6 +1344,14 @@ A benchmark claim is most useful when it retains:
 - quality result;
 - whether the result is measured or projected.
 
+## Benchmark and Regression Tools
+
+- [DFlash2 concurrent API benchmark](benchmarks/benchmark_dflash2_concurrent_rounds.py) captures a shared streaming window at a fixed output length, using 8192- or 32768-token prompt fixtures. It exposes temperature, top-p, top-k and seed settings.
+- [Flash-Next MTP4 round benchmark](benchmarks/benchmark_sm70_mtp4_round.py) measures complete rounds at a fixed 8K input and supports natural-prompt fixtures.
+- [Qwen quality runner](benchmarks/benchmark_sm70_qwen38_quality.py) supports explicit case manifests, timing and output-health checks. [DeepSeek native client](benchmarks/deepseek_v41/native/bench_client.py) uses server counters for emitted and accepted tokens per round.
+
+The v1.5.3 release report publishes summary tables. The tagged benchmark tools have their own inputs and timing windows. The report does not include the exact fixture manifest or a complete replay command for its published matrix.
+
 This README follows that policy wherever the underlying PR retained enough information.
 
 ---
@@ -1253,15 +1376,32 @@ An open or Draft PR is not a merged feature. A merged PR may also retain rejecte
 
 The early ≈79 TFLOP/s Attention candidate is a good example: its historical 256K quality failure does not qualify that arithmetic as a production default. Later repaired FP32 routes were merged separately. The original 79T number remains historical; the later full-FP32 measurements keep their own precision and validation contracts.
 
+## v1.5.3 Runtime Changes
+
+- **Native MTP and grouped verification.** Shared TP2/TP4 dispatch covers qualified NVFP4 and FP8 Qwen shards. MTP4 q5 uses the newer grouped path. DFlash2 q6–q8 keeps the 48-row E4M3 kernel for eligible shapes. [#1472](https://github.com/1CatAI/1Cat-vLLM/pull/1472) · [#1478](https://github.com/1CatAI/1Cat-vLLM/pull/1478) · [#1491](https://github.com/1CatAI/1Cat-vLLM/pull/1491) · [#1505](https://github.com/1CatAI/1Cat-vLLM/pull/1505)
+- **Hybrid prefix cache.** The default geometry uses 2048-token KV/Mamba blocks and partial prefix snapshots on admitted paths. Periodic retention defaults to 8192 where supported and is disabled with authoritative QSA host KV to preserve tail checkpoints. Explicit cache choices take precedence. Pool-capacity checks cover snapshot and hit paths. [#1401](https://github.com/1CatAI/1Cat-vLLM/pull/1401) · [#1492](https://github.com/1CatAI/1Cat-vLLM/pull/1492) · [#1500](https://github.com/1CatAI/1Cat-vLLM/pull/1500)
+- **Startup and request stability.** MRV2 warmup respects bounded host-KV state pools, image encoder state survives until speculative tokens are confirmed, and CUDA capability checks are traceable during compilation. [#1493](https://github.com/1CatAI/1Cat-vLLM/pull/1493) · [#1494](https://github.com/1CatAI/1Cat-vLLM/pull/1494) · [#1498](https://github.com/1CatAI/1Cat-vLLM/pull/1498)
+
+## Known Limitations
+
+- **Flash-Next startup and short prefixes.** Set `--max-num-seqs 8` with the 256K recipe. Bare `vllm serve` may select 256 sequence slots and exhaust the Mamba state pool. The preset reuses prefix blocks at a 2048-token granularity and 250K follow-up TTFT reached **4.58 s** in the release test.
+- **Concurrency and capacity.** Eight sequence slots is the configured limit of the three single-node release profiles. The 27B DFlash2 profile reserves activation memory for images and reports KV capacity equivalent to about five 262144-token contexts. Full-length requests are also constrained by recurrent state and the live prompt-plus-output budget. Flash-Next 64K C8 is absent from the published benchmark matrix. Long incoming prefills can briefly delay active decode.
+- **Non-greedy sampling.** At 8K C1 the measured step cost rises by about 2.7 ms for 27B MTP4 and 3.5 ms for Flash-Next at temperature 0.6 versus greedy. A fresh engine can take roughly three extra seconds on its first nonzero-temperature request while the sampling kernel compiles.
+- **Hardware and precision.** The release matrix covers the 32GB V100 topology above. Checkpoints without compatible MTP weights need another decode configuration. E4M3, FP16 and E5M2 KV paths have different admission and memory contracts.
+
+[Released limitations](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.3) · [Measured TTFT and decode](http://156.226.174.161:48152/1.5.3/#data)
+
 ## Open Follow-ups at This Snapshot
 
-| PR | Reported scope | Status |
-|---|---|---|
-| [#956](https://github.com/1CatAI/1Cat-vLLM/pull/956) | Superseded Mamba state-block retention with align mode, async scheduling and prefill chunks spanning multiple state blocks | Open; pending integration |
-| [#779](https://github.com/1CatAI/1Cat-vLLM/pull/779) | Bound TurboQuant SDPA continuation scratch; retain numerical and model-quality gates | Draft; pending integration |
-| [#715](https://github.com/1CatAI/1Cat-vLLM/pull/715) | DeepSeek-V4 FP16 `hc_head` range handling for attention-sink rows | Open; pending integration |
+| PR | Reported scope |
+| --- | --- |
+| [#1508](https://github.com/1CatAI/1Cat-vLLM/pull/1508) · [#1507](https://github.com/1CatAI/1Cat-vLLM/pull/1507) | Engine FP8 policy for fused GDN verification and bias in SM70 Marlin |
+| [#1506](https://github.com/1CatAI/1Cat-vLLM/pull/1506) · [#1504](https://github.com/1CatAI/1Cat-vLLM/pull/1504) | SM70 regression test maintenance and compile-safe capability cleanup |
+| [#1503](https://github.com/1CatAI/1Cat-vLLM/pull/1503) · [#1502](https://github.com/1CatAI/1Cat-vLLM/pull/1502) · [#1501](https://github.com/1CatAI/1Cat-vLLM/pull/1501) | Triton sampling cutoffs, cold-warmup CUDA stack, compiled Flash-Next MTP context |
+| [#1497](https://github.com/1CatAI/1Cat-vLLM/pull/1497) · [#1495](https://github.com/1CatAI/1Cat-vLLM/pull/1495) · [#1486](https://github.com/1CatAI/1Cat-vLLM/pull/1486) | Cache-drift recovery, alternative tool parsing and tiered KV retention |
+| [#1488](https://github.com/1CatAI/1Cat-vLLM/pull/1488) · [#1271](https://github.com/1CatAI/1Cat-vLLM/pull/1271) | Another community 8×V100 DeepSeek profile and Gemma-4 D=512 support |
 
-These reports remain separate from the merged improvements above. Check the linked PR for the affected configuration, evidence and current resolution before relying on that fix.
+These proposals were open at the November 14, 2026 audit snapshot. The release index lists merged work. [Open PRs](https://github.com/1CatAI/1Cat-vLLM/pulls) · [Release PR index](https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.5.3/PR_INDEX.md)
 
 ---
 
@@ -1305,7 +1445,7 @@ Recent work also reduces resident weights, scale copies, graph scratch and loadi
 |---|---|---|
 | Shared weights / codes / scales | Model allocation **10.07 → 6.47 GiB**; available KV budget **10.57 → 12.68 GiB** | [#671](https://github.com/1CatAI/1Cat-vLLM/pull/671) · QUASAR NVFP4 / TP4 / DFlash2 q7 / E4M3 target KV |
 | Shared graph scratch / draft snapshots | Non-KV active memory: TP2 **17.117 → 15.146 GiB**, TP4 **10.225 → 8.794 GiB** | [#677](https://github.com/1CatAI/1Cat-vLLM/pull/677) · recorded default ON/OFF comparison |
-| Reused compiled subgraphs | First startup **271.26 s**, matching-config restart **95.30 s** | [v1.5.1](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.1) · two observations within the new version |
+| Reused compiled subgraphs | First startup **271.26 s**, matching-config restart **95.30 s** | [v1.5.1](https://github.com/1CatAI/1Cat-vLLM/releases/tag/v1.5.1) · two historical observations within v1.5.1 |
 
 The memory records use V100-SXM2-32GB, CUDA 12.8 / Torch 2.10, FP16 compute/draft KV, 262144 context, 8192-token prefill and CUDA Graphs. #671 uses 32 sequence slots / memory .85; #677 uses 32 slots / memory .90. The savings overlap and must not be added. Automatic KV allocation can consume the recovered space, so total NVML usage need not fall by the same amount. Restart caching still loads weights and captures CUDA graphs; it does not make startup free.
 
@@ -1354,7 +1494,7 @@ Join the **1Cat-LLM Open-Source Community** by adding WeChat ID **`YM_isi`** to 
 - [v100-skinny](https://github.com/dnv2003/v100-skinny) — QPN quadpair-N `m8n8k4` decode layout behind the SM70 QPN2 / QPN4 / QPN8 and MXFP4-QPN kernels (MIT; notice retained in `csrc/sm70_turbomind/ops/LICENSE.v100-skinny`)
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) and the vllm-gguf-plugin bridge — pinned GGUF source provenance is recorded in the [source manifest](csrc/quantization/gguf_upstream/source_manifest.json), with notices retained in the source and wheel.
 
-Special thanks to [@yangzhuxinyzx](https://github.com/yangzhuxinyzx) and [@1CatTCat](https://github.com/1CatTCat) for their outstanding contributions to the continued evolution and performance breakthroughs of **1Cat-LLM**.
+Special thanks to [@yangzhuxinyzx](https://github.com/yangzhuxinyzx) and `@1CatTCat` for their outstanding contributions to the continued evolution and performance breakthroughs of **1Cat-LLM**.
 
 Where external implementations or algorithms are adapted, provenance and license information should be preserved in the corresponding source and PR history.
 
