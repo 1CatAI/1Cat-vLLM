@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.v1.core import kv_cache_utils
 from vllm.v1.worker import gpu_worker
 
 
@@ -25,6 +26,9 @@ def test_profile_failure_reports_memory_and_preserves_error(
         return 1000, 2000
 
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda", lambda: False)
+    # No attention layers: the workspace bounds are not what this test checks.
+    monkeypatch.setattr(gpu_worker, "configure_attention_workspace", lambda *a: None)
+    monkeypatch.setattr(kv_cache_utils, "get_kv_cache_groups", lambda *a: [])
     monkeypatch.setattr(gpu_worker.current_platform, "mem_get_info", driver_info)
 
     def allocator_info(device):
@@ -43,7 +47,8 @@ def test_profile_failure_reports_memory_and_preserves_error(
     )
     worker = gpu_worker.Worker.__new__(gpu_worker.Worker)
     worker.device = torch.device("cpu")
-    worker.model_runner = SimpleNamespace(profile_run=profile)
+    worker.vllm_config = SimpleNamespace()
+    worker.model_runner = SimpleNamespace(profile_run=profile, get_kv_cache_spec=dict)
     with pytest.raises(torch.AcceleratorError) as raised:
         worker.determine_available_memory()
     assert raised.value is failure
