@@ -44,6 +44,9 @@ def extensions(monkeypatch):
             "7.2+PTX",
             ["arch=compute_72,code=sm_72", "arch=compute_72,code=compute_72"],
         ),
+        # Turing since f2674c58c (grouped page4 QSA routes on the RTX).
+        ("7.5", ["arch=compute_75,code=sm_75"]),
+        ("7.0;7.5", ["arch=compute_70,code=sm_70", "arch=compute_75,code=sm_75"]),
     ],
 )
 def test_both_extensions_target_the_requested_volta_architecture(
@@ -63,8 +66,8 @@ def test_both_extensions_target_the_requested_volta_architecture(
         assert [flag for flag in flags if flag.startswith("arch=")] == expected
 
 
-@pytest.mark.parametrize("requested", ["7.5", "8.0"])
+@pytest.mark.parametrize("requested", ["8.0", "8.6", "7.0;8.0"])
 def test_other_architectures_fail_with_a_clear_build_error(monkeypatch, requested):
     monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", requested)
-    with pytest.raises(ValueError, match="7.0 and 7.2"):
+    with pytest.raises(ValueError, match=r"7\.0, 7\.2 and 7\.5"):
         extensions(monkeypatch)
