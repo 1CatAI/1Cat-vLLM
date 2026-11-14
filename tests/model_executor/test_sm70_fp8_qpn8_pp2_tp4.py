@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm import envs
+from vllm._sm70.policy import NativeBindings
 from vllm.config.kernel import Sm70Fp8Config
 from vllm.model_executor.kernels.linear.scaled_mm import sm70_fp8 as fp8
 from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces as ws
@@ -232,8 +233,10 @@ def test_pp2_tp4_qpn8_grouped_dispatches_caller_groups() -> None:
 
     x = torch.zeros((1, 2, 4096), dtype=torch.float16)
     library = _cpu_impl("sm70_fp8_qpn8_dispatch", ws._sm70_fp8_qpn8_dispatch)
+    # The workspace binding captured its native op when the layer was bound.
+    native = ws._workspace_binding(layer.prefix).native
     try:
-        with patch.object(fp8.sm70_ops, "fp8_qpn8_dispatch_sm70_out", fake_dispatch):
+        with patch.object(native, "fp8_qpn8_dispatch_sm70_out", fake_dispatch):
             out = fp8.TurboMindFp8LinearKernel.apply_weights(None, layer, x)
     finally:
         if library is not None:
@@ -300,6 +303,8 @@ def test_pp2_tp4_qpn8_explicit_opt_in_prepares_matching_layer(monkeypatch) -> No
         ):
             method.policy = Sm70Fp8Config()
             method.policy.resolve()
+            # __init__ binds the native ops; this kernel is built with __new__.
+            method.native_ops = NativeBindings(method.policy.native.values)
             method.process_weights_after_loading(layer)
     finally:
         envs.disable_envs_cache()
@@ -369,6 +374,8 @@ def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> No
         ):
             method.policy = Sm70Fp8Config()
             method.policy.resolve()
+            # __init__ binds the native ops; this kernel is built with __new__.
+            method.native_ops = NativeBindings(method.policy.native.values)
             method.process_weights_after_loading(layer)
     finally:
         envs.disable_envs_cache()
@@ -448,6 +455,8 @@ def test_pp2_tp4_shared_gate_prescaled_defaults_to_turbomind_layout(
         ):
             method.policy = Sm70Fp8Config()
             method.policy.resolve()
+            # __init__ binds the native ops; this kernel is built with __new__.
+            method.native_ops = NativeBindings(method.policy.native.values)
             method.process_weights_after_loading(layer)
     finally:
         envs.disable_envs_cache()

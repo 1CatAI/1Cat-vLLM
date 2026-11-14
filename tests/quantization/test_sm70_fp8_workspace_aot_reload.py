@@ -72,17 +72,18 @@ def test_export_reload_resolves_the_current_workspace(
     monkeypatch, op_name, native_name, impl
 ):
     """A serialized graph must not retain the previous process's scratch pointer."""
-    first = torch.ones(32)
-    fp8._bind_sm70_fp8_prefill_workspace(_Layer(_LAYER), first)
     pointers = []
 
-    def native(out, pointer, *args):
+    def native(out, pointer, *args, native_policy=()):
         pointers.append(pointer)
         workspace = ws._layer_workspaces[_LAYER]
         assert pointer == workspace.data_ptr()
         out.fill_(workspace[0].item())
 
+    # Binding a workspace also binds its native ops with the engine policy.
     monkeypatch.setattr(fp8.sm70_ops, native_name, native)
+    first = torch.ones(32)
+    fp8._bind_sm70_fp8_prefill_workspace(_Layer(_LAYER), first)
     extra = {
         "sm70_fp8_qpn8_dispatch": (16, 2, False, False),
         "sm70_fp8_prefill_dispatch": (128, 4, 4, False, 64),
@@ -107,17 +108,20 @@ def test_export_reload_resolves_the_current_workspace(
 
 
 def test_ba_split_export_reload_resolves_the_current_workspace(monkeypatch):
-    first = torch.ones(32)
-    fp8._bind_sm70_fp8_prefill_workspace(_Layer(_LAYER), first)
     pointers = []
 
-    def native(qkv, z, b, a, qkvz_staging, ba_staging, pointer, *args):
+    def native(
+        qkv, z, b, a, qkvz_staging, ba_staging, pointer, *args, native_policy=()
+    ):
         pointers.append(pointer)
         workspace = ws._layer_workspaces[_LAYER]
         assert pointer == workspace.data_ptr()
         qkv.fill_(workspace[0].item())
 
+    # Binding a workspace also binds its native ops with the engine policy.
     monkeypatch.setattr(fp8.sm70_ops, "fp8_qpn8_dispatch_ba_split_sm70_out", native)
+    first = torch.ones(32)
+    fp8._bind_sm70_fp8_prefill_workspace(_Layer(_LAYER), first)
 
     class Projection(torch.nn.Module):
         def forward(self, x, weight, scales):
@@ -160,17 +164,28 @@ def test_bind_rejects_a_second_workspace_for_one_layer():
 
 
 def test_online_hc_export_reload_resolves_current_workspace(monkeypatch):
-    first = torch.ones(32)
-    fp8._bind_sm70_fp8_prefill_workspace(_Layer(_LAYER), first)
     pointers = []
 
-    def native(block_out, injection_out, down, lora, gate, partials, pointer, *args):
+    def native(
+        block_out,
+        injection_out,
+        down,
+        lora,
+        gate,
+        partials,
+        pointer,
+        *args,
+        native_policy=(),
+    ):
         pointers.append(pointer)
         workspace = ws._layer_workspaces[_LAYER]
         assert pointer == workspace.data_ptr()
         block_out.fill_(workspace[0].item())
 
+    # Binding a workspace also binds its native ops with the engine policy.
     monkeypatch.setattr(fp8.sm70_ops, "fp8_qpn8_hc_dispatch_sm70_out", native)
+    first = torch.ones(32)
+    fp8._bind_sm70_fp8_prefill_workspace(_Layer(_LAYER), first)
 
     class Projection(torch.nn.Module):
         def forward(self, x, codes, scales):

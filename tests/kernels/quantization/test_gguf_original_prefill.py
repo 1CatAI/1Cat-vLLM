@@ -95,6 +95,10 @@ def test_projection_dispatch_counts_routed_down_rows(monkeypatch, m, selected):
         SimpleNamespace(ggml_moe_mmq=operation("mmq"), ggml_moe_mmvq=operation("mmvq")),
     )
     method = object.__new__(GGUFNativeMoEMethod)
+    # __init__ defaults: routing trace off, no routed-expert cache, not V4.1.
+    method.expert_trace_tokens = 0
+    method.expert_cache = None
+    method.is_v41 = False
     method.dp4a_admitted = False
     method.hidden_size, method.intermediate_size = 8, 4
     method.input_padding = {}

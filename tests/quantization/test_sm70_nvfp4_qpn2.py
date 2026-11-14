@@ -215,6 +215,16 @@ def test_nvfp4_qpn2_dispatch_crops_padded_output_before_bias(monkeypatch):
         sm70_nvfp4_qpn2_codes=torch.empty((64, 32), dtype=torch.uint8),
         sm70_nvfp4_qpn2_scales=torch.empty((64, 4), dtype=torch.uint8),
     )
+    seen_shapes = []
+
+    def fake_dispatch(*args, native_policy=()):
+        seen_shapes.append(tuple(args[0].shape))
+        args[0].fill_(3)
+
+    # The state binds its native ops with the engine policy when it is built.
+    monkeypatch.setattr(
+        nvfp4_kernel.sm70_ops, "nvfp4_qpn2_dispatch_sm70_out", fake_dispatch
+    )
     setattr(
         layer,
         sm70_tm.STATE_ATTR,
@@ -228,15 +238,6 @@ def test_nvfp4_qpn2_dispatch_crops_padded_output_before_bias(monkeypatch):
             padded_output_size=64,
             op_kind="nvfp4",
         ),
-    )
-    seen_shapes = []
-
-    def fake_dispatch(*args):
-        seen_shapes.append(tuple(args[0].shape))
-        args[0].fill_(3)
-
-    monkeypatch.setattr(
-        nvfp4_kernel.sm70_ops, "nvfp4_qpn2_dispatch_sm70_out", fake_dispatch
     )
     bias = torch.arange(56, dtype=torch.float16)
     output = nvfp4_kernel.Qpn2NvFp4LinearKernel.apply_qpn2(
@@ -302,7 +303,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
     scheme = CompressedTensorsW4A4Fp4()
     monkeypatch.setattr(
         nvfp4_scheme.sm70_tm,
-        "should_prepare_turbomind",
+        "is_exact_sm70_cuda",
         lambda tensor, enabled: enabled,
     )
     config = _runtime_config()
@@ -357,7 +358,8 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
 
     monkeypatch.setattr(nvfp4_scheme.sm70_tm, "prepare_nvfp4_linear", fake_prepare)
 
-    def fake_dispatch(*args):
+    # The prepared state binds these native ops with the engine policy.
+    def fake_dispatch(*args, native_policy=()):
         calls.append(args)
         args[0].fill_(3)
 
@@ -366,7 +368,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
     )
     combined_calls = []
 
-    def fake_combined_dispatch(*args):
+    def fake_combined_dispatch(*args, native_policy=()):
         combined_calls.append(args)
         args[0].fill_(5 if args[1].shape[0] >= args[-1] else 3)
 
@@ -376,7 +378,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
         fake_combined_dispatch,
     )
 
-    def fake_shared_dispatch(*args):
+    def fake_shared_dispatch(*args, native_policy=()):
         assert shared
         state = getattr(layer, sm70_tm.STATE_ATTR)
         assert args[2] is state.weight

@@ -5,6 +5,7 @@ import io
 
 import torch
 
+from vllm.model_executor.kernels.linear.qpn import fp8 as qpn_fp8
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_w8a16_fp8 as ct_fp8,
 )
@@ -15,8 +16,9 @@ def test_export_reload_resolves_current_workspace(monkeypatch):
     workspace = torch.ones(32)
     previous_workspace = workspace
     pointers = []
+    # The dispatch resolves the workspace inside the QPN8 kernel module.
     monkeypatch.setattr(
-        ct_fp8, "_get_sm70_fp8_prefill_exact_dense_workspace", lambda _: workspace
+        qpn_fp8, "_get_sm70_fp8_prefill_exact_dense_workspace", lambda _: workspace
     )
 
     def native(out, pointer, x, codes, scales, split_k, nacc, prefetch, gated):

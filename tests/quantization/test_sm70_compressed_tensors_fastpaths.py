@@ -80,7 +80,8 @@ def test_compressed_tensors_channel_fp8_prepares_and_dispatches_turbomind(
 
     monkeypatch.setattr(torch.ops._C, "fp8_sm70_prepare", object(), raising=False)
 
-    def fake_prepare(weight, scales, group_size, gated_silu):
+    # process_weights_after_loading binds the native ops with the engine policy.
+    def fake_prepare(weight, scales, group_size, gated_silu, native_policy=()):
         prepare_calls.append(
             (tuple(weight.shape), tuple(scales.shape), group_size, gated_silu)
         )
@@ -125,7 +126,8 @@ def test_compressed_tensors_channel_fp8_prepares_and_dispatches_turbomind(
         )
         out.fill_(2)
 
-    monkeypatch.setattr(f"{module}.sm70_ops.fp8_gemm_sm70_out", fake_gemm)
+    # The bound native ops were captured during process_weights_after_loading.
+    monkeypatch.setattr(scheme.native_ops, "fp8_gemm_sm70_out", fake_gemm)
     output = scheme.apply_weights(
         layer,
         torch.ones((2, 4), dtype=torch.float16),
@@ -203,11 +205,19 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
         f"{module}._get_sm70_fp8_prefill_exact_dense_workspace",
         lambda weight: workspace,
     )
+    # The runtime dispatch resolves the shared workspace again inside the QPN8
+    # kernel module; it must be the one weight preparation reserved.
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.qpn.fp8."
+        "_get_sm70_fp8_prefill_exact_dense_workspace",
+        lambda weight: workspace,
+    )
     # An SM70 VllmConfig built earlier in the process exports
     # VLLM_SM70_BATCH_GEMM_LAYOUTS=1; this test covers the QPN8 prepare only.
     monkeypatch.setattr(f"{module}.sm70_tm.use_batched_gemm_layouts", lambda: False)
 
-    def fake_prepare(weight, scales):
+    # process_weights_after_loading binds the native ops with the engine policy.
+    def fake_prepare(weight, scales, native_policy=()):
         prepare_calls.append((tuple(weight.shape), tuple(scales.shape)))
         return (
             torch.empty((4, 6), dtype=torch.uint8),
@@ -235,7 +245,16 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
     dispatch_calls = []
 
     def fake_dispatch(
-        out, workspace_ptr, x, weight, scales, split_k, nacc, prefetch, gated_silu
+        out,
+        workspace_ptr,
+        x,
+        weight,
+        scales,
+        split_k,
+        nacc,
+        prefetch,
+        gated_silu,
+        native_policy=(),
     ):
         dispatch_calls.append(
             (

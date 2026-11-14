@@ -103,6 +103,10 @@ def test_original_experts_keep_fast_route_for_graph_padding(monkeypatch, m):
     method.weight_types = {"w1": 21, "w3": 21, "w2": 42}
     method.input_padding = {"w2": (32, 192)}
     method.q8_intermediate = True
+    # __init__ defaults: routing trace off, no routed-expert cache, not V4.1.
+    method.expert_trace_tokens = 0
+    method.expert_cache = None
+    method.is_v41 = False
     bank = torch.empty(0, dtype=torch.uint8)
     layer = SimpleNamespace(
         apply_router_weight_on_input=False,
@@ -113,11 +117,13 @@ def test_original_experts_keep_fast_route_for_graph_padding(monkeypatch, m):
         gguf_w2=bank,
     )
     calls = []
+    outputs = []
 
     def native(
         x, ids, probabilities, gate, up, down, source, down_type, left, q8, bank_aware
     ):
         calls.append((x.shape[0], source, down_type, left, q8, bank_aware))
+        outputs.append(x)
         return x
 
     monkeypatch.setattr(torch.ops.vllm, "gguf_original_expert_dp4a", native)
@@ -130,5 +136,8 @@ def test_original_experts_keep_fast_route_for_graph_padding(monkeypatch, m):
         None,
         None,
     )
-    assert result is x
+    # Up to 20 rows form one piece (#1242); its native output is returned
+    # as is. The piece is a view of x, so compare with what the op returned.
+    assert result is outputs[0]
+    assert result.data_ptr() == x.data_ptr() and result.shape == x.shape
     assert calls == [(m, 21, 42, 32, True, True)]

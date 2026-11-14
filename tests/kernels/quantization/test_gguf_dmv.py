@@ -352,6 +352,8 @@ def test_iq2_plane_policy_changes_graph_hash():
 
     enabled = KernelConfig(sm70_gguf=Sm70GgufConfig(iq2_signed_nibbles=True))
     disabled = KernelConfig(sm70_gguf=Sm70GgufConfig(iq2_signed_nibbles=False))
+    # Only a policy a loaded GGUF provider activated salts the graph hash.
+    enabled.sm70_gguf.active = disabled.sm70_gguf.active = True
     assert enabled.compute_hash() != disabled.compute_hash()
 
 
