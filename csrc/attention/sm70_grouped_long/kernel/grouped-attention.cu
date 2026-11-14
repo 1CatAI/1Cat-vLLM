@@ -5730,6 +5730,55 @@ at::Tensor private_grouped_e4m3_fp32_paged(
       paired = paired && tensor->stride(dim) % 16 == 0;
   }
   const int query_len = static_cast<int>(q.size(0) / batch_size);
+  if (query_len * kGroupedVerifyHeads > 32) {
+    // Six to eight rows per request (the DFlash2 q8 verifier) keep the
+    // 48-row packed kernel: one 512-thread CTA per split reads each KV tile
+    // once for all 48 rows. The 2-CTA kernel below runs these widths with a
+    // single K warp and is ~12% slower per step at 64K, B1 and B4.
+    auto kernel =
+        query_len == 8
+            ? (paired ? flash_attention_grouped_verify_e5m2_partial_kernel<
+                            8, false, 0, false, false, false,
+                            flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float,
+                            true, true, true, 48, true>
+                      : flash_attention_grouped_verify_e5m2_partial_kernel<
+                            8, false, 0, false, false, false,
+                            flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float,
+                            true, true, false, 48, true>)
+            : (paired ? flash_attention_grouped_verify_e5m2_partial_kernel<
+                            8, false, 0, false, false, false,
+                            flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float,
+                            true, true, true, 48>
+                      : flash_attention_grouped_verify_e5m2_partial_kernel<
+                            8, false, 0, false, false, false,
+                            flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float,
+                            true, true, false, 48>);
+    constexpr int kSmemBytes = sizeof(GroupedE4M3SmemLayout<48, 264>);
+    TORCH_CHECK(properties->sharedMemPerBlockOptin >= kSmemBytes,
+                "E4M3 attention exceeds device opt-in shared memory");
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    kernel<<<dim3(k.size(2), 80, static_cast<unsigned>(batch_size)),
+             kGroupedVerifyThreads, kSmemBytes, stream>>>(
+        reinterpret_cast<const __half*>(aligned_q.data_ptr()), k.data_ptr(),
+        v.data_ptr(), block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
+        partial.data_ptr<float>(), lse.data_ptr<float>(), query_len,
+        block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale,
+        nullptr, static_cast<int>(batch_size), row_lengths.data_ptr<int>(),
+        k.size(2));
+    flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
+        <<<dim3(query_len, q.size(1), static_cast<unsigned>(batch_size)),
+           kGroupedVerifyHeadDim, 0, stream>>>(
+            partial.data_ptr<float>(), lse.data_ptr<float>(),
+            row_lengths.data_ptr<int>(),
+            reinterpret_cast<__half*>(out.data_ptr()), query_len,
+            row_lengths.data_ptr<int>(), k.size(2));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+  }
   const int row_tiles = (query_len * kGroupedVerifyHeads + 7) / 8;
   constexpr int kMinTokensPerSplit = 32;
   float* partial_ptr = nullptr;
