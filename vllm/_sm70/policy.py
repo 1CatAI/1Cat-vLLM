@@ -55,6 +55,7 @@ CONFIGURED_OPERATORS = GGUF_OPERATORS + (
     "fp8_moe_single_token_indexed_dense_w13_sm70_out",
     "fp8_moe_single_token_sm70_out",
     "fp8_qpn8_dequantize_sm70_out",
+    "fp8_qpn8_dispatch_ba_masked_sm70_out",
     "fp8_qpn8_dispatch_ba_split_sm70_out",
     "fp8_qpn8_dispatch_sm70_out",
     "fp8_qpn8_gated_pair_sm70_out",

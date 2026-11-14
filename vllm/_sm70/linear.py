@@ -988,6 +988,58 @@ if hasattr(torch.ops._C, "fp8_qpn8_dispatch_ba_split_sm70_out"):
         return None
 
 
+def fp8_qpn8_dispatch_ba_masked_sm70_out(
+    qkv_out: torch.Tensor,
+    z_out: torch.Tensor,
+    b_out: torch.Tensor,
+    a_out: torch.Tensor,
+    qkvz_staging: torch.Tensor,
+    ba_staging: torch.Tensor,
+    dense_weight_ptr: int,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    ba_weight: torch.Tensor,
+    native_policy: tuple[str, ...] = (),
+) -> None:
+    """Fused QKV/Z FP8 and b/a FP16 projections for fewer than eight rows."""
+    call_native(
+        _qwen38_qpn8_op("fp8_qpn8_dispatch_ba_masked_sm70_out"),
+        native_policy,
+        qkv_out,
+        z_out,
+        b_out,
+        a_out,
+        qkvz_staging,
+        ba_staging,
+        dense_weight_ptr,
+        input,
+        codes,
+        group_scales,
+        ba_weight,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_dispatch_ba_masked_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_dispatch_ba_masked_sm70_out")
+    def _fp8_qpn8_dispatch_ba_masked_sm70_out_fake(
+        qkv_out: torch.Tensor,
+        z_out: torch.Tensor,
+        b_out: torch.Tensor,
+        a_out: torch.Tensor,
+        qkvz_staging: torch.Tensor,
+        ba_staging: torch.Tensor,
+        dense_weight_ptr: int,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        ba_weight: torch.Tensor,
+        native_policy: tuple[str, ...] = (),
+    ) -> None:
+        return None
+
+
 def fp8_qpn8_gated_pair_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1120,6 +1172,7 @@ def _register_qwen38_qpn8_out_fakes() -> None:
         "fp8_qpn8_dispatch_sm70_out",
         "fp8_qpn8_gemm_sm70_out",
         "fp8_qpn8_gemm_ba_split_sm70_out",
+        "fp8_qpn8_dispatch_ba_masked_sm70_out",
         "fp8_qpn8_dispatch_ba_split_sm70_out",
         "fp8_qpn8_gated_pair_sm70_out",
     ):
