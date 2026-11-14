@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The SM70 Marlin dispatch adds the bias after the GEMM.
+"""The SM70 Marlin dense and MoE dispatches add the bias after the GEMM.
 
 Callers pass the bias in Marlin's column order (marlin_permute_bias) while the
 SM70 kernels write logical columns, so the dispatch has to undo that order.
 The weights are packed the way the loader packs them (gptq_marlin_repack and
-awq_marlin_repack), which is the layout the SM70 kernels read.
+awq_marlin_repack), which is the layout the SM70 kernels read; MoE weights are
+the per-expert dense layout, stacked.
 """
 
 import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+    moe_align_block_size,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_workspace_new,
     marlin_permute_bias,
@@ -148,3 +152,145 @@ def test_sm70_marlin_bias_survives_graph_replay() -> None:
         graph.replay()
         eager = _gemm(quant_type, activation, q_weight, scales, None, marlin_bias)
         torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
+NUM_EXPERTS, TOP_K, MOE_BLOCK = 4, 2, 16
+
+
+def _pack_experts(kind: str, group_size: int, num_experts: int):
+    packed = [_pack(kind, group_size) for _ in range(num_experts)]
+    quant_type = packed[0][0]
+    weight_ref, q_weight, scales, zero_points = (
+        None if parts[0] is None else torch.stack(parts)
+        for parts in zip(*(item[1:] for item in packed))
+    )
+    return quant_type, weight_ref, q_weight, scales, zero_points
+
+
+def _moe_gemm(
+    quant_type: ScalarType,
+    activation: torch.Tensor,
+    q_weight: torch.Tensor,
+    scales: torch.Tensor,
+    zero_points: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    routing: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    topk_weights: torch.Tensor,
+    mul_topk_weights: bool,
+) -> torch.Tensor:
+    sorted_ids, expert_ids, padded = routing
+    # Rows of experts outside this rank are never written.
+    output = torch.zeros(
+        (activation.shape[0] * TOP_K, SIZE_N), dtype=torch.float16, device="cuda"
+    )
+    return ops.moe_wna16_marlin_gemm(
+        activation,
+        output,
+        q_weight,
+        bias,
+        scales,
+        None,
+        None,
+        zero_points,
+        None,
+        None,
+        marlin_make_workspace_new(activation.device, 4),
+        sorted_ids,
+        expert_ids,
+        padded,
+        topk_weights,
+        moe_block_size=MOE_BLOCK,
+        top_k=TOP_K,
+        mul_topk_weights=mul_topk_weights,
+        b_q_type=quant_type,
+        size_m=activation.shape[0],
+        size_n=SIZE_N,
+        size_k=SIZE_K,
+        is_k_full=True,
+        use_atomic_add=False,
+        use_fp32_reduce=True,
+        is_zp_float=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "kind,group_size", [("fp8", 128), ("uint4b8", 128), ("uint4", 128)]
+)
+@pytest.mark.parametrize("size_m", [1, 16, 64])
+@pytest.mark.parametrize("mul_topk_weights", [False, True])
+@pytest.mark.parametrize("expert_parallel", [False, True])
+def test_sm70_marlin_moe_bias_follows_routing(
+    kind: str,
+    group_size: int,
+    size_m: int,
+    mul_topk_weights: bool,
+    expert_parallel: bool,
+) -> None:
+    torch.manual_seed(20261116)
+    # With expert parallelism this rank holds global experts 1 and 3 only.
+    local_experts = [1, 3] if expert_parallel else list(range(NUM_EXPERTS))
+    quant_type, weight_ref, q_weight, scales, zero_points = _pack_experts(
+        kind, group_size, len(local_experts)
+    )
+    activation = torch.randn((size_m, SIZE_K), dtype=torch.float16, device="cuda")
+    bias = torch.randn((len(local_experts), SIZE_N), dtype=torch.float16, device="cuda")
+    marlin_bias = torch.stack([marlin_permute_bias(row) for row in bias])
+    topk_ids = torch.stack(
+        [torch.randperm(NUM_EXPERTS, device="cuda")[:TOP_K] for _ in range(size_m)]
+    ).to(torch.int32)
+    topk_weights = torch.rand((size_m, TOP_K), dtype=torch.float32, device="cuda")
+    expert_map = None
+    if expert_parallel:
+        expert_map = torch.full((NUM_EXPERTS,), -1, dtype=torch.int32, device="cuda")
+        expert_map[local_experts] = torch.arange(
+            len(local_experts), dtype=torch.int32, device="cuda"
+        )
+    routing = moe_align_block_size(topk_ids, MOE_BLOCK, NUM_EXPERTS, expert_map)
+
+    def run(row_bias: torch.Tensor | None) -> torch.Tensor:
+        return _moe_gemm(
+            quant_type,
+            activation,
+            q_weight,
+            scales,
+            zero_points,
+            row_bias,
+            routing,
+            topk_weights,
+            mul_topk_weights,
+        )
+
+    without_bias = run(None)
+    with_bias = run(marlin_bias)
+    unpermuted = run(bias.clone())
+
+    flat_experts = topk_ids.flatten().long()
+    local = torch.full((NUM_EXPERTS,), -1, dtype=torch.long, device="cuda")
+    local[local_experts] = torch.arange(len(local_experts), device="cuda")
+    row_expert = local[flat_experts]
+    on_rank = row_expert >= 0
+    row_weight = (
+        topk_weights.flatten()
+        if mul_topk_weights
+        else torch.ones(size_m * TOP_K, device="cuda")
+    )
+    # Upstream order: (A W + bias[e]) * w; the SM70 output is scaled already.
+    # The kernel adds bias * w with one fused multiply-add: exact in float64
+    # here, then rounded to fp32 and to fp16 as the kernel does.
+    row_bias = bias[row_expert.clamp(min=0)].double() * row_weight[:, None].double()
+    expected = (without_bias.double() + row_bias * on_rank[:, None]).float().half()
+    torch.testing.assert_close(with_bias, expected, rtol=0, atol=0)
+    # Rows of other ranks' experts stay untouched.
+    assert torch.equal(with_bias[~on_rank], without_bias[~on_rank])
+    assert not torch.equal(unpermuted, expected)
+
+    tokens = torch.arange(size_m * TOP_K, device="cuda") // TOP_K
+    reference = torch.stack(
+        [
+            (activation[tokens[r]] @ weight_ref[row_expert[r]] + bias[row_expert[r]])
+            * row_weight[r]
+            for r in range(size_m * TOP_K)
+            if on_rank[r]
+        ]
+    )
+    assert _relative_error(with_bias[on_rank], reference) < 0.04
