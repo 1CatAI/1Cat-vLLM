@@ -186,6 +186,7 @@ TYPED_TOOL = ChatCompletionToolsParam(
                 "count": {"type": "integer"},
                 "flag": {"type": "boolean"},
                 "items": {"type": "array"},
+                "data": {"type": "object"},
                 "note": {"type": ["string", "array"]},
                 "optional": {"type": ["string", "null"]},
             },
@@ -209,6 +210,9 @@ TYPED_TOOL = ChatCompletionToolsParam(
         "<arg_key>count</arg_key><arg_value>3</arg_value>"
         '<arg_key>note</arg_key><arg_value>Text mit "Zitat" und \\</arg_value>'
         "<arg_key>task</arg_key><arg_value>Grüße</arg_value>",
+        "<arg_key>count</arg_key><arg_value>\n5\n</arg_value>"
+        "<arg_key>task</arg_key><arg_value>weiter</arg_value>",
+        '<arg_key>data</arg_key><arg_value>{"title":"Notiz","done":false}</arg_value>',
     ],
 )
 def test_streamed_arguments_stay_a_prefix_of_the_finish(glm47_tokenizer, body):
