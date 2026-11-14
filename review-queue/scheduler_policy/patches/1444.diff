@@ -1,0 +1,426 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..565ef4c030 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -5407,6 +5407,79 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=("MoE AWQ",),
+         user_visible=False,
+     ),
++    # Warm-block KV retention.
++    # Blocks that still carry a hash when released stay in a warm table and
++    # keep serving prefix hits, instead of going straight back to the free
++    # queue. They are evicted by pressure-gated retention (cold -> hot): a
++    # block touched on every hit leaves warm, is re-stamped when released
++    # again, and moves to the back, so hot blocks outlive cold ones.
++    # P25..P80 give the retention in seconds when usage is below that tier;
++    # at 80% and above they are reclaimed immediately.
++    "VLLM_KV_RETENTION_ENABLED": env_var(
++        lambda: os.getenv("VLLM_KV_RETENTION_ENABLED", "1").strip().lower()
++        not in ("", "0", "false", "no", "off"),
++        description=(
++            "Retain freed-but-hashed KV blocks in a warm list so repeated "
++            "prefixes keep hitting instead of being re-prefilled. "
++            "Default ON; set 0 to restore the stock free-queue behaviour."
++        ),
++        category="performance",
++        declared_default="True",
++        effective_default="True",
++        automatic_conditions=(),
++        acceleration_paths=("SM70 warm-block KV retention",),
++        user_visible=True,
++    ),
++    "VLLM_KV_RETENTION_P25": env_var(
++        lambda: int(os.getenv("VLLM_KV_RETENTION_P25", "43200")),
++        description="Warm-block retention seconds while KV usage < 25%.",
++        category="performance",
++        declared_default=43200,
++        effective_default=43200,
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=True,
++    ),
++    "VLLM_KV_RETENTION_P35": env_var(
++        lambda: int(os.getenv("VLLM_KV_RETENTION_P35", "21600")),
++        description="Warm-block retention seconds while KV usage < 35%.",
++        category="performance",
++        declared_default=21600,
++        effective_default=21600,
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=True,
++    ),
++    "VLLM_KV_RETENTION_P50": env_var(
++        lambda: int(os.getenv("VLLM_KV_RETENTION_P50", "10800")),
++        description="Warm-block retention seconds while KV usage < 50%.",
++        category="performance",
++        declared_default=10800,
++        effective_default=10800,
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=True,
++    ),
++    "VLLM_KV_RETENTION_P65": env_var(
++        lambda: int(os.getenv("VLLM_KV_RETENTION_P65", "3600")),
++        description="Warm-block retention seconds while KV usage < 65%.",
++        category="performance",
++        declared_default=3600,
++        effective_default=3600,
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=True,
++    ),
++    "VLLM_KV_RETENTION_P80": env_var(
++        lambda: int(os.getenv("VLLM_KV_RETENTION_P80", "1800")),
++        description="Warm-block retention seconds while KV usage < 80%.",
++        category="performance",
++        declared_default=1800,
++        effective_default=1800,
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=True,
++    ),
+     "VLLM_SM70_AUX_KERNEL_WARMUP": env_var(
+         lambda: bool(int(os.getenv("VLLM_SM70_AUX_KERNEL_WARMUP", "1"))),
+         description=(
+@@ -20265,6 +20338,16 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
+     hash everything else. This keeps the cache key aligned across workers."""
+ 
+     ignored_factors: set[str] = {
++        "VLLM_KV_RETENTION_P80",
++        "VLLM_KV_RETENTION_P65",
++        "VLLM_KV_RETENTION_P50",
++        "VLLM_KV_RETENTION_P35",
++        "VLLM_KV_RETENTION_P25",
++        # Warm-block retention is purely a block-management policy: it does
++        # not affect any build artefact, and leaving it out of the key would
++        # invalidate the whole compile cache whenever a retention period is
++        # tuned.
++        "VLLM_KV_RETENTION_ENABLED",
+         "VLLM_INPLACE_AR_MIN",
+         "VLLM_PYNCCL_ALLGATHER",
+         "VLLM_V41_ATTN_TIMING",
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index ff876ed0ea..8cd5889e62 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -1,5 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
++import time
++from collections import OrderedDict
+ from collections.abc import Iterable, Sequence
+ from itertools import groupby
+ from typing import Any
+@@ -235,6 +238,51 @@ def __init__(
+ 
+         self.metrics_collector = metrics_collector
+ 
++        # --- Warm-block KV retention ---
++        # A block that still carries a hash when released stays attached to the
++        # prefix-cache hash table and is kept in a warm table rather than going
++        # straight back to the free queue, so a later request with the same
++        # prefix hits it and skips the recompute.
++        #
++        # When free blocks run short they are evicted under pressure-gated
++        # retention (cold -> hot):
++        #   usage < 25%  -> keep 12h      usage < 65%  -> keep 1h
++        #   usage < 35%  -> keep  6h      usage < 80%  -> keep 30m
++        #   usage < 50%  -> keep  3h      usage >= 80% -> reclaim now
++        #
++        # touch() on a hit removes a block from the warm table, so it is
++        # re-stamped when released again and moves to the back of the queue --
++        # hot blocks survive many eviction rounds while cold ones age out from
++        # the head. OrderedDict gives FIFO order and O(1) removal.
++        #
++        # Partitioned queues: `_PartitionedBlockQueue` splits by block_id range
++        # (the state group is block_id < device_state_blocks). On the current
++        # target device_state_blocks is 0, so the plain queue is used; promotion
++        # filters by block_id either way so groups are never crossed.
++        self._warm_enabled: bool = (
++            os.environ.get("VLLM_KV_RETENTION_ENABLED", "1").strip().lower()
++            not in ("", "0", "false", "no", "off")
++        )
++        self.warm_blocks: OrderedDict[int, KVCacheBlock] = OrderedDict()
++        self._warm_freed_at: dict[int, float] = {}
++        self._device_state_blocks: int = device_state_blocks
++        # (max_usage_exclusive, retention_seconds), in cold -> hot order.
++        self._retention_tiers: list[tuple[float, int]] = [
++            (0.25, int(os.environ.get("VLLM_KV_RETENTION_P25", "43200"))),
++            (0.35, int(os.environ.get("VLLM_KV_RETENTION_P35", "21600"))),
++            (0.50, int(os.environ.get("VLLM_KV_RETENTION_P50", "10800"))),
++            (0.65, int(os.environ.get("VLLM_KV_RETENTION_P65", "3600"))),
++            (0.80, int(os.environ.get("VLLM_KV_RETENTION_P80", "1800"))),
++        ]
++        # The warm table is capped at half the pool so it cannot grow without
++        # bound and crowd out genuinely free blocks.
++        # Over the cap, evict oldest-first up front, trimming as blocks come in.
++        self._warm_cap: int = max((num_gpu_blocks - 1) // 2, 0)
++
++    def _warm_active(self) -> bool:
++        """Whether warm retention is active (enabled and actually caching)."""
++        return self._warm_enabled and self.enable_caching
++
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+     ) -> list[KVCacheBlock] | None:
+@@ -399,6 +447,22 @@ def get_new_blocks(
+         if num_blocks > self.get_num_free_blocks(kv_cache_group_id):
+             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+ 
++        # When the free queue is short, top it up by evicting the oldest
++        # warm blocks first under pressure-gated retention (cold -> hot).
++        # `get_num_free_blocks` counts warm blocks in the total, so passing the
++        # check above does not mean the free queue itself has enough -- it must
++        # be topped up here or popleft_n returns fewer blocks than requested.
++        if self._warm_active() and self.warm_blocks:
++            _queue_free = (
++                self.free_block_queue.for_group(kv_cache_group_id).num_free_blocks
++                if isinstance(self.free_block_queue, _PartitionedBlockQueue)
++                and kv_cache_group_id is not None
++                else self.free_block_queue.num_free_blocks
++            )
++            _shortage = num_blocks - _queue_free
++            if _shortage > 0:
++                self._promote_warm_blocks(_shortage, kv_cache_group_id)
++
+         ret: list[KVCacheBlock] = (
+             self.free_block_queue.popleft_n(num_blocks, kv_cache_group_id)
+             if isinstance(self.free_block_queue, _PartitionedBlockQueue)
+@@ -467,9 +531,21 @@ def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+             blocks: A list of blocks to touch.
+         """
+         for block in blocks:
++            # A hit removes the block from the warm table.
++            # It is not in the free queue (warm blocks are not free
++            # candidates), so it cannot take the path below;
++            # `free_block_queue.remove`. Once detached it is normally
++            # referenced; on the next release it gets
++            # a **fresh** stamp at the back of the queue -- this is what keeps
++            # hot blocks alive longer.
++            _in_warm = False
++            if self._warm_active() and block.ref_cnt == 0 and not block.is_null:
++                _in_warm = self.warm_blocks.pop(block.block_id, None) is not None
++                if _in_warm:
++                    self._warm_freed_at.pop(block.block_id, None)
+             # ref_cnt=0 means this block is in the free list (i.e. eviction
+             # candidate), so remove it.
+-            if block.ref_cnt == 0 and not block.is_null:
++            if block.ref_cnt == 0 and not block.is_null and not _in_warm:
+                 self.free_block_queue.remove(block)
+             block.ref_cnt += 1
+             if self.metrics_collector:
+@@ -511,13 +587,42 @@ def free_blocks(
+                     if reuse_first or block.block_hash is None
+                 ]
+             )
+-            self.free_block_queue.append_n(
+-                [
+-                    block
+-                    for block in freed_blocks
+-                    if not reuse_first and block.block_hash is not None
+-                ]
+-            )
++            # Hashed blocks no longer go straight to the free queue but into
++            # the warm table: they stay attached to the prefix-cache hash table,
++            # so a later request with the same prefix
++            # can be hit directly, saving a recompute. Only when free blocks are
++            # genuinely short does
++            # promoted back out by `_promote_warm_blocks`.
++            #
++            # `reuse_first` blocks (already passed by the sliding window) do
++            # **not** enter the warm table -- in any
++            # boundary alignment, so keeping them would only waste space.
++            if self._warm_active():
++                _now = time.monotonic()
++                _to_queue: list[KVCacheBlock] = []
++                for block in freed_blocks:
++                    if reuse_first or block.block_hash is None:
++                        continue
++                    self.warm_blocks[block.block_id] = block
++                    self._warm_freed_at[block.block_id] = _now
++                # Over the warm cap: evict the oldest up front so the table
++            # cannot grow without bound.
++                while self._warm_cap and len(self.warm_blocks) > self._warm_cap:
++                    _oldest_id, _oldest = next(iter(self.warm_blocks.items()))
++                    del self.warm_blocks[_oldest_id]
++                    self._warm_freed_at.pop(_oldest_id, None)
++                    self._maybe_evict_cached_block(_oldest)
++                    _to_queue.append(_oldest)
++                if _to_queue:
++                    self.free_block_queue.append_n(_to_queue)
++            else:
++                self.free_block_queue.append_n(
++                    [
++                        block
++                        for block in freed_blocks
++                        if not reuse_first and block.block_hash is not None
++                    ]
++                )
+         else:
+             self.free_block_queue.append_n(freed_blocks)
+ 
+@@ -561,6 +666,18 @@ def reset_prefix_cache(self) -> bool:
+         # Remove all hashes so that no new blocks will hit.
+         self.cached_block_hash_to_block = BlockHashToBlockMap()
+ 
++        # Push warm blocks back into the free queue first; otherwise their hash
++        # is cleared by reset_hash() below but the blocks themselves stay in
++        # the warm table and never allocated again (a leak after a cache reset).
++        # Evict block by block through `_maybe_evict_cached_block` so
++        # `cached_block_hash_to_block` and the metrics drain together;
++        # reset_hash() below only clears the hash on each block, not the index.
++        while self.warm_blocks:
++            _, _warm_block = self.warm_blocks.popitem(last=False)
++            self._maybe_evict_cached_block(_warm_block)
++            self.free_block_queue.append_n([_warm_block])
++        self._warm_freed_at.clear()
++
+         # Remove all hashes from all blocks.
+         for block in self.blocks:
+             block.reset_hash()
+@@ -575,17 +692,142 @@ def reset_prefix_cache(self) -> bool:
+ 
+         return True
+ 
++    def _belongs_to_group(self, block_id: int, kv_cache_group_id: int | None) -> bool:
++        """Whether this block belongs to the given kv-cache group.
++
++        Always True when unpartitioned (`device_state_blocks == 0`). When
++        partitioned, decided by block_id range: the state group is
++        `block_id < device_state_blocks`.
++        """
++        if kv_cache_group_id is None or not self._device_state_blocks:
++            return True
++        if not isinstance(self.free_block_queue, _PartitionedBlockQueue):
++            return True
++        in_state = kv_cache_group_id in self.free_block_queue.state_group_ids
++        return (block_id < self._device_state_blocks) == in_state
++
++    @property
++    def warm_block_count(self) -> int:
++        """Number of blocks currently held in the warm table."""
++        return len(self.warm_blocks)
++
++    def _get_retention_seconds(self) -> float:
++        """Retention for warm blocks at the current pressure, in seconds.
++
++        Lower pressure retains longer; at >= 80% this returns 0, meaning
++        reclaim immediately.
++        Same accounting as `get_usage`: allocated plus warm both count as used.
++        """
++        total = self.num_gpu_blocks - 1  # exclude the null block
++        free = self.free_block_queue.num_free_blocks
++        warm = len(self.warm_blocks)
++        allocated = max(total - free - warm, 0)
++        usage = (allocated + warm) / max(total, 1)
++
++        for threshold, retention in self._retention_tiers:
++            if usage < threshold:
++                return float(retention)
++        return 0.0
++
++    def _promote_warm_blocks(
++        self, num_blocks: int, kv_cache_group_id: int | None = None
++    ) -> int:
++        """Demote warm blocks back to the free queue.
++
++        Always oldest-first (cold -> hot), in two phases:
++          Phase 1 -- evict blocks that have **exceeded** the current retention.
++          Phase 2 -- if still short, keep evicting from the head regardless of
++                     age, so the caller always gets its blocks.
++
++        Hot blocks are protected naturally: every hit moves them out of warm
++        via `touch()`, and the next release stamps them fresh at the back of the
++        queue, so they survive many eviction rounds while cold blocks age out
++        from the head.
++
++        Eviction clears the hash too (`_maybe_evict_cached_block`), after which
++        the block can no longer be hit by a prefix -- that is what "demote"
++        means here.
++
++        Returns:
++            How many blocks were demoted.
++        """
++        if not self.warm_blocks:
++            return 0
++        now = time.monotonic()
++        retention = self._get_retention_seconds()
++        promoted = 0
++
++        def _promote(block_id: int) -> None:
++            block = self.warm_blocks.pop(block_id)
++            self._warm_freed_at.pop(block_id, None)
++            self._maybe_evict_cached_block(block)
++            self.free_block_queue.append_n([block])
++
++        # Phase 1: evict expired blocks in FIFO order.
++        expired: list[int] = []
++        for block_id in self.warm_blocks:
++            if promoted >= num_blocks:
++                break
++            if not self._belongs_to_group(block_id, kv_cache_group_id):
++                continue
++            freed_at = self._warm_freed_at.get(block_id, 0.0)
++            if freed_at <= 0.0 or (now - freed_at) >= retention:
++                expired.append(block_id)
++                promoted += 1
++        for block_id in expired:
++            _promote(block_id)
++
++        # Phase 2: still short -> keep taking from the head regardless of age.
++        if promoted < num_blocks:
++            for block_id in list(self.warm_blocks.keys()):
++                if promoted >= num_blocks:
++                    break
++                if not self._belongs_to_group(block_id, kv_cache_group_id):
++                    continue
++                _promote(block_id)
++                promoted += 1
++
++        if promoted:
++            logger.debug(
++                "Promoted %d warm blocks (retention=%.0fs, %d remain).",
++                promoted,
++                retention,
++                len(self.warm_blocks),
++            )
++        return promoted
++
+     def get_num_free_blocks(self, kv_cache_group_id: int | None = None) -> int:
+         """Get the number of free blocks in the pool.
+ 
++        Includes warm blocks: they are freed (can be
++        promoted back into the free queue on demand), so excluding them makes
++        callers believe the pool is full while warm blocks sit unused — the
++        scheduler then raises "Cannot get N free blocks" before
++        `_promote_warm_blocks` ever runs, and the engine stalls with
++        `waiting > 0` and an idle GPU. Both return paths must add them.
++
+         Returns:
+             The number of free blocks.
+         """
+         if kv_cache_group_id is not None and isinstance(
+             self.free_block_queue, _PartitionedBlockQueue
+         ):
+-            return self.free_block_queue.for_group(kv_cache_group_id).num_free_blocks
+-        return self.free_block_queue.num_free_blocks
++            # When partitioned, count only this group's warm blocks (decided
++            # by block_id range).
++            in_state = kv_cache_group_id in self.free_block_queue.state_group_ids
++            if in_state:
++                warm_n = sum(
++                    1 for bid in self.warm_blocks if bid < self._device_state_blocks
++                )
++            else:
++                warm_n = sum(
++                    1 for bid in self.warm_blocks if bid >= self._device_state_blocks
++                )
++            return (
++                self.free_block_queue.for_group(kv_cache_group_id).num_free_blocks
++                + warm_n
++            )
++        return self.free_block_queue.num_free_blocks + len(self.warm_blocks)
+ 
+     def can_allocate_group_blocks(self, demand: dict[int, int]) -> bool:
+         """Check partition quotas; callers still check aggregate free capacity."""

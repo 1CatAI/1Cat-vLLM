@@ -1,0 +1,43 @@
+{
+  "group": "scheduler_policy",
+  "title": "Scheduler and prefix-cache policy qualification queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 943,
+      "title": "[Scheduler] Add a floor and state-block rounding to the mixed-prefill budget",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/943",
+      "head": "83701788a2467aa37e07a6c77bce3365ec8af16e",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "31b2e9054803cce892abc195ab031141b5e296ef098b26c6a1a2459e669ab3fa",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1444,
+      "title": "perf(kv): retain freed hashed blocks for prefix reuse",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1444",
+      "head": "86a3ef1062490d12bf2bf4cf23c191afb2f089e1",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "8b5cb3c150c5d38aecb156c3783770766b19a783a285ba65e8e6d2a95fa8c5c3",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1445,
+      "title": "perf(sched): separate decode and prefill into distinct phases",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1445",
+      "head": "8275b418c00400349c5bffd98e0ef9223ca3d2c3",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "1b056f91e4aa38ab312b32b8b26cd18e051b4918e42c940c02e89b8768cf0e34",
+      "files": 3,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "Scheduling/cache policy changes need correctness under preemption, mixed prefill/decode, prefix eviction, recurrent state and concurrent requests; retaining free hashes must preserve allocator invariants. Measure fairness, TTFT/prefill and throughput with identical workloads before any default phase switch.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}
