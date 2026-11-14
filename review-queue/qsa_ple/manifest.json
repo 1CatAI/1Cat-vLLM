@@ -1,0 +1,65 @@
+{
+  "group": "qsa_ple",
+  "title": "QSA and PLE prefill integration queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 828,
+      "title": "[Perf][SM70] Use the grouped page4 route for QSA DCP prefill attention",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/828",
+      "head": "431232b61c01b9f619241d24cb9935111d311b90",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "917877d8b478d0a1c7e1a9b4baaa5f700f639044144e323bb0146cc053605d80",
+      "files": 3,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1176,
+      "title": "[Kernel] Share QSA scoring and tile query rows",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1176",
+      "head": "f0a3f3c91e91afb1bbfcef28858d97231a901463",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "4f7ff54bc0bfaacf0732a14e844e81674e532cdd9f84b64428a16d273c0140c3",
+      "files": 10,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1235,
+      "title": "[Perf][Qwen4Exp] Bound the page prefetch of the mapped PLE row gather",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1235",
+      "head": "d1c15914b21f279b2984173e69cf11f9ab921c0f",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "6b63ce37ba9c6871a1ef83fb295d2a545298f1ff3c34349db6eb15442ddbdc74",
+      "files": 12,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1236,
+      "title": "[Perf][Qwen4Exp] Run the native page4 QSA prefill routes for 12/24-head ranks, several KV heads and Turing",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1236",
+      "head": "b1a646d80b18438f037909cf3a06a90c8819cc5b",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "264f6a2cda489af4f36c359b6052e342604ee5339cc78ce28567fe46fed1219e",
+      "files": 12,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1217,
+      "title": "[Perf][Qwen4Exp] Overlap the PLE gather of the next prefill chunk",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1217",
+      "head": "27a394faf934e9abf7e0ac736bad8ab821615e66",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "8232c2d50492461ac94684cb875cb58a67073a2c097b8b92f67c81a01edf650e",
+      "files": 14,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "Require Qwen4Exp QSA/PLE checkpoints, 12/24-query-head and several-KV-head cases, DCP ranks, page tails, concurrent prefetch lifetimes and full prefill/decode comparison. The exact #828 merge-base/head trees differ in only3files; its API file list of262 includes unchanged entries. Its regenerated diff is replay-verified. No inference gain is inferred from that reconstruction.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}

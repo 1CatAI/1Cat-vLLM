@@ -1,0 +1,907 @@
+diff --git a/docs/design/architecture/runtime_reference.md b/docs/design/architecture/runtime_reference.md
+index c184519b4b..24cced934e 100644
+--- a/docs/design/architecture/runtime_reference.md
++++ b/docs/design/architecture/runtime_reference.md
+@@ -38,7 +38,7 @@ identify initialization/hash code; they do not evaluate its semantics.
+ | `vllm.config.gdn_state.GdnStateConfig` | kernel_config.gdn.state | resolve: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L39); graph_options: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L52) | [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L23) |
+ | `vllm.config.gdn_state.GdnStateTraceConfig` | observability_config.gdn_state | resolve: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L99); compile_ignored_aliases: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L142) | [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L59) |
+ | `vllm.config.kernel.IrOpPriorityConfig` | kernel_config.ir_op_priority | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L84) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L67) |
+-| `vllm.config.kernel.KernelConfig` | kernel_config | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L1129) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L662) |
++| `vllm.config.kernel.KernelConfig` | kernel_config | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L1133) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L662) |
+ | `vllm.config.kernel.Sm70AwqConfig` | kernel_config.sm70_awq | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L338); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L317) |
+ | `vllm.config.kernel.Sm70Fp8Config` | kernel_config.sm70_fp8 | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L433); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L369) |
+ | `vllm.config.kernel.Sm70GgufConfig` | kernel_config.sm70_gguf |  | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L498) |
+@@ -83,7 +83,7 @@ identify initialization/hash code; they do not evaluate its semantics.
+ | `vllm.config.sm70_runtime.StepProfilerConfig` | observability_config.step_profiler | __post_init__: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L145); compile_ignored_aliases: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L151) | [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L130) |
+ | `vllm.config.sm70_sparse.Sm70SparseConfig` | kernel_config.sm70_sparse | compute_hash: [vllm/config/sm70_sparse.py](../../../vllm/config/sm70_sparse.py#L170); resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L57); value: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L69) | [vllm/config/sm70_sparse.py](../../../vllm/config/sm70_sparse.py#L51) |
+ | `vllm.config.sm70_triton_attention.Sm70TritonAttentionPolicy` | attention_config.sm70_triton | resolve: [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L73); compute_hash: [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L110); value: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L69) | [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L36) |
+-| `vllm.config.speculative.SpeculativeConfig` | speculative_config | compute_hash: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L427); __post_init__: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L769) | [vllm/config/speculative.py](../../../vllm/config/speculative.py#L157) |
++| `vllm.config.speculative.SpeculativeConfig` | speculative_config | compute_hash: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L432); __post_init__: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L774) | [vllm/config/speculative.py](../../../vllm/config/speculative.py#L157) |
+ | `vllm.config.speculative_sampling.SpeculativeSamplingPolicy` | speculative_config.sampling_policy | resolve_fields: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L109); resolve: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L142); compute_hash: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L181) | [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L16) |
+ | `vllm.config.structured_outputs.StructuredOutputsConfig` | structured_outputs_config | compute_hash: [vllm/config/structured_outputs.py](../../../vllm/config/structured_outputs.py#L44) | [vllm/config/structured_outputs.py](../../../vllm/config/structured_outputs.py#L18) |
+ | `vllm.config.turboquant_runtime.TurboQuantDiagnostics` | observability_config.runtime_trace.turboquant | compile_ignored_aliases: [vllm/config/turboquant_runtime.py](../../../vllm/config/turboquant_runtime.py#L106); resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L29); compute_hash: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L37) | [vllm/config/turboquant_runtime.py](../../../vllm/config/turboquant_runtime.py#L72) |
+diff --git a/tests/compile/test_sm70_decode_graph.py b/tests/compile/test_sm70_decode_graph.py
+index 980a11282f..3399774111 100644
+--- a/tests/compile/test_sm70_decode_graph.py
++++ b/tests/compile/test_sm70_decode_graph.py
+@@ -300,6 +300,8 @@ def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
+     connector = SimpleNamespace(
+         _ple_policy=ple_policy(),
+         _launch=lambda num_reqs, num_tokens: launches.append((num_reqs, num_tokens)),
++        early_prefill=False,
++        _host_result_regions={},
+     )
+ 
+     PleOffloadConnector.prepare_forward(
+@@ -375,7 +377,10 @@ def test_hybrid_ple_admits_target_decode_widths(monkeypatch, tokens):
+     monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
+     launches = []
+     connector = SimpleNamespace(
+-        _ple_policy=ple_policy(), _launch=lambda *args: launches.append(args)
++        _ple_policy=ple_policy(),
++        _launch=lambda *args: launches.append(args),
++        early_prefill=False,
++        _host_result_regions={},
+     )
+     PleOffloadConnector.prepare_forward(connector, 1, tokens, False, True)
+     assert launches == []
+diff --git a/tests/models/qwen4_exp/test_gguf_pinned_policy.py b/tests/models/qwen4_exp/test_gguf_pinned_policy.py
+index ca8cc87e4e..4bbf156ece 100644
+--- a/tests/models/qwen4_exp/test_gguf_pinned_policy.py
++++ b/tests/models/qwen4_exp/test_gguf_pinned_policy.py
+@@ -106,6 +106,8 @@ def test_connector_only_skips_requests_for_owned_local_decode(
+         _all_pinned_decode=pinned,
+         _ple_policy=SimpleNamespace(hybrid=False),
+         _launch=lambda *a: calls.append(a),
++        early_prefill=False,
++        _host_result_regions={},
+     )
+     module.PleOffloadConnector.prepare_forward(
+         connector, 4, 20, dummy_run=False, use_local_model=local_model
+diff --git a/tests/v1/worker/test_early_model_inputs.py b/tests/v1/worker/test_early_model_inputs.py
+index dcb6062b11..f63073f567 100644
+--- a/tests/v1/worker/test_early_model_inputs.py
++++ b/tests/v1/worker/test_early_model_inputs.py
+@@ -31,8 +31,9 @@ def prepare_inputs(batch, states):
+         calls.append("inputs")
+         return inputs
+ 
+-    def prepare_forward(reqs, tokens, dummy_run):
+-        assert (reqs, tokens, dummy_run) == (1, 5, False)
++    def prepare_forward(reqs, tokens, dummy_run, cpu_inputs, eager_forward):
++        assert (reqs, tokens, dummy_run, cpu_inputs) == (1, 5, False, None)
++        assert eager_forward == (mode == CUDAGraphMode.NONE)
+         calls.append("ple")
+ 
+     runner = SimpleNamespace(
+@@ -41,7 +42,9 @@ def prepare_forward(reqs, tokens, dummy_run):
+         ),
+         req_states=None,
+         _ple_offload_connector=(
+-            SimpleNamespace(prepare_forward=prepare_forward) if ple else None
++            SimpleNamespace(prepare_forward=prepare_forward, early_prefill=False)
++            if ple
++            else None
+         ),
+     )
+     batch = SimpleNamespace(num_reqs=1, num_tokens_after_padding=5)
+diff --git a/tests/v1/worker/test_ple_offload_worker.py b/tests/v1/worker/test_ple_offload_worker.py
+index 962316bb49..73039fb9cd 100644
+--- a/tests/v1/worker/test_ple_offload_worker.py
++++ b/tests/v1/worker/test_ple_offload_worker.py
+@@ -401,6 +401,7 @@ def test_ple_offload_uses_event_per_inflight_mrv2_batch() -> None:
+     connector.dp_rank = 0
+     connector.fast_lane = None
+     connector._uses_cuda_inputs = True
++    connector._next_seq = 0
+     connector._request_queue = queue.Queue(maxsize=2)
+     connector._d2h_event_pool = queue.Queue(maxsize=2)
+     first_event = Mock()
+diff --git a/tests/v1/worker/test_ple_prefill_early_request.py b/tests/v1/worker/test_ple_prefill_early_request.py
+new file mode 100644
+index 0000000000..cbbf5d8d11
+--- /dev/null
++++ b/tests/v1/worker/test_ple_prefill_early_request.py
+@@ -0,0 +1,250 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import threading
++import time
++from contextlib import nullcontext
++from types import SimpleNamespace
++
++import msgspec
++import numpy as np
++import pytest
++import torch
++
++import vllm.v1.ple_offload.connector as connector_module
++from vllm.model_executor.layers import ple_offload_layer
++from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
++from vllm.v1.ple_offload.connector import PleOffloadConnector
++from vllm.v1.ple_offload.protocol import PleCpuInputs, PleOffloadRequest
++from vllm.v1.ple_offload.worker import (
++    PleOffloadInputBuffers,
++    PleOffloadOutputTarget,
++    PleOffloadRunner,
++)
++
++EOS = 99
++
++
++def _model_state(tokens: dict[int, np.ndarray]) -> Qwen4ExpModelState:
++    state = Qwen4ExpModelState.__new__(Qwen4ExpModelState)
++    state._ple_early_tokens = tokens
++    state.ngram_context_len = 2
++    state.ngram_eos_token_id = EOS
++    state.ngram_context = torch.full((4, 2), EOS, dtype=torch.int32)
++    state.ngram_context_offsets = torch.arange(-2, 0, dtype=torch.int64)
++    return state
++
++
++def _batch(**overrides):
++    batch = dict(
++        num_reqs=2,
++        num_reqs_after_padding=2,
++        num_draft_tokens=0,
++        num_tokens=8,
++        num_tokens_after_padding=8,
++        idx_mapping_np=np.array([3, 1], dtype=np.int32),
++        idx_mapping=torch.tensor([3, 1], dtype=torch.int32),
++        num_computed_prefill_tokens_np=np.array([10, 0], dtype=np.int32),
++        num_scheduled_tokens=np.array([5, 3], dtype=np.int32),
++        prefill_len_np=np.array([30, 5], dtype=np.int32),
++        query_start_loc_np=np.array([0, 5, 8], dtype=np.int32),
++    )
++    batch.update(overrides)
++    return SimpleNamespace(**batch)
++
++
++TOKENS = {
++    3: np.arange(100, 130, dtype=np.int32),
++    1: np.arange(200, 205, dtype=np.int32),
++}
++
++
++def test_cpu_inputs_follow_device_prefill_rules():
++    state = _model_state(TOKENS)
++    batch = _batch()
++    inputs = state.ple_cpu_inputs(batch)
++    assert inputs is not None
++    assert inputs.input_ids.tolist() == [110, 111, 112, 113, 114, 200, 201, 202]
++    assert inputs.query_start_loc.tolist() == [0, 5, 8]
++
++    # The device path reads the same history from all_token_ids.
++    all_token_ids = torch.full((4, 30), -1, dtype=torch.int32)
++    for index, tokens in TOKENS.items():
++        all_token_ids[index, : tokens.size] = torch.from_numpy(tokens)
++    num_computed = torch.zeros(4, dtype=torch.int32)
++    num_computed[3], num_computed[1] = 10, 0
++    req_states = SimpleNamespace(
++        num_computed_tokens=SimpleNamespace(gpu=num_computed),
++        all_token_ids=SimpleNamespace(gpu=all_token_ids),
++    )
++    device_context = state._prepare_ngram_context(batch, req_states)
++    assert inputs.ngram_context is not None
++    assert inputs.ngram_context.tolist() == device_context[:2].tolist()
++    assert inputs.ngram_context.tolist() == [[108, 109], [EOS, EOS]]
++
++
++@pytest.mark.parametrize(
++    "overrides",
++    [
++        {"num_draft_tokens": 4},
++        {"num_tokens_after_padding": 16},
++        {"num_scheduled_tokens": np.array([25, 3], dtype=np.int32)},
++        {"idx_mapping_np": np.array([3, 2], dtype=np.int32)},
++        {"num_reqs": 0},
++    ],
++)
++def test_cpu_inputs_admit_only_prompt_only_unpadded_batches(overrides):
++    assert _model_state(TOKENS).ple_cpu_inputs(_batch(**overrides)) is None
++
++
++def test_cpu_inputs_disabled_without_the_kernel_config_field():
++    assert _model_state(None).ple_cpu_inputs(_batch()) is None  # type: ignore[arg-type]
++
++
++def test_launch_queues_host_inputs_without_a_d2h_event():
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    connector.tp_rank = 0
++    connector.dp_rank = 0
++    connector.fast_lane = None
++    connector._uses_cuda_inputs = True
++    connector._next_seq = 0
++    connector._request_queue = connector_module.queue.Queue(maxsize=2)
++    connector._d2h_event_pool = connector_module.queue.Queue(maxsize=1)
++    inputs = PleCpuInputs(
++        np.zeros(3, dtype=np.int32), np.array([0, 3], dtype=np.int32), None
++    )
++
++    connector._launch(num_reqs=1, num_tokens=3, cpu_inputs=inputs)
++    connector._launch(num_reqs=1, num_tokens=3, cpu_inputs=inputs)
++
++    first = connector._request_queue.get_nowait()
++    second = connector._request_queue.get_nowait()
++    assert first.cpu_inputs is inputs and first.d2h_done_event is None
++    assert (first.request.seq, second.request.seq) == (1, 2)
++    assert connector._d2h_event_pool.empty()
++
++
++def test_early_request_waits_for_the_previous_request(monkeypatch):
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    connector._uses_cuda_inputs = True
++    connector._request_done = np.zeros(1, dtype=np.int64)
++    connector._input_ids_buf = torch.zeros(8, dtype=torch.int32)
++    connector._query_start_loc_buf = torch.zeros(3, dtype=torch.int32)
++    connector._ngram_context_buf = torch.zeros(2, 2, dtype=torch.int32)
++    monkeypatch.setattr(
++        connector_module.torch.cuda.nvtx, "range", lambda *_: nullcontext()
++    )
++    request = PleOffloadRequest(dp_rank=0, num_tokens=3, num_reqs=1, seq=2)
++    inputs = PleCpuInputs(
++        np.array([5, 6, 7], dtype=np.int32),
++        np.array([0, 3], dtype=np.int32),
++        np.array([[1, 2]], dtype=np.int32),
++    )
++    sent: list[bytes] = []
++    socket = SimpleNamespace(send=sent.append)
++    pending = connector_module._PendingPleOffloadRequest(request, None, inputs)
++
++    worker = threading.Thread(target=connector._process_request, args=(pending, socket))
++    worker.start()
++    time.sleep(0.05)
++    # The worker still reads request 1 from the shared buffers.
++    assert sent == []
++    assert connector._input_ids_buf.tolist() == [0] * 8
++    connector._request_done[0] = 1
++    worker.join(timeout=5)
++
++    assert not worker.is_alive()
++    assert sent == [msgspec.msgpack.encode(request)]
++    assert connector._input_ids_buf[:3].tolist() == [5, 6, 7]
++    assert connector._query_start_loc_buf.tolist() == [0, 3, 0]
++    assert connector._ngram_context_buf[0].tolist() == [1, 2]
++
++
++def test_release_skips_results_the_forward_already_released(monkeypatch):
++    released, kept = torch.zeros(1), torch.zeros(1)
++    resets = []
++
++    def layer(flag):
++        return SimpleNamespace(
++            _is_cpu_offloaded=True,
++            _sem=SimpleNamespace(flag_tensor=flag),
++            release_offloaded_output=lambda stream: resets.append(flag),
++        )
++
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    connector.device = torch.device("cpu")
++    connector._layers = {"a": layer(released), "b": layer(kept)}
++    monkeypatch.setattr(
++        connector_module.torch.cuda, "current_stream", lambda device: None
++    )
++    monkeypatch.setattr(
++        connector_module,
++        "finish_early_result_release",
++        lambda: {released.data_ptr()},
++    )
++
++    connector.release_outputs()
++
++    assert resets == [kept]
++
++
++def test_worker_publishes_done_after_the_last_layer():
++    done = torch.zeros(1, dtype=torch.int64)
++    seen = []
++
++    class Layer:
++        def forward_impl(self, hidden, ids, offsets, context, output_buffer):
++            seen.append(int(done[0]))
++            output_buffer[:3].copy_(ids[:, None].expand(3, 2))
++            return output_buffer[:3]
++
++    names = ("first", "second")
++    buffers = {name: torch.full((4, 2), -1, dtype=torch.int32) for name in names}
++    runner = PleOffloadRunner.__new__(PleOffloadRunner)
++    runner._clamp_input_ids = False
++    runner._layers = {name: Layer() for name in names}
++    runner._worker_targets = {
++        0: {
++            name: [
++                PleOffloadOutputTarget(
++                    tp_rank=0,
++                    gpu_output_buffer=None,
++                    sem=SimpleNamespace(flag_tensor=torch.zeros(16, dtype=torch.int32)),
++                    copy_stream=None,
++                    cpu_output_buffer=buffers[name],
++                )
++            ]
++            for name in names
++        }
++    }
++    runner._input_bufs = {
++        0: PleOffloadInputBuffers(
++            input_ids_buf=torch.tensor([11, 12, 13], dtype=torch.int32),
++            query_start_loc_buf=torch.tensor([0, 3], dtype=torch.int32),
++            ngram_context_buf=torch.tensor([[9, 10]], dtype=torch.int32),
++            request_done_buf=done,
++        )
++    }
++    runner._pinned_bufs = {0: buffers}
++
++    runner._handle_requests([PleOffloadRequest(0, 3, 1, seq=7)])
++
++    assert seen == [0, 0]
++    assert int(done[0]) == 7
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize("armed", [False, True])
++def test_wait_op_releases_mapped_result_only_when_armed(armed):
++    flag = torch.ones(1, dtype=torch.int32, device="cuda")
++    gpu_output = torch.zeros(4, 2, dtype=torch.float16, device="cuda")
++    cpu_output = torch.arange(8, dtype=torch.float16).reshape(4, 2).pin_memory()
++    hidden = torch.zeros(1, device="cuda")
++
++    ple_offload_layer.begin_early_result_release(armed)
++    torch.ops.vllm.ple_offload_wait(flag, gpu_output, hidden, cpu_output, 3)
++    torch.accelerator.synchronize()
++    released = ple_offload_layer.finish_early_result_release()
++
++    torch.testing.assert_close(gpu_output[:3].cpu(), cpu_output[:3])
++    assert flag.item() == (0 if armed else 1)
++    assert released == ({flag.data_ptr()} if armed else set())
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index fa6e979a24..f6730b1d9b 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -1014,6 +1014,10 @@ def gdn_spec_replay(self) -> bool:
+     """Serve eligible CPU PLE requests from a native owner thread."""
+     ple_draft_prefetch: bool = True
+     """Read PLE table pages of drafted tokens into page cache while drafting."""
++    ple_prefill_early_request: bool = False
++    """Send prompt-only PLE batches from host token copies at scheduling time and
++    release mapped results right after their consumer copy, so the CPU worker
++    gathers the next prefill chunk while the GPU still runs the current one."""
+     ple_row_cache_mib: int = Field(default=1536, ge=0)
+     """Packed-row cache (MiB) for CPU-owned GGUF PLE: the native fast lane's
+     cache when it serves requests, otherwise the mapped row reader's."""
+@@ -1155,6 +1159,7 @@ def compute_hash(self) -> str:
+             "ple_row_cache_mib",  # CPU-only reuse of bit-identical rows
+             "ple_draft_prefetch",  # Page-cache readahead; results unchanged
+             "ple_fast_lane",  # Same packed rows through a native owner thread
++            "ple_prefill_early_request",  # Request timing only; same rows
+             "ple_disk_row_readers",
+             "qsa_auto_e4m3_reason",
+             "qsa_host_kv_reason",
+diff --git a/vllm/model_executor/layers/ple_offload_layer.py b/vllm/model_executor/layers/ple_offload_layer.py
+index 13656773bc..208180309a 100644
+--- a/vllm/model_executor/layers/ple_offload_layer.py
++++ b/vllm/model_executor/layers/ple_offload_layer.py
+@@ -159,6 +159,35 @@ def wait_reset(self, stream: torch.cuda.Stream | None = None) -> None:
+         )
+ 
+ 
++class _EarlyResultRelease:
++    """Per-forward switch owned by the connector of this GPU worker.
++
++    The custom op runs eagerly in forwards without CUDA graph replay, so it can
++    read this state at run time; graph captures never see ``active``.
++    """
++
++    def __init__(self) -> None:
++        self.active = False
++        self.released: set[int] = set()
++
++
++_early_result_release = _EarlyResultRelease()
++
++
++def begin_early_result_release(active: bool) -> None:
++    """Arm or disarm the mapped early release for the next forward."""
++    _early_result_release.active = active
++    _early_result_release.released.clear()
++
++
++def finish_early_result_release() -> set[int]:
++    """Disarm and return the flag addresses that the forward already reset."""
++    released = set(_early_result_release.released)
++    _early_result_release.active = False
++    _early_result_release.released.clear()
++    return released
++
++
+ # ---------------------------------------------------------------------------
+ # Custom op: vllm::ple_offload_wait
+ # ---------------------------------------------------------------------------
+@@ -176,7 +205,7 @@ def _ple_offload_wait_impl(
+     cpu_output_buffer: torch.Tensor | None = None,
+     num_tokens: int = 0,
+ ) -> None:
+-    """Wait for the CPU result without releasing its output buffer."""
++    """Wait for the CPU result; release a mapped result only when armed."""
+     stream = torch.cuda.current_stream()
+     cuda_stream = cuda_driver.CUstream(stream.cuda_stream)
+     dev_ptr = cuda_driver.CUdeviceptr(sem_flag_tensor.data_ptr())
+@@ -207,6 +236,23 @@ def _ple_offload_wait_impl(
+             ),
+             "cuMemcpyHtoDAsync(PLE consumer result)",
+         )
++        if (
++            _early_result_release.active
++            and not torch.cuda.is_current_stream_capturing()
++        ):
++            # The consumer copy above is the only read of the mapped result.
++            # Releasing it in stream order lets the worker gather the next
++            # chunk while this forward still runs.
++            _cuda_check(
++                cuda_driver.cuStreamWriteValue32(
++                    cuda_stream,
++                    dev_ptr,
++                    CpuGpuSemaphore.RESET_VALUE,
++                    0,
++                ),
++                "cuStreamWriteValue32(early release)",
++            )
++            _early_result_release.released.add(sem_flag_tensor.data_ptr())
+ 
+ 
+ def _ple_offload_wait_fake(
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index 04c46d5800..d72cb0a729 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -4,6 +4,7 @@
+ 
+ from typing import Any
+ 
++import numpy as np
+ import torch
+ import torch.nn as nn
+ 
+@@ -11,6 +12,8 @@
+ from vllm.logger import init_logger
+ from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
+ from vllm.platforms import current_platform
++from vllm.v1.core.sched.output import NewRequestData
++from vllm.v1.ple_offload.protocol import PleCpuInputs
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+@@ -32,6 +35,15 @@ def __init__(
+         super().__init__(vllm_config, model, encoder_cache, device)
+         config = self.model_config.hf_text_config
+         self.uses_ngram_embedding = bool(config.ple_layer_ids)
++        # Host copies of each request's prefill tokens for early PLE requests.
++        # all_token_ids is written by a GPU kernel, so its host view may still
++        # lag behind the previous forward.
++        self._ple_early_tokens: dict[int, np.ndarray] | None = (
++            {}
++            if self.uses_ngram_embedding
++            and vllm_config.kernel_config.ple_prefill_early_request
++            else None
++        )
+         if not self.uses_ngram_embedding:
+             self.ngram_context_len = 0
+             self.ngram_eos_token_id = 0
+@@ -65,6 +77,64 @@ def __init__(
+         self._ple_kernel_config = vllm_config.kernel_config
+         self._ple_input_hardware = current_platform.is_device_capability(70)
+ 
++    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
++        super().add_request(req_index, new_req_data)
++        if self._ple_early_tokens is None:
++            return
++        if new_req_data.prompt_embeds is not None:
++            self._ple_early_tokens.pop(req_index, None)
++            return
++        assert new_req_data.prefill_token_ids is not None
++        self._ple_early_tokens[req_index] = np.asarray(
++            new_req_data.prefill_token_ids, dtype=np.int32
++        )
++
++    def ple_cpu_inputs(self, input_batch: InputBatch) -> PleCpuInputs | None:
++        """Build a prompt-only batch's PLE inputs on the host, else None.
++
++        Mirrors prepare_prefill_inputs and _prepare_ngram_context: tokens
++        ``[computed, computed + scheduled)`` of each request and the
++        ``ngram_context_len`` tokens before ``computed``, EOS-filled.
++        """
++        tokens_by_index = self._ple_early_tokens
++        num_reqs = input_batch.num_reqs
++        if (
++            tokens_by_index is None
++            or num_reqs == 0
++            or input_batch.num_draft_tokens != 0
++            or input_batch.num_tokens != input_batch.num_tokens_after_padding
++        ):
++            return None
++        starts = input_batch.num_computed_prefill_tokens_np[:num_reqs]
++        lengths = input_batch.num_scheduled_tokens[:num_reqs]
++        if np.any(starts + lengths > input_batch.prefill_len_np[:num_reqs]):
++            return None
++        sources = []
++        for req_index in input_batch.idx_mapping_np[:num_reqs]:
++            tokens = tokens_by_index.get(int(req_index))
++            if tokens is None:
++                return None
++            sources.append(tokens)
++
++        context_len = self.ngram_context_len
++        ngram_context = np.full(
++            (num_reqs, context_len), self.ngram_eos_token_id, dtype=np.int32
++        )
++        chunks = []
++        for i, tokens in enumerate(sources):
++            start, length = int(starts[i]), int(lengths[i])
++            chunks.append(tokens[start : start + length])
++            history = tokens[max(0, start - context_len) : start]
++            if history.size:
++                ngram_context[i, context_len - history.size :] = history
++        return PleCpuInputs(
++            input_ids=np.concatenate(chunks),
++            query_start_loc=np.array(
++                input_batch.query_start_loc_np[: num_reqs + 1], dtype=np.int32
++            ),
++            ngram_context=ngram_context,
++        )
++
+     def _prepare_ngram_context(
+         self,
+         input_batch: InputBatch,
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 5fd693b247..ac5daa6209 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -5,6 +5,7 @@
+ import os
+ import queue
+ import threading
++import time
+ from dataclasses import dataclass
+ from multiprocessing.reduction import ForkingPickler
+ from typing import Any
+@@ -26,10 +27,13 @@
+ from vllm.model_executor.layers.ple_offload_layer import (
+     CpuGpuSemaphore,
+     PleOffloadLayer,
++    begin_early_result_release,
++    finish_early_result_release,
+ )
+ from vllm.v1.ple_offload.draft_prefetch import DraftTokenRing
+ from vllm.v1.ple_offload.fast_lane import FastLaneRequest
+ from vllm.v1.ple_offload.protocol import (
++    PleCpuInputs,
+     PleOffloadRegistration,
+     PleOffloadRequest,
+ )
+@@ -39,10 +43,11 @@
+ 
+ @dataclass(frozen=True)
+ class _PendingPleOffloadRequest:
+-    """Bind request metadata to its MRV2 D2H completion event."""
++    """Bind request metadata to its MRV2 D2H event or its host inputs."""
+ 
+     request: PleOffloadRequest
+     d2h_done_event: torch.cuda.Event | None
++    cpu_inputs: PleCpuInputs | None = None
+ 
+ 
+ def _cuda_check(result: Any, operation: str) -> Any:
+@@ -125,6 +130,13 @@ def __init__(
+                 device="cpu",
+             ).share_memory_()
+ 
++        # The worker stores each finished request's seq here. Early requests
++        # stage their host inputs only after the previous request is done.
++        self._request_done_buf = torch.zeros(
++            1, dtype=torch.int64, device="cpu"
++        ).share_memory_()
++        self._next_seq = 0
++
+         # Runner input allocations are address-stable, so bind them once and
+         # pass only batch sizes through the per-forward request queue.
+         self._input_ids_source = input_ids_source
+@@ -132,6 +144,10 @@ def __init__(
+         self._ngram_context_source = ngram_context_source
+         self._uses_cuda_inputs = self._input_ids_source.is_cuda
+         self._validate_input_sources()
++        self.early_prefill = (
++            vllm_config.kernel_config.ple_prefill_early_request
++            and self._uses_cuda_inputs
++        )
+ 
+         self._pinned_input_buffers: list[torch.Tensor] = []
+         self.draft_ring = self._create_draft_ring(vllm_config)
+@@ -156,6 +172,8 @@ def __init__(
+             self._registration_socket = self._zmq_ctx.socket(zmq.PUSH)
+             self._registration_socket.connect(ipc_addr)
+             self._register_with_offload_worker(vllm_config, ipc_addr)
++            # Registration may move CPU storage; view the final address.
++            self._request_done = self._request_done_buf.numpy()
+ 
+             if self.tp_rank == 0:
+                 # ForkingPickler may replace CPU storage while converting its
+@@ -369,6 +387,7 @@ def _register_with_offload_worker(
+                 if self.draft_ring is None
+                 else (self.draft_ring.max_reqs, self.draft_ring.num_spec)
+             ),
++            request_done_buf=self._request_done_buf,
+         )
+ 
+         payload = _dump_registration(registration)
+@@ -433,7 +452,13 @@ def _process_request(
+         """Wait for one staged batch and publish its request."""
+         request = pending.request
+         event = pending.d2h_done_event
+-        if self._uses_cuda_inputs:
++        if pending.cpu_inputs is not None:
++            # The worker reads the shared buffers until it finishes a request.
++            with torch.cuda.nvtx.range("ple_offload.wait_previous_request"):
++                while self._request_done[0] < request.seq - 1:
++                    time.sleep(20e-6)
++            self._write_cpu_inputs(request, pending.cpu_inputs)
++        elif self._uses_cuda_inputs:
+             event_pool = self._d2h_event_pool
+             if event_pool is None or event is None:
+                 raise RuntimeError("MRV2 PLE request is missing its D2H event")
+@@ -453,6 +478,25 @@ def _process_request(
+             assert self._d2h_event_pool is not None
+             self._d2h_event_pool.put_nowait(event)
+ 
++    def _write_cpu_inputs(
++        self, request: PleOffloadRequest, inputs: PleCpuInputs
++    ) -> None:
++        """Stage an early request's host inputs into the shared buffers."""
++        num_tokens = request.num_tokens
++        num_reqs = request.num_reqs
++        if (
++            inputs.input_ids.shape != (num_tokens,)
++            or inputs.query_start_loc.shape != (num_reqs + 1,)
++            or (inputs.ngram_context is None) != (self._ngram_context_buf is None)
++        ):
++            raise ValueError("Early PLE inputs do not match the request shape")
++        with torch.cuda.nvtx.range("ple_offload.write_cpu_inputs"):
++            self._input_ids_buf.numpy()[:num_tokens] = inputs.input_ids
++            self._query_start_loc_buf.numpy()[: num_reqs + 1] = inputs.query_start_loc
++            if self._ngram_context_buf is not None:
++                assert inputs.ngram_context is not None
++                self._ngram_context_buf.numpy()[:num_reqs] = inputs.ngram_context
++
+     def _copy_cpu_inputs(self, request: PleOffloadRequest) -> None:
+         """Stage MRV1's existing CPU mirrors in the notifier thread."""
+         num_tokens = request.num_tokens
+@@ -540,6 +584,7 @@ def _launch(
+         self,
+         num_reqs: int,
+         num_tokens: int,
++        cpu_inputs: PleCpuInputs | None = None,
+     ) -> None:
+         """Queue one batch while keeping staging off the model thread."""
+         # Inputs are replicated across TP ranks. One request per DP rank drives
+@@ -559,11 +604,20 @@ def _launch(
+             )
+             return
+ 
++        self._next_seq += 1
+         request = PleOffloadRequest(
+             dp_rank=self.dp_rank,
+             num_tokens=num_tokens,
+             num_reqs=num_reqs,
++            seq=self._next_seq,
+         )
++        if cpu_inputs is not None:
++            # Prompt-only inputs are known on the host: no D2H wait behind the
++            # previous forward on the model stream.
++            self._request_queue.put_nowait(
++                _PendingPleOffloadRequest(request, None, cpu_inputs)
++            )
++            return
+         d2h_done_event = None
+         if self._uses_cuda_inputs:
+             if self._d2h_event_pool is None:
+@@ -585,14 +639,26 @@ def prepare_forward(
+         num_tokens: int,
+         dummy_run: bool,
+         use_local_model: bool = False,
++        cpu_inputs: PleCpuInputs | None = None,
++        eager_forward: bool = False,
+     ) -> None:
+-        """Submit real inputs or satisfy the PLE wait for a dummy forward."""
++        """Submit real inputs or satisfy the PLE wait for a dummy forward.
++
++        ``cpu_inputs`` and ``eager_forward`` (no CUDA graph replay) are used
++        only with ``kernel_config.ple_prefill_early_request``.
++        """
+         if dummy_run:
+             self.signal_dummy_outputs(num_tokens)
+             return
+         if use_local_model and (self._ple_policy.hybrid or self._all_pinned_decode):
+             return
+-        self._launch(num_reqs, num_tokens)
++        begin_early_result_release(
++            self.early_prefill and eager_forward and bool(self._host_result_regions)
++        )
++        if self.early_prefill and cpu_inputs is not None:
++            self._launch(num_reqs, num_tokens, cpu_inputs)
++        else:
++            self._launch(num_reqs, num_tokens)
+ 
+     def signal_dummy_outputs(self, num_tokens: int) -> None:
+         """Locally satisfy PLE waits for dummy and capture forwards."""
+@@ -608,9 +674,17 @@ def signal_dummy_outputs(self, num_tokens: int) -> None:
+     def release_outputs(self) -> None:
+         """Mark GPU output buffers reusable after the model consumes them."""
+         # Reset only after the consumer forward so the CPU worker cannot
+-        # overwrite an output that a GPU PLE placeholder may still read.
++        # overwrite an output that a GPU PLE placeholder may still read. Mapped
++        # results released early by the wait op (eager prefill) are skipped:
++        # the worker may already have published the next chunk into them.
+         stream = torch.cuda.current_stream(self.device)
++        released = finish_early_result_release()
+         for layer in self._layers.values():
++            if (
++                layer._is_cpu_offloaded
++                and layer._sem.flag_tensor.data_ptr() in released
++            ):
++                continue
+             layer.release_offloaded_output(stream)
+ 
+     def close(self) -> None:
+diff --git a/vllm/v1/ple_offload/protocol.py b/vllm/v1/ple_offload/protocol.py
+index b396279a12..0bce0243b6 100644
+--- a/vllm/v1/ple_offload/protocol.py
++++ b/vllm/v1/ple_offload/protocol.py
+@@ -6,6 +6,7 @@
+ from typing import Any
+ 
+ import msgspec
++import numpy as np
+ import torch
+ 
+ # ---------------------------------------------------------------------------
+@@ -42,6 +43,9 @@ class PleOffloadRegistration:
+     # TP0's mapped request slot for the owner's native request lane.
+     fast_lane_request: torch.Tensor | None = None
+     fast_lane_geometry: tuple[int, int] | None = None
++    # TP0's shared int64 counter: the worker stores the seq of each request
++    # after its last layer, so early requests do not overwrite live inputs.
++    request_done_buf: torch.Tensor | None = None
+ 
+ 
+ @dataclass
+@@ -51,6 +55,21 @@ class PleOffloadRequest:
+     dp_rank: int
+     num_tokens: int
+     num_reqs: int
++    # Per-connector request order, published back through request_done_buf.
++    seq: int = 0
++
++
++@dataclass(frozen=True)
++class PleCpuInputs:
++    """Host copies of a prompt-only batch's PLE inputs, built at scheduling.
++
++    Shapes match the shared buffers: ``input_ids`` (num_tokens,),
++    ``query_start_loc`` (num_reqs + 1,), ``ngram_context`` (num_reqs, context).
++    """
++
++    input_ids: np.ndarray
++    query_start_loc: np.ndarray
++    ngram_context: np.ndarray | None
+ 
+ 
+ _PLE_OFFLOAD_REQUEST_DECODER = msgspec.msgpack.Decoder(PleOffloadRequest)
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index b21fec7a41..b54f25cc55 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -319,6 +319,7 @@ class PleOffloadInputBuffers:
+     input_ids_buf: torch.Tensor  # int32 (max_num_tokens,)
+     query_start_loc_buf: torch.Tensor  # int32 (max_num_reqs + 1,)
+     ngram_context_buf: torch.Tensor | None  # int32 (max_num_reqs, ngram_context_len)
++    request_done_buf: torch.Tensor | None = None  # int64 (1,), last finished seq
+ 
+ 
+ @dataclass
+@@ -883,6 +884,7 @@ def accept_registrations(
+                     input_ids_buf=registration.input_ids_buf,
+                     query_start_loc_buf=registration.query_start_loc_buf,
+                     ngram_context_buf=registration.ngram_context_buf,
++                    request_done_buf=registration.request_done_buf,
+                 )
+ 
+         if set(self._input_bufs) != set(range(dp_size)):
+@@ -1219,3 +1221,10 @@ def _handle_requests(self, requests: list[PleOffloadRequest]) -> None:
+                         with torch.cuda.stream(target.copy_stream):
+                             destination.copy_(result, non_blocking=True)
+                             target.sem.signal(target.copy_stream)
++
++        # Every layer has read this request's inputs; the connector may now
++        # stage the next request into the shared input buffers.
++        for dp_rank, request in requests_by_dp.items():
++            done = self._input_bufs[dp_rank].request_done_buf
++            if done is not None and request.seq > 0:
++                done[0] = request.seq
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 07c1f240b9..4da93c8b50 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -115,6 +115,7 @@
+ from vllm.v1.worker.gpu.lora_utils import LoraState
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ from vllm.v1.worker.gpu.model_states import init_model_state
++from vllm.v1.worker.gpu.model_states.interface import ModelState
+ from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+ from vllm.v1.worker.gpu.pp_utils import PPHandler, scatter_draft_tokens
+ from vllm.v1.worker.gpu.sample.output import SamplerOutput
+@@ -383,6 +384,14 @@ def _setup_ple_offload(self, ipc_addr: str) -> None:
+             query_start_loc_source=query_start_loc_source,
+             ngram_context_source=ngram_context_source,
+         )
++        if (
++            self._ple_offload_connector.early_prefill
++            and type(self.model_state).ple_cpu_inputs is ModelState.ple_cpu_inputs
++        ):
++            raise RuntimeError(
++                "kernel_config.ple_prefill_early_request needs a model state "
++                "that builds host PLE inputs (ple_cpu_inputs)"
++            )
+         ring = self._ple_offload_connector.draft_ring
+         speculator = self.speculator
+         if (
+@@ -1287,10 +1296,17 @@ def prepare_model_inputs_early(
+             return self.model_state.prepare_inputs(input_batch, self.req_states), False
+         if self._ple_offload_connector is not None and mode != CUDAGraphMode.FULL:
+             inputs = self.model_state.prepare_inputs(input_batch, self.req_states)
+-            self._ple_offload_connector.prepare_forward(
++            connector = self._ple_offload_connector
++            connector.prepare_forward(
+                 input_batch.num_reqs,
+                 input_batch.num_tokens_after_padding,
+                 dummy_run=False,
++                cpu_inputs=(
++                    self.model_state.ple_cpu_inputs(input_batch)
++                    if connector.early_prefill
++                    else None
++                ),
++                eager_forward=mode == CUDAGraphMode.NONE,
+             )
+             return inputs, True
+         return None, False
+diff --git a/vllm/v1/worker/gpu/model_states/interface.py b/vllm/v1/worker/gpu/model_states/interface.py
+index 4ad8946a16..f8e0458ddd 100644
+--- a/vllm/v1/worker/gpu/model_states/interface.py
++++ b/vllm/v1/worker/gpu/model_states/interface.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
+-from typing import Any
++from typing import TYPE_CHECKING, Any
+ 
+ import torch
+ import torch.nn as nn
+@@ -16,6 +16,9 @@
+ from vllm.v1.worker.gpu.states import RequestState
+ from vllm.v1.worker.utils import AttentionGroup
+ 
++if TYPE_CHECKING:
++    from vllm.v1.ple_offload.protocol import PleCpuInputs
++
+ 
+ class ModelSpecificAttnMetadata:
+     """Base class for model-specific attention metadata."""
+@@ -63,6 +66,10 @@ def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+     def apply_staged_writes(self) -> None:
+         return None
+ 
++    def ple_cpu_inputs(self, input_batch: InputBatch) -> "PleCpuInputs | None":
++        """Host PLE inputs for an early request; None keeps the device path."""
++        return None
++
+     def preprocess_state(
+         self,
+         input_batch: InputBatch,
