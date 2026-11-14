@@ -36,20 +36,104 @@ from packaging import version
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.mem_utils import get_max_shared_memory_bytes
 
 is_hip_ = current_platform.is_rocm()
 
 
-def _decode_grouped_block_size(
+# (BLOCK_N, BLOCK_H) candidates of the grouped stage-1 kernel, preferred first.
+# BLOCK_N stays >= 16 because the second tl.dot needs K >= 16.
+_GROUPED_TILES = ((32, 16), (16, 16), (16, 8), (16, 4))
+
+# Bytes per element Triton stages in shared memory for the dot operands before sm80.
+_FP32_STAGED_ELEMENT_BYTES = 4
+
+
+def _triton_stages_dot_operands_in_fp32(device: torch.device) -> bool:
+    # Before sm80 there is neither cp.async nor a bf16/fp16 MMA path that reads
+    # shared memory directly, so Triton stages the operands of tl.dot as fp32
+    # (num_stages has no effect). From sm80 on the footprint depends on the
+    # operand dtype and num_stages; it is not modelled here.
+    return not current_platform.has_device_capability(80, device.index)
+
+
+def _grouped_stage1_smem_bytes(
+    *,
+    block_n: int,
+    block_h: int,
+    block_dmodel: int,
+    block_dpe: int,
+    block_dv: int,
+) -> int:
+    # Measured against the compiled kernel's metadata.shared on sm70/sm75
+    # (tests/kernels/attention/test_triton_decode_attention.py): Q (with its
+    # rope part) stays resident, plus the larger of the K and V tiles.
+    return _FP32_STAGED_ELEMENT_BYTES * (
+        block_h * (block_dmodel + block_dpe) + block_n * max(block_dmodel, block_dv)
+    )
+
+
+def _grouped_block_dims(lk: int, lv: int, *, is_mla: bool) -> tuple[int, int, int]:
+    """Return (BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV) of the grouped stage-1 kernel."""
+    # Align tile dimensions with latent rank for MLA to avoid shape mismatch.
+    if is_mla:
+        if not is_hip_ and lk == 576:
+            block_dmodel, block_dpe = 512, 64
+        elif not is_hip_ and lk == 288:
+            block_dmodel, block_dpe = 256, 32
+        else:
+            block_dmodel = triton.next_power_of_2(lv)
+            block_dpe = triton.next_power_of_2(lk - lv) if lk > lv else 0
+    else:
+        block_dmodel = triton.next_power_of_2(lk)
+        block_dpe = 0
+    return block_dmodel, block_dpe, triton.next_power_of_2(lv)
+
+
+def _decode_grouped_tile(
     *,
     is_hip: bool,
-    is_mla: bool,
     block_dmodel: int,
-    is_sm70: bool,
-) -> int:
-    if is_hip or (is_mla and block_dmodel >= 512 and is_sm70):
-        return 16
-    return 32
+    block_dpe: int,
+    block_dv: int,
+    smem_budget: int | None,
+) -> tuple[int, int]:
+    """Return (BLOCK_N, BLOCK_H) of the grouped stage-1 kernel.
+
+    ``smem_budget`` is the per-block shared memory limit of the device, or None
+    where the footprint is not modelled (see
+    ``_triton_stages_dot_operands_in_fp32``).
+    """
+    if is_hip:
+        return 16, 16
+    if smem_budget is None:
+        return _GROUPED_TILES[0]
+    for block_n, block_h in _GROUPED_TILES:
+        if (
+            _grouped_stage1_smem_bytes(
+                block_n=block_n,
+                block_h=block_h,
+                block_dmodel=block_dmodel,
+                block_dpe=block_dpe,
+                block_dv=block_dv,
+            )
+            <= smem_budget
+        ):
+            return block_n, block_h
+    raise ValueError(
+        "No grouped decode attention tile fits into "
+        f"{smem_budget} bytes of shared memory for BLOCK_DMODEL={block_dmodel}, "
+        f"BLOCK_DPE={block_dpe}, BLOCK_DV={block_dv}"
+    )
+
+
+def _device_smem_budget(device: torch.device) -> int | None:
+    """Shared memory budget of ``device`` where it is modelled, else None."""
+    if not current_platform.is_cuda():
+        return None
+    if not _triton_stages_dot_operands_in_fp32(device):
+        return None
+    return get_max_shared_memory_bytes(device.index)
 
 
 logger = logging.getLogger(__name__)
@@ -474,43 +558,25 @@ def _decode_grouped_att_m_fwd(
     # could increase BLOCK or num_stages.
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
+    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV = _grouped_block_dims(Lk, Lv, is_mla=is_mla)
 
-    # Align tile dimensions with latent rank for MLA to avoid shape mismatch.
-    if is_mla:
-        if not is_hip_ and Lk == 576:
-            BLOCK_DMODEL = 512
-            BLOCK_DPE = 64
-        elif not is_hip_ and Lk == 288:
-            BLOCK_DMODEL = 256
-            BLOCK_DPE = 32
-        else:
-            BLOCK_DMODEL = triton.next_power_of_2(Lv)
-            BLOCK_DPE = triton.next_power_of_2(Lk - Lv) if Lk > Lv else 0
-    else:
-        BLOCK_DMODEL = triton.next_power_of_2(Lk)
-        BLOCK_DPE = 0
-    BLOCK_DV = triton.next_power_of_2(Lv)
-
-    # Patch 0103: BLOCK=16 for HIP (original) and for MLA-large on SM70 (V100).
-    # On SM70 at BLOCK=32 the stage-1 kernel needs 102,400 B of smem (Triton
-    # stages dot operands as fp32 on sm70: peak = 4 B x [BLOCK_H*(BLOCK_DMODEL+
-    # BLOCK_DPE) + BLOCK*BLOCK_DMODEL]) against the 98,304 B hardware limit ->
-    # OutOfResources on the first decode. BLOCK=16 fits (69,632 B) and won the
-    # tiling bench vs BN32/BH8 (spill catastrophe) and BN16/BH8 (loses at
-    # saturated grids) at 128-user shapes. num_stages is a no-op here (no
-    # cp.async on sm70 - KV loads cannot be multi-buffered); leave it alone.
-    # Proof + bench: patches/0103-mla-triton-decode-smem/poc/.
-    BLOCK = _decode_grouped_block_size(
+    # The tile follows from the shared memory budget of this device. On sm70 an
+    # MLA c_kv tile of 512 at BLOCK_N=32 needs 102,400 B against 98,304 B and
+    # falls to BLOCK_N=16 (69,632 B), which won the tiling bench vs BN32/BH8
+    # (spill catastrophe) and BN16/BH8 (loses at saturated grids) at 128 users.
+    # num_stages is a no-op before sm80 (no cp.async: KV loads cannot be
+    # multi-buffered); leave it alone.
+    BLOCK, BLOCK_H = _decode_grouped_tile(
         is_hip=is_hip_,
-        is_mla=is_mla,
         block_dmodel=BLOCK_DMODEL,
-        is_sm70=current_platform.is_device_capability(70),
+        block_dpe=BLOCK_DPE,
+        block_dv=BLOCK_DV,
+        smem_budget=_device_smem_budget(q.device),
     )
 
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[-2]
 
-    BLOCK_H = 16
     NUM_KV_SPLITS = num_kv_splits
     grid = (
         batch,
