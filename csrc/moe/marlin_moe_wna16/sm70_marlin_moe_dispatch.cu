@@ -28,40 +28,11 @@
 #include <cuda_fp16.h>
 
 #include "quantization/marlin/marlin.cuh"
+#include "quantization/marlin/sm70_marlin_metadata.cuh"
 #include "core/registration.h"
 #include "core/scalar_type.hpp"
 
 namespace {
-
-__device__ __forceinline__ int sm70_inverse_zp_interleave(int idx,
-                                                          int num_bits) {
-  if (num_bits == 4) {
-    constexpr int inv[8] = {0, 4, 1, 5, 2, 6, 3, 7};
-    return inv[idx];
-  }
-  constexpr int inv[4] = {0, 2, 1, 3};
-  return inv[idx];
-}
-
-__device__ __forceinline__ int sm70_inverse_scale_perm(int idx, int perm_len) {
-  if (perm_len == 64) {
-    return (idx % 8) * 8 + idx / 8;
-  }
-  constexpr int inv[32] = {0,  1,  8,  9,  16, 17, 24, 25, 2,  3,  10,
-                           11, 18, 19, 26, 27, 4,  5,  12, 13, 20, 21,
-                           28, 29, 6,  7,  14, 15, 22, 23, 30, 31};
-  return inv[idx];
-}
-
-__global__ void sm70_unpermute_half_metadata_kernel(
-    const half* __restrict__ src, half* __restrict__ dst, int64_t total,
-    int perm_len) {
-  const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total) return;
-  const int64_t block = idx / perm_len;
-  const int pos = static_cast<int>(idx % perm_len);
-  dst[idx] = src[block * perm_len + sm70_inverse_scale_perm(pos, perm_len)];
-}
 
 __global__ void sm70_unpack_moe_zp_to_half_kernel(
     const int32_t* __restrict__ packed_zp, const half* __restrict__ scales,
@@ -98,21 +69,7 @@ torch::Tensor sm70_moe_scales_as_logical(torch::Tensor const& b_scales,
               "SM70 Marlin MoE adapter expects fp16 scales.");
   const bool uses_group_perm =
       group_size < size_k && group_size != -1 && !is_a_8bit;
-  const int perm_len = uses_group_perm ? 64 : 32;
-  TORCH_CHECK(b_scales.numel() % perm_len == 0,
-              "SM70 Marlin MoE scale metadata size is not divisible by ",
-              perm_len);
-
-  auto out = torch::empty_like(b_scales);
-  const int64_t total = out.numel();
-  constexpr int threads = 256;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  sm70_unpermute_half_metadata_kernel<<<blocks, threads, 0,
-                                        at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const half*>(b_scales.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(out.data_ptr<at::Half>()), total, perm_len);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
+  return sm70_unpermute_half(b_scales, uses_group_perm ? 64 : 32);
 }
 
 torch::Tensor sm70_moe_zp_as_half(torch::Tensor const& b_zeros,
