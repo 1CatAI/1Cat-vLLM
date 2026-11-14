@@ -115,6 +115,10 @@ def _run(plan, *, synchronous, attach):
     engine._sm70_async_cpu_trace_step = 0
     engine.batch_queue = deque()
     engine.batch_queue_size = 2
+    # What __init__ sets with the DeepSeek-V4.1 PP switches off (9fbc11c6f).
+    engine._v41_micro = False
+    engine._v41_depth = engine.batch_queue_size
+    engine._v41_skip = 0
     engine.scheduler = _Scheduler(plan, log)
     engine.model_executor = _Executor(attach)
     engine.is_ec_consumer = True

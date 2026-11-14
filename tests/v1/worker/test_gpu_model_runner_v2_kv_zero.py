@@ -7,9 +7,10 @@ from unittest import mock
 
 import torch
 
-from vllm import envs
+from vllm.config.sm70_moe import Sm70UnquantizedMoEConfig
 from vllm.v1.worker.gpu import kv_connector as mrv2_kv_connector
 from vllm.v1.worker.gpu import model_runner as mrv2
+from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
 
@@ -38,6 +39,12 @@ def test_v2_initializes_kv_zeroer_from_all_attention_groups(monkeypatch) -> None
     runner.compilation_config = SimpleNamespace(
         static_forward_context=static_forward_context
     )
+    runner.kv_cache_config = SimpleNamespace(
+        kv_cache_tensors=[
+            SimpleNamespace(host_backed=False, shared_by=["attn.device"]),
+            SimpleNamespace(host_backed=True, shared_by=["attn.host"]),
+        ]
+    )
 
     runner._init_kv_zero_meta()
 
@@ -51,6 +58,7 @@ def test_v2_initializes_kv_zeroer_from_all_attention_groups(monkeypatch) -> None
         "cache_dtype": "auto",
         "runner_only_attn_layers": set(),
         "static_forward_context": static_forward_context,
+        "host_backed_layers": {"attn.host"},
     }
 
 
@@ -79,6 +87,7 @@ def test_v2_clears_new_cache_blocks_before_zero_token_return() -> None:
     scheduler_output = SimpleNamespace(
         total_num_scheduled_tokens=0,
         new_block_ids_to_zero=[3, 7],
+        kv_block_copies=None,
     )
 
     output = runner.execute_model(scheduler_output)
@@ -115,12 +124,18 @@ def test_v2_warms_qwen38_mtp_moe_prefill_and_decode_shapes(monkeypatch) -> None:
     speculator.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=4),
         compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1]),
+        kernel_config=SimpleNamespace(
+            sm70_moe=SimpleNamespace(
+                unquantized=Sm70UnquantizedMoEConfig(mtp_tuned=True)
+            )
+        ),
     )
     speculator.max_num_tokens = 8192
     speculator.num_speculative_steps = 0
     speculator.max_num_reqs = 1
 
     runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    # The SM70 and auxiliary-warmup gates are resolved at runner init (2f459e30d).
     runner._auxiliary_warmup_enabled = True
     runner._kv_block_zeroer = zeroer
     runner.speculator = speculator
@@ -129,15 +144,8 @@ def test_v2_warms_qwen38_mtp_moe_prefill_and_decode_shapes(monkeypatch) -> None:
 
     with (
         mock.patch.object(
-            mrv2.current_platform, "is_device_capability", return_value=True
+            eagle_speculator.current_platform, "is_device_capability", return_value=True
         ),
-        mock.patch(
-            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
-            "_warmup_sm70_qwen_gdn_causal_conv1d",
-            return_value=False,
-        ),
-        mock.patch.object(envs, "VLLM_SM70_AUX_KERNEL_WARMUP", True),
-        mock.patch.object(envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", True),
         mock.patch.object(torch.accelerator, "synchronize"),
     ):
         runner._warmup_sm70_aux_kernels()

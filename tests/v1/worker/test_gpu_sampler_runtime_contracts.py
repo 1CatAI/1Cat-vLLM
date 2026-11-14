@@ -138,15 +138,17 @@ def test_prompt_logprobs_shared_helper_across_chunk_boundary(count):
     columns = 1 + (vocab_size if count == -1 else count)
     assert values.shape == (1025, columns)
     assert values.dtype == torch.float32
-    torch.testing.assert_close(ids[:, 0], prompt_ids)
-    expected = torch.log_softmax(logits.float(), dim=-1).gather(1, ids.long())
+    # Each chunk is copied to the host, so GPU output storage stays bounded
+    # by the chunk size whatever the prompt length (96a3129c6).
+    assert ids.device.type == values.device.type == ranks.device.type == "cpu"
+    torch.testing.assert_close(ids[:, 0], prompt_ids.cpu())
+    reference = logits.float().cpu()
+    expected = torch.log_softmax(reference, dim=-1).gather(1, ids.long())
     torch.testing.assert_close(values, expected, atol=2e-5, rtol=1e-5)
-    expected_ranks = (logits >= logits[:, 77:78]).sum(dim=-1)
+    expected_ranks = (logits >= logits[:, 77:78]).sum(dim=-1).cpu()
     torch.testing.assert_close(ranks, expected_ranks)
     if count == -1:
-        assert torch.all(
-            ids[:, 1:].sort(dim=-1).values == torch.arange(vocab_size, device="cuda")
-        )
+        assert torch.all(ids[:, 1:].sort(dim=-1).values == torch.arange(vocab_size))
 
 
 @pytest.mark.parametrize("drafts", [[], [7], [7, 8], [7, 8, 7]])

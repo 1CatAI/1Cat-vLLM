@@ -16,7 +16,11 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner
-from tests.v1.core.utils import create_requests, create_scheduler
+from tests.v1.core.utils import (
+    create_requests,
+    create_scheduler,
+    pretend_gpus_without_capability,
+)
 from vllm.config import DeviceConfig
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -32,12 +36,8 @@ MAX_MODEL_LEN = 512
 @pytest.fixture(autouse=True)
 def two_devices(monkeypatch):
     # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
-    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
     # CPU scheduler fixtures have no physical capability for simulated PP ranks.
-    monkeypatch.setattr(
-        "vllm.config.parallel.current_platform.get_device_capability",
-        lambda device_id=0: None,
-    )
+    pretend_gpus_without_capability(monkeypatch, 2)
 
 
 def _runner(monkeypatch, keep: bool, is_last_rank: bool) -> GPUModelRunner:
