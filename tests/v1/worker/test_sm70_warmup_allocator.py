@@ -8,6 +8,8 @@ import pytest
 import torch
 
 from vllm.config import CUDAGraphMode
+from vllm.config.execution_policy import GraphPolicy
+from vllm.v1.core import kv_cache_utils
 from vllm.v1.worker import gpu_worker
 
 MiB = 1024 * 1024
@@ -22,12 +24,13 @@ def test_compile_allocator_restored_before_measuring_or_returning(
     original = "roundup_power2_divisions:[256:1,512:2,>:4],max_split_size_mb:512"
     scoped = original.replace("max_split_size_mb:512", "max_split_size_mb:20")
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", original)
+    # The allocator scope does not depend on the attention workspace bounds,
+    # and this worker has no attention layers to bind them to.
+    monkeypatch.setattr(gpu_worker, "configure_attention_workspace", lambda *a: None)
+    monkeypatch.setattr(kv_cache_utils, "get_kv_cache_groups", lambda *a: [])
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda", lambda: cuda)
     monkeypatch.setattr(
         gpu_worker.current_platform, "is_device_capability", lambda _: sm70
-    )
-    monkeypatch.setattr(
-        gpu_worker.envs, "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", False
     )
     settings: list[str] = []
     monkeypatch.setattr(
@@ -36,7 +39,7 @@ def test_compile_allocator_restored_before_measuring_or_returning(
     worker = gpu_worker.Worker.__new__(gpu_worker.Worker)
     worker.device = torch.device("cpu")
     worker.init_snapshot = SimpleNamespace(
-        free_memory=1000 * MiB, torch_memory=10 * MiB
+        free_memory=1000 * MiB, torch_memory=10 * MiB, torch_allocated_memory=10 * MiB
     )
     worker.requested_memory = 800 * MiB
     worker.cache_config = SimpleNamespace(
@@ -44,7 +47,10 @@ def test_compile_allocator_restored_before_measuring_or_returning(
         gpu_memory_utilization=0.8,
     )
     worker.vllm_config = SimpleNamespace(
-        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.NONE,
+            runtime=GraphPolicy(estimate_graph_memory=False),
+        )
     )
     worker.use_v2_model_runner = False
     calls = []
@@ -58,14 +64,20 @@ def test_compile_allocator_restored_before_measuring_or_returning(
         else:
             assert settings == ([scoped, original] if cuda and sm70 else [])
 
-    worker.model_runner = SimpleNamespace(profile_run=run, model_memory_usage=100 * MiB)
+    worker.model_runner = SimpleNamespace(
+        profile_run=run, model_memory_usage=100 * MiB, get_kv_cache_spec=lambda: {}
+    )
 
     @contextmanager
     def profile(snapshot, weights_memory):
         assert settings == ([scoped, original] if cuda and sm70 else [])
         calls.append("measure")
         yield SimpleNamespace(
-            before_profile=SimpleNamespace(torch_peak=20 * MiB, torch_memory=110 * MiB),
+            before_profile=SimpleNamespace(
+                torch_peak=20 * MiB,
+                torch_memory=110 * MiB,
+                torch_allocated_memory=110 * MiB,
+            ),
             after_profile=SimpleNamespace(free_memory=700 * MiB),
             non_torch_increase=50 * MiB,
             weights_memory=weights_memory,

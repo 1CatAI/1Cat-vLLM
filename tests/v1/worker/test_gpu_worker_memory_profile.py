@@ -13,12 +13,22 @@ from vllm.config import CUDAGraphMode
 from vllm.config.execution_policy import GraphPolicy
 from vllm.platforms import current_platform
 from vllm.utils.mem_utils import MemorySnapshot
+from vllm.v1.core import kv_cache_utils
+from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu_worker import Worker
 
 MiB = 1024 * 1024
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(), reason="needs a CUDA device for memory stats"
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_attention_workspace(monkeypatch):
+    # The KV budget does not depend on the attention workspace bounds, and
+    # these workers have no attention layers to bind them to.
+    monkeypatch.setattr(gpu_worker, "configure_attention_workspace", lambda *a: None)
+    monkeypatch.setattr(kv_cache_utils, "get_kv_cache_groups", lambda *a: [])
 
 
 class _FakeRunner:
@@ -50,6 +60,9 @@ class _FakeRunner:
     def profile_cudagraph_memory(self) -> int:
         self.graph_calls += 1
         return 32 * MiB
+
+    def get_kv_cache_spec(self) -> dict:
+        return {}
 
 
 @pytest.mark.parametrize(
@@ -134,6 +147,9 @@ def test_explicit_kv_bytes_profiles_once_and_skips_memory_estimation() -> None:
     worker = Worker.__new__(Worker)
     worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=128 * MiB)
     worker.init_snapshot = SimpleNamespace(free_memory=1024 * MiB)
-    worker.model_runner = SimpleNamespace(profile_run=lambda: calls.append("profile"))
+    worker.vllm_config = SimpleNamespace()
+    worker.model_runner = SimpleNamespace(
+        profile_run=lambda: calls.append("profile"), get_kv_cache_spec=dict
+    )
     assert worker.determine_available_memory() == 128 * MiB
     assert calls == ["profile"]
