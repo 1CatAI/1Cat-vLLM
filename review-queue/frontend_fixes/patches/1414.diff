@@ -1,0 +1,614 @@
+diff --git a/tests/entrypoints/openai/chat_completion/test_serving_chat.py b/tests/entrypoints/openai/chat_completion/test_serving_chat.py
+index bca2fd685..df68ba14d 100644
+--- a/tests/entrypoints/openai/chat_completion/test_serving_chat.py
++++ b/tests/entrypoints/openai/chat_completion/test_serving_chat.py
+@@ -2070,6 +2070,89 @@ async def test_streaming_n_gt1_independent_tool_parsers():
+         )
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_prompt_tokens_details_reports_zero_cached_tokens(stream: bool):
++    """With --enable-prompt-tokens-details, a prompt without prefix-cache hit
++    must report cached_tokens=0 instead of omitting prompt_tokens_details."""
++    mock_engine = MagicMock(spec=AsyncLLM)
++    mock_engine.errored = False
++    mock_engine.model_config = MockModelConfig()
++    mock_engine.input_processor = MagicMock()
++    mock_engine.renderer = _build_renderer(mock_engine.model_config)
++
++    models = OpenAIServingModels(
++        engine_client=mock_engine,
++        base_model_paths=BASE_MODEL_PATHS,
++    )
++    serving_chat = OpenAIServingChat(
++        mock_engine,
++        models,
++        response_role="assistant",
++        openai_serving_render=_build_serving_render(mock_engine, models.registry),
++        chat_template=CHAT_TEMPLATE,
++        chat_template_content_format="auto",
++        request_logger=None,
++        enable_prompt_tokens_details=True,
++    )
++
++    request = ChatCompletionRequest(
++        model=MODEL_NAME,
++        messages=[{"role": "user", "content": "test"}],
++        stream=stream,
++        stream_options={"include_usage": True} if stream else None,
++    )
++
++    async def result_generator():
++        yield RequestOutput(
++            request_id="test-req",
++            prompt="test",
++            prompt_token_ids=[1, 2, 3],
++            prompt_logprobs=None,
++            outputs=[
++                CompletionOutput(
++                    index=0,
++                    text="Hi",
++                    token_ids=[4],
++                    cumulative_logprob=0.0,
++                    logprobs=None,
++                    finish_reason="stop",
++                )
++            ],
++            finished=True,
++            num_cached_tokens=0,
++        )
++
++    generator_kwargs = dict(
++        request=request,
++        result_generator=result_generator(),
++        request_id="test-req",
++        model_name=MODEL_NAME,
++        conversation=[],
++        tokenizer=get_tokenizer(MODEL_NAME),
++        request_metadata=RequestResponseMetadata(
++            request_id="test-req",
++            model_name=MODEL_NAME,
++        ),
++    )
++    if stream:
++        usage = None
++        async for chunk_str in serving_chat.chat_completion_stream_generator(
++            **generator_kwargs
++        ):
++            if chunk_str.startswith("data: ") and "[DONE]" not in chunk_str:
++                data = json.loads(chunk_str[6:].strip())
++                if data.get("usage"):
++                    usage = data["usage"]
++        assert usage is not None
++        assert usage["prompt_tokens_details"] == {"cached_tokens": 0}
++    else:
++        response = await serving_chat.chat_completion_full_generator(**generator_kwargs)
++        assert isinstance(response, ChatCompletionResponse)
++        assert response.usage.prompt_tokens_details is not None
++        assert response.usage.prompt_tokens_details.cached_tokens == 0
++
++
+ class TestCreateRemainingArgsDelta:
+     """Tests for _create_remaining_args_delta helper function.
+ 
+diff --git a/tests/entrypoints/openai/completion/test_completion.py b/tests/entrypoints/openai/completion/test_completion.py
+index 8ca0d1604..a16fa83fe 100644
+--- a/tests/entrypoints/openai/completion/test_completion.py
++++ b/tests/entrypoints/openai/completion/test_completion.py
+@@ -58,9 +58,12 @@ async def test_single_completion(client: openai.AsyncOpenAI, model_name: str) ->
+     choice = completion.choices[0]
+     assert len(choice.text) >= 5
+     assert choice.finish_reason == "length"
+-    assert completion.usage == openai.types.CompletionUsage(
+-        completion_tokens=5, prompt_tokens=6, total_tokens=11
+-    )
++    assert completion.usage is not None
++    assert completion.usage.completion_tokens == 5
++    assert completion.usage.prompt_tokens == 6
++    assert completion.usage.total_tokens == 11
++    assert completion.usage.prompt_tokens_details is not None
++    assert completion.usage.prompt_tokens_details.cached_tokens == 0
+ 
+     # test using token IDs
+     completion = await client.completions.create(
+diff --git a/tests/entrypoints/serve/disagg/test_generate_stream.py b/tests/entrypoints/serve/disagg/test_generate_stream.py
+index ac5b8bcd9..bd5286334 100644
+--- a/tests/entrypoints/serve/disagg/test_generate_stream.py
++++ b/tests/entrypoints/serve/disagg/test_generate_stream.py
+@@ -512,3 +512,46 @@ async def test_stream_prompt_tokens_details():
+     usage_chunk = parsed[-2]
+     assert usage_chunk["choices"] == []
+     assert usage_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
++
++
++@pytest.mark.asyncio
++async def test_stream_prompt_tokens_details_zero_cached():
++    """enable_prompt_tokens_details includes cached_tokens=0 in final usage.
++
++    Regression test for https://github.com/vllm-project/vllm/issues/44377:
++    zero cached tokens must not be treated as falsy and omitted.
++    """
++    engine = _mock_engine()
++
++    async def mock_generate(*args, **kwargs):
++        yield _make_request_output(
++            "req-1",
++            token_ids=[10],
++            finish_reason="stop",
++            finished=True,
++            num_cached_tokens=0,
++        )
++
++    engine.generate = MagicMock(side_effect=mock_generate)
++    serving = _build_serving_tokens(engine, enable_prompt_tokens_details=True)
++
++    request = GenerateRequest(
++        token_ids=[1, 2, 3],
++        sampling_params=SamplingParams(max_tokens=10),
++        model=MODEL_NAME,
++        stream=True,
++        stream_options=StreamOptions(include_usage=True),
++    )
++
++    response = await serving.serve_tokens(request)
++    chunks = []
++    async for chunk in response:
++        chunks.append(chunk)
++
++    parsed = _parse_sse_chunks(chunks)
++    # Usage-only chunk (before [DONE])
++    usage_chunk = parsed[-2]
++    assert usage_chunk["choices"] == []
++    # Zero cached tokens must be present, not omitted
++    assert usage_chunk["usage"]["prompt_tokens_details"] is not None
++    assert usage_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+diff --git a/tests/tool_parsers/test_deepseekv4_tool_parser.py b/tests/tool_parsers/test_deepseekv4_tool_parser.py
+index ab66d6e64..dbd160645 100644
+--- a/tests/tool_parsers/test_deepseekv4_tool_parser.py
++++ b/tests/tool_parsers/test_deepseekv4_tool_parser.py
+@@ -332,3 +332,35 @@ def test_composed_schema_converts_object_and_array_params():
+         "wait": {"type": "for", "minutes": 2880},
+         "patches": [{"op": "replace", "path": "/schedule", "value": "quiet"}],
+     }
++
++
++@pytest.mark.parametrize("streaming", [False, True])
++def test_integer_schema_accepts_whole_number_float(streaming):
++    tool = ChatCompletionToolsParam(
++        type="function",
++        function={
++            "name": "round_to",
++            "parameters": {
++                "type": "object",
++                "properties": {"precision": {"type": "integer"}},
++            },
++        },
++    )
++    parser = make_parser(tools=[tool])
++    model_output = (
++        f"{TC_START}\n"
++        f'{INV_START}round_to">\n'
++        f'{PARAM_START}precision" string="false">3.0{PARAM_END}\n'
++        f"{INV_END}\n"
++        f"{TC_END}"
++    )
++
++    if streaming:
++        args = reconstruct_args(stream(parser, model_output))
++    else:
++        result = parser.extract_tool_calls(model_output, make_request(tools=[tool]))
++        assert result.tools_called
++        args = result.tool_calls[0].function.arguments
++    precision = json.loads(args)["precision"]
++    assert precision == 3
++    assert isinstance(precision, int)
+diff --git a/tests/tool_parsers/test_qwen3coder_tool_parser.py b/tests/tool_parsers/test_qwen3coder_tool_parser.py
+index dbeeb61e1..8849ffccd 100644
+--- a/tests/tool_parsers/test_qwen3coder_tool_parser.py
++++ b/tests/tool_parsers/test_qwen3coder_tool_parser.py
+@@ -1777,3 +1777,132 @@ def test_adjust_request_required_prefers_structural_tag(
+     out = qwen3_tool_parser.adjust_request(req)
+     assert out.structured_outputs is not None
+     assert out.structured_outputs.structural_tag is not None
++
++
++_WEATHER_CALL = (
++    "<tool_call>\n<function=get_current_weather>\n<parameter=city>\nDallas\n"
++    "</parameter>\n<parameter=state>\nTX\n</parameter>\n</function>\n</tool_call>"
++)
++
++
++def _stream_content_and_calls(parser, tokenizer, model_output, request):
++    content = ""
++    calls: dict[int, dict[str, str]] = {}
++    for delta in stream_delta_message_generator(
++        parser, tokenizer, model_output, request
++    ):
++        content += delta.content or ""
++        for tool_call in delta.tool_calls or []:
++            call = calls.setdefault(tool_call.index, {"name": "", "arguments": ""})
++            if tool_call.function and tool_call.function.name:
++                call["name"] = tool_call.function.name
++            if tool_call.function and tool_call.function.arguments:
++                call["arguments"] += tool_call.function.arguments
++    return content, calls
++
++
++@pytest.mark.parametrize(
++    ("model_output", "expected_content"),
++    [
++        (
++            "<tool_call></tool_call>Content after empty tools.",
++            "Content after empty tools.",
++        ),
++        ('Before.<tool_call>{"name":</tool_call> After.', "Before. After."),
++    ],
++)
++def test_streaming_empty_tool_block_keeps_following_content(
++    qwen3_tool_parser, qwen3_tokenizer, model_output, expected_content
++):
++    """A block that closes without a function header must not swallow the
++    rest of the stream (non-streaming keeps the text as content)."""
++    request = ChatCompletionRequest(model=MODEL, messages=[])
++
++    content, calls = _stream_content_and_calls(
++        qwen3_tool_parser, qwen3_tokenizer, model_output, request
++    )
++    assert content == expected_content
++    assert calls == {}
++
++    extracted = qwen3_tool_parser.extract_tool_calls(model_output, request=request)
++    assert not extracted.tools_called
++    assert extracted.content == model_output
++
++
++def test_streaming_empty_tool_block_before_call(qwen3_tool_parser, qwen3_tokenizer):
++    """A call after an empty block streams with index 0, as in non-streaming."""
++    model_output = "<tool_call></tool_call>\n" + _WEATHER_CALL
++    request = ChatCompletionRequest(model=MODEL, messages=[])
++
++    content, calls = _stream_content_and_calls(
++        qwen3_tool_parser, qwen3_tokenizer, model_output, request
++    )
++    assert content == ""
++    assert list(calls) == [0]
++    assert calls[0]["name"] == "get_current_weather"
++    assert json.loads(calls[0]["arguments"]) == {"city": "Dallas", "state": "TX"}
++
++    extracted = qwen3_tool_parser.extract_tool_calls(model_output, request=request)
++    assert extracted.tools_called
++    assert [call.function.name for call in extracted.tool_calls] == [
++        "get_current_weather"
++    ]
++
++
++def test_streaming_empty_tool_block_in_multi_token_delta(qwen3_tool_parser):
++    """Speculative decoding can deliver the empty block and the text after it
++    in one delta; the text after the block must still arrive."""
++    from tests.tool_parsers.utils import run_tool_extraction_streaming
++
++    reconstructor = run_tool_extraction_streaming(
++        qwen3_tool_parser,
++        ["<tool_call></tool_call>Content after", " empty tools."],
++        ChatCompletionRequest(model=MODEL, messages=[]),
++        assert_one_tool_per_delta=False,
++    )
++
++    assert reconstructor.other_content == "Content after empty tools."
++    assert reconstructor.tool_calls == []
++
++
++@pytest.mark.parametrize(
++    ("call_body", "expected_arguments"),
++    [
++        ("", {}),
++        (
++            (
++                "<parameter=city>\nDallas\n</parameter>\n"
++                "<parameter=state>\nTX\n</parameter>\n"
++            ),
++            {"city": "Dallas", "state": "TX"},
++        ),
++    ],
++)
++def test_streaming_call_completed_in_delta_after_skipped_empty_block(
++    qwen3_tool_parser, call_body, expected_arguments
++):
++    """The empty block and the next call's header arrive in one delta, the
++    rest of that call in the next one, then only EOS follows: the call must
++    come out in the delta that skips the empty block (as in non-streaming)."""
++    from tests.tool_parsers.utils import run_tool_extraction_streaming
++
++    deltas = [
++        "<tool_call></tool_call>\n<tool_call>\n<function=get_current_weather>\n",
++        f"{call_body}</function>\n</tool_call>",
++    ]
++    request = ChatCompletionRequest(model=MODEL, messages=[])
++
++    reconstructor = run_tool_extraction_streaming(
++        qwen3_tool_parser, deltas, request, assert_one_tool_per_delta=False
++    )
++    assert len(reconstructor.tool_calls) == 1
++    assert reconstructor.tool_calls[0].function.name == "get_current_weather"
++    assert (
++        json.loads(reconstructor.tool_calls[0].function.arguments) == expected_arguments
++    )
++
++    extracted = qwen3_tool_parser.extract_tool_calls("".join(deltas), request=request)
++    assert [call.function.name for call in extracted.tool_calls] == [
++        "get_current_weather"
++    ]
++    assert json.loads(extracted.tool_calls[0].function.arguments) == expected_arguments
+diff --git a/tests/tool_parsers/test_utils.py b/tests/tool_parsers/test_utils.py
+index 2faf88a56..ee88ed566 100644
+--- a/tests/tool_parsers/test_utils.py
++++ b/tests/tool_parsers/test_utils.py
+@@ -76,6 +76,20 @@ class TestCoerceToSchemaType:
+         def test_long_alias(self):
+             assert coerce_to_schema_type("100", "long") == 100
+ 
++        @pytest.mark.parametrize(("value", "expected"), [("3.0", 3), ("1e3", 1000)])
++        def test_whole_number_float_returns_int(self, value, expected):
++            result = coerce_to_schema_type(value, "integer")
++            assert result == expected
++            assert isinstance(result, int)
++
++        def test_fractional_value_is_not_rounded(self):
++            assert coerce_to_schema_type("3.5", "integer") == 3.5
++            assert coerce_to_schema_type("3.5", ["integer", "number"]) == 3.5
++
++        @pytest.mark.parametrize("value", ["inf", "NaN"])
++        def test_non_finite_value_stays_string(self, value):
++            assert coerce_to_schema_type(value, "integer") == value
++
+     class TestNumberType:
+         def test_number_type(self):
+             assert coerce_to_schema_type("3.14", "number") == 3.14
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 60c598808..6491f7131 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -1102,7 +1102,7 @@ class OpenAIServingChat(OpenAIServing):
+                     completion_tokens=completion_tokens,
+                     total_tokens=num_prompt_tokens + completion_tokens,
+                 )
+-                if self.enable_prompt_tokens_details and num_cached_tokens:
++                if self.enable_prompt_tokens_details and num_cached_tokens is not None:
+                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
+                         cached_tokens=num_cached_tokens
+                     )
+@@ -1536,7 +1536,10 @@ class OpenAIServingChat(OpenAIServing):
+             completion_tokens=num_generated_tokens,
+             total_tokens=num_prompt_tokens + num_generated_tokens,
+         )
+-        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
++        if (
++            self.enable_prompt_tokens_details
++            and final_res.num_cached_tokens is not None
++        ):
+             usage.prompt_tokens_details = PromptTokenUsageInfo(
+                 cached_tokens=final_res.num_cached_tokens
+             )
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index 80abe1433..e2d3ab1ef 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -445,7 +445,7 @@ class OpenAIServingCompletion(OpenAIServing):
+                 total_tokens=total_prompt_tokens + total_completion_tokens,
+             )
+ 
+-            if self.enable_prompt_tokens_details and num_cached_tokens:
++            if self.enable_prompt_tokens_details and num_cached_tokens is not None:
+                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
+                     cached_tokens=num_cached_tokens
+                 )
+@@ -585,7 +585,7 @@ class OpenAIServingCompletion(OpenAIServing):
+         if (
+             self.enable_prompt_tokens_details
+             and last_final_res
+-            and last_final_res.num_cached_tokens
++            and last_final_res.num_cached_tokens is not None
+         ):
+             usage.prompt_tokens_details = PromptTokenUsageInfo(
+                 cached_tokens=last_final_res.num_cached_tokens
+diff --git a/vllm/entrypoints/serve/disagg/serving.py b/vllm/entrypoints/serve/disagg/serving.py
+index 6bfe18d57..a10d0f27c 100644
+--- a/vllm/entrypoints/serve/disagg/serving.py
++++ b/vllm/entrypoints/serve/disagg/serving.py
+@@ -311,7 +311,10 @@ class ServingTokens(OpenAIServing):
+             completion_tokens=num_generated_tokens,
+             total_tokens=num_prompt_tokens + num_generated_tokens,
+         )
+-        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
++        if (
++            self.enable_prompt_tokens_details
++            and final_res.num_cached_tokens is not None
++        ):
+             # This info is not available at the /coordinator level
+             usage.prompt_tokens_details = PromptTokenUsageInfo(
+                 cached_tokens=final_res.num_cached_tokens
+@@ -428,7 +431,7 @@ class ServingTokens(OpenAIServing):
+                 total_tokens=num_prompt_tokens + total_completion_tokens,
+             )
+ 
+-            if self.enable_prompt_tokens_details and num_cached_tokens:
++            if self.enable_prompt_tokens_details and num_cached_tokens is not None:
+                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
+                     cached_tokens=num_cached_tokens
+                 )
+diff --git a/vllm/tool_parsers/qwen3coder_tool_parser.py b/vllm/tool_parsers/qwen3coder_tool_parser.py
+index 699b14168..136b45f88 100644
+--- a/vllm/tool_parsers/qwen3coder_tool_parser.py
++++ b/vllm/tool_parsers/qwen3coder_tool_parser.py
+@@ -122,6 +122,36 @@ class Qwen3CoderToolParser(ToolParser):
+         self.accumulated_params = {}
+         self.streaming_request = None
+         self.json_tool_calls_streamed = 0
++        # Closed <tool_call> blocks without a function header hold no call, so
++        # the block index runs ahead of current_tool_index by this count, and
++        # content is searched for new tool markers only after the last one.
++        self.skipped_tool_blocks = 0
++        self.content_search_start = 0
++
++    def _current_tool_block(self) -> int:
++        """Index of the <tool_call> block the streaming parser is in."""
++        return self.current_tool_index + self.skipped_tool_blocks
++
++    def _skip_tool_block(
++        self, current_text: str, block_end_idx: int
++    ) -> DeltaMessage | None:
++        """Leave a closed block without a function header and stream the
++        text after it, so neither content nor later calls are lost."""
++        self.skipped_tool_blocks += 1
++        self.content_search_start = block_end_idx + len(self.tool_call_end_token)
++        if self._current_tool_block() < len(self._tool_start_positions(current_text)):
++            # Go on with the next block in this call: it may already be
++            # complete, and a later delta (maybe only EOS) would not get to it.
++            return self._stream_current_tool_block(current_text)
++
++        self.is_tool_call_started = False
++        # Nothing after the block has been emitted yet: while inside it, the
++        # parser swallowed every delta, also text after its end.
++        tail = current_text[self.content_search_start :]
++        held_prefix = self._trailing_tool_marker_prefix(current_text)
++        if held_prefix:
++            tail = tail[: -len(held_prefix)]
++        return DeltaMessage(content=tail) if tail else None
+ 
+     def _convert_param_value(
+         self, param_value: str, param_name: str, param_config: dict, func_name: str
+@@ -633,7 +663,7 @@ class Qwen3CoderToolParser(ToolParser):
+         if self.json_closed and not self.in_function:
+             # Check if this tool call has ended
+             tool_ends = current_text.count(self.tool_call_end_token)
+-            if tool_ends > self.current_tool_index:
++            if tool_ends > self._current_tool_block():
+                 # This tool has ended, advance to next
+                 self.current_tool_index += 1
+                 self.header_sent = False
+@@ -644,7 +674,7 @@ class Qwen3CoderToolParser(ToolParser):
+ 
+                 # Check if there are more tool calls
+                 tool_starts = current_text.count(self.tool_call_start_token)
+-                if self.current_tool_index >= tool_starts:
++                if self._current_tool_block() >= tool_starts:
+                     # No more tool calls
+                     self.is_tool_call_started = False
+                 # Continue processing next tool
+@@ -656,8 +686,10 @@ class Qwen3CoderToolParser(ToolParser):
+             tool_start_candidates = [
+                 pos
+                 for pos in (
+-                    current_text.find(self.tool_call_start_token),
+-                    current_text.find(self.tool_call_prefix),
++                    current_text.find(
++                        self.tool_call_start_token, self.content_search_start
++                    ),
++                    current_text.find(self.tool_call_prefix, self.content_search_start),
+                 )
+                 if pos != -1
+             ]
+@@ -691,17 +723,20 @@ class Qwen3CoderToolParser(ToolParser):
+                 # Normal content, no tool call
+                 return DeltaMessage(content=delta_text)
+ 
++        return self._stream_current_tool_block(current_text)
++
++    def _stream_current_tool_block(self, current_text: str) -> DeltaMessage | None:
++        """Stream the progress of the <tool_call> block the parser is in."""
+         # Check if we're between tool calls (waiting for next one)
+         # Count tool calls we've seen vs processed
+         tool_start_positions = self._tool_start_positions(current_text)
+         tool_starts_count = len(tool_start_positions)
+-        if self.current_tool_index >= tool_starts_count:
++        if self._current_tool_block() >= tool_starts_count:
+             # We're past all tool calls, shouldn't be here
+             return None
+ 
+         # We're in a tool call, find the current tool call portion
+-        # Need to find the correct tool call based on current_tool_index
+-        tool_start_idx = tool_start_positions[self.current_tool_index]
++        tool_start_idx = tool_start_positions[self._current_tool_block()]
+         # Find where this tool call ends (or current position if not ended yet)
+         tool_end_idx = current_text.find(self.tool_call_end_token, tool_start_idx)
+         if tool_end_idx == -1:
+@@ -779,6 +814,10 @@ class Qwen3CoderToolParser(ToolParser):
+                             )
+                         ]
+                     )
++            elif tool_end_idx != -1:
++                # Empty or malformed block: it closed without a function
++                # header, so no call will ever start in it.
++                return self._skip_tool_block(current_text, tool_end_idx)
+             return None
+ 
+         # We've sent header, now handle function body
+diff --git a/vllm/tool_parsers/utils.py b/vllm/tool_parsers/utils.py
+index 3788f0a2a..f37231f41 100644
+--- a/vllm/tool_parsers/utils.py
++++ b/vllm/tool_parsers/utils.py
+@@ -548,6 +548,26 @@ def _is_json_finite(obj: Any) -> bool:
+         return False
+ 
+ 
++def _parse_finite_number(value: str) -> int | float | None:
++    """Parse a finite JSON number; whole values (also "3.0", "1e3") as int.
++
++    int() comes first so that integers above 2**53 stay exact. inf/-inf/nan
++    are not valid JSON numbers and give None (int(float("inf")) would raise
++    OverflowError, json.dumps(inf) would emit invalid JSON "Infinity").
++    """
++    try:
++        return int(value)
++    except (ValueError, TypeError):
++        pass
++    try:
++        number = float(value)
++    except (ValueError, TypeError):
++        return None
++    if not math.isfinite(number):
++        return None
++    return int(number) if number.is_integer() else number
++
++
+ def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
+     """Best-effort coercion of a raw string value to a JSON Schema type.
+ 
+@@ -589,26 +609,17 @@ def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
+         if candidate_type == "string":
+             return value
+         if candidate_type == "integer":
+-            try:
+-                return int(value)
+-            except (ValueError, TypeError):
+-                continue
++            number = _parse_finite_number(value)
++            # JSON Schema integers include whole numbers written as floats.
++            if isinstance(number, int):
++                return number
++            continue
+         if candidate_type == "number":
+-            try:
+-                return int(value)
+-            except (ValueError, TypeError):
+-                pass
+-            try:
+-                val = float(value)
+-            except (ValueError, TypeError):
+-                continue
+-            if not math.isfinite(val):
+-                # inf/-inf/nan are not valid JSON numbers. Fall through so
+-                # the value is preserved as a string instead of crashing
+-                # (int(float("inf")) raises OverflowError) or emitting
+-                # invalid JSON (json.dumps(inf) -> "Infinity").
+-                continue
+-            return val if val != int(val) else int(val)
++            number = _parse_finite_number(value)
++            if number is not None:
++                return number
++            # Not a number, or inf/nan: try the next type.
++            continue
+         if candidate_type == "boolean":
+             lower_val = value.lower().strip()
+             if lower_val in ("true", "1"):

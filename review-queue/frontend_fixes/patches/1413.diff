@@ -1,0 +1,915 @@
+diff --git a/tests/tokenizers_/fixtures/deepseek_v4/test_output_1.txt b/tests/tokenizers_/fixtures/deepseek_v4/test_output_1.txt
+index dbd823476..7e3c9bd5a 100644
+--- a/tests/tokenizers_/fixtures/deepseek_v4/test_output_1.txt
++++ b/tests/tokenizers_/fixtures/deepseek_v4/test_output_1.txt
+@@ -1,4 +1,4 @@
+-<｜begin▁of▁sentence｜>
++<｜begin▁of▁sentence｜>You are a helpful assistant.
+ 
+ ## Tools
+ 
+@@ -26,7 +26,7 @@ Otherwise, output directly after </think> with tool calls or final response.
+ {"name": "search", "description": "Search the web for information", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}, "num_results": {"type": "integer", "description": "Number of results to return"}}, "required": ["query"]}}
+ 
+ You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+-You are a helpful assistant.<｜User｜>What's the weather in Beijing?<｜Assistant｜><think>The user wants to know the weather in Beijing. I should use the get_weather tool.</think>
++<｜User｜>What's the weather in Beijing?<｜Assistant｜><think>The user wants to know the weather in Beijing. I should use the get_weather tool.</think>
+ 
+ <｜DSML｜tool_calls>
+ <｜DSML｜invoke name="get_weather">
+diff --git a/tests/tokenizers_/test_deepseek_v4.py b/tests/tokenizers_/test_deepseek_v4.py
+index 358732eab..c871799c1 100644
+--- a/tests/tokenizers_/test_deepseek_v4.py
++++ b/tests/tokenizers_/test_deepseek_v4.py
+@@ -96,6 +96,108 @@ def test_deepseek_v4_enables_thinking_with_compatible_kwargs(kwargs):
+     assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜><think>")
+ 
+ 
++@pytest.mark.parametrize(
++    ("enable_thinking", "thinking_token"),
++    [(False, "</think>"), (True, "<think>")],
++)
++def test_deepseek_v4_appends_assistant_transition_after_trailing_system(
++    enable_thinking, thinking_token
++):
++    prompt = _tokenizer().apply_chat_template(
++        [
++            {"role": "system", "content": "You are helpful."},
++            {"role": "user", "content": "What is 2+2?"},
++            {"role": "system", "content": "Be concise."},
++        ],
++        tokenize=False,
++        enable_thinking=enable_thinking,
++        reasoning_effort="low",
++    )
++
++    assert prompt == (
++        "<｜begin▁of▁sentence｜>You are helpful."
++        f"<｜User｜>What is 2+2?Be concise.<｜Assistant｜>{thinking_token}"
++    )
++
++
++def test_deepseek_v4_does_not_transition_after_mid_conversation_system():
++    prompt = _tokenizer().apply_chat_template(
++        [
++            {"role": "user", "content": "What is 3+3?"},
++            {"role": "assistant", "content": "6"},
++            {"role": "system", "content": "Answer in French."},
++            {"role": "user", "content": "What is 5+5?"},
++        ],
++        tokenize=False,
++        enable_thinking=False,
++    )
++
++    assert prompt == (
++        "<｜begin▁of▁sentence｜><｜User｜>What is 3+3?"
++        "<｜Assistant｜></think>6<｜end▁of▁sentence｜>"
++        "Answer in French.<｜User｜>What is 5+5?"
++        "<｜Assistant｜></think>"
++    )
++
++
++@pytest.mark.parametrize(
++    ("enable_thinking", "expected"),
++    [
++        (
++            False,
++            (
++                "<｜begin▁of▁sentence｜>rules<｜Assistant｜></think>answer"
++                "<｜end▁of▁sentence｜>"
++            ),
++        ),
++        (
++            True,
++            (
++                "<｜begin▁of▁sentence｜>rules<｜Assistant｜><think>reason</think>answer"
++                "<｜end▁of▁sentence｜>"
++            ),
++        ),
++    ],
++)
++def test_deepseek_v4_transitions_from_system_to_assistant(enable_thinking, expected):
++    prompt = _tokenizer().apply_chat_template(
++        [
++            {"role": "system", "content": "rules"},
++            {
++                "role": "assistant",
++                "reasoning": "reason",
++                "content": "answer",
++            },
++        ],
++        tokenize=False,
++        enable_thinking=enable_thinking,
++        reasoning_effort="low",
++    )
++
++    assert prompt == expected
++
++
++def test_deepseek_v4_opens_assistant_turn_after_compressed_history_summary():
++    """AIfred's history compression yields system prompt, summary as system,
++    then the remaining turns, which may start with assistant."""
++    prompt = _tokenizer().apply_chat_template(
++        [
++            {"role": "system", "content": "You are AIfred."},
++            {"role": "system", "content": "[Summary]\nEarlier: weather."},
++            {"role": "assistant", "content": "It will be sunny."},
++            {"role": "user", "content": "And tomorrow?"},
++        ],
++        tokenize=False,
++        enable_thinking=True,
++    )
++
++    assert prompt == (
++        "<｜begin▁of▁sentence｜>You are AIfred.[Summary]\nEarlier: weather."
++        "<｜Assistant｜></think>It will be sunny.<｜end▁of▁sentence｜>"
++        "<｜User｜>And tomorrow?<｜Assistant｜><think>"
++    )
++
++
+ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
+     tools = [
+         {
+@@ -288,3 +390,148 @@ def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
+ 
+     expected = (FIXTURES_DIR / f"test_output_{case_id}.txt").read_text()
+     assert prompt == expected
++
++
++def _request_tools():
++    return [
++        {
++            "type": "function",
++            "function": {
++                "name": "get_weather",
++                "description": "Get weather for a city",
++                "parameters": {
++                    "type": "object",
++                    "properties": {"city": {"type": "string"}},
++                    "required": ["city"],
++                },
++            },
++        }
++    ]
++
++
++def _encode_reference(messages):
++    from vllm.tokenizers.deepseek_v4_encoding import encode_messages
++
++    # The wrapper maps OpenAI's "low" to "high"; this fork's encoder knows only
++    # None, "high" and "max".
++    return encode_messages(messages, thinking_mode="thinking", reasoning_effort="high")
++
++
++def test_deepseek_v4_attaches_request_tools_to_existing_system_message():
++    messages = [
++        {"role": "system", "content": "You are helpful."},
++        {"role": "user", "content": "Weather in Paris?"},
++    ]
++
++    prompt = _tokenizer().apply_chat_template(
++        messages,
++        tools=_request_tools(),
++        tokenize=False,
++        thinking=True,
++        reasoning_effort="low",
++    )
++
++    expected = _encode_reference(
++        [{**messages[0], "tools": _request_tools()}, messages[1]]
++    )
++    assert prompt == expected
++    assert prompt.startswith("<｜begin▁of▁sentence｜>You are helpful.\n\n## Tools")
++    assert prompt.count("## Tools") == 1
++
++
++def test_deepseek_v4_synthetic_system_only_when_no_system_message():
++    """Without a system message, request tools still get a synthetic leading
++    system entry."""
++    messages = [{"role": "user", "content": "Weather in Paris?"}]
++
++    prompt = _tokenizer().apply_chat_template(
++        messages,
++        tools=_request_tools(),
++        tokenize=False,
++        thinking=True,
++        reasoning_effort="low",
++    )
++
++    expected = _encode_reference(
++        [{"role": "system", "tools": _request_tools()}, messages[0]]
++    )
++    assert prompt == expected
++    assert prompt.startswith("<｜begin▁of▁sentence｜>\n\n## Tools")
++
++
++def test_deepseek_v4_request_tools_override_system_message_tools():
++    message_tools = [
++        {
++            "type": "function",
++            "function": {
++                "name": "message_level_tool",
++                "description": "Should not be rendered",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++    ]
++    system_message = {
++        "role": "system",
++        "content": "You are helpful.",
++        "tools": message_tools,
++    }
++    user_message = {"role": "user", "content": "Weather in Paris?"}
++
++    prompt = _tokenizer().apply_chat_template(
++        [system_message, user_message],
++        tools=_request_tools(),
++        tokenize=False,
++        thinking=True,
++        reasoning_effort="low",
++    )
++
++    expected = _encode_reference(
++        [{**system_message, "tools": _request_tools()}, user_message]
++    )
++    assert prompt == expected
++    assert '"name": "get_weather"' in prompt
++    assert "message_level_tool" not in prompt
++
++
++def test_deepseek_v4_attaches_request_tools_to_first_system_message_only():
++    """Only the first system message, at any index, gets the request tools."""
++    messages = [
++        {"role": "user", "content": "Hi"},
++        {"role": "system", "content": "First system."},
++        {"role": "system", "content": "Second system."},
++        {"role": "user", "content": "Weather in Paris?"},
++    ]
++
++    prompt = _tokenizer().apply_chat_template(
++        messages,
++        tools=_request_tools(),
++        tokenize=False,
++        thinking=True,
++        reasoning_effort="low",
++    )
++
++    expected = _encode_reference(
++        [
++            messages[0],
++            {**messages[1], "tools": _request_tools()},
++            messages[2],
++            messages[3],
++        ]
++    )
++    assert prompt == expected
++    assert "First system.\n\n## Tools" in prompt
++    assert prompt.count("## Tools") == 1
++
++
++def test_deepseek_v4_request_tools_do_not_mutate_caller_messages():
++    import copy
++
++    messages = [
++        {"role": "system", "content": "You are helpful."},
++        {"role": "user", "content": "Weather in Paris?"},
++    ]
++    snapshot = copy.deepcopy(messages)
++
++    _tokenizer().apply_chat_template(messages, tools=_request_tools(), tokenize=False)
++
++    assert messages == snapshot
+diff --git a/tests/tool_parsers/test_deepseekv4_tool_parser.py b/tests/tool_parsers/test_deepseekv4_tool_parser.py
+index ab66d6e64..0ca0ad0c1 100644
+--- a/tests/tool_parsers/test_deepseekv4_tool_parser.py
++++ b/tests/tool_parsers/test_deepseekv4_tool_parser.py
+@@ -85,10 +85,19 @@ def build_tool_call(func_name: str, params: dict[str, str]) -> str:
+ 
+ 
+ def stream(parser: DeepSeekV4ToolParser, full_text: str, chunk_size: int = 7):
++    return stream_chunks(
++        parser,
++        [
++            full_text[start : start + chunk_size]
++            for start in range(0, len(full_text), chunk_size)
++        ],
++    )
++
++
++def stream_chunks(parser: DeepSeekV4ToolParser, chunks: list[str]):
+     deltas = []
+     previous_text = ""
+-    for start in range(0, len(full_text), chunk_size):
+-        delta_text = full_text[start : start + chunk_size]
++    for delta_text in chunks:
+         current_text = previous_text + delta_text
+         delta = parser.extract_tool_calls_streaming(
+             previous_text=previous_text,
+@@ -142,7 +151,9 @@ def test_extract_tool_calls():
+     }
+ 
+ 
+-def test_function_calls_block_is_not_accepted():
++def test_function_calls_wrapper_is_not_recognized():
++    # The V3.2 wrapper is not a V4 terminal, so it passes through as content,
++    # but the invoke inside it is still parsed (tool calls anchor on the invoke).
+     parser = make_parser()
+     model_output = build_tool_call("search", {"query": "vllm"}).replace(
+         "tool_calls", "function_calls"
+@@ -150,8 +161,38 @@ def test_function_calls_block_is_not_accepted():
+ 
+     result = parser.extract_tool_calls(model_output, make_request())
+ 
+-    assert not result.tools_called
+-    assert result.content == model_output
++    assert result.tools_called
++    assert result.tool_calls[0].function.name == "search"
++    assert result.content == "<｜DSML｜function_calls>\n"
++
++
++def test_missing_tool_calls_wrapper_is_recovered():
++    # Regression for #48931: at long context the model omits the
++    # <｜DSML｜tool_calls> START token but still emits a complete invoke.
++    parser = make_parser()
++    model_output = build_tool_call("search", {"query": "vllm"}).replace(
++        TC_START + "\n", ""
++    )
++    assert TC_START not in model_output
++
++    result = parser.extract_tool_calls(model_output, make_request())
++
++    assert result.tools_called
++    assert result.tool_calls[0].function.name == "search"
++    assert json.loads(result.tool_calls[0].function.arguments) == {"query": "vllm"}
++    assert result.content is None
++
++    deltas = stream(make_parser(), model_output, chunk_size=3)
++    names = [
++        tc.function.name
++        for d in deltas
++        if d.tool_calls
++        for tc in d.tool_calls
++        if tc.function.name
++    ]
++    assert names == ["search"]
++    assert json.loads(reconstruct_args(deltas)) == {"query": "vllm"}
++    assert not any(d.content and "DSML" in d.content for d in deltas)
+ 
+ 
+ def test_streaming_extracts_complete_invokes():
+@@ -332,3 +373,180 @@ def test_composed_schema_converts_object_and_array_params():
+         "wait": {"type": "for", "minutes": 2880},
+         "patches": [{"op": "replace", "path": "/schedule", "value": "quiet"}],
+     }
++
++
++def test_missing_parameter_close_does_not_swallow_next_parameter():
++    """Without </｜DSML｜parameter>, the next parameter's opener ends the value
++    (batch and streaming, the opener split across deltas)."""
++    chunks = [
++        TC_START,
++        f'{INV_START}get_weather">\n',
++        f'{PARAM_START}location" string="true">Paris a<b><｜DSML｜parameter',
++        ' name="date" string="true">tomorrow',
++        PARAM_END,
++        f"\n{INV_END}",
++        f"\n{TC_END}",
++    ]
++    expected = {"location": "Paris a<b>", "date": "tomorrow"}
++
++    result = make_parser().extract_tool_calls("".join(chunks), make_request())
++    assert result.tools_called
++    assert json.loads(result.tool_calls[0].function.arguments) == expected
++
++    deltas = stream_chunks(make_parser(), chunks)
++    arguments = reconstruct_args(deltas)
++    assert "DSML" not in arguments
++    assert json.loads(arguments) == expected
++
++
++_ORPHAN_INVOKE = (
++    f'{INV_START}terminal">\n'
++    f'{PARAM_START}command" string="true">echo hi{PARAM_END}\n'
++    f"{INV_END}\n"
++)
++
++
++@pytest.mark.parametrize("trailing_end", [True, False])
++def test_missing_wrapper_with_preamble_and_trailing_text(trailing_end):
++    """Upstream issue #48931: an invoke without <｜DSML｜tool_calls> is a call,
++    the text before it is content and text after the block is dropped,
++    whether or not the closing wrapper is there (batch and streaming)."""
++    model_output = "Let me run it.\n" + _ORPHAN_INVOKE
++    if trailing_end:
++        model_output += TC_END
++    model_output += "Done."
++
++    result = make_parser().extract_tool_calls(model_output, make_request())
++    assert [call.function.name for call in result.tool_calls] == ["terminal"]
++    assert json.loads(result.tool_calls[0].function.arguments) == {"command": "echo hi"}
++    assert result.content == "Let me run it.\n"
++
++    deltas = stream_chunks(make_parser(), list(model_output))
++    names = [
++        tool_call.function.name
++        for delta in deltas
++        for tool_call in delta.tool_calls or []
++        if tool_call.function and tool_call.function.name
++    ]
++    assert names == ["terminal"]
++    assert json.loads(reconstruct_args(deltas)) == {"command": "echo hi"}
++    assert "".join(delta.content or "" for delta in deltas) == "Let me run it.\n"
++
++
++def test_wrapped_block_after_orphan_invoke():
++    model_output = _ORPHAN_INVOKE + TC_START + "\n" + _ORPHAN_INVOKE + TC_END
++
++    result = make_parser().extract_tool_calls(model_output, make_request())
++    assert [call.function.name for call in result.tool_calls] == [
++        "terminal",
++        "terminal",
++    ]
++    assert result.content is None
++
++    deltas = stream_chunks(make_parser(), list(model_output))
++    assert [
++        tool_call.index
++        for delta in deltas
++        for tool_call in delta.tool_calls or []
++        if tool_call.function and tool_call.function.name
++    ] == [0, 1]
++    assert not any(delta.content for delta in deltas)
++
++
++_WEATHER_BLOCK_BODY = (
++    f'{INV_START}get_weather">\n'
++    f'{PARAM_START}city" string="true">Seoul{PARAM_END}\n'
++    f"{INV_END}\n"
++    f"{TC_END}"
++)
++
++
++@pytest.mark.parametrize("wrapper", DeepSeekV4ToolParser.tool_call_start_token_variants)
++@pytest.mark.parametrize("preamble", ["", "Let me check.\n"])
++def test_misspelled_wrapper_behaves_like_real_one(wrapper, preamble):
++    """Upstream issue #51914: known misspellings of the opener open a block
++    like the real wrapper, so the markup never reaches the content."""
++    model_output = f"{preamble}{wrapper}\n{_WEATHER_BLOCK_BODY}"
++    reference = make_parser().extract_tool_calls(
++        f"{preamble}{TC_START}\n{_WEATHER_BLOCK_BODY}", make_request()
++    )
++
++    result = make_parser().extract_tool_calls(model_output, make_request())
++    assert [call.function.name for call in result.tool_calls] == ["get_weather"]
++    assert json.loads(result.tool_calls[0].function.arguments) == {"city": "Seoul"}
++    assert result.content == reference.content
++
++    deltas = stream_chunks(make_parser(), list(model_output))
++    assert json.loads(reconstruct_args(deltas)) == {"city": "Seoul"}
++    assert "".join(delta.content or "" for delta in deltas) == (reference.content or "")
++
++
++@pytest.mark.parametrize(
++    "model_output",
++    [
++        "see <｜DSML｜foo> and <｜DSML｜tool_call> here",
++        "see <｜DSML｜ here\nnext line",
++        "see <|DSML|tool> and <|DSML|toolcalls> there",
++    ],
++)
++def test_unregistered_dsml_markup_is_content(model_output):
++    result = make_parser().extract_tool_calls(model_output, make_request())
++    assert not result.tools_called
++    assert result.content == model_output
++
++    deltas = stream_chunks(make_parser(), list(model_output))
++    assert "".join(delta.content or "" for delta in deltas) == model_output
++
++
++def test_missing_string_attribute_keeps_parameter():
++    """The model sometimes omits string=; the parameter must survive, and the
++    stream must not hang on the opener (split across deltas here)."""
++    chunks = [
++        TC_START,
++        f'{INV_START}get_weather">\n',
++        '<｜DSML｜parameter name="loc',
++        'ation">Par',
++        "is",
++        PARAM_END,
++        f'\n{PARAM_START}date" string="true">tomorrow{PARAM_END}\n',
++        INV_END,
++        TC_END,
++    ]
++    expected = {"location": "Paris", "date": "tomorrow"}
++
++    result = make_parser().extract_tool_calls("".join(chunks), make_request())
++    assert json.loads(result.tool_calls[0].function.arguments) == expected
++
++    deltas = stream_chunks(make_parser(), chunks)
++    assert json.loads(reconstruct_args(deltas)) == expected
++
++
++@pytest.mark.parametrize("streaming", [False, True])
++def test_missing_string_attribute_uses_schema_type(streaming):
++    tool = ChatCompletionToolsParam(
++        type="function",
++        function={
++            "name": "lookup",
++            "parameters": {
++                "type": "object",
++                "properties": {"limit": {"type": "integer"}},
++            },
++        },
++    )
++    model_output = (
++        f"{TC_START}\n"
++        f'{INV_START}lookup">\n'
++        f'<｜DSML｜parameter name="limit">7{PARAM_END}\n'
++        f"{INV_END}\n"
++        f"{TC_END}"
++    )
++
++    parser = make_parser(tools=[tool])
++    if streaming:
++        args = reconstruct_args(stream(parser, model_output))
++    else:
++        result = parser.extract_tool_calls(model_output, make_request(tools=[tool]))
++        args = result.tool_calls[0].function.arguments
++    limit = json.loads(args)["limit"]
++    assert limit == 7
++    assert isinstance(limit, int)
+diff --git a/vllm/tokenizers/deepseek_v4.py b/vllm/tokenizers/deepseek_v4.py
+index 2a6aaaf73..2d07ced3e 100644
+--- a/vllm/tokenizers/deepseek_v4.py
++++ b/vllm/tokenizers/deepseek_v4.py
+@@ -37,8 +37,18 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+             conversation = kwargs.get("conversation", messages)
+             messages = conversation.copy()
+             if tools is not None and len(tools) > 0:
+-                messages.insert(0, {"role": "system"})
+-                messages[0]["tools"] = tools  # type: ignore[typeddict-unknown-key]
++                # Match the Rust renderer: request tools attach to the first
++                # system message; synthesize one only when none exists.
++                system_idx = next(
++                    (i for i, m in enumerate(messages) if m.get("role") == "system"),
++                    None,
++                )
++                if system_idx is None:
++                    messages.insert(0, {"role": "system"})
++                    system_idx = 0
++                else:
++                    messages[system_idx] = copy.copy(messages[system_idx])
++                messages[system_idx]["tools"] = tools  # type: ignore[typeddict-unknown-key]
+ 
+             reasoning_effort = kwargs.get("reasoning_effort")
+             if not isinstance(reasoning_effort, str):
+diff --git a/vllm/tokenizers/deepseek_v4_encoding.py b/vllm/tokenizers/deepseek_v4_encoding.py
+index 6895771e2..0a7b4b534 100644
+--- a/vllm/tokenizers/deepseek_v4_encoding.py
++++ b/vllm/tokenizers/deepseek_v4_encoding.py
+@@ -387,7 +387,15 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
+             prompt += thinking_end_token if thinking_mode != "thinking" else thinking_start_token
+             prompt += task_sp_token
+ 
+-    elif messages[index].get("role") in ["user", "developer"]:
++    # A trailing system message opens generation, while a system message
++    # followed by assistant opens that assistant history turn.
++    elif role in ["user", "developer"] or (
++        role == "system"
++        and (
++            index == len(messages) - 1
++            or messages[index + 1].get("role") == "assistant"
++        )
++    ):
+         # Normal generation: append Assistant + thinking token
+         prompt += ASSISTANT_SP_TOKEN
+         if not drop_thinking and thinking_mode == "thinking":
+diff --git a/vllm/tool_parsers/deepseekv32_tool_parser.py b/vllm/tool_parsers/deepseekv32_tool_parser.py
+index 5e058a9ca..493cd4e65 100644
+--- a/vllm/tool_parsers/deepseekv32_tool_parser.py
++++ b/vllm/tool_parsers/deepseekv32_tool_parser.py
+@@ -52,6 +52,8 @@ class DeepSeekV32ToolParser(ToolParser):
+     """
+ 
+     tool_call_start_token: str = "<｜DSML｜function_calls>"
++    # Misspelled openers a model is known to emit; they open a block too.
++    tool_call_start_token_variants: tuple[str, ...] = ()
+     tool_call_end_token: str = "</｜DSML｜function_calls>"
+     invoke_tag_name: str = "invoke"
+     parameter_tag_name: str = "parameter"
+@@ -75,26 +77,32 @@ class DeepSeekV32ToolParser(ToolParser):
+         self._args_started: list[bool] = []
+ 
+         # Regex patterns for complete parsing
+-        self.tool_call_complete_regex = re.compile(
+-            re.escape(self.tool_call_start_token)
+-            + r"(.*?)"
+-            + re.escape(self.tool_call_end_token),
+-            re.DOTALL,
+-        )
+         invoke = re.escape(self.invoke_tag_name)
+         parameter = re.escape(self.parameter_tag_name)
++        # The model sometimes omits </｜DSML｜parameter>. The opener of the
++        # next parameter then ends the value too, in both parsing paths, so
++        # the value does not swallow that parameter.
++        self.parameter_open_marker = f"<｜DSML｜{self.parameter_tag_name} name="
++        # The model sometimes drops the tool-calls wrapper at long context and
++        # opens an invoke directly (upstream issue #48931); the invoke opener
++        # then starts the tool calls as well.
++        self.invoke_open_marker = f'<｜DSML｜{self.invoke_tag_name} name="'
+         self.invoke_complete_regex = re.compile(
+             rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>(.*?)</｜DSML｜{invoke}>',
+             re.DOTALL,
+         )
++        # The string attribute is optional: the model sometimes omits it, and
++        # without it the parameter would be lost (see _string_attr).
++        parameter_head = (
++            rf'<｜DSML｜{parameter}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
++        )
+         self.parameter_complete_regex = re.compile(
+-            rf'<｜DSML｜{parameter}\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜{parameter}>',
++            rf"{parameter_head}(.*?)"
++            rf"(?:</｜DSML｜{parameter}>|(?={re.escape(self.parameter_open_marker)}))",
+             re.DOTALL,
+         )
+         self.invoke_start_regex = re.compile(rf'<｜DSML｜{invoke}\s+name="([^"]+)"\s*>')
+-        self.parameter_start_regex = re.compile(
+-            rf'<｜DSML｜{parameter}\s+name="([^"]+)"\s+string="(true|false)"\s*>'
+-        )
++        self.parameter_start_regex = re.compile(parameter_head)
+ 
+         if not self.model_tokenizer:
+             raise ValueError(
+@@ -124,12 +132,18 @@ class DeepSeekV32ToolParser(ToolParser):
+         """Generate a unique tool call ID."""
+         return f"call_{uuid.uuid4().hex[:24]}"
+ 
++    @staticmethod
++    def _string_attr(value: str | None) -> str:
++        """A missing string attribute counts as string="false", so the tool
++        schema decides the type, as for any non-string DSML value."""
++        return value or "false"
++
+     def _parse_invoke_params(self, invoke_str: str) -> dict[str, tuple[str, str]]:
+         param_dict: dict[str, tuple[str, str]] = {}
+         for param_name, string_attr, param_val in self.parameter_complete_regex.findall(
+             invoke_str
+         ):
+-            param_dict[param_name] = (param_val, string_attr)
++            param_dict[param_name] = (param_val, self._string_attr(string_attr))
+         return param_dict
+ 
+     @staticmethod
+@@ -181,14 +195,33 @@ class DeepSeekV32ToolParser(ToolParser):
+     def _json_escape_string_content(text: str) -> str:
+         return json.dumps(text, ensure_ascii=False)[1:-1]
+ 
++    @staticmethod
++    def _find_first_marker(text: str, markers: Sequence[str]) -> int:
++        """Position of the earliest marker in *text*, or -1."""
++        positions = [pos for pos in map(text.find, markers) if pos != -1]
++        return min(positions, default=-1)
++
++    @staticmethod
++    def _marker_overlap(text: str, markers: Sequence[str]) -> int:
++        """Length of the longest suffix of *text* that may start a marker."""
++        return max(partial_tag_overlap(text, marker) for marker in markers)
++
++    def _tool_call_start_tokens(self) -> tuple[str, ...]:
++        return (self.tool_call_start_token, *self.tool_call_start_token_variants)
++
++    def _tool_calls_start_markers(self) -> tuple[str, ...]:
++        return (*self._tool_call_start_tokens(), self.invoke_open_marker)
++
+     def extract_tool_calls(
+         self,
+         model_output: str,
+         request: ChatCompletionRequest,
+     ) -> ExtractedToolCallInformation:
+         """Extract tool calls from complete model output (non-streaming)."""
+-        # Quick check
+-        if self.tool_call_start_token not in model_output:
++        first_tool_idx = self._find_first_marker(
++            model_output, self._tool_calls_start_markers()
++        )
++        if first_tool_idx == -1:
+             return ExtractedToolCallInformation(
+                 tools_called=False, tool_calls=[], content=model_output
+             )
+@@ -196,31 +229,29 @@ class DeepSeekV32ToolParser(ToolParser):
+         try:
+             tool_calls = []
+ 
+-            # Find all complete tool_call blocks
+-            for tool_call_match in self.tool_call_complete_regex.findall(model_output):
+-                # Find all invokes within this tool_call
+-                for invoke_name, invoke_content in self.invoke_complete_regex.findall(
+-                    tool_call_match
+-                ):
+-                    param_dict = self._parse_invoke_params(invoke_content)
+-                    params = self._convert_params_with_schema(invoke_name, param_dict)
+-                    tool_calls.append(
+-                        ToolCall(
+-                            type="function",
+-                            function=FunctionCall(
+-                                name=invoke_name,
+-                                arguments=json.dumps(params, ensure_ascii=False),
+-                            ),
+-                        )
++            # Every complete invoke from the first tool marker on is a call,
++            # inside a tool-calls block or not. A tool call ends the turn,
++            # so text between and after the blocks is not content.
++            for invoke_name, invoke_content in self.invoke_complete_regex.findall(
++                model_output, first_tool_idx
++            ):
++                param_dict = self._parse_invoke_params(invoke_content)
++                params = self._convert_params_with_schema(invoke_name, param_dict)
++                tool_calls.append(
++                    ToolCall(
++                        type="function",
++                        function=FunctionCall(
++                            name=invoke_name,
++                            arguments=json.dumps(params, ensure_ascii=False),
++                        ),
+                     )
++                )
+ 
+             if not tool_calls:
+                 return ExtractedToolCallInformation(
+                     tools_called=False, tool_calls=[], content=model_output
+                 )
+ 
+-            # Extract content before first tool call
+-            first_tool_idx = model_output.find(self.tool_call_start_token)
+             content = model_output[:first_tool_idx] if first_tool_idx > 0 else None
+ 
+             return ExtractedToolCallInformation(
+@@ -371,6 +402,26 @@ class DeepSeekV32ToolParser(ToolParser):
+         for key, value in converted.items():
+             self._append_json_param_value(tool_call_deltas, index, key, value)
+ 
++    def _finish_streaming_param(
++        self,
++        tool_call_deltas: dict[int, DeltaToolCall],
++        index: int,
++        raw_content: str,
++    ) -> None:
++        if self._active_param_mode in ("wrapper", "buffered"):
++            self._active_param_parts.append(raw_content)
++            self._finish_buffered_param(tool_call_deltas, index)
++        elif self._active_param_mode == "string":
++            arguments = self._json_escape_string_content(raw_content) + '"'
++            self._add_tool_call_delta(tool_call_deltas, index, arguments=arguments)
++        else:
++            self._add_tool_call_delta(tool_call_deltas, index, arguments=raw_content)
++
++        self._active_param_name = None
++        self._active_param_string_attr = None
++        self._active_param_mode = None
++        self._active_param_parts.clear()
++
+     def _close_streaming_tool_call(
+         self,
+         tool_call_deltas: dict[int, DeltaToolCall],
+@@ -404,13 +455,14 @@ class DeepSeekV32ToolParser(ToolParser):
+         parameter_end_token = f"</｜DSML｜{self.parameter_tag_name}>"
+         invoke_end_token = f"</｜DSML｜{self.invoke_tag_name}>"
+ 
++        start_markers = self._tool_calls_start_markers()
++        between_markers = (*start_markers, self.tool_call_end_token)
++
+         while True:
+             if not self._in_tool_calls:
+-                start_idx = self._buffer.find(self.tool_call_start_token)
++                start_idx = self._find_first_marker(self._buffer, start_markers)
+                 if start_idx == -1:
+-                    overlap = partial_tag_overlap(
+-                        self._buffer, self.tool_call_start_token
+-                    )
++                    overlap = self._marker_overlap(self._buffer, start_markers)
+                     sendable_idx = len(self._buffer) - overlap
+                     if sendable_idx > 0:
+                         content_parts.append(self._buffer[:sendable_idx])
+@@ -422,56 +474,66 @@ class DeepSeekV32ToolParser(ToolParser):
+                     self._buffer = self._buffer[start_idx:]
+                     continue
+ 
+-                self._buffer = self._buffer[len(self.tool_call_start_token) :]
++                # From here on the turn is tool calls (as in the batch path).
+                 self._in_tool_calls = True
+                 continue
+ 
+             if self._active_tool_index is None:
+-                stripped_len = len(self._buffer) - len(self._buffer.lstrip())
+-                if stripped_len:
+-                    self._buffer = self._buffer[stripped_len:]
+-                    continue
+-
+-                if self._buffer.startswith(self.tool_call_end_token):
+-                    self._buffer = self._buffer[len(self.tool_call_end_token) :]
+-                    self._in_tool_calls = False
++                # Between calls. The wrapper tokens only frame the calls, and
++                # text between or after the blocks is dropped: a tool call
++                # ends the turn (as in the batch path).
++                wrapper_token = next(
++                    (
++                        token
++                        for token in (
++                            *self._tool_call_start_tokens(),
++                            self.tool_call_end_token,
++                        )
++                        if self._buffer.startswith(token)
++                    ),
++                    None,
++                )
++                if wrapper_token is not None:
++                    self._buffer = self._buffer[len(wrapper_token) :]
+                     continue
+ 
+                 match = self.invoke_start_regex.match(self._buffer)
+-                if match is None:
+-                    return
++                if match is not None:
++                    self._buffer = self._buffer[match.end() :]
++                    self._begin_streaming_tool_call(match.group(1), tool_call_deltas)
++                    continue
+ 
+-                self._buffer = self._buffer[match.end() :]
+-                self._begin_streaming_tool_call(match.group(1), tool_call_deltas)
++                marker_idx = self._find_first_marker(self._buffer, between_markers)
++                if marker_idx == -1:
++                    marker_idx = len(self._buffer) - self._marker_overlap(
++                        self._buffer, between_markers
++                    )
++                if marker_idx == 0:
++                    return  # an opener is still arriving, or nothing to drop
++                self._buffer = self._buffer[marker_idx:]
+                 continue
+ 
+             index = self._active_tool_index
+ 
+             if self._active_param_mode is not None:
+                 end_pos = self._buffer.find(parameter_end_token)
++                next_pos = self._buffer.find(self.parameter_open_marker)
++                if next_pos != -1 and (end_pos == -1 or next_pos < end_pos):
++                    # Implicit close: keep the next opener in the buffer.
++                    raw_content = self._buffer[:next_pos]
++                    self._buffer = self._buffer[next_pos:]
++                    self._finish_streaming_param(tool_call_deltas, index, raw_content)
++                    continue
+                 if end_pos != -1:
+                     raw_content = self._buffer[:end_pos]
+                     self._buffer = self._buffer[end_pos + len(parameter_end_token) :]
+-                    if self._active_param_mode in ("wrapper", "buffered"):
+-                        self._active_param_parts.append(raw_content)
+-                        self._finish_buffered_param(tool_call_deltas, index)
+-                    elif self._active_param_mode == "string":
+-                        arguments = self._json_escape_string_content(raw_content) + '"'
+-                        self._add_tool_call_delta(
+-                            tool_call_deltas, index, arguments=arguments
+-                        )
+-                    else:
+-                        self._add_tool_call_delta(
+-                            tool_call_deltas, index, arguments=raw_content
+-                        )
+-
+-                    self._active_param_name = None
+-                    self._active_param_string_attr = None
+-                    self._active_param_mode = None
+-                    self._active_param_parts.clear()
++                    self._finish_streaming_param(tool_call_deltas, index, raw_content)
+                     continue
+ 
+-                overlap = partial_tag_overlap(self._buffer, parameter_end_token)
++                overlap = max(
++                    partial_tag_overlap(self._buffer, parameter_end_token),
++                    partial_tag_overlap(self._buffer, self.parameter_open_marker),
++                )
+                 safe_len = len(self._buffer) - overlap
+                 if safe_len > 0:
+                     raw_content = self._buffer[:safe_len]
+@@ -506,7 +568,7 @@ class DeepSeekV32ToolParser(ToolParser):
+ 
+             self._buffer = self._buffer[match.end() :]
+             name = match.group(1)
+-            string_attr = match.group(2)
++            string_attr = self._string_attr(match.group(2))
+             self._active_param_name = name
+             self._active_param_string_attr = string_attr
+ 
+diff --git a/vllm/tool_parsers/deepseekv4_tool_parser.py b/vllm/tool_parsers/deepseekv4_tool_parser.py
+index e32451cd8..17fdb2336 100644
+--- a/vllm/tool_parsers/deepseekv4_tool_parser.py
++++ b/vllm/tool_parsers/deepseekv4_tool_parser.py
+@@ -20,6 +20,11 @@ class DeepSeekV4ToolParser(DeepSeekV32ToolParser):
+     """
+ 
+     tool_call_start_token: str = "<｜DSML｜tool_calls>"
++    # Seen from DeepSeek-V4-Flash in production (upstream issue #51914).
++    tool_call_start_token_variants: tuple[str, ...] = (
++        "<｜DSML｜toolcalls>",
++        "<｜DSML｜tool>",
++    )
+     tool_call_end_token: str = "</｜DSML｜tool_calls>"
+ 
+     def get_structural_tag(self, request: ChatCompletionRequest):
