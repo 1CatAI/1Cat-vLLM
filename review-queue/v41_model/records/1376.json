@@ -1,0 +1,132 @@
+{
+  "initial_inventory": {
+    "number": 1376,
+    "title": "[Perf][DeepSeek-V4.1] Skip layers 21-39 in early prefill chunks (VLLM_V41_PREFILL_SKIP_ROWS)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1376",
+    "isDraft": false,
+    "headRefOid": "bcfeaaffbf6b8281d011f201991450989106ee9b",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1376,
+    "title": "[Perf][DeepSeek-V4.1] Skip layers 21-39 in early prefill chunks (VLLM_V41_PREFILL_SKIP_ROWS)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1370.** This branch is #1370 (two commits) plus one commit; review only the last commit, \"Skip layers 21-39 in early prefill chunks\". It uses #1370's per-stage layer ranges (`start_layer` / `end_layer`) and runs on the last pipeline stage. Stack order: #1370, then this PR.\n\n**Credit.** The idea of skipping replayable rows, and `K = 3072`, follow `VLLM_DS41_REPLAY_ROWS` in `philbert440/deepseek-v4.1-v100`, which was our design reference. The implementation here is ours.\n\n## Purpose\n\nCut DeepSeek-V4.1 first-token time on long prompts without changing the output.\n\nLayers 21-39 of DeepSeek-V4.1 own no compressed KV and no index keys: layer 20 is the last `kv_source_layer_ids` entry, and the reindex layers 24/28/32/36 score layer 20's index keys with their own queries. Their only per-token state is a 256-row window ring each, and layer 39's output is read only at the sampled rows. A prefill chunk that ends at least K rows before the end of every scheduled prompt therefore needs layers 0-20 and layer 20's attention, and nothing after it.\n\nWhy it is exact (the full argument is in the `prefill_skip.py` docstring): each of layers 21-39 reads a 128-row window, so after the first executed chunk at position `s` layer L's inputs are exact from `s + 127 * (L - 21)`, and layer 39's output from `s + 2413`. With `K >= 2560`, the sampled row, the window keys decode reads, the DSpark drafter's window and same-session prefix hits all see exactly the baseline inputs. Every executed kernel keeps its shape, so outputs are bitwise the baseline's where kernels compute rows independently. The rings of the skipped layers are zeroed on every skipped step.\n\n- `VLLM_V41_PREFILL_SKIP_ROWS=K`: `0` (default) = off; `1..2559` refused at start; `3072` recommended.\n- Fails closed, logged once: pooling models, speculative methods other than DSpark, KV/EC transfer connectors, prompt logprobs, routed-expert capture.\n- A request freed inside or just after its skipped chunks (abort, preemption) drops its session-prefix record (`session_record_ok`), so no hit is admitted against its rings.\n- Never under CUDA-graph capture; a skipped step runs eagerly.\n- `benchmarks/deepseek_v41/tools/prefill_skip_greedy.py`: long-prompt greedy A/B with a near-tie gate (byte-identical, or the first differing token is the baseline's #2 with both top-2 gaps <= 0.10 nats). Its `run` step needs a needle-haystack builder that is not in this repository; `compare` is standalone.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_prefill_skip.py \\\n  tests/models/test_deepseek_v41_pp_forward.py tests/models/test_deepseek_v41_pp_split.py \\\n  tests/v1/core/test_prefix_caching.py\n# runner / scheduler files this PR touches, compared with #1370 alone:\nCUDA_VISIBLE_DEVICES= pytest -q tests/v1/worker/test_gpu_model_runner.py tests/v1/core/test_scheduler.py \\\n  tests/v1/core/test_kv_cache_utils.py\n```\n\nGPU: serve `serve-pp2.yaml` (#1370) with `VLLM_V41_PREFILL_SKIP_ROWS` 0 and 3072 in OFF ON ON OFF arms, cold prompts of 32K, 150K and 300K tokens, then `prefill_skip_greedy.py compare OFF.jsonl ON.jsonl`.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Skipped prefill step | DeepSeek-V4.1 GGUF | K >= 2560, last PP stage, eager prefill chunk ending >= K rows before every prompt end | layers > 20 skipped, rings zeroed | CPU tests (cone, session record, gate); measured on 8x V100 PP2 x TP4 | not re-served on this branch |\n| Unsupported configuration | — | pooling, non-DSpark speculation, KV/EC connector, prompt logprobs, routed-expert capture | skip off, reason logged once | CPU tests | — |\n| Default | all | K = 0 | unchanged | CPU tests of the touched files, same results as #1370 | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in, `VLLM_V41_PREFILL_SKIP_ROWS=3072`; default 0 (off).\n- Required CLI options and environment switches: DeepSeek-V4.1 with #1370; DSpark or no speculation.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change on #1370, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none.\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; the unsupported configurations above turn the skip off.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: `VLLM_V41_PREFILL_SKIP_ROWS` registered with metadata; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +1 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one cold prompt per length per arm, arms OFF ON ON2 OFF2, `K = 3072`:\n\n| prompt | first token OFF / OFF2 | first token ON / ON2 | change | output |\n| --- | ---: | ---: | ---: | --- |\n| 32,718 tokens | 22.634 / 22.776 s | 20.678 / 20.743 s | -8.8 % | identical (sha), all four arms |\n| 150,038 tokens | 111.054 / 111.855 s | 88.453 / 88.462 s | -20.6 % | identical |\n| 299,227 tokens | 263.925 / 265.040 s | 181.321 / 180.860 s | -31.5 % | identical |\n\n**Re-run for this PR, 2026-11-05,** CPU only (no visible GPU), on #1370 rebased onto `main` `3c051b52e`:\n\n- pytest, the four files above: 119 passed.\n- pytest `test_gpu_model_runner.py`, `test_scheduler.py`, `test_kv_cache_utils.py`: 193 passed, 2 skipped, 11 failed, 17 errors on both this branch and #1370 alone, with identical failing names (no CUDA device visible, NCCL unavailable). Nothing new fails.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check` on the changed Python files: pass.\n\nTwo changes from the measured code, both made while rebasing: `model.py` defines its module `logger` here (on our stack another commit defined it), and the docstring and test use main's `_V41_RING_REACH` (128) instead of a variable `main` does not have; the exactness bound still holds (ring rows >= processed - 255, inputs exact from `s + 2286`).\n\nNot re-run: any GPU test or serving; the table was not re-measured on this branch.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1376",
+    "isDraft": false,
+    "headRefName": "pli/v41-prefill-skip",
+    "headRefOid": "bcfeaaffbf6b8281d011f201991450989106ee9b",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1376,
+    "id": "PR_kwDORjYFXs8AAAABNIs0VA",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "bcfeaaffbf6b8281d011f201991450989106ee9b",
+    "title": "[Perf][DeepSeek-V4.1] Skip layers 21-39 in early prefill chunks (VLLM_V41_PREFILL_SKIP_ROWS)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1376",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1370.** This branch is #1370 (two commits) plus one commit; review only the last commit, \"Skip layers 21-39 in early prefill chunks\". It uses #1370's per-stage layer ranges (`start_layer` / `end_layer`) and runs on the last pipeline stage. Stack order: #1370, then this PR.\n\n**Credit.** The idea of skipping replayable rows, and `K = 3072`, follow `VLLM_DS41_REPLAY_ROWS` in `philbert440/deepseek-v4.1-v100`, which was our design reference. The implementation here is ours.\n\n## Purpose\n\nCut DeepSeek-V4.1 first-token time on long prompts without changing the output.\n\nLayers 21-39 of DeepSeek-V4.1 own no compressed KV and no index keys: layer 20 is the last `kv_source_layer_ids` entry, and the reindex layers 24/28/32/36 score layer 20's index keys with their own queries. Their only per-token state is a 256-row window ring each, and layer 39's output is read only at the sampled rows. A prefill chunk that ends at least K rows before the end of every scheduled prompt therefore needs layers 0-20 and layer 20's attention, and nothing after it.\n\nWhy it is exact (the full argument is in the `prefill_skip.py` docstring): each of layers 21-39 reads a 128-row window, so after the first executed chunk at position `s` layer L's inputs are exact from `s + 127 * (L - 21)`, and layer 39's output from `s + 2413`. With `K >= 2560`, the sampled row, the window keys decode reads, the DSpark drafter's window and same-session prefix hits all see exactly the baseline inputs. Every executed kernel keeps its shape, so outputs are bitwise the baseline's where kernels compute rows independently. The rings of the skipped layers are zeroed on every skipped step.\n\n- `VLLM_V41_PREFILL_SKIP_ROWS=K`: `0` (default) = off; `1..2559` refused at start; `3072` recommended.\n- Fails closed, logged once: pooling models, speculative methods other than DSpark, KV/EC transfer connectors, prompt logprobs, routed-expert capture.\n- A request freed inside or just after its skipped chunks (abort, preemption) drops its session-prefix record (`session_record_ok`), so no hit is admitted against its rings.\n- Never under CUDA-graph capture; a skipped step runs eagerly.\n- `benchmarks/deepseek_v41/tools/prefill_skip_greedy.py`: long-prompt greedy A/B with a near-tie gate (byte-identical, or the first differing token is the baseline's #2 with both top-2 gaps <= 0.10 nats). Its `run` step needs a needle-haystack builder that is not in this repository; `compare` is standalone.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_prefill_skip.py \\\n  tests/models/test_deepseek_v41_pp_forward.py tests/models/test_deepseek_v41_pp_split.py \\\n  tests/v1/core/test_prefix_caching.py\n# runner / scheduler files this PR touches, compared with #1370 alone:\nCUDA_VISIBLE_DEVICES= pytest -q tests/v1/worker/test_gpu_model_runner.py tests/v1/core/test_scheduler.py \\\n  tests/v1/core/test_kv_cache_utils.py\n```\n\nGPU: serve `serve-pp2.yaml` (#1370) with `VLLM_V41_PREFILL_SKIP_ROWS` 0 and 3072 in OFF ON ON OFF arms, cold prompts of 32K, 150K and 300K tokens, then `prefill_skip_greedy.py compare OFF.jsonl ON.jsonl`.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Skipped prefill step | DeepSeek-V4.1 GGUF | K >= 2560, last PP stage, eager prefill chunk ending >= K rows before every prompt end | layers > 20 skipped, rings zeroed | CPU tests (cone, session record, gate); measured on 8x V100 PP2 x TP4 | not re-served on this branch |\n| Unsupported configuration | — | pooling, non-DSpark speculation, KV/EC connector, prompt logprobs, routed-expert capture | skip off, reason logged once | CPU tests | — |\n| Default | all | K = 0 | unchanged | CPU tests of the touched files, same results as #1370 | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in, `VLLM_V41_PREFILL_SKIP_ROWS=3072`; default 0 (off).\n- Required CLI options and environment switches: DeepSeek-V4.1 with #1370; DSpark or no speculation.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change on #1370, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none.\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; the unsupported configurations above turn the skip off.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: `VLLM_V41_PREFILL_SKIP_ROWS` registered with metadata; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +1 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one cold prompt per length per arm, arms OFF ON ON2 OFF2, `K = 3072`:\n\n| prompt | first token OFF / OFF2 | first token ON / ON2 | change | output |\n| --- | ---: | ---: | ---: | --- |\n| 32,718 tokens | 22.634 / 22.776 s | 20.678 / 20.743 s | -8.8 % | identical (sha), all four arms |\n| 150,038 tokens | 111.054 / 111.855 s | 88.453 / 88.462 s | -20.6 % | identical |\n| 299,227 tokens | 263.925 / 265.040 s | 181.321 / 180.860 s | -31.5 % | identical |\n\n**Re-run for this PR, 2026-11-05,** CPU only (no visible GPU), on #1370 rebased onto `main` `3c051b52e`:\n\n- pytest, the four files above: 119 passed.\n- pytest `test_gpu_model_runner.py`, `test_scheduler.py`, `test_kv_cache_utils.py`: 193 passed, 2 skipped, 11 failed, 17 errors on both this branch and #1370 alone, with identical failing names (no CUDA device visible, NCCL unavailable). Nothing new fails.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check` on the changed Python files: pass.\n\nTwo changes from the measured code, both made while rebasing: `model.py` defines its module `logger` here (on our stack another commit defined it), and the docstring and test use main's `_V41_RING_REACH` (128) instead of a variable `main` does not have; the exactness bound still holds (ring rows >= processed - 255, inputs exact from `s + 2286`).\n\nNot re-run: any GPU test or serving; the table was not re-measured on this branch.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-prefill-skip",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1376,
+    "title": "[Perf][DeepSeek-V4.1] Skip layers 21-39 in early prefill chunks (VLLM_V41_PREFILL_SKIP_ROWS)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1376",
+    "isDraft": false,
+    "headRefOid": "bcfeaaffbf6b8281d011f201991450989106ee9b",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/main_smoke.py",
+      "benchmarks/deepseek_v41/serve-pp2-eager.yaml",
+      "benchmarks/deepseek_v41/serve-pp2.yaml",
+      "benchmarks/deepseek_v41/tools/pp2_m1.py",
+      "benchmarks/deepseek_v41/tools/prefill_skip_greedy.py",
+      "docs/design/architecture/runtime_reference.md",
+      "tests/models/gguf/test_shared_expert_pp_stage.py",
+      "tests/models/test_deepseek_v41_index_overlap.py",
+      "tests/models/test_deepseek_v41_markov_shard.py",
+      "tests/models/test_deepseek_v41_pp_commit.py",
+      "tests/models/test_deepseek_v41_pp_drafter.py",
+      "tests/models/test_deepseek_v41_pp_forward.py",
+      "tests/models/test_deepseek_v41_pp_split.py",
+      "tests/models/test_deepseek_v41_prefill_skip.py",
+      "tests/v1/worker/test_gpu_model_runner.py",
+      "vllm/config/kernel.py",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/quantization/gguf_expert_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_layout.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_prefill.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_runtime.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_v41_moe.py",
+      "vllm/model_executor/model_loader/gguf_adapters/deepseek_v41.py",
+      "vllm/model_executor/model_loader/gguf_loader.py",
+      "vllm/models/deepseek_v41/attention_ops.py",
+      "vllm/models/deepseek_v41/contract.py",
+      "vllm/models/deepseek_v41/dense_tm.py",
+      "vllm/models/deepseek_v41/dspark.py",
+      "vllm/models/deepseek_v41/markov_shard.py",
+      "vllm/models/deepseek_v41/model.py",
+      "vllm/models/deepseek_v41/pp_commit.py",
+      "vllm/models/deepseek_v41/prefill_skip.py",
+      "vllm/v1/core/kv_cache_manager.py",
+      "vllm/v1/core/sched/scheduler.py",
+      "vllm/v1/engine/core.py",
+      "vllm/v1/spec_decode/dspark.py",
+      "vllm/v1/worker/gpu_model_runner.py"
+    ],
+    "diff_bytes": 267047,
+    "diff_sha256": "d02c0df9bab6a56394c76fc405b41ba5cf0eb965b2d9871807d5f69a03c282df"
+  },
+  "full_tree_diff_proof": null
+}

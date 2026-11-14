@@ -1,0 +1,112 @@
+{
+  "initial_inventory": {
+    "number": 1373,
+    "title": "[Perf][V1][PP] Retain persistent request rows across empty steps",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1373",
+    "isDraft": false,
+    "headRefOid": "78f90ccb70278c3a17dc7ac309333a14a44138e7",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1373,
+    "title": "[Perf][V1][PP] Retain persistent request rows across empty steps",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code) and reviewed in three rounds before opening.\n\n**Depends on #1371.** The first commit of this branch is #1371; review only the second commit here. Stack order: #1371, then this PR.\n\n**Credit.** This is a V1-runner port of the idea in #1263 by `Peuqui` (stop resending a request's token history to the V2 runner every decode step). The V1 retention code is ours; the approach is theirs.\n\n## Purpose\n\nEmpty synchronous PP steps discard V1 persistent request rows and the scheduler's previous-step record. The next decode step then resends and rebuilds the complete token history. With VLLM_PP_KEEP_BATCH=1, retain rows and the matching record across fully empty steps, while removing finished and preempted requests. Nonempty steps keep the existing replacement behavior.\n\nThis PR is based on the companion **[Bugfix][V1][PP] Preserve synchronous speculative step ownership** (#1371); its first commit is that PR. Review that correctness change separately; this incremental change is opt-in. It is the V1 counterpart to #1263's existing V2 history reuse. SpeculativeConfig owns method capability, and SchedulerConfig owns the serialized retention setting. Explicit unsupported requests fail with the setting's name.\n\n## Test Plan\n\n```bash\npython -m tools.generate_architecture_reference --check\npython -m tools.generate_env_reference --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.config_inventory --check\npython tools/pre_commit/check_layering.py\npython -m pytest -q --confcutdir=tests/tools tests/tools/test_architecture_reference.py tests/tools/test_architecture_doc_urls.py tests/tools/test_architecture_check_scope.py\npython -m pytest -q --confcutdir=tests/config tests/config/test_pp_keep_batch_policy.py tests/config/test_runtime_default_ownership.py\npython -m pytest -q --confcutdir=tests/v1 tests/v1/core/test_pp_keep_batch.py tests/v1/worker/test_pp_keep_batch_runner.py tests/v1/engine/test_pp_spec_decode_cadence.py tests/v1/core/test_pp_spec_decode_inflight.py tests/v1/worker/test_pp_spec_decode_history.py\n```\n\nFor a public target/drafter pair already admitted by synchronous PP, set TARGET_CHECKPOINT and DRAFT_CHECKPOINT to those identifiers. Run the same command with ENABLED=0 and 1 in disabled/enabled/enabled/disabled order:\n\n```bash\nVLLM_USE_V2_MODEL_RUNNER=0 VLLM_PP_KEEP_BATCH=\"$ENABLED\" \\\n  vllm serve \"$TARGET_CHECKPOINT\" --tensor-parallel-size 1 \\\n  --pipeline-parallel-size 2 --max-num-seqs 4 --no-async-scheduling \\\n  --speculative-config \"{\\\"model\\\":\\\"$DRAFT_CHECKPOINT\\\",\\\"num_speculative_tokens\\\":3}\"\n```\n\nWarm greedy and seeded sampled paths. Compare complete token IDs and per-request histories with retention off/on for one request, staggered requests, one remaining request, cancellation, preemption and prefix-cache reset. Confirm that a fully empty step keeps only live nonpreempted rows and that the next step omits their history resend. Record first-token latency, decode-only milliseconds per verification round and acceptance separately. Repeat at longer contexts supported by the selected model. Test plain decode as well as speculation.\n\nThe public V4.1 adapter currently admits TP4/PP1, so reproducing the historical PP2 V4.1 numbers needs the PP2 x TP4 port (#1370) and a GGUF hybrid checkpoint. This generic PP test plan qualifies another admitted public model; it does not reproduce those historical numbers.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| V1 synchronous PP | Persistent request rows / histories | PP above one; fully empty step; opt-in | Retain live rows and matching scheduler record | Executed real scheduler and CPU InputBatch state tests; historical measurement | Current-main GPU serving, graphs and speed |\n| Finished / preempted / resumed | Same | Removal during an empty step or later resumption | Remove stale records; resend resumed history | Executed CPU state and request lifecycle tests | GPU lifecycle |\n| Disabled / nonempty | Same | OFF or any request scheduled | Original row replacement behavior on top of companion bugfix | Executed off/on CPU controls | GPU identity comparison |\n| Unsupported explicit request | Other runner/state contracts | V2, async, external launcher, connectors, pooling, hybrid state or unsupported speculation | Construction refuses and names VLLM_PP_KEEP_BATCH | Executed capability/admission tests | No broader model qualification |\n| Synchronous speculation | Step-owned draft snapshots | Multiple request groups; inherited bugfix | Apply each step's own proposals after its output | Executed real engine-loop cadence regression | Worker GPU production, transport and structured-output serving |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: Opt-in via scheduler_config.pp_keep_batch or VLLM_PP_KEEP_BATCH=1; default off.\n- Required CLI options and environment switches: V1, synchronous PP above one; admitted model/state contract. Errors name the requested setting.\n- KV cache dtype used for the benchmark: Historical #1277 packed V4.1 KV; retention adds no codec.\n- Wheel SHA or source commit: This branch: `main` `3c051b52e` plus #1371. The numbers below were measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port (#1370); this branch has not run on a GPU.\n- PYTHONPATH, source overlays, or external native libraries used (write \"none\" if absent): No native library added by retention. The measurements used the V4.1 PP2 port (#1370), native kernels and a GGUF hybrid checkpoint that is not published.\n- User-entry route-hit, speed, and output-quality evidence: MEASURED 2026-11-03 (table under Test Result): 32K/64K/128K round times 32.69/37.19/44.73 to 29.51/30.73/33.62 ms, same text and unchanged first-token time. The earlier aggregate included first-token timing; it is not the later decode-only contract. These values cannot be reproduced by this branch alone and do not qualify the repaired current-main port.\n- Existing kernel/backend registry and capability-rejection reasons: No kernel priority change. Shared scheduler/runner admission rejects unsupported state contracts.\n- Per-engine configuration and deprecated-variable compatibility: Typed serialized SchedulerConfig field, initialization-only alias, explicit typed override, no extra model graph hash salt.\n- New/changed environment metadata and generated reference check: VLLM_PP_KEEP_BATCH registered as experimental; architecture/env references and all five gates pass.\n- Route snapshot command and intentional changed rows (write \"none\" for refactors): python -m tools.sm70_route_snapshot --category moe --output /dev/stdout; none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: SM70 registrations unchanged; one generic PP alias added; no new unregistered execution reads; no expanded model admission.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4 (#1370), one request, DSpark 5, V1 runner, setting OFF -> ON, ms per verify round (aggregate including first-token time):\n\n| prompt | OFF | ON | change |\n| --- | ---: | ---: | ---: |\n| 32K | 32.69 | 29.51 | -9.7 % |\n| 64K | 37.19 | 30.73 | -17.4 % |\n| 128K | 44.73 | 33.62 | -24.8 % (84 -> 111 tok/s) |\n| short, T=0 / T=1 | | | -0.17 / -0.30 ms |\n\nTexts identical; first-token time unchanged. These were measured on the earlier code, before the correctness repairs now split out into #1371.\n\n**Re-run on `main` for this PR, 2026-11-05,** CPU only (no visible GPU), branch = `3c051b52e` + #1371 + this commit:\n\n- pytest, the ten files in the plan: 100 passed, 10 failed. The 10 failures are all in `tests/config/test_runtime_default_ownership.py` and fail identically on unmodified `main` (`SimpleNamespace` has no attribute `model`).\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass. `check_layering.py` output is identical to `main`.\n- ruff 0.14.0 `check` and `format --check` on the 16 changed Python files: pass.\n\nNot run on this branch: any GPU or serving test, and no re-measurement of the table.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1373",
+    "isDraft": false,
+    "headRefName": "pli/pp-keep-batch",
+    "headRefOid": "78f90ccb70278c3a17dc7ac309333a14a44138e7",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1373,
+    "id": "PR_kwDORjYFXs8AAAABNIPe8Q",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "78f90ccb70278c3a17dc7ac309333a14a44138e7",
+    "title": "[Perf][V1][PP] Retain persistent request rows across empty steps",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1373",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code) and reviewed in three rounds before opening.\n\n**Depends on #1371.** The first commit of this branch is #1371; review only the second commit here. Stack order: #1371, then this PR.\n\n**Credit.** This is a V1-runner port of the idea in #1263 by `Peuqui` (stop resending a request's token history to the V2 runner every decode step). The V1 retention code is ours; the approach is theirs.\n\n## Purpose\n\nEmpty synchronous PP steps discard V1 persistent request rows and the scheduler's previous-step record. The next decode step then resends and rebuilds the complete token history. With VLLM_PP_KEEP_BATCH=1, retain rows and the matching record across fully empty steps, while removing finished and preempted requests. Nonempty steps keep the existing replacement behavior.\n\nThis PR is based on the companion **[Bugfix][V1][PP] Preserve synchronous speculative step ownership** (#1371); its first commit is that PR. Review that correctness change separately; this incremental change is opt-in. It is the V1 counterpart to #1263's existing V2 history reuse. SpeculativeConfig owns method capability, and SchedulerConfig owns the serialized retention setting. Explicit unsupported requests fail with the setting's name.\n\n## Test Plan\n\n```bash\npython -m tools.generate_architecture_reference --check\npython -m tools.generate_env_reference --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.config_inventory --check\npython tools/pre_commit/check_layering.py\npython -m pytest -q --confcutdir=tests/tools tests/tools/test_architecture_reference.py tests/tools/test_architecture_doc_urls.py tests/tools/test_architecture_check_scope.py\npython -m pytest -q --confcutdir=tests/config tests/config/test_pp_keep_batch_policy.py tests/config/test_runtime_default_ownership.py\npython -m pytest -q --confcutdir=tests/v1 tests/v1/core/test_pp_keep_batch.py tests/v1/worker/test_pp_keep_batch_runner.py tests/v1/engine/test_pp_spec_decode_cadence.py tests/v1/core/test_pp_spec_decode_inflight.py tests/v1/worker/test_pp_spec_decode_history.py\n```\n\nFor a public target/drafter pair already admitted by synchronous PP, set TARGET_CHECKPOINT and DRAFT_CHECKPOINT to those identifiers. Run the same command with ENABLED=0 and 1 in disabled/enabled/enabled/disabled order:\n\n```bash\nVLLM_USE_V2_MODEL_RUNNER=0 VLLM_PP_KEEP_BATCH=\"$ENABLED\" \\\n  vllm serve \"$TARGET_CHECKPOINT\" --tensor-parallel-size 1 \\\n  --pipeline-parallel-size 2 --max-num-seqs 4 --no-async-scheduling \\\n  --speculative-config \"{\\\"model\\\":\\\"$DRAFT_CHECKPOINT\\\",\\\"num_speculative_tokens\\\":3}\"\n```\n\nWarm greedy and seeded sampled paths. Compare complete token IDs and per-request histories with retention off/on for one request, staggered requests, one remaining request, cancellation, preemption and prefix-cache reset. Confirm that a fully empty step keeps only live nonpreempted rows and that the next step omits their history resend. Record first-token latency, decode-only milliseconds per verification round and acceptance separately. Repeat at longer contexts supported by the selected model. Test plain decode as well as speculation.\n\nThe public V4.1 adapter currently admits TP4/PP1, so reproducing the historical PP2 V4.1 numbers needs the PP2 x TP4 port (#1370) and a GGUF hybrid checkpoint. This generic PP test plan qualifies another admitted public model; it does not reproduce those historical numbers.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| V1 synchronous PP | Persistent request rows / histories | PP above one; fully empty step; opt-in | Retain live rows and matching scheduler record | Executed real scheduler and CPU InputBatch state tests; historical measurement | Current-main GPU serving, graphs and speed |\n| Finished / preempted / resumed | Same | Removal during an empty step or later resumption | Remove stale records; resend resumed history | Executed CPU state and request lifecycle tests | GPU lifecycle |\n| Disabled / nonempty | Same | OFF or any request scheduled | Original row replacement behavior on top of companion bugfix | Executed off/on CPU controls | GPU identity comparison |\n| Unsupported explicit request | Other runner/state contracts | V2, async, external launcher, connectors, pooling, hybrid state or unsupported speculation | Construction refuses and names VLLM_PP_KEEP_BATCH | Executed capability/admission tests | No broader model qualification |\n| Synchronous speculation | Step-owned draft snapshots | Multiple request groups; inherited bugfix | Apply each step's own proposals after its output | Executed real engine-loop cadence regression | Worker GPU production, transport and structured-output serving |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: Opt-in via scheduler_config.pp_keep_batch or VLLM_PP_KEEP_BATCH=1; default off.\n- Required CLI options and environment switches: V1, synchronous PP above one; admitted model/state contract. Errors name the requested setting.\n- KV cache dtype used for the benchmark: Historical #1277 packed V4.1 KV; retention adds no codec.\n- Wheel SHA or source commit: This branch: `main` `3c051b52e` plus #1371. The numbers below were measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port (#1370); this branch has not run on a GPU.\n- PYTHONPATH, source overlays, or external native libraries used (write \"none\" if absent): No native library added by retention. The measurements used the V4.1 PP2 port (#1370), native kernels and a GGUF hybrid checkpoint that is not published.\n- User-entry route-hit, speed, and output-quality evidence: MEASURED 2026-11-03 (table under Test Result): 32K/64K/128K round times 32.69/37.19/44.73 to 29.51/30.73/33.62 ms, same text and unchanged first-token time. The earlier aggregate included first-token timing; it is not the later decode-only contract. These values cannot be reproduced by this branch alone and do not qualify the repaired current-main port.\n- Existing kernel/backend registry and capability-rejection reasons: No kernel priority change. Shared scheduler/runner admission rejects unsupported state contracts.\n- Per-engine configuration and deprecated-variable compatibility: Typed serialized SchedulerConfig field, initialization-only alias, explicit typed override, no extra model graph hash salt.\n- New/changed environment metadata and generated reference check: VLLM_PP_KEEP_BATCH registered as experimental; architecture/env references and all five gates pass.\n- Route snapshot command and intentional changed rows (write \"none\" for refactors): python -m tools.sm70_route_snapshot --category moe --output /dev/stdout; none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: SM70 registrations unchanged; one generic PP alias added; no new unregistered execution reads; no expanded model admission.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4 (#1370), one request, DSpark 5, V1 runner, setting OFF -> ON, ms per verify round (aggregate including first-token time):\n\n| prompt | OFF | ON | change |\n| --- | ---: | ---: | ---: |\n| 32K | 32.69 | 29.51 | -9.7 % |\n| 64K | 37.19 | 30.73 | -17.4 % |\n| 128K | 44.73 | 33.62 | -24.8 % (84 -> 111 tok/s) |\n| short, T=0 / T=1 | | | -0.17 / -0.30 ms |\n\nTexts identical; first-token time unchanged. These were measured on the earlier code, before the correctness repairs now split out into #1371.\n\n**Re-run on `main` for this PR, 2026-11-05,** CPU only (no visible GPU), branch = `3c051b52e` + #1371 + this commit:\n\n- pytest, the ten files in the plan: 100 passed, 10 failed. The 10 failures are all in `tests/config/test_runtime_default_ownership.py` and fail identically on unmodified `main` (`SimpleNamespace` has no attribute `model`).\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass. `check_layering.py` output is identical to `main`.\n- ruff 0.14.0 `check` and `format --check` on the 16 changed Python files: pass.\n\nNot run on this branch: any GPU or serving test, and no re-measurement of the table.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/pp-keep-batch",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1373,
+    "title": "[Perf][V1][PP] Retain persistent request rows across empty steps",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1373",
+    "isDraft": false,
+    "headRefOid": "78f90ccb70278c3a17dc7ac309333a14a44138e7",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "docs/configuration/env_var_reference.md",
+      "docs/design/architecture/runtime_reference.md",
+      "tests/config/test_pp_keep_batch_policy.py",
+      "tests/v1/core/test_pp_keep_batch.py",
+      "tests/v1/core/test_pp_spec_decode_inflight.py",
+      "tests/v1/core/utils.py",
+      "tests/v1/engine/test_pp_spec_decode_cadence.py",
+      "tests/v1/worker/test_pp_keep_batch_runner.py",
+      "tests/v1/worker/test_pp_spec_decode_history.py",
+      "vllm/config/scheduler.py",
+      "vllm/config/speculative.py",
+      "vllm/envs.py",
+      "vllm/v1/core/sched/pp_keep_batch.py",
+      "vllm/v1/core/sched/scheduler.py",
+      "vllm/v1/engine/core.py",
+      "vllm/v1/outputs.py",
+      "vllm/v1/worker/gpu/model_runner.py",
+      "vllm/v1/worker/gpu_model_runner.py"
+    ],
+    "diff_bytes": 73006,
+    "diff_sha256": "b45075d6191ae313ceaddb939b4939df8c26a27b0d25fb5999a95dd1674a4acb"
+  },
+  "full_tree_diff_proof": null
+}

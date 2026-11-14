@@ -1,0 +1,705 @@
+diff --git a/tests/v1/worker/test_mrv2_dspark_context_buckets.py b/tests/v1/worker/test_mrv2_dspark_context_buckets.py
+new file mode 100644
+index 0000000000..bd0990a8fc
+--- /dev/null
++++ b/tests/v1/worker/test_mrv2_dspark_context_buckets.py
+@@ -0,0 +1,111 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from types import SimpleNamespace
++
++import numpy as np
++import torch
++
++from vllm.config.compilation import CUDAGraphMode
++from vllm.v1.worker.gpu.cudagraph_utils import (
++    BatchExecutionDescriptor,
++    ModelCudaGraphManager,
++)
++from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
++from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
++
++
++class _RecordingDraft:
++    def __init__(self, layer_names):
++        self._layer_names = layer_names
++        self.slots = "unset"
++
++    def get_draft_kv_cache_layer_names(self):
++        return self._layer_names
++
++    def precompute_and_store_context_kv(self, hidden, positions, slots):
++        self.slots = slots
++
++    def map_draft_to_target(self, ids):
++        return ids + 100
++
++
++def _speculator(model) -> DSparkSpeculator:
++    speculator = object.__new__(DSparkSpeculator)
++    speculator.model = model
++    speculator.draft_logits = None
++    return speculator
++
++
++def test_context_slots_are_passed_per_cache_layer():
++    model = _RecordingDraft(["layer.a", "layer.b"])
++    speculator = _speculator(model)
++    hidden, positions = torch.zeros(3, 4), torch.zeros(3, dtype=torch.int64)
++    first, shared = torch.tensor([1, 2, 3]), torch.tensor([7, 8, 9])
++
++    speculator._precompute_context_kv(hidden, positions, [first, None])
++    assert model.slots == {"layer.a": first}
++
++    speculator._precompute_context_kv(hidden, positions, shared)
++    assert model.slots == {"layer.a": shared, "layer.b": shared}
++
++    speculator._precompute_context_kv(hidden, positions, None)
++    assert model.slots is None
++
++
++def test_greedy_step_maps_the_draft_argmax_to_target_ids():
++    speculator = _speculator(_RecordingDraft([]))
++    logits = torch.tensor([[0.1, 0.9, 0.0], [0.7, 0.2, 0.1]])
++    tokens = speculator._sample_step(
++        logits, torch.zeros(2, dtype=torch.int32), torch.ones(2, dtype=torch.int64), 0
++    )
++    assert tokens.tolist() == [101, 100]
++
++
++def test_dummy_batch_at_a_context_bound_keeps_query_offsets():
++    buffers = InputBuffers(
++        max_num_reqs=4, max_num_tokens=16, device=torch.device("cpu")
++    )
++    batch = InputBatch.make_dummy(2, 12, buffers, context_len=4096)
++    assert batch.query_start_loc.tolist() == [0, 6, 12]
++    assert batch.seq_lens.tolist() == [4096, 4096]
++    assert batch.seq_lens_cpu_upper_bound.tolist() == [4096, 4096]
++    assert batch.num_computed_tokens_np.tolist() == [4090, 4090]
++    assert batch.capture_context_len == 4096
++
++    plain = InputBatch.make_dummy(2, 12, buffers)
++    assert plain.seq_lens.tolist() == [6, 6]
++    assert plain.capture_context_len is None
++    assert np.array_equal(plain.num_computed_tokens_np, np.zeros(2, dtype=np.int32))
++
++
++def _manager_with_buckets(buckets):
++    desc = BatchExecutionDescriptor(CUDAGraphMode.FULL, 6, 1, uniform_token_count=6)
++    variants = tuple(
++        BatchExecutionDescriptor(
++            CUDAGraphMode.FULL, 6, 1, uniform_token_count=6, attention_context_bucket=b
++        )
++        for b in buckets
++    )
++    manager = object.__new__(ModelCudaGraphManager)
++    manager._compressed_context_graphs = {desc: variants}
++    manager._qsa_short_graphs = {}
++    manager._long_attention_graphs = {}
++    manager.graphs = {variant: SimpleNamespace() for variant in variants}
++    return manager, desc, variants
++
++
++def test_replay_selects_the_smallest_covering_context_bucket():
++    manager, desc, (b2k, b4k, b16k) = _manager_with_buckets((2048, 4096, 16384))
++    select = manager.select_attention_graph
++    assert select(desc, torch.tensor([300], dtype=torch.int32)) == b2k
++    assert select(desc, torch.tensor([2049], dtype=torch.int32)) == b4k
++    assert select(desc, torch.tensor([16384], dtype=torch.int32)) == b16k
++    # Beyond the largest bucket, or without a host bound: the full-length graph.
++    assert select(desc, torch.tensor([16385], dtype=torch.int32)) == desc
++    assert select(desc, torch.tensor([], dtype=torch.int32)) == desc
++
++
++def test_replay_skips_buckets_that_were_not_captured():
++    manager, desc, (b2k, b4k) = _manager_with_buckets((2048, 4096))
++    del manager.graphs[b2k]
++    assert manager.select_attention_graph(desc, torch.tensor([100])) == b4k
+diff --git a/tests/v1/worker/test_sm70_long_attention_graphs.py b/tests/v1/worker/test_sm70_long_attention_graphs.py
+index 8164f5b15e..162a5fa378 100644
+--- a/tests/v1/worker/test_sm70_long_attention_graphs.py
++++ b/tests/v1/worker/test_sm70_long_attention_graphs.py
+@@ -26,6 +26,7 @@ def graph_pair():
+     ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, 8, 1, 8)
+     bounded = replace(ordinary, attention_context_bucket=BUILTIN_MAX_CONTEXT)
+     manager._qsa_short_graphs = {}
++    manager._compressed_context_graphs = {}
+     manager._long_attention_graphs = {ordinary: bounded}
+     manager.graphs = {ordinary: object(), bounded: object()}
+     return manager, ordinary, bounded
+@@ -51,6 +52,7 @@ def test_request_major_q8_context_boundary(num_reqs):
+     ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_reqs * 8, num_reqs, 8)
+     bounded = replace(ordinary, attention_context_bucket=BUILTIN_MAX_CONTEXT)
+     manager._qsa_short_graphs = {}
++    manager._compressed_context_graphs = {}
+     manager._long_attention_graphs = {ordinary: bounded}
+     manager.graphs = {ordinary: object(), bounded: object()}
+ 
+@@ -89,6 +91,7 @@ def test_scalar_graph_retains_short_and_oversized_fallback():
+     ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1, 1)
+     bounded = replace(ordinary, attention_context_bucket=262144)
+     manager._qsa_short_graphs = {}
++    manager._compressed_context_graphs = {}
+     manager._long_attention_graphs = {ordinary: bounded}
+     manager.graphs = {ordinary: object(), bounded: object()}
+     for upper in (1, 1024, 131071, 262145):
+diff --git a/tools/pre_commit/layering_baseline.json b/tools/pre_commit/layering_baseline.json
+index 4fcc6a1db0..653d2c16ce 100644
+--- a/tools/pre_commit/layering_baseline.json
++++ b/tools/pre_commit/layering_baseline.json
+@@ -514,7 +514,7 @@
+  },
+  "vllm/v1/worker/gpu/cudagraph_utils.py": {
+   "model": 11,
+-  "platform": 33
++  "platform": 34
+  },
+  "vllm/v1/worker/gpu/mamba_align.py": {
+   "model": 2
+@@ -539,6 +539,9 @@
+  "vllm/v1/worker/gpu/spec_decode/__init__.py": {
+   "model": 16
+  },
++ "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py": {
++  "model": 6
++ },
+  "vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py": {
+   "model": 6
+  },
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 23ccd0b38c..388596859e 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -2440,13 +2440,15 @@ def _get_v2_model_runner_unsupported_features(self) -> list[str]:
+                 "eagle3",
+                 "mtp",
+                 "dflash",
++                "dspark",
+             ):
+                 unsupported.append(f"speculative method '{speculative_config.method}'")
+ 
+             # V2 EagleSpeculator does not support parallel_drafting (required by PEagle)
++            parallel_drafting_methods = ("dflash", "dspark")
+             if (
+                 speculative_config.parallel_drafting
+-                and speculative_config.method != "dflash"
++                and speculative_config.method not in parallel_drafting_methods
+             ):
+                 unsupported.append("parallel drafting for speculative decoding")
+ 
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index bc95173f6e..858513b992 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -623,9 +623,57 @@ def __init__(
+                 scope="process",
+             )
+ 
++        # Compressed-index (DeepSeek-V4) decode graphs captured at each context
++        # bucket, as the V1 dispatcher does: the indexer and sparse attention
++        # are bounded by the bucket instead of the model's maximum length.
++        self._compressed_context_graphs: dict[
++            BatchExecutionDescriptor, tuple[BatchExecutionDescriptor, ...]
++        ] = {}
++        from vllm.platforms.sm70.graph_policy import resolve_graph_plan
++
++        compressed_buckets = resolve_graph_plan(vllm_config).compressed_buckets
++        if compressed_buckets:
++            descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
++            for desc in list(descs):
++                # One request with one decode (or verification) block.
++                if (
++                    desc.attention_context_bucket is None
++                    and desc.num_reqs == 1
++                    and desc.num_tokens == self.decode_query_len
++                ):
++                    variants = tuple(
++                        replace(desc, attention_context_bucket=bucket)
++                        for bucket in compressed_buckets
++                    )
++                    self._compressed_context_graphs[desc] = variants
++                    descs.extend(variants)
++            logger.info_once(
++                "Compressed-index decode graph variants captured at context "
++                "buckets %s for %d decode shapes.",
++                compressed_buckets,
++                len(self._compressed_context_graphs),
++                scope="process",
++            )
++        self._compressed_bucket_descs = {
++            variant
++            for variants in self._compressed_context_graphs.values()
++            for variant in variants
++        }
++
+     def select_attention_graph(
+         self, desc: BatchExecutionDescriptor, cpu_upper_bounds: torch.Tensor
+     ) -> BatchExecutionDescriptor:
++        variants = self._compressed_context_graphs.get(desc)
++        if variants:
++            # The smallest captured bucket that covers the live context.
++            if cpu_upper_bounds.device.type == "cpu" and cpu_upper_bounds.numel():
++                upper = int(cpu_upper_bounds.max())
++                for bucket_desc in variants:
++                    bucket = bucket_desc.attention_context_bucket
++                    assert bucket is not None
++                    if 0 < upper <= bucket and bucket_desc in self.graphs:
++                        return bucket_desc
++            return desc
+         short = self._qsa_short_graphs.get(desc)
+         if (
+             short is not None
+@@ -724,6 +772,11 @@ def create_forward_fn(
+                 attn_groups,
+                 kv_cache_config,
+                 skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
++                context_len=(
++                    desc.attention_context_bucket
++                    if desc in self._compressed_bucket_descs
++                    else None
++                ),
+             )
+ 
+             def forward_fn(cg_mode: CUDAGraphMode) -> None:
+@@ -813,8 +866,11 @@ def prepare_inputs_to_capture(
+     attn_groups: list[list[AttentionGroup]],
+     kv_cache_config: KVCacheConfig,
+     skip_attn: bool = False,
++    context_len: int | None = None,
+ ) -> CapturedAttentionState:
+-    input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
++    input_batch = InputBatch.make_dummy(
++        num_reqs, num_tokens, input_buffers, context_len=context_len
++    )
+     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+     slot_mappings_by_layer = build_slot_mappings_by_layer(
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index b4310bd220..5b0ecbc040 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -99,6 +99,9 @@ class InputBatch:
+     is_incomplete_prefilling_np: np.ndarray | None = None
+     # Dummy profiling and graph-capture inputs must never write KV slots.
+     is_dummy_batch: bool = False
++    # Context bound a context-bucket graph is captured at; the attention
++    # metadata is built for this length instead of the model's maximum.
++    capture_context_len: int | None = None
+ 
+     @classmethod
+     def make_dummy(
+@@ -106,7 +109,13 @@ def make_dummy(
+         num_reqs: int,
+         num_tokens: int,
+         input_buffers: InputBuffers,
++        context_len: int | None = None,
+     ) -> "InputBatch":
++        """Dummy batch for profiling and graph capture.
++
++        ``context_len`` (a context-bucket graph's bound) gives every request
++        that sequence length; otherwise seq_len equals query_len.
++        """
+         assert 0 < num_reqs <= num_tokens
+         device = input_buffers.device
+ 
+@@ -146,6 +155,15 @@ def make_dummy(
+         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
+         # Dummy: seq_len == query_len (fresh-prefill shape).
+         seq_lens_cpu_upper_bound = torch.from_numpy(num_scheduled_tokens.copy())
++        num_computed_tokens_np = np.zeros(num_reqs, dtype=np.int32)
++        if context_len is not None:
++            assert context_len >= int(num_scheduled_tokens.max())
++            # query_start_loc above already holds the query offsets.
++            input_buffers.seq_lens[:num_reqs] = context_len
++            seq_lens_cpu_upper_bound = torch.full(
++                (num_reqs,), context_len, dtype=torch.int32
++            )
++            num_computed_tokens_np = context_len - num_scheduled_tokens
+         return cls(
+             req_ids=req_ids,
+             num_reqs=num_reqs,
+@@ -164,7 +182,7 @@ def make_dummy(
+             seq_lens=seq_lens,
+             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+             dcp_local_seq_lens=None,
+-            num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
++            num_computed_tokens_np=num_computed_tokens_np,
+             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
+             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
+             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
+@@ -176,6 +194,7 @@ def make_dummy(
+             cu_num_logits_np=cu_num_logits_np,
+             has_structured_output_reqs=False,
+             is_dummy_batch=True,
++            capture_context_len=context_len,
+         )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 2dd1256d73..c1db487c45 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -236,8 +236,8 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device):
+             if self.is_last_pp_rank:
+                 self.speculator = init_speculator(self.vllm_config, self.device)
+ 
+-            if self.speculative_config.method in ("eagle3", "dflash"):
+-                # EAGLE3 and DFlash may require auxiliary target hidden states.
++            if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
++                # EAGLE3, DFlash and DSpark may require auxiliary target hidden states.
+                 self.use_aux_hidden_state_outputs = True
+                 if self.use_pp and self.speculative_config.method == "eagle3":
+                     raise ValueError(
+@@ -697,6 +697,20 @@ def _warmup_sm70_aux_kernels(self) -> None:
+         if warmed:
+             logger.info_once("SM70 V2 auxiliary kernel warmup finished: %s", warmed)
+ 
++    def _speculator_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Hidden state fed to the drafter.
++
++        The target may override it (DeepSeek V4 MTP needs the pre-hc_head
++        residual) with a persistent buffer sized at max_num_batched_tokens,
++        sliced to the active token count that propose() expects. Targets
++        return no buffer for other draft methods (e.g. DSpark).
++        """
++        get_override = getattr(self.model, "get_mtp_target_hidden_states", None)
++        override = get_override() if get_override is not None else None
++        if override is None:
++            return hidden_states
++        return override[: hidden_states.shape[0]]
++
+     @torch.inference_mode()
+     @step_eplb_after(is_dummy=True)
+     def _dummy_run(
+@@ -780,14 +794,7 @@ def _dummy_run(
+                     ),
+                 )
+ 
+-            # Let the target override the hidden state fed to the drafter
+-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
+-            # target returns a persistent buffer sized at max_num_batched_tokens;
+-            # slice to the active token count that propose() expects.
+-            spec_hidden_states = hidden_states
+-            if hasattr(self.model, "get_mtp_target_hidden_states"):
+-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++            spec_hidden_states = self._speculator_hidden_states(hidden_states)
+             self.speculator.propose(
+                 input_batch=input_batch,
+                 attn_metadata=attn_metadata,
+@@ -1883,14 +1890,7 @@ def sample_tokens(
+             requires_host_token_state = bool(
+                 getattr(self.speculator, "requires_host_token_state", False)
+             )
+-            # Let the target override the hidden state fed to the drafter
+-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
+-            # target returns a persistent buffer sized at max_num_batched_tokens;
+-            # slice to the active token count that propose() expects.
+-            spec_hidden_states = hidden_states
+-            if hasattr(self.model, "get_mtp_target_hidden_states"):
+-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++            spec_hidden_states = self._speculator_hidden_states(hidden_states)
+             mtp_draft_start = self._step_profiler.start_context(mtp_profile_ctx)
+             if self._ple_draft_ring is not None:
+                 # The committed state now ends at each request's bonus token.
+diff --git a/vllm/v1/worker/gpu/model_states/default.py b/vllm/v1/worker/gpu/model_states/default.py
+index 86a1886083..42b449f6d0 100644
+--- a/vllm/v1/worker/gpu/model_states/default.py
++++ b/vllm/v1/worker/gpu/model_states/default.py
+@@ -179,8 +179,9 @@ def prepare_attn(
+         max_query_len = input_batch.num_scheduled_tokens.max().item()
+         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
+         if for_capture:
+-            # Capture with worst-case max_seq_len so the graph is valid at any replay.
+-            max_seq_len = self.max_model_len
++            # Capture with worst-case max_seq_len so the graph is valid at any
++            # replay; a context-bucket graph replays only within its bound.
++            max_seq_len = input_batch.capture_context_len or self.max_model_len
+         else:
+             max_seq_len = int(seq_lens_cpu_upper_bound[:num_reqs].max().item())
+         attn_metadata = build_attn_metadata(
+diff --git a/vllm/v1/worker/gpu/spec_decode/__init__.py b/vllm/v1/worker/gpu/spec_decode/__init__.py
+index ee25697099..ee1d7e5cef 100644
+--- a/vllm/v1/worker/gpu/spec_decode/__init__.py
++++ b/vllm/v1/worker/gpu/spec_decode/__init__.py
+@@ -46,6 +46,10 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
+         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+ 
+         return DFlashSpeculator(vllm_config, device)
++    if speculative_config.method == "dspark":
++        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
++
++        return DSparkSpeculator(vllm_config, device)
+     if speculative_config.use_eagle():
+         from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+index c9d025eeee..be35e404d5 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+@@ -35,7 +35,12 @@ def _validate_dflash_shared_weights(
+     )
+ 
+ 
+-def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
++def get_parallel_draft_model(vllm_config: VllmConfig, model_tag: str) -> nn.Module:
++    """Build a DFlash-family (parallel query block) drafter from its own config.
++
++    Shared by DFlash and DSpark; each caller then shares target weights under
++    its own contract.
++    """
+     from vllm.compilation.backends import set_model_tag
+     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
+ 
+@@ -73,10 +78,12 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+             else vllm_config.cache_config
+         ),
+     )
+-    with set_model_tag("dflash_head"):
+-        dflash_model = get_model(
+-            vllm_config=draft_vllm_config, model_config=draft_model_config
+-        )
++    with set_model_tag(model_tag):
++        return get_model(vllm_config=draft_vllm_config, model_config=draft_model_config)
++
++
++def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
++    dflash_model = get_parallel_draft_model(vllm_config, "dflash_head")
+ 
+     target_language_model = (
+         target_model.get_language_model()
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py b/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py
+new file mode 100644
+index 0000000000..208f01a7cb
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+new file mode 100644
+index 0000000000..0ef5a83ef1
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -0,0 +1,189 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DSpark speculator for Model Runner V2: semi-autoregressive parallel drafting.
++
++DSpark drafts a block of ``num_speculative_tokens`` tokens in one parallel pass
++(the DFlash machinery: context-KV precompute plus a query-block forward), then
++adds intra-block dependency with a light sequential Markov head.
++
++Differences from DFlash:
++  * Anchor-as-first-prediction: each request emits exactly N query tokens
++    (anchor + N-1 noise tokens), every query position predicts the next token
++    (the ``SAMPLE_FROM_ANCHOR`` path of the shared prepare-inputs kernel).
++  * Sequential Markov sampling: tokens are sampled left to right, adding a bias
++    derived from the previously sampled token at each step.
++
++The draft step, backbone forward and Markov sampling, runs inside the drafter's
++FULL CUDA graph. Follows vllm-project/vllm's MRV2 DSparkSpeculator.
++"""
++
++from typing import Any
++
++import torch
++import torch.nn as nn
++
++from vllm.config import VllmConfig
++from vllm.config.compilation import CUDAGraphMode
++from vllm.distributed.parallel_state import get_pp_group
++from vllm.logger import init_logger
++from vllm.model_executor.models.shared_weights import (
++    LEGACY_DRAFT_WEIGHTS,
++    share_embeddings,
++    share_lm_head,
++)
++from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
++from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++from vllm.v1.worker.gpu.spec_decode.dflash.utils import get_parallel_draft_model
++
++logger = init_logger(__name__)
++
++
++class DSparkSpeculator(DFlashSpeculator):
++    _speculator_name = "DSpark"
++
++    def __init__(self, vllm_config: VllmConfig, device: torch.device):
++        super().__init__(vllm_config, device)
++        speculative_config = self.speculative_config
++        if (
++            speculative_config.dspark_confidence_threshold > 0.0
++            or speculative_config.dspark_max_verification_tokens is not None
++        ):
++            raise ValueError(
++                "DSpark confidence-scheduled verification is not supported by "
++                "Model Runner V2; set VLLM_USE_V2_MODEL_RUNNER=0 to use it."
++            )
++        # DSpark consumes the target aux states combined to hidden_size by
++        # main_proj, not DeepSeek-V4 MTP's hc_mult-wide residual for which the
++        # base class widens hidden_size: size the staging buffers to the drafter.
++        self.hidden_size = self.draft_model_config.get_hidden_size()
++        self.hidden_states = torch.zeros(
++            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
++        )
++        self.inputs_embeds = torch.zeros(
++            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
++        )
++        # The anchor is the first prediction: N query positions per request.
++        self.sample_from_anchor = True
++        self.num_query_per_req = self.draft_block
++        # Anchor (bonus) token of each request = input id at query offset 0.
++        # A persistent index keeps the read graph-stable.
++        self._anchor_idx = (
++            torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
++            * self.num_query_per_req
++        )
++        # Row s holds column s for every request: the draft_logits column each
++        # sequential step writes, contiguous for the sampling kernel.
++        self._step_cols = (
++            torch.arange(self.draft_block, dtype=torch.int32, device=device)
++            .repeat_interleave(self.max_num_reqs)
++            .view(self.draft_block, self.max_num_reqs)
++        )
++
++    def load_draft_model(
++        self,
++        target_model: nn.Module,
++        target_attn_layer_names: set[str],
++    ) -> nn.Module:
++        model = get_parallel_draft_model(self.vllm_config, "dspark_head")
++        target_language_model = (
++            target_model.get_language_model()
++            if hasattr(target_model, "get_language_model")
++            else target_model
++        )
++        # The DeepSeek-V4 drafter loads its own copy of the target embedding
++        # from the checkpoint. With pipeline parallelism the target embedding
++        # lives on the first stage, so the drafter keeps that copy: the same
++        # contract as the V1 proposer.
++        share_embeddings(
++            model,
++            target_language_model,
++            LEGACY_DRAFT_WEIGHTS,
++            pp_size=get_pp_group().world_size,
++            log=logger,
++        )
++        share_lm_head(
++            model,
++            target_language_model,
++            target_language_model,
++            LEGACY_DRAFT_WEIGHTS,
++            log=logger,
++        )
++        return model
++
++    def _precompute_context_kv(
++        self,
++        hidden_states: torch.Tensor,
++        positions: torch.Tensor,
++        slots: torch.Tensor | list[torch.Tensor | None] | None,
++    ) -> None:
++        # The DeepSeek-V4 drafter takes its context slots per cache layer name.
++        slots_by_layer: dict[str, torch.Tensor] | None = None
++        if slots is not None:
++            layer_names = self.model.get_draft_kv_cache_layer_names()
++            per_layer = slots if isinstance(slots, list) else [slots] * len(layer_names)
++            slots_by_layer = {
++                name: layer_slots
++                for name, layer_slots in zip(layer_names, per_layer)
++                if layer_slots is not None
++            }
++        self.model.precompute_and_store_context_kv(
++            hidden_states, positions, slots_by_layer
++        )
++
++    def _sample_step(
++        self,
++        logits: torch.Tensor,
++        idx_mapping: torch.Tensor,
++        sample_pos: torch.Tensor,
++        step: int,
++    ) -> torch.Tensor:
++        if self.draft_logits is None:
++            return self.model.map_draft_to_target(logits.argmax(dim=-1))
++        # sample_pos is the predicted token's position P. Sampling keys a draw
++        # by the position before the sampled token, P-1.
++        sampled = gumbel_sample(
++            logits,
++            idx_mapping,
++            self.temperature,
++            self.seeds,
++            sample_pos - 1,
++            apply_temperature=True,
++            is_drafting=True,
++            output_processed_logits=self.draft_logits,
++            output_processed_logits_col=self._step_cols[step, : logits.shape[0]],
++            use_fp64=self.use_fp64_gumbel,
++        )
++        return self.model.map_draft_to_target(sampled)
++
++    def _generate_draft(
++        self,
++        num_reqs: int,
++        num_tokens_padded: int,
++        attn_metadata: dict[str, Any] | None,
++        slot_mappings: dict[str, torch.Tensor] | None,
++        num_tokens_across_dp: torch.Tensor | None,
++        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
++    ) -> None:
++        head_hidden = self._run_model(
++            num_tokens_padded,
++            attn_metadata,
++            slot_mappings,
++            num_tokens_across_dp,
++            cudagraph_runtime_mode,
++        )
++        num_steps = self.draft_block
++        num_sample = num_reqs * num_steps
++        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
++        base_logits = self.model.compute_logits(sample_hidden)
++        base_logits = base_logits.view(num_reqs, num_steps, base_logits.shape[-1])
++        idx_mapping = self.sample_idx_mapping[:num_sample].view(num_reqs, num_steps)
++        sample_pos = self.sample_pos[:num_sample].view(num_reqs, num_steps)
++
++        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]].to(torch.long)
++        for step in range(num_steps):
++            markov_embed = self.model.markov_embed(prev)
++            logits = base_logits[:, step] + self.model.markov_bias(markov_embed)
++            prev = self._sample_step(
++                logits, idx_mapping[:, step], sample_pos[:, step], step
++            )
++            self.draft_tokens[:num_reqs, step] = prev
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+index 8c8d56ba31..717364dd0c 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+@@ -49,6 +49,11 @@ def get_eagle3_aux_layers_from_config(
+         target_layer_ids = getattr(hf_config, "target_layer_ids", None)
+         if target_layer_ids:
+             layer_ids = [i + 1 for i in target_layer_ids]
++    if not layer_ids:
++        # DSpark config uses zero-based decoder-layer IDs.
++        dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
++        if dspark_layer_ids:
++            layer_ids = [i + 1 for i in dspark_layer_ids]
+     if layer_ids and isinstance(layer_ids, (list, tuple)):
+         return tuple(layer_ids)
+     return None
+diff --git a/vllm/v1/worker/gpu/spec_decode/utils.py b/vllm/v1/worker/gpu/spec_decode/utils.py
+index be6fb3d8aa..4ef2311983 100644
+--- a/vllm/v1/worker/gpu/spec_decode/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/utils.py
+@@ -66,7 +66,9 @@ def get_parallel_drafting_token_id(hf_config) -> int:
+         return int(hf_config.pard_token)
+     if hasattr(hf_config, "ptd_token_id"):
+         return int(hf_config.ptd_token_id)
++    if hasattr(hf_config, "dspark_noise_token_id"):
++        return int(hf_config.dspark_noise_token_id)
+     raise ValueError(
+         "Model config must specify dflash_config.mask_token_id, pard_token, "
+-        "or ptd_token_id for parallel drafting."
++        "ptd_token_id, or dspark_noise_token_id for parallel drafting."
+     )
