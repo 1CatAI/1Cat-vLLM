@@ -6,6 +6,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.v1.attention.ops.triton_decode_attention import (
     _decode_grouped_block_size,
     decode_attention_fwd,
@@ -42,6 +43,11 @@ def test_decode_grouped_block_size_is_sm70_scoped(
     )
 
 
+# Grouped (non-MLA) decode with D_QK=576 runs a BLOCK_DMODEL 1024 tile, for which
+# Triton requests 196608 bytes of shared memory in bfloat16 and in float16 alike.
+_GROUPED_D576_SHARED_MEMORY = 192 * 1024
+
+
 @pytest.mark.parametrize("B", [3, 5])
 @pytest.mark.parametrize("L", [1027, 1025])
 @pytest.mark.parametrize("H_Q", [32])
@@ -51,11 +57,15 @@ def test_decode_grouped_block_size_is_sm70_scoped(
 @pytest.mark.parametrize("CACHE_SIZE", [16384])
 @pytest.mark.parametrize("PAGE_SIZE", [1, 16])
 def test_decode_attention(B, L, H_Q, H_KV, D_QK, D_V, CACHE_SIZE, PAGE_SIZE):
-    if current_platform.is_device_capability(70) and H_KV != H_Q and D_QK == 576:
-        # Grouped, non-MLA: BLOCK_DMODEL 1024 with fp32-staged dot operands.
+    if (
+        H_KV != H_Q
+        and D_QK == 576
+        and get_max_shared_memory_bytes(torch.accelerator.current_device_index())
+        < _GROUPED_D576_SHARED_MEMORY
+    ):
         pytest.skip(
-            "Triton on SM70 needs 192 KiB of shared memory for the grouped "
-            "D_QK=576 tile; the hardware limit is 96 KiB"
+            "The grouped D_QK=576 tile needs 192 KiB of shared memory per block, "
+            "more than this GPU allows (V100 96 KiB, Turing 64 KiB)"
         )
     assert CACHE_SIZE % PAGE_SIZE == 0
     dtype = torch.bfloat16
