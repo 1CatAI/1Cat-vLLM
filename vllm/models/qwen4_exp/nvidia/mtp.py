@@ -924,18 +924,16 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 object.__setattr__(self, "_hc_prefill_sequence_model", view)
             backbone = self._hc_prefill_sequence_model
         # Draft row stages keep the original replicated producer reductions;
-        # they must not inherit the target's partial-producer context.
-        from .sm70_hcx import hc_prefill_sequence_parallel_context
-
-        with hc_prefill_sequence_parallel_context(False):
-            return backbone(
-                input_ids,
-                positions,
-                hidden_states,
-                intermediate_tensors,
-                inputs_embeds,
-                spec_step_idx=spec_step_idx,
-            )
+        # they must not inherit the target's partial-producer context. The
+        # speculator applies that context outside this compiled forward.
+        return backbone(
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=spec_step_idx,
+        )
 
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
