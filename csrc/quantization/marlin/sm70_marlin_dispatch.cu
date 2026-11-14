@@ -28,40 +28,11 @@
 #include <cuda_fp16.h>
 
 #include "marlin.cuh"
+#include "sm70_marlin_metadata.cuh"
 #include "core/registration.h"
 #include "core/scalar_type.hpp"
 
 namespace {
-
-__device__ __forceinline__ int sm70_inverse_zp_interleave(int idx,
-                                                          int num_bits) {
-  if (num_bits == 4) {
-    constexpr int inv[8] = {0, 4, 1, 5, 2, 6, 3, 7};
-    return inv[idx];
-  }
-  constexpr int inv[4] = {0, 2, 1, 3};
-  return inv[idx];
-}
-
-__device__ __forceinline__ int sm70_inverse_scale_perm(int idx, int perm_len) {
-  if (perm_len == 64) {
-    return (idx % 8) * 8 + idx / 8;
-  }
-  constexpr int inv[32] = {0,  1,  8,  9,  16, 17, 24, 25, 2,  3,  10,
-                           11, 18, 19, 26, 27, 4,  5,  12, 13, 20, 21,
-                           28, 29, 6,  7,  14, 15, 22, 23, 30, 31};
-  return inv[idx];
-}
-
-__global__ void sm70_unpermute_half_metadata_kernel(
-    const half* __restrict__ src, half* __restrict__ dst, int64_t total,
-    int perm_len) {
-  const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total) return;
-  const int64_t block = idx / perm_len;
-  const int pos = static_cast<int>(idx % perm_len);
-  dst[idx] = src[block * perm_len + sm70_inverse_scale_perm(pos, perm_len)];
-}
 
 __global__ void sm70_unpack_dense_zp_to_half_kernel(
     const int32_t* __restrict__ packed_zp, const half* __restrict__ scales,
@@ -95,20 +66,7 @@ torch::Tensor sm70_dense_scales_as_logical(torch::Tensor const& b_scales,
               "SM70 Marlin adapter expects fp16 scales.");
   const bool uses_group_perm =
       group_size < size_k && group_size != -1 && !is_a_8bit;
-  const int perm_len = uses_group_perm ? 64 : 32;
-  TORCH_CHECK(b_scales.numel() % perm_len == 0,
-              "SM70 Marlin scale metadata size is not divisible by ", perm_len);
-
-  auto out = torch::empty_like(b_scales);
-  const int64_t total = out.numel();
-  constexpr int threads = 256;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  sm70_unpermute_half_metadata_kernel<<<blocks, threads, 0,
-                                        at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const half*>(b_scales.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(out.data_ptr<at::Half>()), total, perm_len);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
+  return sm70_unpermute_half(b_scales, uses_group_perm ? 64 : 32);
 }
 
 torch::Tensor sm70_dense_zp_as_half(torch::Tensor const& b_zeros,
@@ -507,9 +465,8 @@ torch::Tensor marlin_gemm(
               "SM70 Marlin expects int32 packed weights.");
   TORCH_CHECK(!has_act_order,
               "act_order is not supported for the SM70 Marlin path.");
-  TORCH_CHECK(
-      !has_bias,
-      "SM70 Marlin does not support bias. TODO: add epilogue bias fusion.");
+  TORCH_CHECK(!has_bias || b_bias.scalar_type() == c.scalar_type(),
+              "SM70 Marlin expects the bias in the output dtype.");
   TORCH_CHECK((b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) ||
                   global_scale.numel() == 0,
               "SM70 Marlin supports global_scale only for "
@@ -522,83 +479,94 @@ torch::Tensor marlin_gemm(
   TORCH_CHECK(group_size == -1 || group_size > 0,
               "SM70 Marlin received invalid group_size = ", group_size);
 
-  if (b_type == vllm::kU4) {
-    TORCH_CHECK(size_k % 32 == 0,
-                "SM70 Marlin uint4 dense path requires size_k % 32 == 0.");
-    TORCH_CHECK(has_zp && zp_is_float,
-                "SM70 Marlin uint4 dense path requires fp16 zero points.");
-    return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales_kernel, b_zeros,
-                               size_m, size_n, size_k, group_size);
-  }
-
-  if (b_type == vllm::kU8) {
-    TORCH_CHECK(size_k % 32 == 0,
-                "SM70 Marlin uint8 dense path requires size_k % 32 == 0.");
-    TORCH_CHECK(has_zp && zp_is_float,
-                "SM70 Marlin uint8 dense path requires fp16 zero points.");
-    return sm70_marlin_u8_gemm(a, c, b_q_weight, b_scales_kernel, b_zeros,
-                               size_m, size_n, size_k, group_size);
-  }
-
-  if (b_type == vllm::kU8B128) {
-    TORCH_CHECK(size_k % 32 == 0,
-                "SM70 Marlin uint8b128 dense path requires size_k % 32 == 0.");
-    TORCH_CHECK(!has_zp && !is_zp_float,
-                "SM70 Marlin uint8b128 does not support "
-                "zero-point metadata.");
-    return sm70_marlin_u8b128_gemm(a, c, b_q_weight, b_scales_kernel, size_m,
-                                   size_n, size_k, group_size);
-  }
-
-  if (b_type == vllm::kFE4M3fn) {
-    TORCH_CHECK(size_k % 32 == 0,
-                "SM70 Marlin FP8 dense path requires size_k % 32 == 0.");
-    TORCH_CHECK(group_size == -1 || group_size == 128,
-                "SM70 Marlin FP8 supports only group_size -1 or "
-                "128. Got ",
-                group_size);
-    TORCH_CHECK(!has_zp && !is_zp_float,
-                "SM70 Marlin FP8 does not support zero-point "
-                "metadata.");
-    return sm70_marlin_fp8_gemm(a, c, b_q_weight, b_scales_kernel, size_m,
-                                size_n, size_k, group_size);
-  }
-
-  if (b_type == vllm::kFE2M1f) {
-    TORCH_CHECK(size_k % 32 == 0,
-                "SM70 Marlin FP4 dense path requires size_k % 32 == 0.");
-    TORCH_CHECK(!has_zp && !is_zp_float,
-                "SM70 Marlin FP4 does not support zero-point "
-                "metadata.");
-    if (s_type == vllm::kFE4M3fn) {
-      TORCH_CHECK(
-          global_scale.numel() == 1,
-          "the global_scale parameter must be passed for nvfp4 format.");
-      TORCH_CHECK(group_size == 16,
-                  "SM70 Marlin NVFP4 supports only group_size 16. "
-                  "Got ",
-                  group_size);
-      return sm70_marlin_nvfp4_gemm(a, c, b_q_weight, b_scales_kernel,
-                                    global_scale, size_m, size_n, size_k,
-                                    group_size);
+  // The kernels have no bias epilogue: add the bias to the finished output.
+  auto gemm = [&]() -> torch::Tensor {
+    if (b_type == vllm::kU4) {
+      TORCH_CHECK(size_k % 32 == 0,
+                  "SM70 Marlin uint4 dense path requires size_k % 32 == 0.");
+      TORCH_CHECK(has_zp && zp_is_float,
+                  "SM70 Marlin uint4 dense path requires fp16 zero points.");
+      return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales_kernel, b_zeros,
+                                 size_m, size_n, size_k, group_size);
     }
 
-    TORCH_CHECK(s_type == vllm::kFE8M0fnu,
-                "SM70 Marlin MXFP4 expects float8_e8m0fnu "
-                "MXFP4 scales.");
-    TORCH_CHECK(group_size == 32,
-                "SM70 Marlin MXFP4 supports only group_size 32 "
-                "when global_scale is not provided. Got ",
-                group_size);
-    return sm70_marlin_mxfp4_gemm(a, c, b_q_weight, b_scales_kernel, size_m,
-                                  size_n, size_k, group_size);
-  }
+    if (b_type == vllm::kU8) {
+      TORCH_CHECK(size_k % 32 == 0,
+                  "SM70 Marlin uint8 dense path requires size_k % 32 == 0.");
+      TORCH_CHECK(has_zp && zp_is_float,
+                  "SM70 Marlin uint8 dense path requires fp16 zero points.");
+      return sm70_marlin_u8_gemm(a, c, b_q_weight, b_scales_kernel, b_zeros,
+                                 size_m, size_n, size_k, group_size);
+    }
 
-  TORCH_CHECK(!has_zp && !is_zp_float,
-              "SM70 Marlin uint4b8 does not support zero-point "
-              "metadata.");
-  return sm70_marlin_u4b8_gemm(a, c, b_q_weight, b_scales_kernel, size_m,
-                               size_n, size_k, group_size);
+    if (b_type == vllm::kU8B128) {
+      TORCH_CHECK(
+          size_k % 32 == 0,
+          "SM70 Marlin uint8b128 dense path requires size_k % 32 == 0.");
+      TORCH_CHECK(!has_zp && !is_zp_float,
+                  "SM70 Marlin uint8b128 does not support "
+                  "zero-point metadata.");
+      return sm70_marlin_u8b128_gemm(a, c, b_q_weight, b_scales_kernel, size_m,
+                                     size_n, size_k, group_size);
+    }
+
+    if (b_type == vllm::kFE4M3fn) {
+      TORCH_CHECK(size_k % 32 == 0,
+                  "SM70 Marlin FP8 dense path requires size_k % 32 == 0.");
+      TORCH_CHECK(group_size == -1 || group_size == 128,
+                  "SM70 Marlin FP8 supports only group_size -1 or "
+                  "128. Got ",
+                  group_size);
+      TORCH_CHECK(!has_zp && !is_zp_float,
+                  "SM70 Marlin FP8 does not support zero-point "
+                  "metadata.");
+      return sm70_marlin_fp8_gemm(a, c, b_q_weight, b_scales_kernel, size_m,
+                                  size_n, size_k, group_size);
+    }
+
+    if (b_type == vllm::kFE2M1f) {
+      TORCH_CHECK(size_k % 32 == 0,
+                  "SM70 Marlin FP4 dense path requires size_k % 32 == 0.");
+      TORCH_CHECK(!has_zp && !is_zp_float,
+                  "SM70 Marlin FP4 does not support zero-point "
+                  "metadata.");
+      if (s_type == vllm::kFE4M3fn) {
+        TORCH_CHECK(
+            global_scale.numel() == 1,
+            "the global_scale parameter must be passed for nvfp4 format.");
+        TORCH_CHECK(group_size == 16,
+                    "SM70 Marlin NVFP4 supports only group_size 16. "
+                    "Got ",
+                    group_size);
+        return sm70_marlin_nvfp4_gemm(a, c, b_q_weight, b_scales_kernel,
+                                      global_scale, size_m, size_n, size_k,
+                                      group_size);
+      }
+
+      TORCH_CHECK(s_type == vllm::kFE8M0fnu,
+                  "SM70 Marlin MXFP4 expects float8_e8m0fnu "
+                  "MXFP4 scales.");
+      TORCH_CHECK(group_size == 32,
+                  "SM70 Marlin MXFP4 supports only group_size 32 "
+                  "when global_scale is not provided. Got ",
+                  group_size);
+      return sm70_marlin_mxfp4_gemm(a, c, b_q_weight, b_scales_kernel, size_m,
+                                    size_n, size_k, group_size);
+    }
+
+    TORCH_CHECK(!has_zp && !is_zp_float,
+                "SM70 Marlin uint4b8 does not support zero-point "
+                "metadata.");
+    return sm70_marlin_u4b8_gemm(a, c, b_q_weight, b_scales_kernel, size_m,
+                                 size_n, size_k, group_size);
+  };
+  torch::Tensor out = gemm();
+  if (has_bias) {
+    // Callers pass the bias in Marlin's single-scale order
+    // (marlin_permute_bias).
+    out.add_(sm70_unpermute_half(b_bias, 32));
+  }
+  return out;
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
