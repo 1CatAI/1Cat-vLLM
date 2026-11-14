@@ -1043,6 +1043,44 @@ class OpenAIServingChat(OpenAIServing):
                         )
                         # only check if there are any tool calls
                         # detected by partial parsing
+                        # Hold-back parsers that release ALL tool calls in one
+                        # final delta with full args (e.g. the DeepSeek-V4.1 DSML
+                        # engine parser) have already streamed every call in full.
+                        # The compensation below assumes the vanilla invariant that
+                        # the final delta carries only the LAST call's incremental
+                        # args tail and that it is safe to REPLACE the whole delta
+                        # with a single remaining-args call; given a multi-call
+                        # release delta it reads tool_calls[0] (the FIRST call),
+                        # trims the last call's streamed args by the wrong length,
+                        # and DROPS every other call. If the parser's own
+                        # bookkeeping says the last call's args were already
+                        # streamed in full, there is nothing to compensate: skip.
+                        if (
+                            should_check
+                            and tool_parser
+                            and auto_tools_called
+                            and 0 <= index < len(tool_parser.prev_tool_call_arr)
+                            and index < len(tool_parser.streamed_args_for_tool)
+                            and tool_parser.streamed_args_for_tool[index]
+                            == (
+                                tool_parser.prev_tool_call_arr[index].get(
+                                    "arguments", {}
+                                )
+                                if isinstance(
+                                    tool_parser.prev_tool_call_arr[index].get(
+                                        "arguments", {}
+                                    ),
+                                    str,
+                                )
+                                else json.dumps(
+                                    tool_parser.prev_tool_call_arr[index].get(
+                                        "arguments", {}
+                                    ),
+                                    ensure_ascii=False,
+                                )
+                            )
+                        ):
+                            should_check = False
                         if (
                             should_check
                             and tool_parser
