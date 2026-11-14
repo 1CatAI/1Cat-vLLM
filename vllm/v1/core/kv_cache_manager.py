@@ -38,6 +38,27 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
+class KVPartialHitDriftError(Exception):
+    """A partial-prefix hit no longer matches the entry it was redirected on.
+
+    `_redirect_partial_hit` verified that the request's blocks still ended with
+    the entry's blocks. Eviction (`_reclaim_partial_blocks`) has no in-flight
+    protection and frees the entry's blocks back to the pool for reuse, so the
+    tail block can change under a request between the hit and the redirect.
+    The check used to be an assert, which killed EngineCore for the whole
+    process. Raising this instead lets the scheduler drop the stale hit and
+    recompute the request from scratch: only the request is affected.
+    """
+
+    def __init__(self, request: Request, entry: PartialEntry):
+        self.request = request
+        self.entry = entry
+        self.key = entry.key
+        super().__init__(
+            f"partial hit drift: req={request.request_id} key={entry.key}"
+        )
+
+
 _V41_SESSION_PREFIX = envs.VLLM_V41_SESSION_PREFIX == "1"
 # Available rewind behind the last committed token, before rejected drafts.
 _V41_RING_REACH = 128
@@ -404,11 +425,21 @@ class KVCacheManager:
 
     def _redirect_partial_hit(self, request: Request, entry: PartialEntry) -> None:
         """Copy-on-write: continue the request on private copies."""
+        # Verify every group before writing anything: a drift found halfway
+        # through the loop would otherwise leave a half-updated request. On a
+        # mismatch the scheduler drops the hit and recomputes the request.
+        req_blocks_by_group = []
+        for group_id, manager in enumerate(self.coordinator.single_type_managers):
+            req_blocks = manager.req_to_blocks.get(request.request_id)
+            last = len(req_blocks) - 1 if req_blocks else -1
+            if last < 0 or req_blocks[last] is not entry.blocks[group_id][-1]:
+                raise KVPartialHitDriftError(request, entry)
+            req_blocks_by_group.append(req_blocks)
+
         sources = []
         for group_id, manager in enumerate(self.coordinator.single_type_managers):
-            req_blocks = manager.req_to_blocks[request.request_id]
+            req_blocks = req_blocks_by_group[group_id]
             last = len(req_blocks) - 1
-            assert req_blocks[last] is entry.blocks[group_id][-1]
             # Blocks before the last one are full and only read.
             manager.num_cached_block[request.request_id] = (
                 last if entry.copy_last[group_id] else last + 1

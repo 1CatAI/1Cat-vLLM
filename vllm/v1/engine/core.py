@@ -32,6 +32,7 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.cache import MultiModalCacheMissError
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -43,6 +44,7 @@ from vllm.utils.gc_utils import (
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.v1.core.kv_cache_manager import KVPartialHitDriftError
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -1601,7 +1603,17 @@ class EngineCoreProc(EngineCore):
         """Called only when there are unfinished local requests."""
 
         # Step the engine core.
-        outputs, model_executed = self.step_fn()
+        # Backstop: a partial-prefix drift that escapes the scheduler must not
+        # take EngineCore down. Recovery is a per-request recompute, so it is
+        # always safe to swallow here and stop this step.
+        try:
+            outputs, model_executed = self.step_fn()
+        except KVPartialHitDriftError as e:
+            try:
+                self.scheduler._recover_partial_hit_drift(e.request, e.entry)
+            except Exception:
+                logger.exception("partial hit drift recovery failed")
+            return False
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
@@ -1843,6 +1855,9 @@ class EngineCoreProc(EngineCore):
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
                             request = self.preprocess_add_request(req)
+                        except MultiModalCacheMissError as e:
+                            self._handle_mm_cache_miss(req, e)
+                            continue
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
@@ -1925,6 +1940,26 @@ class EngineCoreProc(EngineCore):
                 elif len(reuse_buffers) < max_reuse_bufs:
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
+
+    def _handle_mm_cache_miss(
+        self, request: EngineCoreRequest, err: MultiModalCacheMissError
+    ) -> None:
+        """Fail a request whose multi-modal items are missing from the engine
+        cache although the frontend sent them without data (P0/P1 drift).
+
+        The frontend drops the items it sent without data for a request that
+        fails, so a retry sends them again. Expected after a request that was
+        rendered but rejected before it reached the engine, so this logs a
+        warning rather than a traceback.
+        """
+        logger.warning(
+            "Multi-modal items %s of request %s are not in the engine cache "
+            "(frontend/engine cache drift); failing the request so that a "
+            "retry sends their data again.",
+            err.mm_hashes,
+            request.request_id,
+        )
+        self._send_error_outputs_to_client([request.request_id], request.client_index)
 
     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
         """Log and return a request-scoped error response for exceptions raised
