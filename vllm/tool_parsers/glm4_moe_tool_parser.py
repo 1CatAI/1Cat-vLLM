@@ -394,9 +394,11 @@ class Glm4MoeModelToolParser(ToolParser):
                     escaped = self._json_escape_string_content(partial_content)
                     # Open quote but no close — more content may arrive
                     parts.append(f'{key_json}: "{escaped}')
-                else:
-                    # Non-string partial: include raw content, no wrapping
-                    parts.append(f"{key_json}: {partial_content}")
+                # A non-string value is held back until </arg_value> closes it:
+                # its JSON form (json.dumps of the deserialized value) can differ
+                # from the raw text (True -> true, plain text -> a quoted
+                # string), and every streamed delta must stay a prefix of the
+                # arguments extract_tool_calls returns at the finish.
 
         if not parts:
             return "{}" if is_complete else ""
