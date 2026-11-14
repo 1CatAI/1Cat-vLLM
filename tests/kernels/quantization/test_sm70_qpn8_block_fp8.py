@@ -309,14 +309,16 @@ def test_concurrent_streams_keep_their_own_prefill_buffer(
 def test_volta_medium_prefill_keeps_original_turbomind_output(default_vllm_config, m):
     if torch.cuda.get_device_capability()[0:2] not in ((7, 0), (7, 2)):
         pytest.skip("Volta retains the TurboMind fallback layout")
-    from vllm import _sm70_ops as ops
 
     layer, _ = _layer(1536, 4096)
     kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(1536, 4096))
     kernel.process_weights_after_loading(layer)
     x = torch.randn(m, 4096, device="cuda", dtype=torch.float16)
     expected = torch.empty((m, 1536), device="cuda", dtype=torch.float16)
-    ops.fp8_gemm_sm70_out(
+    # The kernel calls the original operator with its bound native policy.
+    # TurboMind keeps one dispatch cache per policy, so the reference uses the
+    # same binding instead of the process-wide legacy one.
+    kernel.native_ops.fp8_gemm_sm70_out(
         expected,
         x,
         layer._sm70_block_fp8_turbomind_packed_weight,

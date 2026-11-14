@@ -4,6 +4,7 @@
 import pytest
 
 import vllm.model_executor.layers.quantization.awq_sm70_moe as awq_sm70_moe
+from vllm.config.sm70_moe import Sm70MoEFormatConfig
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -97,10 +98,7 @@ def test_persistent_max_tokens_for_runtime(
         "get_current_vllm_config_or_none",
         lambda: config,
     )
-    monkeypatch.setattr(
-        awq_sm70_moe.envs,
-        "VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS",
-        override,
-    )
+    # The override is the captured engine policy that _allocate_buffers passes.
+    policy = Sm70MoEFormatConfig(persistent_tokens=override)
 
-    assert awq_sm70_moe._persistent_max_tokens_for_runtime() == expected
+    assert awq_sm70_moe._persistent_max_tokens_for_runtime(policy) == expected

@@ -32,11 +32,25 @@ def test_feature_fields_have_one_owner_and_are_layer_local():
 def test_verifier_configuration_preserves_short_circuit_reads(monkeypatch, available):
     reads = []
 
-    def registered(name):
-        reads.append(name)
-        return 32768 if name.endswith("MIN_MODEL_LEN") else True
+    # The switches are read from the engine's Flash-V100 policy and options.
+    class Policy:
+        @property
+        def grouped_verify(self):
+            reads.append("grouped_verify")
+            return True
 
-    monkeypatch.setattr(attention_policy._config, "registered", registered)
+        @property
+        def grouped_verify_min_model_len(self):
+            reads.append("grouped_verify_min_model_len")
+            return 32768
+
+    class Options:
+        def value(self, name):
+            reads.append(name)
+            return True
+
+    monkeypatch.setattr(attention_policy, "flash_v100_policy", Policy)
+    monkeypatch.setattr(attention_policy._config, "options", Options)
     monkeypatch.setattr(
         attention_policy.current_platform, "is_device_capability", lambda _: True
     )
@@ -52,12 +66,12 @@ def test_verifier_configuration_preserves_short_circuit_reads(monkeypatch, avail
     assert state.dflash2_grouped_verify_min_model_len == 32768
     assert reads == (
         [
-            "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY",
-            "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY",
-            "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN",
+            "grouped_verify",
+            "dflash2_batched_grouped_verify",
+            "grouped_verify_min_model_len",
         ]
         if available
-        else ["VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN"]
+        else ["grouped_verify_min_model_len"]
     )
 
 

@@ -85,10 +85,16 @@ def test_sm70_gdn_qpn8_ba_weight_contract_is_layout_based(input_width) -> None:
         weight=torch.empty((24, input_width), dtype=torch.float16, device="meta"),
         bias=None,
     )
+    # One TP rank with 4 key and 12 value heads of 128: the shard widths the
+    # contract derives from the model (4392c5853) match the operator shapes.
     layer = SimpleNamespace(
         enable_sm70_gdn_qpn8_ba_split=True,
         in_proj_qkvz=qkvz,
         in_proj_ba=ba,
+        num_v_heads=12,
+        tp_size=1,
+        key_dim=4 * 128,
+        value_dim=12 * 128,
     )
 
     assert gdn._sm70_gdn_qpn8_ba_weight_contract(layer)

@@ -22,7 +22,11 @@ from vllm.v1.core.sched.pp_keep_batch import (
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
-from .utils import create_requests, create_scheduler
+from .utils import (
+    create_requests,
+    create_scheduler,
+    pretend_gpus_without_capability,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -32,12 +36,8 @@ KNOB = "VLLM_PP_KEEP_BATCH"
 @pytest.fixture
 def two_devices(monkeypatch):
     # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
-    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
     # CPU scheduler fixtures have no physical capability for simulated PP ranks.
-    monkeypatch.setattr(
-        "vllm.config.parallel.current_platform.get_device_capability",
-        lambda device_id=0: None,
-    )
+    pretend_gpus_without_capability(monkeypatch, 2)
 
 
 def _knob(monkeypatch, value: str | None) -> None:

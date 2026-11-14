@@ -16,6 +16,9 @@ def test_gguf_policy_is_enabled_and_part_of_the_graph_contract():
     assert default.sm70_gguf.enabled
     assert default.sm70_gguf.prefill_min_m == 8
     disabled = KernelConfig(sm70_gguf=Sm70GgufConfig(enabled=False))
+    # Only a loaded GGUF provider salts the graph key (GGUFConfig.get_quant_method).
+    for kernel in (default, disabled):
+        kernel.sm70_gguf.active = True
     assert default.compute_hash() != disabled.compute_hash()
     assert linear_policy_report(default)["sm70_gguf"]["configuration"]["enabled"]
     with pytest.raises(ValueError, match="positive"):

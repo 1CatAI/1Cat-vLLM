@@ -59,7 +59,8 @@ def setup_functions(tmp_path):
     [
         (None, None, "7.0"),
         ("7.2", None, "7.2"),
-        ("7.0;7.2;7.5", None, "7.0;7.2"),
+        # f2674c58c builds the grouped page4 QSA routes for Turing as well.
+        ("7.0;7.2;7.5", None, "7.0;7.2;7.5"),
         ("7.2+PTX;8.0", None, "7.2+PTX"),
         ("7.2", "7.0", "7.0"),
     ],

@@ -146,15 +146,16 @@ def test_warmup_reuses_active_op_and_runtime_policy(monkeypatch, strict):
     monkeypatch.setattr(
         torch.ops._C, "awq_moe_dense_stage_sm70_out", object(), raising=False
     )
+    # The warmup calls these through NativeBindings, which adds native_policy=.
     monkeypatch.setattr(
         warmup.sm70_ops,
         "awq_moe_dense_stage_sm70_out",
-        lambda *a: dense_calls.append(a),
+        lambda *a, **k: dense_calls.append(a),
     )
     monkeypatch.setattr(
         warmup.sm70_ops,
         "awq_moe_active_dense_stage_sm70_out",
-        lambda *a: active_calls.append(a),
+        lambda *a, **k: active_calls.append(a),
     )
     monkeypatch.setattr(warmup, "_silu_and_mul_w13", lambda *a: None)
     assert warmup._warmup_moe_dense_stage_layers([layer], [1, 2, 4, 8, 9]) == 10

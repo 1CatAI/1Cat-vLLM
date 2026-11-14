@@ -11,7 +11,6 @@ node that mixes Volta and Turing.
 """
 
 import pytest
-import torch
 
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _sm70_current_device_is_volta,
@@ -25,12 +24,16 @@ def devices(monkeypatch):
 
     def _apply(capabilities: dict[int, tuple[int, int]], current: int):
         monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+        # device_id=None answers for the worker's selected device
+        # (CudaPlatformBase.resolve_device_id); an explicit index for that card.
         monkeypatch.setattr(
             current_platform,
             "is_device_capability",
-            lambda capability, device_id=0: capabilities.get(device_id) == capability,
+            lambda capability, device_id=None: (
+                capabilities.get(current if device_id is None else device_id)
+                == capability
+            ),
         )
-        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: current)
 
     return _apply
 

@@ -111,6 +111,8 @@ def test_existing_disable_switch_still_selects_the_base_communicator(monkeypatch
     transport = module.CudaCommunicator.__new__(module.CudaCommunicator)
     transport._pynccl_strided_gather = True
     transport.pynccl_comm = SimpleNamespace(disabled=False)
+    # No custom all-reduce, so the all-reduce gather of 9fbc11c6f stays out.
+    transport.ca_comm = None
     value, expected = torch.ones(2, 3), torch.empty(2, 12)
     calls: list[tuple[object, torch.Tensor, int]] = []
 

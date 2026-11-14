@@ -5,11 +5,13 @@ import asyncio
 import os
 from collections.abc import Callable
 from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
+from vllm.config.execution_policy import PlePlacementPolicy
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.sampling_params import SamplingParams
@@ -53,12 +55,6 @@ def test_uniproc_executor_starts_ple_worker_around_model_load(monkeypatch):
         "WorkerWrapperBase",
         MagicMock(return_value=driver_worker),
     )
-    monkeypatch.setattr(uniproc_executor_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
-    monkeypatch.setattr(
-        uniproc_executor_module.envs,
-        "VLLM_SM70_QWEN38_HYBRID_PLE",
-        False,
-    )
     monkeypatch.setattr(
         uniproc_executor_module.envs,
         "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH",
@@ -72,7 +68,10 @@ def test_uniproc_executor_starts_ple_worker_around_model_load(monkeypatch):
     monkeypatch.setattr(uniproc_executor_module, "current_platform", MagicMock())
 
     executor = UniProcExecutor.__new__(UniProcExecutor)
-    executor.vllm_config = object()
+    # The executor reads the engine's resolved PLE placement policy.
+    executor.vllm_config = SimpleNamespace(
+        offload_config=SimpleNamespace(ple=PlePlacementPolicy(cpu=True, hybrid=False))
+    )
     monkeypatch.setattr(executor, "_distributed_args", lambda: ("local://", 0, 0))
 
     executor._init_executor()
@@ -93,12 +92,6 @@ def test_uniproc_executor_delays_hybrid_ple_spawn(monkeypatch):
         "WorkerWrapperBase",
         MagicMock(return_value=driver_worker),
     )
-    monkeypatch.setattr(uniproc_executor_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
-    monkeypatch.setattr(
-        uniproc_executor_module.envs,
-        "VLLM_SM70_QWEN38_HYBRID_PLE",
-        True,
-    )
     monkeypatch.setattr(
         uniproc_executor_module.envs,
         "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH",
@@ -112,7 +105,10 @@ def test_uniproc_executor_delays_hybrid_ple_spawn(monkeypatch):
     monkeypatch.setattr(uniproc_executor_module, "current_platform", MagicMock())
 
     executor = UniProcExecutor.__new__(UniProcExecutor)
-    executor.vllm_config = object()
+    # The executor reads the engine's resolved PLE placement policy.
+    executor.vllm_config = SimpleNamespace(
+        offload_config=SimpleNamespace(ple=PlePlacementPolicy(cpu=True, hybrid=True))
+    )
     monkeypatch.setattr(executor, "_distributed_args", lambda: ("local://", 0, 0))
 
     executor._init_executor()

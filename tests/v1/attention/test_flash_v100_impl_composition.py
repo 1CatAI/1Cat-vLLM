@@ -733,6 +733,22 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
         "__init__",
         "_flash_v100_decode",
         "_run_prefill_prefix_decode_rows",
+        # c8efae47b reads options, traces and diagnostics from the engine policy.
+        "_flash_v100_ddtree_small_query_prefill_dense",
+        "_flash_v100_prefill_with_prefix",
+        "_maybe_write_triton_tensor_dump",
+        "_prefill_prefix_decode_rows_allowed",
+        "_run_prefill_paged_call",
+        "_should_use_prefill_gather_dense",
+        "_write_bhmd_compare_report",
+        "_write_triton_compare_report",
+        # #1287 reserves the long-prefix workspaces in the profiling forward;
+        # #1298 adds split-KV to the FP8 prefix bridge.
+        "forward",
+        "_run_fp8_prefill_bridge",
+        "_should_use_fp8_prefill_bridge",
+        # c6ae9c5d7 calls the grouped FP16 verifier once per KV head.
+        "_call_flash_attn_smallq_decode_paged",
     }
     assert actual.keys() == fixture.keys()
     assert {k: v for k, v in actual.items() if k not in changed_policy} == {

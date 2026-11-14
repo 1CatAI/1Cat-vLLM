@@ -26,11 +26,15 @@ def test_teacher_reads_unmasked_full_logits_once_after_verifier(tmp_path, rank):
         calls.append(x.clone())
         return torch.arange(7).reshape(1, 7).float()
 
+    # Rank 0 also samples PLE result buffers and host KV rows; this runner has none.
     runner = SimpleNamespace(
         execute_model=lambda: None,
         vocab_size=7,
-        model=SimpleNamespace(compute_logits=head),
-        execute_model_state=SimpleNamespace(input_batch=batch, hidden_states=hidden),
+        model=SimpleNamespace(compute_logits=head, named_modules=lambda: ()),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        execute_model_state=SimpleNamespace(
+            input_batch=batch, hidden_states=hidden, slot_mappings_by_layer=None
+        ),
     )
     worker = GGUFTeacherWorkerExtension()
     worker.rank, worker.model_runner = rank, runner

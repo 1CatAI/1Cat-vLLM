@@ -16,6 +16,7 @@ from compressed_tensors.quantization import (
 )
 
 from tests.models.utils import check_logprobs_close
+from tests.utils import create_new_process_for_each_test
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.device import DeviceConfig
 from vllm.model_executor.kernels.linear import (
@@ -73,6 +74,28 @@ ROCM_TRITON_SCALED_MM_SUPPORTED_INT8_MODEL = [
 ]
 
 
+def _cuda_below(capability: int) -> bool:
+    return current_platform.is_cuda() and not current_platform.has_device_capability(
+        capability
+    )
+
+
+# Each scheme states the oldest CUDA GPU it admits. Volta (SM70) has no INT8 or
+# FP8 GEMM and admits weight-only INT4/INT8 only through opt-in SM70 backends.
+requires_int8_w8a8 = pytest.mark.skipif(
+    _cuda_below(CompressedTensorsW8A8Int8.get_min_capability()),
+    reason="INT8 W8A8 needs a GPU with INT8 GEMM (SM75 or newer).",
+)
+requires_wna16 = pytest.mark.skipif(
+    _cuda_below(CompressedTensorsWNA16.get_min_capability()),
+    reason="The weight-only INT4/INT8 scheme does not admit this GPU.",
+)
+requires_fp8_w8a8 = pytest.mark.skipif(
+    _cuda_below(CompressedTensorsW8A8Fp8.get_min_capability()),
+    reason="FP8 W8A8 needs a GPU with FP8 GEMM (SM89 or newer).",
+)
+
+
 @pytest.fixture(scope="function", autouse=True)
 def enable_pickle(monkeypatch):
     """`LLM.apply_model` requires pickling a function."""
@@ -98,6 +121,7 @@ def enable_pickle(monkeypatch):
         ),
     ],
 )
+@requires_int8_w8a8
 def test_compressed_tensors_w8a8_static_setup(vllm_runner, model_args):
     model_path, strategy, quant_type, shape_0, is_symmetric = model_args
 
@@ -169,6 +193,10 @@ def test_compressed_tensors_w8a8_static_setup(vllm_runner, model_args):
 @pytest.mark.parametrize(
     "use_aiter", [True, False] if current_platform.is_rocm() else [False]
 )
+@requires_int8_w8a8
+@pytest.mark.skipif(
+    _cuda_below(80), reason="The comparison runs in bfloat16 (SM80 or newer)."
+)
 def test_compressed_tensors_w8a8_logprobs(
     hf_runner,
     vllm_runner,
@@ -221,6 +249,7 @@ def test_compressed_tensors_w8a8_logprobs(
         torch.accelerator.synchronize()
 
 
+@requires_int8_w8a8
 def test_compressed_tensors_no_enforce_eager(vllm_runner):
     model_path = "nm-testing/tinyllama-oneshot-w8w8-test-static-shape-change"
     with vllm_runner(model_path) as llm:
@@ -241,6 +270,7 @@ def test_compressed_tensors_no_enforce_eager(vllm_runner):
 @pytest.mark.parametrize(
     "use_aiter", [True, False] if current_platform.is_rocm() else [False]
 )
+@requires_int8_w8a8
 def test_compressed_tensors_w8a8_dynamic_per_token(
     vllm_runner,
     model_args,
@@ -304,6 +334,7 @@ def test_compressed_tensors_w8a8_dynamic_per_token(
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="The tests are skipped on non-CUDA platform."
 )
+@requires_wna16
 def test_compressed_tensors_wNa16(vllm_runner, wNa16_args):
     model, strategy, group, pack_factor, symmetric, has_g_idx = wNa16_args
     with vllm_runner(model, enforce_eager=True) as llm:
@@ -343,9 +374,9 @@ def test_compressed_tensors_fp8(vllm_runner):
                 (CompressedTensorsW8A8Fp8, CompressedTensorsW8A16Fp8),
             )
 
-            assert qkv_proj.input_scale.dtype is torch.float32
-
+            # Weight-only W8A16 (GPUs without FP8 GEMM) drops the input scale.
             if isinstance(qkv_proj.scheme, CompressedTensorsW8A8Fp8):
+                assert qkv_proj.input_scale.dtype is torch.float32
                 assert len(qkv_proj.input_scale.shape) == 0
                 assert qkv_proj.weight.dtype is current_platform.fp8_dtype()
                 assert qkv_proj.weight_scale.dtype is torch.float32
@@ -471,6 +502,7 @@ def test_compressed_tensors_w4a8_fp8(vllm_runner, args):
         ),
     ],
 )
+@requires_wna16
 def test_compressed_tensors_transforms_perplexity(
     vllm_runner, model, prompt, exp_perplexity
 ):
@@ -480,6 +512,7 @@ def test_compressed_tensors_transforms_perplexity(
         assert perplexity <= exp_perplexity
 
 
+@requires_fp8_w8a8
 def test_compressed_tensors_fp8_block_enabled(vllm_runner):
     model_path = "RedHatAI/Qwen3-0.6B-FP8-BLOCK"
     with vllm_runner(model_path, enforce_eager=True) as llm:
@@ -515,6 +548,7 @@ def test_compressed_tensors_fp8_block_enabled(vllm_runner):
     not current_platform.is_cuda(),
     reason="This test is not for non-CUDA platforms",
 )
+@requires_wna16
 def test_compressed_tensors_moe_ignore_with_model(vllm_runner):
     """
     Integration test for MoE layer ignore functionality with a real model.
@@ -558,6 +592,7 @@ def test_compressed_tensors_moe_ignore_with_model(vllm_runner):
         assert output
 
 
+@requires_wna16
 def test_w4a16_moe_torch_compile(vllm_runner):
     """Regression test: MoE quant_config must be initialized inside the
     moe_forward custom op, not just in forward_native which is compiled by
@@ -626,6 +661,10 @@ def _make_qwen3_coder_awq4_config() -> CompressedTensorsConfig:
     )
 
 
+# The CPU post-load runs OpenMP regions in the test process. GNU OpenMP is not
+# fork-safe: a later test that forks an EngineCore from that process hangs in
+# its first parallel CPU op, so the CPU work runs in a process of its own.
+@create_new_process_for_each_test()
 def test_qwen3_coder_awq4_moe_postload_does_not_require_sm70_hidden_size(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -684,6 +723,7 @@ def test_qwen3_coder_awq4_moe_postload_does_not_require_sm70_hidden_size(
     assert layer.workspace.numel() == 0
 
 
+@requires_wna16
 def test_get_quant_method_returns_linear_method_for_parallel_lm_head():
     """ParallelLMHead whose name matches a target must get a quantised method."""
     config = _make_ct_config(target="re:.*lm_head")

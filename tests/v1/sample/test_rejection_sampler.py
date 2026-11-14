@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 import vllm.v1.sample.rejection_sampler as rejection_sampler_module
 from tests.v1.sample.utils import create_allowed_token_ids
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import BatchUpdate, LogitsProcessors
@@ -1386,6 +1387,9 @@ def _make_synthetic_sampler(rates: list[float]) -> RejectionSampler:
     spec_config = Mock()
     spec_config.rejection_sample_method = "synthetic"
     spec_config.synthetic_acceptance_rates = rates
+    # The sampler reads its per-engine policy from the config; a Mock attribute
+    # would admit token matching and break the dynamic-tail comparison.
+    spec_config.sampling_policy = SpeculativeSamplingPolicy()
     return RejectionSampler(mock_sampler, spec_config, torch.device(DEVICE_TYPE))
 
 

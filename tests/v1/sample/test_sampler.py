@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 import torch
 
-import vllm.envs as envs
 from tests.v1.sample.utils import create_allowed_token_ids
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -27,7 +26,8 @@ MAX_NUM_PROMPT_TOKENS = 64
 
 
 def test_sm70_compact_topk20_metadata_gate(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(envs, "VLLM_SM70_COMPACT_TOPK20_SAMPLER", True)
+    # The standalone layer execution policy reads its switch from the environment.
+    monkeypatch.setenv("VLLM_SM70_COMPACT_TOPK20_SAMPLER", "1")
     metadata = _create_default_sampling_metadata(
         num_output_tokens=0,
         batch_size=1,

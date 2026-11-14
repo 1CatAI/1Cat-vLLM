@@ -59,6 +59,28 @@ def pretend_gpu_count(monkeypatch: pytest.MonkeyPatch, count: int) -> None:
     )
 
 
+def pretend_gpus_without_capability(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    """Let a CPU scheduler test build a config for GPUs that report no capability.
+
+    No runtime default then takes a device-specific route. The defaults probe
+    every participating GPU through is_device_capability, which the platform
+    answers from its own class, so that probe is replaced as well.
+    """
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_count", lambda: count)
+    monkeypatch.setattr(
+        current_platform, "get_device_capability", lambda device_id=None: None
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability",
+        lambda capability, device_id=None: False,
+    )
+
+
 def create_scheduler(
     model: str = "facebook/opt-125m",
     max_num_seqs: int = 16,

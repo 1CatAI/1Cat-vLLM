@@ -263,7 +263,10 @@ def test_adaptive_lookup_rejects_explicit_async_scheduling(monkeypatch) -> None:
 
 def test_dflash_forces_v2_and_rejects_explicit_v1(monkeypatch) -> None:
     fake = SimpleNamespace(
-        speculative_config=SimpleNamespace(use_dflash=lambda: True),
+        # No reduced draft vocabulary: only DFlash asks for Model Runner V2.
+        speculative_config=SimpleNamespace(
+            use_dflash=lambda: True, draft_token_map=None
+        ),
         model_config=None,
     )
     monkeypatch.setattr("vllm.config.vllm.envs.VLLM_USE_V2_MODEL_RUNNER", None)

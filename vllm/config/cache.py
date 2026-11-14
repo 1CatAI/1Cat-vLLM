@@ -148,8 +148,8 @@ class CacheConfig:
     CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports
     fp8 (=fp8_e4m3). Intel Gaudi (HPU) supports fp8 (using fp8_inc).
     On SM70 with the 1Cat Flash-V100 backend enabled, the user-facing ``fp8``
-    shorthand resolves to fp8_e5m2 for compatibility with its optimized KV
-    path; explicit fp8_e4m3 keeps the upstream E4M3 behavior.
+    shorthand resolves to fp8_e4m3; explicit fp8_e5m2 requests the legacy E5M2
+    KV storage.
     Some models (namely DeepSeekV3.2) default to fp8, set to bfloat16 to use
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.

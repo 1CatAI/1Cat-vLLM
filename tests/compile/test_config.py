@@ -21,7 +21,7 @@ from vllm.config import (
 )
 from vllm.config.compilation import CompilationMode, PassConfig
 from vllm.engine.arg_utils import EngineArgs
-from vllm.platforms import current_platform
+from vllm.platforms import current_platform, runtime_defaults
 from vllm.utils.torch_utils import (
     _is_torch_equal_or_newer,
     is_torch_equal,
@@ -433,9 +433,17 @@ def test_cudagraph_sizes_post_init(
     if expected_max_size == ValidationError:
         ctx = pytest.raises(expected_max_size)
 
+    # These cases pin the generic sizing. On Volta and Turing the SM70 runtime
+    # defaults replace it with decode shapes (tests/config/
+    # test_sm70_compilation_policy.py), so keep them out of this test.
     with (
         ctx,
         patch.object(current_platform, "device_count", return_value=tp_size),
+        patch.object(
+            runtime_defaults,
+            "_any_participating_device_is_capability",
+            return_value=False,
+        ),
     ):
         kwargs = {}
         if cudagraph_capture_sizes is not None:
@@ -637,6 +645,10 @@ def test_sequence_parallelism_requires_full_graph_compilation(
     ) == expected_enable_sp
 
 
+@pytest.mark.skipif(
+    current_platform.is_cuda() and not current_platform.has_device_capability(80),
+    reason="Inductor does not compile bfloat16 below SM80",
+)
 def test_cached_compilation_config(default_vllm_config):
     import torch
     from torch._inductor.utils import run_and_get_code

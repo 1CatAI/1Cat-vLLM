@@ -134,9 +134,13 @@ def test_prepare_inputs_padded_does_not_alias_target_seq_lens():
     original_dcp_lens = common_attn_metadata.dcp_local_seq_lens.clone()
     original_upper_bound = common_attn_metadata.seq_lens_cpu_upper_bound.clone()
 
+    # The engine's sampling policy keeps the exact CPU shadow off by default.
+    proposer = SimpleNamespace(
+        _sampling_policy=SimpleNamespace(exact_draft_seq_lens_cpu=False)
+    )
     output_metadata, _, num_rejected_tokens_gpu = (
         SpecDecodeBaseProposer.prepare_inputs_padded(
-            None,
+            proposer,
             common_attn_metadata,
             spec_decode_metadata,
             valid_sampled_tokens_count,

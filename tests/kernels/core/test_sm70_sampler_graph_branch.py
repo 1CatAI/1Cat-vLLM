@@ -139,10 +139,12 @@ def test_live_rejection_branches_match_dense_distribution(use_fp64):
             top_ps,
             expanded,
             flags,
+            values,  # floors: unused without penalties (has_floor=False)
             values.stride(0),
             64,
             20,
             64,
+            False,
             num_warps=1,
         )
         return values, ids

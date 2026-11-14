@@ -384,6 +384,10 @@ def test_scaled_fp8_quant(dtype) -> None:
     current_platform.is_fp8_fnuz(),
     reason="FP8 e4m3fn weight reloading is not supported on e4m3fnuz platforms",
 )
+@pytest.mark.skipif(
+    current_platform.is_cuda() and not current_platform.supports_fp8(),
+    reason="Without FP8 GEMM the weights take the Marlin repack this test excludes.",
+)
 @pytest.mark.parametrize("method_cls", [Fp8LinearMethod, Fp8MoEMethod])
 # FP8 weight reloading does not support online quantization
 @pytest.mark.parametrize("is_checkpoint_fp8_serialized", [True])  # skip False
@@ -590,10 +594,13 @@ def test_kv_cache_dtype_skip_layers(vllm_runner, monkeypatch):
         kv_cache_dtype_skip_layers=["0", "2"],
         enforce_eager=True,
     ) as llm:
+        # SM70 Flash-V100 resolves the fp8 alias to its E4M3 name.
+        kv_cache_dtype = llm.llm.llm_engine.vllm_config.cache_config.cache_dtype
+        assert kv_cache_dtype in ("fp8", "fp8_e4m3")
 
         def check_layers(model):
             for i, layer in enumerate(model.model.decoder.layers):
-                expected = "auto" if str(i) in ["0", "2"] else "fp8"
+                expected = "auto" if str(i) in ["0", "2"] else kv_cache_dtype
                 assert layer.self_attn.attn.kv_cache_dtype == expected
 
         llm.apply_model(check_layers)

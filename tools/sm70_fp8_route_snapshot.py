@@ -23,6 +23,7 @@ from vllm.config.kernel import KernelConfig
 from vllm.model_executor.kernels import linear
 from vllm.model_executor.kernels.linear.scaled_mm import sm70_fp8
 from vllm.model_executor.layers.quantization import fp8
+from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces
 from vllm.platforms import PlatformEnum
 from vllm.platforms.interface import DeviceCapability
 
@@ -35,6 +36,28 @@ ROLES = {
     "down_proj": (17408, 5120),
 }
 M_VALUES = (1, 4, 8, 16, 4096, 8192)
+
+
+class PlanOnlyNativeBindings:
+    """Native bindings without policy arguments, for the meta/native doubles.
+
+    The doubles have no policy-argument ABI, so a real NativeBindings refuses
+    the captured engine policy. The snapshot records routes and scalar plans;
+    tests/quantization/test_sm70_native_policy.py covers the policy binding.
+    """
+
+    values: tuple[str, ...] = ()
+    arguments: tuple[str, ...] = ()
+    owner = None
+
+    def __init__(self, values=()):
+        del values
+
+    def invoke(self, operation, *args, **kwargs):
+        return operation(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(_sm70_ops, name)
 
 
 def load_baseline(ref, directory):
@@ -250,10 +273,18 @@ def probe(module, cfg, role, k, n, *, missing_qpn8=False, workspace=True, bmm=Fa
                     record("prescaled_prefill"),
                 ),
                 patch.object(torch.ops, "_C", native),
+                patch.object(
+                    sm70_layer_workspaces, "NativeBindings", PlanOnlyNativeBindings
+                ),
                 patch.object(torch.ops, "vllm", opaque),
             )
             for context in contexts:
                 stack.enter_context(context)
+            # A baseline module loaded from an older ref may predate the bindings.
+            if hasattr(target, "NativeBindings"):
+                stack.enter_context(
+                    patch.object(target, "NativeBindings", PlanOnlyNativeBindings)
+                )
             quant = module.Fp8Config(True, "dynamic", weight_block_size=[128, 128])
             quant.use_deep_gemm = False
             method = module.Fp8LinearMethod(quant)

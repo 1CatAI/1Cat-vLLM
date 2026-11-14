@@ -139,22 +139,21 @@ def test_expert_bank_retains_complete_tp_rows_and_counts_storage(
             ),
         ),
     )
-    monkeypatch.setattr(
-        torch.ops,
-        "_C",
-        SimpleNamespace(
-            gguf_lattice_sm70_prepare=lambda codes, stats, *args: (
-                codes,
-                stats,
-                torch.tensor([1, 2, 3, 4]),
-            ),
-            awq_moe_build_strided_ptrs=lambda *args: (
-                torch.empty(2, dtype=torch.uint8),
-                torch.empty(2, dtype=torch.uint8),
-            ),
-            gguf_lattice_grouped_gemm_sm70_out=object(),
+    # Stub single ops: the bank binds its native policy against the real _C ABI.
+    stubs = {
+        "gguf_lattice_sm70_prepare": lambda codes, stats, *args: (
+            codes,
+            stats,
+            torch.tensor([1, 2, 3, 4]),
         ),
-    )
+        "awq_moe_build_strided_ptrs": lambda *args: (
+            torch.empty(2, dtype=torch.uint8),
+            torch.empty(2, dtype=torch.uint8),
+        ),
+        "gguf_lattice_grouped_gemm_sm70_out": object(),
+    }
+    for name, stub in stubs.items():
+        monkeypatch.setattr(torch.ops._C, name, stub, raising=False)
     _, block_bytes = quant_size(kind)
     sources = np.random.default_rng(kind).integers(
         0, 256, (2, 128, block_bytes), dtype=np.uint8
