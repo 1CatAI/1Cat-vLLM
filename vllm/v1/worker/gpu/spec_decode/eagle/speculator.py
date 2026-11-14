@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
@@ -386,12 +387,24 @@ class EagleSpeculator(TargetSamplingHooks):
                 )
                 inputs_embeds = self.inputs_embeds[:num_tokens]
 
-            ret_hidden_states = self.model(
-                input_ids=self.input_buffers.input_ids[:num_tokens],
-                positions=self.input_buffers.positions[:num_tokens],
-                hidden_states=self.hidden_states[:num_tokens],
-                inputs_embeds=inputs_embeds,
-            )
+            # Applied outside the compiled MTP forward: the compiled path must
+            # not call ContextVar.set. Invariants: (1) the var defaults to False,
+            # (2) _hc_prefill_sequence_qualified is set in __init__ (not lazy),
+            # (3) this is the only call site of the compiled MTP forward.
+            hc_ctx = nullcontext()
+            if hasattr(self.model, "_hc_prefill_sequence_qualified"):
+                from vllm.models.qwen4_exp.nvidia.sm70_hcx import (
+                    hc_prefill_sequence_parallel_context,
+                )
+
+                hc_ctx = hc_prefill_sequence_parallel_context(False)
+            with hc_ctx:
+                ret_hidden_states = self.model(
+                    input_ids=self.input_buffers.input_ids[:num_tokens],
+                    positions=self.input_buffers.positions[:num_tokens],
+                    hidden_states=self.hidden_states[:num_tokens],
+                    inputs_embeds=inputs_embeds,
+                )
         # Some MTP models declare a single-tensor contract but return
         # (logits_hidden, feedback_hidden) for final-norm correctness.
         if isinstance(ret_hidden_states, tuple):
