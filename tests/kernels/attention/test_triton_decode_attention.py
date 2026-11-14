@@ -51,6 +51,12 @@ def test_decode_grouped_block_size_is_sm70_scoped(
 @pytest.mark.parametrize("CACHE_SIZE", [16384])
 @pytest.mark.parametrize("PAGE_SIZE", [1, 16])
 def test_decode_attention(B, L, H_Q, H_KV, D_QK, D_V, CACHE_SIZE, PAGE_SIZE):
+    if current_platform.is_device_capability(70) and H_KV != H_Q and D_QK == 576:
+        # Grouped, non-MLA: BLOCK_DMODEL 1024 with fp32-staged dot operands.
+        pytest.skip(
+            "Triton on SM70 needs 192 KiB of shared memory for the grouped "
+            "D_QK=576 tile; the hardware limit is 96 KiB"
+        )
     assert CACHE_SIZE % PAGE_SIZE == 0
     dtype = torch.bfloat16
     seq_len = L  # This represents the number of tokens already in the sequence
@@ -155,6 +161,10 @@ def _quantize_to_fp8(tensor: torch.Tensor):
 def test_decode_attention_fp8(B, L, H_Q, H_KV, D_QK, D_V, CACHE_SIZE, PAGE_SIZE):
     """Test FP8 KV cache path: quantize K/V to FP8, run kernel with scales,
     and compare against BF16 reference output."""
+    if not current_platform.has_device_capability(89):
+        pytest.skip(
+            "Triton limitation: fp8e4nv data type is not supported on CUDA arch < 89"
+        )
     assert CACHE_SIZE % PAGE_SIZE == 0
     dtype = torch.bfloat16
     seq_len = L
