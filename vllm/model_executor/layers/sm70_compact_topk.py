@@ -19,7 +19,7 @@ def compact_half_topk(
         not logits.is_cuda
         or logits.dtype != torch.float16
         or logits.ndim != 2
-        or not 1 <= logits.shape[0] <= 32
+        or not 1 <= logits.shape[0] <= 64
         or not 64 <= logits.shape[1] <= 65535
         or logits.stride(1) != 1
         or logits.stride(0) > (2**31 - 1) // logits.shape[0]

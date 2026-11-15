@@ -271,6 +271,11 @@ class EagleSpeculator(TargetSamplingHooks):
         self.draft_attn_layer_names = set(all_attn_layers) - set(
             target_attn_layer_names
         )
+        from vllm.v1.worker.gpu.spec_decode.sm70_sparse_target import (
+            maybe_warmup_sparse_target,
+        )
+
+        maybe_warmup_sparse_target(self)
 
     def set_attn(
         self,
@@ -411,22 +416,18 @@ class EagleSpeculator(TargetSamplingHooks):
         *,
         allow_graph: bool = True,
     ):
-        """Compact top-k target sampling for argmax drafts (SM70, opt-in)."""
-        if self.draft_logits is not None or not getattr(
-            self.vllm_config.kernel_config, "sm70_sparse_target_sampling", False
-        ):
-            return None
+        """Compact top-k target sampling for argmax drafts."""
         from vllm.v1.worker.gpu.spec_decode.sm70_sparse_target import (
-            try_greedy_draft_sparse_rejection,
+            maybe_sample_sparse_target,
         )
 
-        return try_greedy_draft_sparse_rejection(
+        return maybe_sample_sparse_target(
+            self,
             model,
             rejection_sampler,
             hidden_states,
             input_batch,
             grammar_output,
-            reference_check=self.vllm_config.kernel_config.sm70_sparse_target_reference_check,
         )
 
     def _validate_local_argmax_reduction(self) -> None:

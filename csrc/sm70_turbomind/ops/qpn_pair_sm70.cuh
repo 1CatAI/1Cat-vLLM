@@ -141,14 +141,11 @@ __global__ void qpn_pair_m16_kernel(const uint8_t* __restrict__ codes,
     for (int p = 0; p < 2; ++p) readers[p].load(group, weights[p]);
 #pragma unroll
     for (int row_tile = 0; row_tile < kRows; ++row_tile) {
-      uint4 a01 = make_uint4(0, 0, 0, 0);
-      uint4 a23 = make_uint4(0, 0, 0, 0);
       const int row = row_tile * 8 + local_row;
-      if (row < m) {
-        const half* a = input + (static_cast<size_t>(group) * m + row) * 16;
-        a01 = *reinterpret_cast<const uint4*>(a);
-        a23 = *reinterpret_cast<const uint4*>(a + 8);
-      }
+      const int safe_row = row < m ? row : 0;
+      const half* a = input + (static_cast<size_t>(group) * m + safe_row) * 16;
+      const uint4 a01 = __ldg(reinterpret_cast<const uint4*>(a));
+      const uint4 a23 = __ldg(reinterpret_cast<const uint4*>(a + 8));
       const unsigned* a0 = reinterpret_cast<const unsigned*>(&a01);
       const unsigned* a1 = reinterpret_cast<const unsigned*>(&a23);
 #pragma unroll

@@ -44,8 +44,9 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
-KEEP = 32
-_MAX_BOUNDED_ROWS = 40
+KEEP = 128
+_CANDIDATE_TOPK_KEEP = 128
+_MAX_BOUNDED_ROWS = 64
 
 
 @triton.jit
@@ -107,6 +108,7 @@ def _upper_topk_tiles(
     Upper,
     Scratch,
     Vocab: tl.constexpr,
+    ValidVocab: tl.constexpr,
     Tiles: tl.constexpr,
     Keep: tl.constexpr,
     Block: tl.constexpr,
@@ -116,6 +118,7 @@ def _upper_topk_tiles(
     row, tile = tl.program_id(0), tl.program_id(1)
     col = tile * Block + tl.arange(0, Block)
     mask = col < Vocab
+    valid_mask = col < ValidVocab
     coarse = tl.load(Coarse + row * Vocab + col, mask, 0).to(tl.float32)
     coefficient = tl.load(Coeff + col * 2, mask, 0)
     norm_sum = tl.load(Coeff + col * 2 + 1, mask, 0)
@@ -123,10 +126,10 @@ def _upper_topk_tiles(
     upper = _compute_upper_bound(coarse, coefficient, norm_sum, xnorm, subnorm)
     if StoreUpper:
         tl.store(Upper + row * Vocab + col, upper, mask)
-    values = tl.where(mask, upper, -float("inf"))
+    values = tl.where(valid_mask, upper, -float("inf"))
     keys = _score_id_keys(values, col, WideIds)
     sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
-    keys = tl.where(mask, keys, sentinel)
+    keys = tl.where(valid_mask, keys, sentinel)
     selected = tl.topk(keys, Keep)
     lane = tl.arange(0, Keep)
     tl.store(Scratch + row * Tiles * Keep + tile * Keep + lane, selected)
@@ -251,6 +254,144 @@ def _masked_max_finish(
     tl.store(Output + row * 2 + 1, token)
 
 
+@triton.jit
+def _unpack_score_id_keys(keys, WideIds: tl.constexpr):
+    if WideIds:
+        ukeys = keys.to(tl.uint64, bitcast=True)
+        local_ids = (0xFFFFFFFF - (ukeys & 0xFFFFFFFF)).to(tl.int64)
+        ordered = (((ukeys >> 32) & 0xFFFF) ^ 0x8000).to(tl.uint32)
+    else:
+        ukeys = keys.to(tl.uint32, bitcast=True)
+        local_ids = (65535 - (ukeys & 0xFFFF)).to(tl.int64)
+        ordered = (((ukeys >> 16) & 0xFFFF) ^ 0x8000).to(tl.uint32)
+    fp16_bits = tl.where(ordered >= 0x8000, ordered ^ 0x8000, (~ordered) & 0xFFFF)
+    fp16_bits = tl.where(ordered == 0xFFFF, 0x7E00, fp16_bits)
+    vals = fp16_bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+    return vals, local_ids
+
+
+@triton.jit
+def _certify_local_topk(
+    Ids,
+    Scores,
+    Coarse,
+    Coeff,
+    Norms,
+    CertVals,
+    CertIds,
+    Flags,
+    Vocab: tl.constexpr,
+    CandKeep: tl.constexpr,
+    KReq: tl.constexpr,
+    KPow2: tl.constexpr,
+    Start: tl.constexpr,
+    Block: tl.constexpr,
+    WideIds: tl.constexpr,
+):
+    row = tl.program_id(0)
+    lane = tl.arange(0, Block)
+    in_cand = lane < CandKeep
+    cand_scores = tl.load(Scores + row * CandKeep + lane, in_cand, other=-float("inf"))
+    cand_ids = tl.load(Ids + row * CandKeep + lane, in_cand, other=0)
+    cand_f32 = cand_scores.to(tl.float32)
+    bad = in_cand & ((cand_f32 != cand_f32) | (tl.abs(cand_f32) == float("inf")))
+    valid = tl.sum(bad.to(tl.int32), 0) == 0
+
+    keys = _score_id_keys(cand_scores, cand_ids, WideIds)
+    sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
+    keys = tl.where(in_cand, keys, sentinel)
+    top_keys = tl.topk(keys, KPow2)
+    top_vals, top_local_ids = _unpack_score_id_keys(top_keys, WideIds)
+
+    out_lane = tl.arange(0, KPow2)
+    kth_val = tl.sum(tl.where(out_lane == (KReq - 1), top_vals, 0.0), 0)
+    last = tl.load(Ids + row * CandKeep + CandKeep - 1)
+    coarse = tl.load(Coarse + row * Vocab + last).to(tl.float32)
+    coefficient = tl.load(Coeff + last * 2)
+    norm_sum = tl.load(Coeff + last * 2 + 1)
+    xnorm, subnorm = tl.load(Norms + row * 2), tl.load(Norms + row * 2 + 1)
+    cutoff = _compute_upper_bound(coarse, coefficient, norm_sum, xnorm, subnorm).to(
+        tl.float32
+    )
+    flag = valid & (cutoff == cutoff) & (cutoff != float("inf")) & (kth_val > cutoff)
+    tl.store(Flags + row, flag.to(tl.int32))
+    out_mask = out_lane < KReq
+    tl.store(CertVals + row * KReq + out_lane, top_vals, out_mask)
+    tl.store(CertIds + row * KReq + out_lane, top_local_ids + Start, out_mask)
+
+
+@triton.jit
+def _masked_topk_tiles(
+    Dense,
+    Flags,
+    Scratch,
+    Vocab: tl.constexpr,
+    ValidVocab: tl.constexpr,
+    Tiles: tl.constexpr,
+    Keep: tl.constexpr,
+    Block: tl.constexpr,
+    WideIds: tl.constexpr,
+):
+    row, tile = tl.program_id(0), tl.program_id(1)
+    if tl.load(Flags + row) == 0:
+        offsets = tile * Block + tl.arange(0, Block)
+        valid_mask = offsets < ValidVocab
+        values = tl.load(Dense + row * Vocab + offsets, valid_mask, other=-float("inf"))
+        keys = _score_id_keys(values, offsets, WideIds)
+        sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
+        keys = tl.where(valid_mask, keys, sentinel)
+        selected = tl.topk(keys, Keep)
+        lane = tl.arange(0, Keep)
+        tl.store(Scratch + row * Tiles * Keep + tile * Keep + lane, selected)
+
+
+@triton.jit
+def _masked_topk_stage(
+    Flags,
+    Src,
+    Dst,
+    Count: tl.constexpr,
+    Stages: tl.constexpr,
+    Keep: tl.constexpr,
+    Block: tl.constexpr,
+    WideIds: tl.constexpr,
+):
+    row, stage = tl.program_id(0), tl.program_id(1)
+    if tl.load(Flags + row) == 0:
+        offsets = stage * Block + tl.arange(0, Block)
+        sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
+        keys = tl.load(Src + row * Count + offsets, offsets < Count, sentinel)
+        selected = tl.topk(keys, Keep)
+        lane = tl.arange(0, Keep)
+        tl.store(Dst + row * Stages * Keep + stage * Keep + lane, selected)
+
+
+@triton.jit
+def _masked_topk_finish(
+    Flags,
+    Scratch,
+    OutVals,
+    OutIds,
+    Count: tl.constexpr,
+    KReq: tl.constexpr,
+    KPow2: tl.constexpr,
+    Start: tl.constexpr,
+    Block: tl.constexpr,
+    WideIds: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if tl.load(Flags + row) == 0:
+        offsets = tl.arange(0, Block)
+        sentinel: tl.constexpr = -9223372036854775808 if WideIds else -2147483648
+        keys = tl.load(Scratch + row * Count + offsets, offsets < Count, sentinel)
+        top_keys = tl.topk(keys, KPow2)
+        top_vals, top_local_ids = _unpack_score_id_keys(top_keys, WideIds)
+        out_lane = tl.arange(0, KPow2)
+        out_mask = out_lane < KReq
+        tl.store(OutVals + row * KReq + out_lane, top_vals, out_mask)
+        tl.store(OutIds + row * KReq + out_lane, top_local_ids + Start, out_mask)
+
+
 def _prepare_proposal(weight, native_ops):
     """Compute the exact QPN8 effective weights and upward-rounded coefficients."""
     vocab, width = weight.shape
@@ -282,8 +423,20 @@ def _prepare_proposal(weight, native_ops):
     return codes, scales, coefficients
 
 
-def _proposal(x, codes, scales, coefficients, native_policy=(), *, return_upper=True):
+def _proposal(
+    x,
+    codes,
+    scales,
+    coefficients,
+    native_policy=(),
+    *,
+    return_upper=True,
+    keep: int = KEEP,
+    valid_vocab: int | None = None,
+):
     rows, vocab = x.size(0), codes.numel() // x.size(1)
+    if valid_vocab is None:
+        valid_vocab = vocab
     assert 32 <= vocab <= 2147483647
     coarse = torch.empty(rows, vocab, device=x.device, dtype=torch.float16)
     call_native(
@@ -302,16 +455,16 @@ def _proposal(x, codes, scales, coefficients, native_policy=(), *, return_upper=
     _input_norms[(rows,)](x, norms, x.size(1), num_warps=8)
     upper = torch.empty_like(coarse) if return_upper else None
     wide_ids = vocab > 65536
-    tile_block = 2048 if (KEEP <= 32 and vocab > 32768) else 1024
+    tile_block = 2048 if (keep <= 32 and vocab > 32768) else 1024
     tiles = triton.cdiv(vocab, tile_block)
-    count = tiles * KEEP
+    count = tiles * keep
     scratch = torch.empty(
         rows,
         count,
         device=x.device,
         dtype=torch.int64 if wide_ids else torch.int32,
     )
-    ids = torch.empty(rows, KEEP, device=x.device, dtype=torch.int32)
+    ids = torch.empty(rows, keep, device=x.device, dtype=torch.int32)
     _upper_topk_tiles[(rows, tiles)](
         coarse,
         coefficients,
@@ -319,30 +472,38 @@ def _proposal(x, codes, scales, coefficients, native_policy=(), *, return_upper=
         upper,
         scratch,
         vocab,
+        valid_vocab,
         tiles,
-        KEEP,
+        keep,
         tile_block,
         wide_ids,
         return_upper,
-        num_warps=8 if tile_block > 1024 else 4,
+        num_warps=8 if (tile_block > 1024 or keep > 64) else 4,
     )
     while count > 1024:
         stages = triton.cdiv(count, 1024)
-        reduced = torch.empty(rows, stages * KEEP, device=x.device, dtype=scratch.dtype)
+        reduced = torch.empty(rows, stages * keep, device=x.device, dtype=scratch.dtype)
         _topk_stage[(rows, stages)](
-            scratch, reduced, count, stages, KEEP, 1024, wide_ids, num_warps=4
+            scratch,
+            reduced,
+            count,
+            stages,
+            keep,
+            1024,
+            wide_ids,
+            num_warps=8 if keep > 64 else 4,
         )
         scratch = reduced
-        count = stages * KEEP
+        count = stages * keep
     merge_block = max(64, triton.next_power_of_2(count))
     _topk_merge[(rows,)](
         scratch,
         ids,
         count,
-        KEEP,
+        keep,
         merge_block,
         wide_ids,
-        num_warps=4 if merge_block <= 1024 else 8,
+        num_warps=4 if (merge_block <= 1024 and keep <= 64) else 8,
     )
     return coarse, norms, upper, ids
 
@@ -376,8 +537,8 @@ def _bounded_pair(
         vocab,
         KEEP,
         start,
-        KEEP,
-        num_warps=1,
+        max(32, triton.next_power_of_2(KEEP)),
+        num_warps=2 if KEEP > 32 else 1,
     )
     gathered = tensor_model_parallel_all_gather(packet, dim=-1)
     flags = torch.empty(rows, device=x.device, dtype=torch.int32)
@@ -438,6 +599,115 @@ register_policy_op(
 )
 
 
+def _bounded_local_topk(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    coefficients: torch.Tensor,
+    start: int,
+    valid_vocab: int,
+    k_req: int,
+    native_policy=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = x.contiguous()
+    rows, vocab = x.size(0), weight.size(0)
+    cand_keep = _CANDIDATE_TOPK_KEEP
+    coarse, norms, _, ids = _proposal(
+        x,
+        codes,
+        scales,
+        coefficients,
+        native_policy or (),
+        return_upper=False,
+        keep=cand_keep,
+        valid_vocab=valid_vocab,
+    )
+    scores = torch.empty(rows, cand_keep, device=x.device, dtype=torch.float16)
+    torch.ops._C.sm70_fp16_candidate_scores_out(scores, x, weight, ids, True)
+
+    k_pow2 = max(2, triton.next_power_of_2(k_req))
+    wide_ids = vocab > 65536
+    out_vals = torch.empty(rows, k_req, device=x.device, dtype=torch.float32)
+    out_ids = torch.empty(rows, k_req, device=x.device, dtype=torch.int64)
+    flags = torch.empty(rows, device=x.device, dtype=torch.int32)
+    cand_block = max(64, triton.next_power_of_2(cand_keep))
+    _certify_local_topk[(rows,)](
+        ids,
+        scores,
+        coarse,
+        coefficients,
+        norms,
+        out_vals,
+        out_ids,
+        flags,
+        vocab,
+        cand_keep,
+        k_req,
+        k_pow2,
+        start,
+        cand_block,
+        wide_ids,
+        num_warps=4,
+    )
+
+    dense = torch.empty_like(coarse)
+    torch.ops._C.sm70_fp16_masked_head_out(dense, x, weight, flags, True)
+    tiles = triton.cdiv(vocab, 1024)
+    count = tiles * k_pow2
+    scratch = torch.empty(
+        rows,
+        count,
+        device=x.device,
+        dtype=torch.int64 if wide_ids else torch.int32,
+    )
+    _masked_topk_tiles[(rows, tiles)](
+        dense,
+        flags,
+        scratch,
+        vocab,
+        valid_vocab,
+        tiles,
+        k_pow2,
+        1024,
+        wide_ids,
+        num_warps=4,
+    )
+    while count > 1024:
+        stages = triton.cdiv(count, 1024)
+        reduced = torch.empty(
+            rows, stages * k_pow2, device=x.device, dtype=scratch.dtype
+        )
+        _masked_topk_stage[(rows, stages)](
+            flags,
+            scratch,
+            reduced,
+            count,
+            stages,
+            k_pow2,
+            1024,
+            wide_ids,
+            num_warps=4,
+        )
+        scratch = reduced
+        count = stages * k_pow2
+    merge_block = max(64, triton.next_power_of_2(count))
+    _masked_topk_finish[(rows,)](
+        flags,
+        scratch,
+        out_vals,
+        out_ids,
+        count,
+        k_req,
+        k_pow2,
+        start,
+        merge_block,
+        wide_ids,
+        num_warps=4 if merge_block <= 1024 else 8,
+    )
+    return out_vals, out_ids
+
+
 class MTPBoundedTargetHead(nn.Module):
     """Preserve the dense head while owning disposable search weights."""
 
@@ -460,6 +730,10 @@ class MTPBoundedTargetHead(nn.Module):
         return self.head.weight
 
     @property
+    def num_embeddings_padded(self):
+        return self.head.num_embeddings_padded
+
+    @property
     def quant_method(self):
         return self
 
@@ -468,6 +742,47 @@ class MTPBoundedTargetHead(nn.Module):
 
     def maybe_get_sm70_lm_head_top1(self, hidden_states, bias=None):
         return self.head.maybe_get_sm70_lm_head_top1(hidden_states, bias)
+
+    def maybe_get_sm70_dflash2_top20(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+        bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if (
+            bias is not None
+            or hidden_states.ndim < 2
+            or hidden_states.shape[-1] != 5120
+            or hidden_states.dtype != torch.float16
+            or hidden_states.device != self.weight.device
+        ):
+            return None
+        x_2d = hidden_states.reshape(-1, 5120)
+        rows = int(x_2d.shape[0])
+        vocab = int(self.weight.shape[0])
+        num_pad = int(getattr(self.shard_indices, "num_org_vocab_padding", 0))
+        valid_vocab = vocab - num_pad
+        k_req = min(int(top_k), valid_vocab)
+        if (
+            not 1 <= rows <= _MAX_BOUNDED_ROWS
+            or not 1 <= k_req <= 64
+            or valid_vocab < _CANDIDATE_TOPK_KEEP
+        ):
+            return None
+        vals, ids = self.native_ops.invoke(
+            _bounded_local_topk,
+            x_2d,
+            self.weight,
+            self.codes,
+            self.scales,
+            self.coefficients,
+            self.start,
+            valid_vocab,
+            k_req,
+            self.native_ops.arguments,
+        )
+        out_shape = (*hidden_states.shape[:-1], k_req)
+        return vals.reshape(out_shape), ids.reshape(out_shape)
 
     def maybe_get_sm70_lm_head_top1_pair(self, hidden_states, bias=None):
         if (

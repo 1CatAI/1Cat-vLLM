@@ -13,7 +13,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("rows,width", [(8, 62080), (32, 65535), (8, 1025)])
+@pytest.mark.parametrize(
+    "rows,width", [(8, 62080), (32, 65535), (40, 62080), (64, 65535), (8, 1025)]
+)
 @torch.inference_mode()
 def test_half_source_values_and_live_graph(rows, width):
     torch.manual_seed(1530)
@@ -52,7 +54,7 @@ def test_fp32_source_never_qualifies():
     assert compact_half_topk(logits) is None
 
 
-@pytest.mark.parametrize("rows", [8, 32])
+@pytest.mark.parametrize("rows", [8, 32, 40])
 @torch.inference_mode()
 def test_target_probe_preserves_dense_token_mask(rows):
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch

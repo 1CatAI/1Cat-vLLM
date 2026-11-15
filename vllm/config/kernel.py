@@ -921,11 +921,12 @@ class KernelConfig:
     penalties, logprobs, grammar masks or random sampling retain the dense path.
     Explicit false keeps dense verification."""
 
-    sm70_sparse_target_sampling: bool = False
-    """Verify argmax drafts of top-k 20 sampled requests from TP-local target
+    sm70_sparse_target_sampling: bool | None = None
+    """Verify argmax drafts of top-k sampled requests from TP-local target
     candidates (merged global top-k) instead of full-vocabulary logits and the
-    dense sampler. Exact: requests with an ambiguous top-k/top-p cutoff fall
-    back to the full-vocabulary sampler."""
+    dense sampler. By default, enable this for the SM70 Qwen3.5/3.8 native MTP
+    contract. Exact: requests with an ambiguous top-k/top-p cutoff fall back to
+    the full-vocabulary sampler."""
 
     sm70_sparse_target_reference_check: bool = True
     """With sparse target sampling, copy the candidates to the host each round
@@ -1155,6 +1156,8 @@ class KernelConfig:
             self.sm70_mtp_refined_head = prefer
         if self.sm70_mtp_bounded_target_head is None:
             self.sm70_mtp_bounded_target_head = prefer
+        if self.sm70_sparse_target_sampling is None:
+            self.sm70_sparse_target_sampling = prefer
         if self.sm70_gdn_spec_replay is None:
             from vllm.model_executor.models.config import sm70_mtp_verifier_qualified
 

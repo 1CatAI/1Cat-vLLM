@@ -17,7 +17,7 @@ __global__ void select_compact_half_keys(const half* x, uint32_t* partial,
   constexpr int Threads = 256, Tile = Threads * Items;
   using Sort = cub::BlockRadixSort<uint32_t, Threads, Items>;
   __shared__ typename Sort::TempStorage storage;
-  const int row = blockIdx.x;
+  const int64_t row = blockIdx.x;
   uint32_t keys[Items];
 #pragma unroll
   for (int i = 0; i < Items; ++i) {
@@ -56,7 +56,7 @@ void sm70_compact_half_topk_out(const at::Tensor& x, at::Tensor partial,
   TORCH_CHECK(x.size(1) <= 65535 && x.size(1) >= k && k == 64);
   int tiles = (x.size(1) + 1023) / 1024, width = tiles * k;
   TORCH_CHECK(width <= 4096 && partial.numel() == x.size(0) * width);
-  TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 32);
+  TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 64);
   TORCH_CHECK(partial.is_cuda() && values.is_cuda() && ids.is_cuda());
   TORCH_CHECK(partial.device() == x.device() && values.device() == x.device() &&
               ids.device() == x.device());

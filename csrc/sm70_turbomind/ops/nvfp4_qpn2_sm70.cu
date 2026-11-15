@@ -38,7 +38,7 @@ namespace {
 constexpr int kPrepareThreads = 256;
 constexpr int kQpn2RowsPerCta = 8;
 constexpr int kQpn2MaxRows = 64;
-constexpr int kQpn2DispatchMaxRows = 40;
+constexpr int kQpn2DispatchMaxRows = 64;
 
 __device__ __forceinline__ int qpn2_col_from_lane(int lane) {
   return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
@@ -166,9 +166,10 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
 }
 
 // Batch kernels share the native/TurboMind reader without a second layout.
-template <bool TurboMindLayout, bool BundledScales = false>
+template <bool TurboMindLayout, bool BundledScales = false,
+          bool RebiasedScale = false>
 struct Nvfp4PairReader {
-  static constexpr bool kFp4 = true;
+  [[maybe_unused]] static constexpr bool kFp4 = true;
   Nvfp4Qpn2CodeReader<TurboMindLayout, false, BundledScales> codes;
   const uint8_t* scales;
   float global_scale;
@@ -186,8 +187,8 @@ struct Nvfp4PairReader {
     const half2 scale = nvfp4_effective_scale(
         __ldg(scales + static_cast<size_t>(group) * (BundledScales ? 288 : 32)),
         global_scale);
-    dequant_e2m1x8(q.x, scale, weights);
-    dequant_e2m1x8(q.y, scale, weights + 4);
+    dequant_e2m1x8<RebiasedScale>(q.x, scale, weights);
+    dequant_e2m1x8<RebiasedScale>(q.y, scale, weights + 4);
   }
 };
 
@@ -447,14 +448,13 @@ __device__ __forceinline__ void nvfp4_qpn2_accumulate_sm70(
     const unsigned* b = reinterpret_cast<const unsigned*>(weights);
 #pragma unroll
     for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
-      uint4 input01 = make_uint4(0, 0, 0, 0);
-      uint4 input23 = make_uint4(0, 0, 0, 0);
       const int row = row_base + row_tile * kQpn2RowsPerCta + local_row;
-      if (row < m) {
-        const half* input_row = input + static_cast<size_t>(row) * k;
-        input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
-        input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
-      }
+      const int safe_row = row < m ? row : 0;
+      const half* input_row = input + static_cast<size_t>(safe_row) * k;
+      const uint4 input01 =
+          __ldg(reinterpret_cast<const uint4*>(input_row + group * 16));
+      const uint4 input23 =
+          __ldg(reinterpret_cast<const uint4*>(input_row + group * 16 + 8));
       const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
       const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
       VLLM_SM70_QPN2_MMA(accum[row_tile][0], a0[0], a0[1], b[0], b[1]);
@@ -611,14 +611,13 @@ __device__ __forceinline__ void nvfp4_qpn2_gated_accumulate_sm70(
     const unsigned* b = reinterpret_cast<const unsigned*>(weights);
 #pragma unroll
     for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
-      uint4 input01 = make_uint4(0, 0, 0, 0);
-      uint4 input23 = make_uint4(0, 0, 0, 0);
       const int row = row_base + row_tile * kQpn2RowsPerCta + local_row;
-      if (row < m) {
-        const half* input_row = input + static_cast<size_t>(row) * k;
-        input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
-        input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
-      }
+      const int safe_row = row < m ? row : 0;
+      const half* input_row = input + static_cast<size_t>(safe_row) * k;
+      const uint4 input01 =
+          __ldg(reinterpret_cast<const uint4*>(input_row + group * 16));
+      const uint4 input23 =
+          __ldg(reinterpret_cast<const uint4*>(input_row + group * 16 + 8));
       const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
       const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
       VLLM_SM70_QPN2_MMA(accum[row_tile][0], a0[0], a0[1], b[0], b[1]);
@@ -708,35 +707,47 @@ __launch_bounds__(16 * TileColumns, 64 / TileColumns) void nvfp4_qpn2_gated_proj
       global_scale);
 }
 
-// Qualified M<=8 native gate/up shares A registers across both projections.
-template <bool Interleave, int NAcc = 1>
+// Qualified M<=8 gate/up shares A registers across both projections.
+template <bool TurboMindLayout, bool BundledScales, bool Interleave,
+          int NAcc = 1, int TileColumns = 32, bool RebiasedScale = false>
 __global__ __launch_bounds__(
-    256, 3) void nvfp4_qpn2_m8_paired_gated_sm70_kernel(const uint8_t* codes,
-                                                        const uint8_t* scales,
-                                                        const half* input,
-                                                        half* output,
-                                                        int hidden, int k,
-                                                        int m, float global) {
+    8 * TileColumns,
+    TileColumns == 16
+        ? 4
+        : 3) void nvfp4_qpn2_m8_paired_gated_sm70_kernel(const uint8_t* codes,
+                                                         const uint8_t* scales,
+                                                         const half* input,
+                                                         half* output,
+                                                         int hidden, int k,
+                                                         int m, float global) {
+  static_assert(TileColumns == 16 || TileColumns == 32);
   constexpr int Split = 8;
-  __shared__ float partials[2][Split][256];
+  constexpr int QuadsPerTile = TileColumns / 8;
+  __shared__ float partials[2][Split][8 * TileColumns];
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
   const int qp = (lane >> 2) & 3;
+  const int warp = (threadIdx.x >> 5) * (32 / TileColumns) + qp / QuadsPerTile;
+  const int output_tile = blockIdx.x;
+  const int tile0 = output_tile * TileColumns / 32;
+  const int tile1 = tile0 + hidden / 32;
+  const int mapped_lane =
+      (lane & 19) |
+      ((qp % QuadsPerTile + (output_tile % (32 / TileColumns)) * QuadsPerTile)
+       << 2);
   const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int safe_row = row < m ? row : 0;
   const int groups = k / 16;
   const int per_warp = groups / Split;
-  Nvfp4PairReader<false, true> readers[2] = {
-      Nvfp4PairReader<false, true>(codes, scales, blockIdx.x, groups, lane,
-                                   global),
-      Nvfp4PairReader<false, true>(codes, scales, blockIdx.x + hidden / 32,
-                                   groups, lane, global)};
+  using Reader = Nvfp4PairReader<TurboMindLayout, BundledScales, RebiasedScale>;
+  Reader readers[2] = {
+      Reader(codes, scales, tile0, groups, mapped_lane, global),
+      Reader(codes, scales, tile1, groups, mapped_lane, global)};
   float accum[2][NAcc][8] = {};
 #pragma unroll 4
   for (int group = warp * per_warp; group < (warp + 1) * per_warp; ++group) {
     const half* a = input + static_cast<size_t>(safe_row) * k + group * 16;
-    const uint4 a01 = *reinterpret_cast<const uint4*>(a);
-    const uint4 a23 = *reinterpret_cast<const uint4*>(a + 8);
+    const uint4 a01 = __ldg(reinterpret_cast<const uint4*>(a));
+    const uint4 a23 = __ldg(reinterpret_cast<const uint4*>(a + 8));
     const unsigned* a0 = reinterpret_cast<const unsigned*>(&a01);
     const unsigned* a1 = reinterpret_cast<const unsigned*>(&a23);
     if constexpr (Interleave) {
@@ -773,25 +784,450 @@ __global__ __launch_bounds__(
       if constexpr (NAcc == 2) accum[p][0][i] += accum[p][1][i];
       const int r = (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
       const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-      partials[p][warp][r * 32 + qp * 8 + c] = accum[p][0][i];
+      partials[p][warp][r * TileColumns + (qp % QuadsPerTile) * 8 + c] =
+          accum[p][0][i];
     }
   }
   __syncthreads();
-  const int e = threadIdx.x;
-  const int out_row = e / 32;
-  if (out_row < m) {
-    float gate = 0.0f, up = 0.0f;
+  for (int e = threadIdx.x; e < 8 * TileColumns; e += blockDim.x) {
+    const int out_row = e / TileColumns;
+    if (out_row < m) {
+      float gate = 0.0f, up = 0.0f;
 #pragma unroll
-    for (int w = 0; w < Split; ++w) {
-      gate += partials[0][w][e];
-      up += partials[1][w][e];
+      for (int w = 0; w < Split; ++w) {
+        gate += partials[0][w][e];
+        up += partials[1][w][e];
+      }
+      const half gh = __float2half(gate);
+      const half uh = __float2half(up);
+      const float gf = __half2float(gh);
+      const half silu = __float2half(gf / (1.0f + expf(-gf)));
+      output[static_cast<size_t>(out_row) * hidden + output_tile * TileColumns +
+             e % TileColumns] = __hmul(silu, uh);
     }
-    const half gh = __float2half(gate);
-    const half uh = __float2half(up);
-    const float gf = __half2float(gh);
-    const half silu = __float2half(gf / (1.0f + expf(-gf)));
-    output[static_cast<size_t>(out_row) * hidden + blockIdx.x * 32 + e % 32] =
-        __hmul(silu, uh);
+  }
+}
+
+// Single-phase zero-spill cooperative batch GEMM for M=9..64 (16- or 32-col).
+template <int Split, int NAcc, int RowTiles, bool TurboMindLayout,
+          bool BundledScales, int TileColumns, int MinBlocks,
+          bool RebiasedScale>
+__global__
+__launch_bounds__(Split* TileColumns, MinBlocks) void nvfp4_qpn2_coop_batch_sm70_kernel(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
+    const half* __restrict__ input, half* __restrict__ output, int n, int k,
+    int m, float global_scale) {
+  static_assert(RowTiles >= 2 && RowTiles <= 5);
+  static_assert(TileColumns == 16 || TileColumns == 32);
+  constexpr int QuadsPerTile = TileColumns / 8;
+  __shared__ float partial[Split][8 * TileColumns];
+
+  const int lane = threadIdx.x & 31;
+  const int qp = (lane >> 2) & 3;
+  const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int warp = (threadIdx.x >> 5) * (32 / TileColumns) + qp / QuadsPerTile;
+  const int row_base = blockIdx.x * RowTiles * 8;
+  const int output_tile = blockIdx.y;
+  const int tile = output_tile * TileColumns / 32;
+  const int mapped_lane =
+      (lane & 19) |
+      ((qp % QuadsPerTile + (output_tile % (32 / TileColumns)) * QuadsPerTile)
+       << 2);
+  const int groups = k >> 4;
+  const int per_warp = groups / Split;
+  const int begin = warp * per_warp;
+  const int end = begin + per_warp;
+
+  const Nvfp4PairReader<TurboMindLayout, BundledScales, RebiasedScale> reader(
+      codes, scales, tile, groups, mapped_lane, global_scale);
+
+  float accum[RowTiles][NAcc][8] = {};
+#pragma unroll 1
+  for (int group = begin; group < end; ++group) {
+    half2 weights[8];
+    reader.load(group, weights);
+    const unsigned* b = reinterpret_cast<const unsigned*>(weights);
+    const half* a_group = input + static_cast<size_t>(group) * m * 16;
+#pragma unroll
+    for (int tr = 0; tr < RowTiles; ++tr) {
+      const int row = row_base + tr * 8 + local_row;
+      const int safe_row = row < m ? row : 0;
+      const half* a = a_group + safe_row * 16;
+      const uint4 a01 = __ldg(reinterpret_cast<const uint4*>(a));
+      const uint4 a23 = __ldg(reinterpret_cast<const uint4*>(a + 8));
+      const unsigned* a0 = reinterpret_cast<const unsigned*>(&a01);
+      const unsigned* a1 = reinterpret_cast<const unsigned*>(&a23);
+      VLLM_SM70_QPN2_MMA(accum[tr][0], a0[0], a0[1], b[0], b[1]);
+      VLLM_SM70_QPN2_MMA(accum[tr][1 % NAcc], a0[2], a0[3], b[2], b[3]);
+      VLLM_SM70_QPN2_MMA(accum[tr][0], a1[0], a1[1], b[4], b[5]);
+      VLLM_SM70_QPN2_MMA(accum[tr][1 % NAcc], a1[2], a1[3], b[6], b[7]);
+    }
+  }
+
+#pragma unroll
+  for (int tr = 0; tr < RowTiles; ++tr) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      if constexpr (NAcc == 2) accum[tr][0][i] += accum[tr][1][i];
+      const int r = (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+      const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      partial[warp][r * TileColumns + (qp % QuadsPerTile) * 8 + c] =
+          accum[tr][0][i];
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < 8 * TileColumns; e += blockDim.x) {
+      const int row = row_base + tr * 8 + e / TileColumns;
+      if (row < m) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < Split; ++w) sum += partial[w][e];
+        output[static_cast<size_t>(row) * n + output_tile * TileColumns +
+               e % TileColumns] = __float2half(sum);
+      }
+    }
+    if (tr + 1 < RowTiles) __syncthreads();
+  }
+}
+
+// Paired two-tile (64-column GEMM or 32+32 gated-SiLU) zero-spill batch kernel.
+// Issues two independent 256-byte weight loads per warp to saturate HBM2 MLP
+// while sharing K16 activation broadcasts from L1 across both tiles.
+template <int Split, int RowTiles, bool Gated, bool TurboMindLayout,
+          bool BundledScales, int MinBlocks, bool RebiasedScale>
+__global__
+__launch_bounds__(Split * 32, MinBlocks) void nvfp4_qpn2_pair_batch_sm70_kernel(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
+    const half* __restrict__ input, half* __restrict__ output,
+    half* __restrict__ k16_output, int width, int k, int m,
+    float global_scale) {
+  static_assert(RowTiles >= 2 && RowTiles <= 5);
+  __shared__ float partial[2][Split][256];
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int qp = (lane >> 2) & 3;
+  const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int row_base = blockIdx.x * RowTiles * 8;
+  const int out_pair = blockIdx.y;
+  const int total_tiles = width / 32;
+  const int tile0 = Gated ? out_pair : 2 * out_pair;
+  const int tile1 = Gated ? out_pair + total_tiles : 2 * out_pair + 1;
+  const bool has_tile1 = Gated || (tile1 < total_tiles);
+  const int safe_tile1 = has_tile1 ? tile1 : tile0;
+  const int groups = k >> 4;
+  const int per_warp = groups / Split;
+  const int begin = warp * per_warp;
+  const int end = begin + per_warp;
+
+  const Nvfp4PairReader<TurboMindLayout, BundledScales, RebiasedScale> r0(
+      codes, scales, tile0, groups, lane, global_scale);
+  const Nvfp4PairReader<TurboMindLayout, BundledScales, RebiasedScale> r1(
+      codes, scales, safe_tile1, groups, lane, global_scale);
+
+  float accum[2][RowTiles][8] = {};
+#pragma unroll 1
+  for (int group = begin; group < end; ++group) {
+    half2 w0[8], w1[8];
+    r0.load(group, w0);
+    r1.load(group, w1);
+    const unsigned* b0 = reinterpret_cast<const unsigned*>(w0);
+    const unsigned* b1 = reinterpret_cast<const unsigned*>(w1);
+    const half* a_group = input + static_cast<size_t>(group) * m * 16;
+#pragma unroll
+    for (int tr = 0; tr < RowTiles; ++tr) {
+      const int row = row_base + tr * 8 + local_row;
+      const int safe_row = row < m ? row : 0;
+      const half* a = a_group + safe_row * 16;
+      const uint4 a01 = __ldg(reinterpret_cast<const uint4*>(a));
+      const uint4 a23 = __ldg(reinterpret_cast<const uint4*>(a + 8));
+      const unsigned* a0 = reinterpret_cast<const unsigned*>(&a01);
+      const unsigned* a1 = reinterpret_cast<const unsigned*>(&a23);
+      VLLM_SM70_QPN2_MMA(accum[0][tr], a0[0], a0[1], b0[0], b0[1]);
+      VLLM_SM70_QPN2_MMA(accum[1][tr], a0[0], a0[1], b1[0], b1[1]);
+      VLLM_SM70_QPN2_MMA(accum[0][tr], a0[2], a0[3], b0[2], b0[3]);
+      VLLM_SM70_QPN2_MMA(accum[1][tr], a0[2], a0[3], b1[2], b1[3]);
+      VLLM_SM70_QPN2_MMA(accum[0][tr], a1[0], a1[1], b0[4], b0[5]);
+      VLLM_SM70_QPN2_MMA(accum[1][tr], a1[0], a1[1], b1[4], b1[5]);
+      VLLM_SM70_QPN2_MMA(accum[0][tr], a1[2], a1[3], b0[6], b0[7]);
+      VLLM_SM70_QPN2_MMA(accum[1][tr], a1[2], a1[3], b1[6], b1[7]);
+    }
+  }
+
+#pragma unroll
+  for (int tr = 0; tr < RowTiles; ++tr) {
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int r = (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+        const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+        partial[p][warp][r * 32 + qp * 8 + c] = accum[p][tr][i];
+      }
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < 256; e += blockDim.x) {
+      const int row = row_base + tr * 8 + e / 32;
+      if (row < m) {
+        float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+        for (int w = 0; w < Split; ++w) {
+          s0 += partial[0][w][e];
+          s1 += partial[1][w][e];
+        }
+        if constexpr (Gated) {
+          const half gh = __float2half(s0);
+          const half uh = __float2half(s1);
+          const float gf = __half2float(gh);
+          const half result = __hmul(__float2half(gf / (1.0f + expf(-gf))), uh);
+          const int col = tile0 * 32 + e % 32;
+          output[static_cast<size_t>(row) * width + col] = result;
+          if (k16_output != nullptr) {
+            k16_output[vllm::sm70::k16_half_index(row, col, m)] = result;
+          }
+        } else {
+          output[static_cast<size_t>(row) * width + tile0 * 32 + e % 32] =
+              __float2half(s0);
+          if (has_tile1) {
+            output[static_cast<size_t>(row) * width + tile1 * 32 + e % 32] =
+                __float2half(s1);
+          }
+        }
+      }
+    }
+    if (tr + 1 < RowTiles) __syncthreads();
+  }
+}
+
+// Narrow 16-column paired gated fallback when hidden / 32 < SM count.
+template <int Split, int RowTiles, bool TurboMindLayout, bool BundledScales,
+          int MinBlocks, bool RebiasedScale>
+__global__
+__launch_bounds__(Split * 16, MinBlocks) void nvfp4_qpn2_paired_gated_narrow_sm70_kernel(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
+    const half* __restrict__ input, half* __restrict__ output,
+    half* __restrict__ k16_output, int hidden, int k, int m,
+    float global_scale) {
+  static_assert(RowTiles >= 3 && RowTiles <= 5);
+  __shared__ float partial[2][Split][128];
+
+  const int lane = threadIdx.x & 31;
+  const int qp = (lane >> 2) & 3;
+  const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int warp = (threadIdx.x >> 5) * 2 + qp / 2;
+  const int row_base = blockIdx.x * RowTiles * 8;
+  const int output_tile = blockIdx.y;
+  const int tile0 = output_tile / 2;
+  const int tile1 = tile0 + hidden / 32;
+  const int mapped_lane =
+      (lane & 19) | (((qp % 2) + (output_tile % 2) * 2) << 2);
+  const int groups = k >> 4;
+  const int per_warp = groups / Split;
+  const int begin = warp * per_warp;
+  const int end = begin + per_warp;
+
+  const Nvfp4PairReader<TurboMindLayout, BundledScales, RebiasedScale> r0(
+      codes, scales, tile0, groups, mapped_lane, global_scale);
+  const Nvfp4PairReader<TurboMindLayout, BundledScales, RebiasedScale> r1(
+      codes, scales, tile1, groups, mapped_lane, global_scale);
+
+  float accum[2][RowTiles][8] = {};
+#pragma unroll 1
+  for (int group = begin; group < end; ++group) {
+    half2 w0[8], w1[8];
+    r0.load(group, w0);
+    r1.load(group, w1);
+    const unsigned* b0 = reinterpret_cast<const unsigned*>(w0);
+    const unsigned* b1 = reinterpret_cast<const unsigned*>(w1);
+    const half* a_group = input + static_cast<size_t>(group) * m * 16;
+#pragma unroll
+    for (int tr = 0; tr < RowTiles; ++tr) {
+      const int row = row_base + tr * 8 + local_row;
+      const int safe_row = row < m ? row : 0;
+      const half* a = a_group + safe_row * 16;
+      const uint4 a01 = __ldg(reinterpret_cast<const uint4*>(a));
+      const uint4 a23 = __ldg(reinterpret_cast<const uint4*>(a + 8));
+      const unsigned* a0 = reinterpret_cast<const unsigned*>(&a01);
+      const unsigned* a1 = reinterpret_cast<const unsigned*>(&a23);
+      VLLM_SM70_QPN2_MMA(accum[0][tr], a0[0], a0[1], b0[0], b0[1]);
+      VLLM_SM70_QPN2_MMA(accum[1][tr], a0[0], a0[1], b1[0], b1[1]);
+      VLLM_SM70_QPN2_MMA(accum[0][tr], a0[2], a0[3], b0[2], b0[3]);
+      VLLM_SM70_QPN2_MMA(accum[1][tr], a0[2], a0[3], b1[2], b1[3]);
+      VLLM_SM70_QPN2_MMA(accum[0][tr], a1[0], a1[1], b0[4], b0[5]);
+      VLLM_SM70_QPN2_MMA(accum[1][tr], a1[0], a1[1], b1[4], b1[5]);
+      VLLM_SM70_QPN2_MMA(accum[0][tr], a1[2], a1[3], b0[6], b0[7]);
+      VLLM_SM70_QPN2_MMA(accum[1][tr], a1[2], a1[3], b1[6], b1[7]);
+    }
+  }
+
+#pragma unroll
+  for (int tr = 0; tr < RowTiles; ++tr) {
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int r = (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+        const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+        partial[p][warp][r * 16 + (qp % 2) * 8 + c] = accum[p][tr][i];
+      }
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < 128; e += blockDim.x) {
+      const int row = row_base + tr * 8 + e / 16;
+      if (row < m) {
+        float gate = 0.0f, up = 0.0f;
+#pragma unroll
+        for (int w = 0; w < Split; ++w) {
+          gate += partial[0][w][e];
+          up += partial[1][w][e];
+        }
+        const half gh = __float2half(gate);
+        const half uh = __float2half(up);
+        const float gf = __half2float(gh);
+        const half result = __hmul(__float2half(gf / (1.0f + expf(-gf))), uh);
+        const int col = output_tile * 16 + e % 16;
+        output[static_cast<size_t>(row) * hidden + col] = result;
+        if (k16_output != nullptr) {
+          k16_output[vllm::sm70::k16_half_index(row, col, m)] = result;
+        }
+      }
+    }
+    if (tr + 1 < RowTiles) __syncthreads();
+  }
+}
+
+template <int RowTiles, bool TurboMindLayout, bool BundledScales>
+void launch_qpn2_coop_batch(const uint8_t* codes, const uint8_t* scales,
+                            const half* packed_input, half* output, int n,
+                            int k, int m, float global_scale,
+                            cudaStream_t stream) {
+  const int row_blocks = (m + RowTiles * 8 - 1) / (RowTiles * 8);
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const bool rebias =
+      global_scale > 0.0f && global_scale <= 65504.0f / (16384.0f * 480.0f);
+  const int pairs = (n + 63) / 64;
+  const bool can_split16 = ((k >> 4) % 16 == 0);
+  if (pairs * row_blocks >= (sms * 3) / 4) {
+    const dim3 grid(row_blocks, pairs);
+    if constexpr (RowTiles == 5) {
+      // RowTiles == 5 holds 80 FP32 accumulators (~140 regs); 256 threads with
+      // MinBlocks = 1 avoids all register spills while keeping 2x weight MLP.
+      if (rebias) {
+        nvfp4_qpn2_pair_batch_sm70_kernel<8, RowTiles, false, TurboMindLayout,
+                                          BundledScales, 1, true>
+            <<<grid, 256, 0, stream>>>(codes, scales, packed_input, output,
+                                       nullptr, n, k, m, global_scale);
+      } else {
+        nvfp4_qpn2_pair_batch_sm70_kernel<8, RowTiles, false, TurboMindLayout,
+                                          BundledScales, 1, false>
+            <<<grid, 256, 0, stream>>>(codes, scales, packed_input, output,
+                                       nullptr, n, k, m, global_scale);
+      }
+    } else if (can_split16) {
+      if (rebias) {
+        nvfp4_qpn2_pair_batch_sm70_kernel<16, RowTiles, false, TurboMindLayout,
+                                          BundledScales, 1, true>
+            <<<grid, 512, 0, stream>>>(codes, scales, packed_input, output,
+                                       nullptr, n, k, m, global_scale);
+      } else {
+        nvfp4_qpn2_pair_batch_sm70_kernel<16, RowTiles, false, TurboMindLayout,
+                                          BundledScales, 1, false>
+            <<<grid, 512, 0, stream>>>(codes, scales, packed_input, output,
+                                       nullptr, n, k, m, global_scale);
+      }
+    } else {
+      if (rebias) {
+        nvfp4_qpn2_pair_batch_sm70_kernel<8, RowTiles, false, TurboMindLayout,
+                                          BundledScales, 2, true>
+            <<<grid, 256, 0, stream>>>(codes, scales, packed_input, output,
+                                       nullptr, n, k, m, global_scale);
+      } else {
+        nvfp4_qpn2_pair_batch_sm70_kernel<8, RowTiles, false, TurboMindLayout,
+                                          BundledScales, 2, false>
+            <<<grid, 256, 0, stream>>>(codes, scales, packed_input, output,
+                                       nullptr, n, k, m, global_scale);
+      }
+    }
+  } else if ((n / 32) * row_blocks >= sms) {
+    const dim3 grid(row_blocks, n / 32);
+    if (can_split16) {
+      if (rebias) {
+        nvfp4_qpn2_coop_batch_sm70_kernel<16, 1, RowTiles, TurboMindLayout,
+                                          BundledScales, 32, 1, true>
+            <<<grid, 512, 0, stream>>>(codes, scales, packed_input, output, n,
+                                       k, m, global_scale);
+      } else {
+        nvfp4_qpn2_coop_batch_sm70_kernel<16, 1, RowTiles, TurboMindLayout,
+                                          BundledScales, 32, 1, false>
+            <<<grid, 512, 0, stream>>>(codes, scales, packed_input, output, n,
+                                       k, m, global_scale);
+      }
+    } else {
+      if (rebias) {
+        nvfp4_qpn2_coop_batch_sm70_kernel<8, 1, RowTiles, TurboMindLayout,
+                                          BundledScales, 32, 2, true>
+            <<<grid, 256, 0, stream>>>(codes, scales, packed_input, output, n,
+                                       k, m, global_scale);
+      } else {
+        nvfp4_qpn2_coop_batch_sm70_kernel<8, 1, RowTiles, TurboMindLayout,
+                                          BundledScales, 32, 2, false>
+            <<<grid, 256, 0, stream>>>(codes, scales, packed_input, output, n,
+                                       k, m, global_scale);
+      }
+    }
+  } else {
+    constexpr int MinBlocks = (RowTiles == 5) ? 3 : 4;
+    const dim3 grid(row_blocks, n / 16);
+    if (rebias) {
+      nvfp4_qpn2_coop_batch_sm70_kernel<8, 2, RowTiles, TurboMindLayout,
+                                        BundledScales, 16, MinBlocks, true>
+          <<<grid, 128, 0, stream>>>(codes, scales, packed_input, output, n, k,
+                                     m, global_scale);
+    } else {
+      nvfp4_qpn2_coop_batch_sm70_kernel<8, 2, RowTiles, TurboMindLayout,
+                                        BundledScales, 16, MinBlocks, false>
+          <<<grid, 128, 0, stream>>>(codes, scales, packed_input, output, n, k,
+                                     m, global_scale);
+    }
+  }
+}
+
+template <int RowTiles, bool TurboMindLayout, bool BundledScales>
+void launch_qpn2_paired_gated_batch(const uint8_t* codes, const uint8_t* scales,
+                                    const half* packed_input, half* output,
+                                    half* k16_output, int hidden, int k, int m,
+                                    float global_scale, cudaStream_t stream) {
+  const int row_blocks = (m + RowTiles * 8 - 1) / (RowTiles * 8);
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const bool rebias =
+      global_scale > 0.0f && global_scale <= 65504.0f / (16384.0f * 480.0f);
+  if ((hidden / 32) * row_blocks < sms) {
+    constexpr int MinBlocks = (RowTiles <= 4) ? 4 : 3;
+    const dim3 grid(row_blocks, hidden / 16);
+    if (rebias) {
+      nvfp4_qpn2_paired_gated_narrow_sm70_kernel<8, RowTiles, TurboMindLayout,
+                                                 BundledScales, MinBlocks, true>
+          <<<grid, 128, 0, stream>>>(codes, scales, packed_input, output,
+                                     k16_output, hidden, k, m, global_scale);
+    } else {
+      nvfp4_qpn2_paired_gated_narrow_sm70_kernel<
+          8, RowTiles, TurboMindLayout, BundledScales, MinBlocks, false>
+          <<<grid, 128, 0, stream>>>(codes, scales, packed_input, output,
+                                     k16_output, hidden, k, m, global_scale);
+    }
+  } else {
+    constexpr int MinBlocks = (RowTiles == 5) ? 1 : 2;
+    const dim3 grid(row_blocks, hidden / 32);
+    if (rebias) {
+      nvfp4_qpn2_pair_batch_sm70_kernel<8, RowTiles, true, TurboMindLayout,
+                                        BundledScales, MinBlocks, true>
+          <<<grid, 256, 0, stream>>>(codes, scales, packed_input, output,
+                                     k16_output, hidden, k, m, global_scale);
+    } else {
+      nvfp4_qpn2_pair_batch_sm70_kernel<8, RowTiles, true, TurboMindLayout,
+                                        BundledScales, MinBlocks, false>
+          <<<grid, 256, 0, stream>>>(codes, scales, packed_input, output,
+                                     k16_output, hidden, k, m, global_scale);
+    }
   }
 }
 
@@ -1124,9 +1560,45 @@ void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
 
   // Preserve the single-request route; M9-M16 shares A across two
   // projections without creating another persistent weight layout, and
-  // M17-M40 reuses each decoded weight across four or five 8-row tiles.
+  // M17-M64 reuses each decoded weight across cooperative single-phase tiles.
   {
-    if (m > 8 && m <= 16 && k >= 1024 && n >= 2048 && n % 64 == 0 &&
+    if (((m > 16 && m <= 64) || (m > 8 && m <= 16 && n % 64 != 0)) &&
+        k >= 512 && (k / 16) % 8 == 0 && n >= 1024 && n % 32 == 0 &&
+        (split_k == 8 || split_k == 16) && accumulator_chains == 2) {
+      torch::Tensor packed_input;
+      auto* packed_ptr =
+          vllm::sm70::k16_packed_input(input, packed_input, stream);
+      const auto gscale = static_cast<float>(global_scale);
+      if (m <= 16) {
+        launch_qpn2_coop_batch<2, TurboMindLayout, BundledScales>(
+            code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m, gscale,
+            stream);
+      } else if (m <= 24) {
+        launch_qpn2_coop_batch<3, TurboMindLayout, BundledScales>(
+            code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m, gscale,
+            stream);
+      } else if (m <= 32) {
+        launch_qpn2_coop_batch<4, TurboMindLayout, BundledScales>(
+            code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m, gscale,
+            stream);
+      } else if (m <= 40) {
+        launch_qpn2_coop_batch<5, TurboMindLayout, BundledScales>(
+            code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m, gscale,
+            stream);
+      } else if (m <= 48) {
+        launch_qpn2_coop_batch<3, TurboMindLayout, BundledScales>(
+            code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m, gscale,
+            stream);
+      } else {
+        launch_qpn2_coop_batch<4, TurboMindLayout, BundledScales>(
+            code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m, gscale,
+            stream);
+      }
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
+    vllm::sm70::k16_clear();
+    if (m > 8 && m <= 16 && k >= 512 && n >= 1024 && n % 64 == 0 &&
         (split_k == 8 || split_k == 16) && accumulator_chains == 2) {
       if (split_k == 8) {
         vllm::sm70::launch_qpn_pair_m16<
@@ -1139,61 +1611,6 @@ void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
             out, input, codes, scales, static_cast<float>(global_scale),
             stream);
       }
-      return;
-    }
-    if (m > 16 && m <= 40 && k >= 1024 && n >= 2048 && n % 32 == 0 &&
-        (split_k == 8 || split_k == 16) && accumulator_chains == 2) {
-      torch::Tensor packed_input;
-      auto* packed_ptr =
-          vllm::sm70::k16_packed_input(input, packed_input, stream);
-      if (split_k == 8) {
-        if (m <= 32) {
-          auto kernel =
-              m == 32 ? nvfp4_qpn2_m32_twophase_sm70_kernel<
-                            8, false, true, TurboMindLayout, BundledScales, 4>
-                      : nvfp4_qpn2_m32_twophase_sm70_kernel<
-                            8, false, false, TurboMindLayout, BundledScales, 4>;
-          C10_CUDA_CHECK(cudaFuncSetAttribute(
-              kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-          kernel<<<dim3(1, n / 32), 128, 0, stream>>>(
-              code_ptr, scale_ptr, packed_ptr, output_ptr, nullptr, n, k, m,
-              static_cast<float>(global_scale));
-        } else {
-          auto kernel =
-              m == 40 ? nvfp4_qpn2_m32_twophase_sm70_kernel<
-                            8, false, true, TurboMindLayout, BundledScales, 5>
-                      : nvfp4_qpn2_m32_twophase_sm70_kernel<
-                            8, false, false, TurboMindLayout, BundledScales, 5>;
-          C10_CUDA_CHECK(cudaFuncSetAttribute(
-              kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-          kernel<<<dim3(1, n / 32), 128, 0, stream>>>(
-              code_ptr, scale_ptr, packed_ptr, output_ptr, nullptr, n, k, m,
-              static_cast<float>(global_scale));
-        }
-      } else if (m <= 32) {
-        auto kernel =
-            m == 32 ? nvfp4_qpn2_m32_twophase_sm70_kernel<
-                          16, false, true, TurboMindLayout, BundledScales, 4>
-                    : nvfp4_qpn2_m32_twophase_sm70_kernel<
-                          16, false, false, TurboMindLayout, BundledScales, 4>;
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-        kernel<<<dim3(1, n / 32), 256, 0, stream>>>(
-            code_ptr, scale_ptr, packed_ptr, output_ptr, nullptr, n, k, m,
-            static_cast<float>(global_scale));
-      } else {
-        auto kernel =
-            m == 40 ? nvfp4_qpn2_m32_twophase_sm70_kernel<
-                          16, false, true, TurboMindLayout, BundledScales, 5>
-                    : nvfp4_qpn2_m32_twophase_sm70_kernel<
-                          16, false, false, TurboMindLayout, BundledScales, 5>;
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-        kernel<<<dim3(1, n / 32), 256, 0, stream>>>(
-            code_ptr, scale_ptr, packed_ptr, output_ptr, nullptr, n, k, m,
-            static_cast<float>(global_scale));
-      }
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
     }
   }
@@ -1255,14 +1672,52 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
   const int k = static_cast<int>(input.size(1));
   const int m = static_cast<int>(input.size(0));
 
-  if constexpr (!TurboMindLayout && BundledScales) {
-    if (m <= 8 && k % 128 == 0 && hidden % 32 == 0 && split_k == 8) {
-      auto kernel = accumulator_chains == 1
-                        ? nvfp4_qpn2_m8_paired_gated_sm70_kernel<false, 1>
-                        : nvfp4_qpn2_m8_paired_gated_sm70_kernel<false, 2>;
-      kernel<<<hidden / 32, 256, 0, stream>>>(code_ptr, scale_ptr, input_ptr,
-                                              output_ptr, hidden, k, m,
-                                              static_cast<float>(global_scale));
+  // Unbundled M<=8 uses the 32-warp/SM launch_qpn2_gated projection kernel
+  // (677 GB/s cold-L2 on V100); bundled scales use the paired M<=8 kernel.
+  if constexpr (BundledScales) {
+    if (m <= 8 && k % 128 == 0 && hidden >= 1024 && hidden % 32 == 0 &&
+        split_k == 8) {
+      vllm::sm70::k16_clear();
+      const auto gscale = static_cast<float>(global_scale);
+      const bool rebias =
+          gscale > 0.0f && gscale <= 65504.0f / (16384.0f * 480.0f);
+      const int sms =
+          at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+      if (hidden / 32 < sms) {
+        if (accumulator_chains == 1) {
+          auto kernel =
+              rebias ? nvfp4_qpn2_m8_paired_gated_sm70_kernel<
+                           TurboMindLayout, BundledScales, false, 1, 16, true>
+                     : nvfp4_qpn2_m8_paired_gated_sm70_kernel<
+                           TurboMindLayout, BundledScales, false, 1, 16, false>;
+          kernel<<<hidden / 16, 128, 0, stream>>>(
+              code_ptr, scale_ptr, input_ptr, output_ptr, hidden, k, m, gscale);
+        } else {
+          auto kernel =
+              rebias ? nvfp4_qpn2_m8_paired_gated_sm70_kernel<
+                           TurboMindLayout, BundledScales, false, 2, 16, true>
+                     : nvfp4_qpn2_m8_paired_gated_sm70_kernel<
+                           TurboMindLayout, BundledScales, false, 2, 16, false>;
+          kernel<<<hidden / 16, 128, 0, stream>>>(
+              code_ptr, scale_ptr, input_ptr, output_ptr, hidden, k, m, gscale);
+        }
+      } else if (accumulator_chains == 1) {
+        auto kernel =
+            rebias ? nvfp4_qpn2_m8_paired_gated_sm70_kernel<
+                         TurboMindLayout, BundledScales, false, 1, 32, true>
+                   : nvfp4_qpn2_m8_paired_gated_sm70_kernel<
+                         TurboMindLayout, BundledScales, false, 1, 32, false>;
+        kernel<<<hidden / 32, 256, 0, stream>>>(
+            code_ptr, scale_ptr, input_ptr, output_ptr, hidden, k, m, gscale);
+      } else {
+        auto kernel =
+            rebias ? nvfp4_qpn2_m8_paired_gated_sm70_kernel<
+                         TurboMindLayout, BundledScales, false, 2, 32, true>
+                   : nvfp4_qpn2_m8_paired_gated_sm70_kernel<
+                         TurboMindLayout, BundledScales, false, 2, 32, false>;
+        kernel<<<hidden / 32, 256, 0, stream>>>(
+            code_ptr, scale_ptr, input_ptr, output_ptr, hidden, k, m, gscale);
+      }
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
     }
@@ -1270,48 +1725,53 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
 
   // Preserve the single-request route; M9-M16 shares A across two
   // projections without creating another persistent weight layout, and
-  // M17-M40 reuses each decoded weight across four or five 8-row tiles.
+  // M17-M64 reuses each decoded weight across paired single-phase tiles.
   {
-    if (m > 8 && m <= 16 && k >= 1024 && hidden >= 2048 && hidden % 32 == 0 &&
+    if (m > 8 && m <= 16 && k >= 512 && hidden >= 1024 && hidden % 32 == 0 &&
         split_k == 8 && accumulator_chains == 2) {
+      vllm::sm70::k16_clear();
       vllm::sm70::launch_qpn_pair_m16<
           Nvfp4PairReader<TurboMindLayout, BundledScales>, 8, true>(
           out, input, codes, scales, static_cast<float>(global_scale), stream);
       return;
     }
-    if (m > 16 && m <= 40 && k >= 1024 && hidden >= 2048 && hidden % 32 == 0 &&
-        split_k == 8 && accumulator_chains == 2) {
+    if (m > 16 && m <= 64 && k >= 512 && (k / 16) % 8 == 0 && hidden >= 1024 &&
+        hidden % 32 == 0 && split_k == 8 && accumulator_chains == 2) {
       torch::Tensor packed_input, twin;
       auto* packed_ptr =
           vllm::sm70::k16_packed_input(input, packed_input, stream);
       half* k16_output = vllm::sm70::k16_twin_for(out, twin);
-      if (m <= 32) {
-        auto kernel =
-            m == 32 ? nvfp4_qpn2_m32_twophase_sm70_kernel<
-                          8, true, true, TurboMindLayout, BundledScales, 4>
-                    : nvfp4_qpn2_m32_twophase_sm70_kernel<
-                          8, true, false, TurboMindLayout, BundledScales, 4>;
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-        kernel<<<dim3(1, hidden / 32), 256, 0, stream>>>(
+      const auto gscale = static_cast<float>(global_scale);
+      if (m <= 24) {
+        launch_qpn2_paired_gated_batch<3, TurboMindLayout, BundledScales>(
             code_ptr, scale_ptr, packed_ptr, output_ptr, k16_output, hidden, k,
-            m, static_cast<float>(global_scale));
+            m, gscale, stream);
+      } else if (m <= 32) {
+        launch_qpn2_paired_gated_batch<4, TurboMindLayout, BundledScales>(
+            code_ptr, scale_ptr, packed_ptr, output_ptr, k16_output, hidden, k,
+            m, gscale, stream);
+      } else if (m <= 40) {
+        launch_qpn2_paired_gated_batch<5, TurboMindLayout, BundledScales>(
+            code_ptr, scale_ptr, packed_ptr, output_ptr, k16_output, hidden, k,
+            m, gscale, stream);
+      } else if (m <= 48) {
+        launch_qpn2_paired_gated_batch<3, TurboMindLayout, BundledScales>(
+            code_ptr, scale_ptr, packed_ptr, output_ptr, k16_output, hidden, k,
+            m, gscale, stream);
       } else {
-        auto kernel =
-            m == 40 ? nvfp4_qpn2_m32_twophase_sm70_kernel<
-                          8, true, true, TurboMindLayout, BundledScales, 5>
-                    : nvfp4_qpn2_m32_twophase_sm70_kernel<
-                          8, true, false, TurboMindLayout, BundledScales, 5>;
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-        kernel<<<dim3(1, hidden / 32), 256, 0, stream>>>(
+        launch_qpn2_paired_gated_batch<4, TurboMindLayout, BundledScales>(
             code_ptr, scale_ptr, packed_ptr, output_ptr, k16_output, hidden, k,
-            m, static_cast<float>(global_scale));
+            m, gscale, stream);
       }
       C10_CUDA_KERNEL_LAUNCH_CHECK();
-      if (k16_output != nullptr) vllm::sm70::k16_publish(out, twin);
+      if (k16_output != nullptr) {
+        vllm::sm70::k16_publish(out, twin);
+      } else {
+        vllm::sm70::k16_clear();
+      }
       return;
     }
+    vllm::sm70::k16_clear();
   }
 
 #define VLLM_LAUNCH_QPN2_GATED(ROWS, SPLIT, NACC)                       \

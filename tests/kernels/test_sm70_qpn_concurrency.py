@@ -143,3 +143,50 @@ def test_fp8_native_plan_mismatch_uses_supported_fallback(native, monkeypatch):
             False,
         )
         assert torch.equal(output, torch.zeros_like(output))
+
+
+@pytest.mark.parametrize("rows", [5, 17, 20, 40, 64])
+def test_nvfp4_qpn2_batch_odd_tiles_and_k16_handoff(native, rows):
+    from vllm.model_executor.kernels.linear.qpn.nvfp4_dequant import (
+        nvfp4_qpn2_dequant_reference,
+    )
+
+    torch.manual_seed(9041 + rows)
+    k_in, hidden, n_odd = 512, 256, 96  # n_odd=96 -> 3 tiles of 32 (TileColumns=16)
+    w_gu = torch.randint(256, (hidden * 2, k_in // 2), device="cuda", dtype=torch.uint8)
+    s_gu = torch.randint(
+        1, 48, (hidden * 2, k_in // 16), device="cuda", dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    c_gu, ps_gu = native.prepare(w_gu, s_gu)
+    ref_gu = nvfp4_qpn2_dequant_reference(c_gu, ps_gu, 0.0625, hidden * 2, k_in)
+
+    w_odd = torch.randint(256, (n_odd, hidden // 2), device="cuda", dtype=torch.uint8)
+    s_odd = torch.randint(
+        1, 48, (n_odd, hidden // 16), device="cuda", dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    c_odd, ps_odd = native.prepare(w_odd, s_odd)
+    ref_odd = nvfp4_qpn2_dequant_reference(c_odd, ps_odd, 0.0625, n_odd, hidden)
+
+    x = torch.randn(rows, k_in, device="cuda", dtype=torch.float16) * 0.25
+    mid = torch.empty(rows, hidden, device="cuda", dtype=torch.float16)
+    out = torch.empty(rows, n_odd, device="cuda", dtype=torch.float16)
+
+    native.gated(mid, x, c_gu, ps_gu, 0.0625, 8, 2)
+    native.gemm(out, mid, c_odd, ps_odd, 0.0625, 16, 2)
+
+    raw_gu = (x.float() @ ref_gu.float().T).half()
+    g_ref, u_ref = raw_gu.chunk(2, dim=-1)
+    mid_ref = torch.nn.functional.silu(g_ref.float()).half() * u_ref
+    out_ref = (mid_ref.float() @ ref_odd.float().T).half()
+    assert (out.float() - out_ref.float()).norm() / out_ref.float().norm().clamp_min(
+        1e-12
+    ) < 2e-3
+
+    # Overwriting mid in-place without gated producer must not read stale K16 cache.
+    mid.normal_(0, 0.3)
+    out2 = torch.empty_like(out)
+    native.gemm(out2, mid, c_odd, ps_odd, 0.0625, 16, 2)
+    out2_ref = (mid.float() @ ref_odd.float().T).half()
+    assert (out2.float() - out2_ref.float()).norm() / out2_ref.float().norm().clamp_min(
+        1e-12
+    ) < 2e-3

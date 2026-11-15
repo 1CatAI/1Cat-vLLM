@@ -4936,10 +4936,8 @@ __device__ __forceinline__ int e4m3_2cta_active_splits(int total_kv,
                                                        int max_splits,
                                                        int min_tok_per_split,
                                                        int query_len = 1) {
+  (void)query_len;
   if (total_kv <= 256) return 1;
-  if (query_len >= 4 && total_kv <= 65536) {
-    max_splits = min(max_splits, 80);
-  }
   const int min_tok = total_kv <= 4096
                           ? max(64, min_tok_per_split)
                           : (total_kv <= 16384 ? max(128, min_tok_per_split)
@@ -5050,7 +5048,7 @@ __device__ __forceinline__ uint32_t e4m3_2cta_softmax_subrow(
 }
 
 template <int ROW_TILES, bool PAIRED, bool COMPENSATE_P>
-__global__ __launch_bounds__(256, 2) void grouped_e4m3_2cta_partial_kernel(
+__global__ __launch_bounds__(256, ROW_TILES == 1 ? 3 : 2) void grouped_e4m3_2cta_partial_kernel(
     const __half* __restrict__ q, const uint8_t* __restrict__ k_cache,
     const uint8_t* __restrict__ v_cache, const int* __restrict__ block_table,
     const int* __restrict__ row_lengths, float* __restrict__ partial_out,
@@ -5433,7 +5431,7 @@ __global__ __launch_bounds__(256, 2) void grouped_e4m3_2cta_partial_kernel(
   }
 }
 
-template <int MAX_SPLITS = 160>
+template <int MAX_SPLITS = 240>
 __global__ __launch_bounds__(256, 4) void grouped_e4m3_parallel_combine_kernel(
     const float* __restrict__ partial_out,
     const float* __restrict__ partial_lse, const int* __restrict__ row_lengths,
@@ -5563,46 +5561,93 @@ __global__ __launch_bounds__(256, 4) void grouped_e4m3_parallel_combine_kernel(
   }
 }
 
+constexpr int kMaxWorkspacePanelSplits = 160;
+
 struct E4M3Split160Workspace {
   int device = -1;
   cudaStream_t stream = nullptr;
   const void* caller_ptr = nullptr;
-  int64_t panels = 0;
+  int64_t panel_splits = 0;
   at::Tensor partial;
   at::Tensor lse;
 };
+
+std::mutex& e4m3_split160_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::vector<E4M3Split160Workspace>& e4m3_split160_bank() {
+  static std::vector<E4M3Split160Workspace> bank;
+  return bank;
+}
+
+void warm_e4m3_split160_workspace(const at::Tensor& partial,
+                                  const at::Tensor& lse, int64_t panel_splits,
+                                  cudaStream_t stream) {
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  const cudaError_t capture_err =
+      cudaStreamIsCapturing(stream, &capture_status);
+  if (capture_err != cudaSuccess ||
+      capture_status != cudaStreamCaptureStatusNone) {
+    (void)cudaGetLastError();
+    return;
+  }
+  const int device = partial.get_device();
+  const void* caller_ptr = partial.data_ptr();
+  const int64_t needed =
+      std::max<int64_t>(panel_splits, kMaxWorkspacePanelSplits);
+  auto& bank = e4m3_split160_bank();
+  std::lock_guard<std::mutex> lock(e4m3_split160_mutex());
+  for (const auto& entry : bank) {
+    if (entry.device == device && entry.panel_splits >= needed) {
+      return;
+    }
+  }
+  try {
+    auto ws_partial = at::empty({needed, 8, 6, 256}, partial.options());
+    auto ws_lse = at::empty({needed, 8, 6, 2}, lse.options());
+    bank.push_back({device, stream, caller_ptr, needed, std::move(ws_partial),
+                    std::move(ws_lse)});
+  } catch (...) {
+    (void)cudaGetLastError();
+  }
+}
 
 void resolve_e4m3_split160_workspace(at::Tensor& partial, at::Tensor& lse,
                                      int64_t panels, int query_len,
                                      cudaStream_t stream, float*& partial_ptr,
                                      float*& lse_ptr, int& max_splits) {
-  constexpr int kTargetSplits = 160;
-  if (kTargetSplits * query_len <= 80 * 8) {
+  const int base_splits = query_len == 1 ? 240 : 160;
+  const int target_splits =
+      std::max(20, base_splits / static_cast<int>(std::max<int64_t>(1, panels)));
+  const int64_t panel_splits = panels * target_splits;
+  if (target_splits * query_len <= 80 * 8) {
+    warm_e4m3_split160_workspace(partial, lse, panel_splits, stream);
     partial_ptr = partial.data_ptr<float>();
     lse_ptr = lse.data_ptr<float>();
-    max_splits = kTargetSplits;
+    max_splits = target_splits;
     return;
   }
   const int device = partial.get_device();
   const void* caller_ptr = partial.data_ptr();
-  static std::mutex mutex;
-  static std::vector<E4M3Split160Workspace> bank;
-  std::lock_guard<std::mutex> lock(mutex);
+  auto& bank = e4m3_split160_bank();
+  std::lock_guard<std::mutex> lock(e4m3_split160_mutex());
   for (const auto& entry : bank) {
     if (entry.device == device && entry.caller_ptr == caller_ptr &&
-        entry.panels >= panels) {
+        entry.panel_splits >= panel_splits) {
       partial_ptr = entry.partial.data_ptr<float>();
       lse_ptr = entry.lse.data_ptr<float>();
-      max_splits = kTargetSplits;
+      max_splits = target_splits;
       return;
     }
   }
   for (const auto& entry : bank) {
     if (entry.device == device && entry.stream == stream &&
-        entry.panels >= panels) {
+        entry.panel_splits >= panel_splits) {
       partial_ptr = entry.partial.data_ptr<float>();
       lse_ptr = entry.lse.data_ptr<float>();
-      max_splits = kTargetSplits;
+      max_splits = target_splits;
       return;
     }
   }
@@ -5612,15 +5657,14 @@ void resolve_e4m3_split160_workspace(at::Tensor& partial, at::Tensor& lse,
   if (capture_err == cudaSuccess &&
       capture_status == cudaStreamCaptureStatusNone) {
     try {
-      const int64_t alloc_panels = std::max<int64_t>(panels, 32);
-      auto ws_partial = at::empty({alloc_panels, kTargetSplits, 8, 6, 256},
-                                  partial.options());
-      auto ws_lse =
-          at::empty({alloc_panels, kTargetSplits, 8, 6, 2}, lse.options());
+      const int64_t alloc_ps =
+          std::max<int64_t>(panel_splits, kMaxWorkspacePanelSplits);
+      auto ws_partial = at::empty({alloc_ps, 8, 6, 256}, partial.options());
+      auto ws_lse = at::empty({alloc_ps, 8, 6, 2}, lse.options());
       partial_ptr = ws_partial.data_ptr<float>();
       lse_ptr = ws_lse.data_ptr<float>();
-      max_splits = kTargetSplits;
-      bank.push_back({device, stream, caller_ptr, alloc_panels,
+      max_splits = target_splits;
+      bank.push_back({device, stream, caller_ptr, alloc_ps,
                       std::move(ws_partial), std::move(ws_lse)});
       return;
     } catch (...) {
@@ -5630,10 +5674,10 @@ void resolve_e4m3_split160_workspace(at::Tensor& partial, at::Tensor& lse,
     (void)cudaGetLastError();
   }
   for (const auto& entry : bank) {
-    if (entry.device == device && entry.panels >= panels) {
+    if (entry.device == device && entry.panel_splits >= panel_splits) {
       partial_ptr = entry.partial.data_ptr<float>();
       lse_ptr = entry.lse.data_ptr<float>();
-      max_splits = kTargetSplits;
+      max_splits = target_splits;
       return;
     }
   }
@@ -5731,6 +5775,8 @@ at::Tensor private_grouped_e4m3_fp32_paged(
   }
   const int query_len = static_cast<int>(q.size(0) / batch_size);
   if (query_len * kGroupedVerifyHeads > 32) {
+    warm_e4m3_split160_workspace(partial, lse, kMaxWorkspacePanelSplits,
+                                 stream);
     // Six to eight rows per request (the DFlash2 q8 verifier) keep the
     // 48-row packed kernel: one 512-thread CTA per split reads each KV tile
     // once for all 48 rows. The 2-CTA kernel below runs these widths with a
@@ -5788,13 +5834,11 @@ at::Tensor private_grouped_e4m3_fp32_paged(
                                   partial_ptr, lse_ptr, max_splits);
   const int64_t max_possible_kv = block_table.size(1) * k.size(1);
   const int panel_split_cap =
-      panels <= 2 ? max_splits : std::max(20, 320 / static_cast<int>(panels));
+      std::max(20, (row_tiles == 1 ? 240 : 160) / static_cast<int>(panels));
   const int l2_split_cap = std::max(
       10, static_cast<int>(800 / std::max<int64_t>(1, panels * query_len)));
   const int split_cap =
-      panels <= 2
-          ? max_splits
-          : std::min(max_splits, std::min(panel_split_cap, l2_split_cap));
+      std::min(max_splits, std::min(panel_split_cap, l2_split_cap));
   const int launch_splits = max_possible_kv <= 256
                                 ? 1
                                 : static_cast<int>(std::min<int64_t>(
@@ -5839,7 +5883,7 @@ at::Tensor private_grouped_e4m3_fp32_paged(
   } else {
     dispatch_rt(std::false_type{});
   }
-  grouped_e4m3_parallel_combine_kernel<160>
+  grouped_e4m3_parallel_combine_kernel<240>
       <<<dim3(query_len * 4, q.size(1), static_cast<unsigned>(batch_size)), 256,
          0, stream>>>(partial_ptr, lse_ptr, row_lengths.data_ptr<int>(),
                       reinterpret_cast<__half*>(out.data_ptr()), query_len,

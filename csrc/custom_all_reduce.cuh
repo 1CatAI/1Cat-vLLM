@@ -1923,6 +1923,29 @@ __launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
     sm70_push_store_volatile_16b(
         own, destination + (epoch + Rank * Stride) * sizeof(P), pack);
   }
+  // Hoist local HBM reads above the NVLink spin-wait to overlap DRAM latency.
+  const float4 ra = reinterpret_cast<const float4*>(residual)[pack * 2];
+  const float4 rb = reinterpret_cast<const float4*>(residual)[pack * 2 + 1];
+  float weights[8];
+  if constexpr (std::is_same_v<Weight, float>) {
+    const float4 w0 = __ldg(reinterpret_cast<const float4*>(weight + column));
+    const float4 w1 =
+        __ldg(reinterpret_cast<const float4*>(weight + column) + 1);
+    weights[0] = w0.x;
+    weights[1] = w0.y;
+    weights[2] = w0.z;
+    weights[3] = w0.w;
+    weights[4] = w1.x;
+    weights[5] = w1.y;
+    weights[6] = w1.z;
+    weights[7] = w1.w;
+  } else {
+    const uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(weight) + tid);
+    const P packed_weight = *reinterpret_cast<const P*>(&w_u4);
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      weights[i] = __half2float(packed_weight.data[i]);
+  }
   P empty;
 #pragma unroll
   for (int i = 0; i < 8; ++i)
@@ -1931,21 +1954,22 @@ __launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
   P sum;
   if (owner == Rank) {
     P peers[4];
+    peers[Rank] = own;
+    uint32_t arrived = (1u << Rank);
     while (true) {
-      bool missing = false;
 #pragma unroll
       for (int peer = 0; peer < 4; ++peer) {
-        if (peer == Rank) {
-          peers[peer] = own;
-        } else {
+        if (peer != Rank && !(arrived & (1u << peer))) {
           sm70_push_load_volatile_16b(
               peers[peer], data + (epoch + peer * Stride) * sizeof(P), pack);
+          bool peer_missing = false;
 #pragma unroll
           for (int i = 0; i < 8; ++i)
-            missing |= sm70_push_is_sentinel(peers[peer].data[i]);
+            peer_missing |= sm70_push_is_sentinel(peers[peer].data[i]);
+          if (!peer_missing) arrived |= (1u << peer);
         }
       }
-      if (!missing) break;
+      if (arrived == 0xfu) break;
     }
     if (rotated_order) {
       const int partition_owner = pack / (gridDim.x * 160);
@@ -1953,12 +1977,7 @@ __launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
     } else {
       sum = sm70_push_reduce<P, 4, A>(peers);
     }
-#pragma unroll
-    for (int peer = 0; peer < 4; ++peer) {
-      if (peer != Rank)
-        sm70_push_store_volatile_16b(
-            empty, data + (epoch + peer * Stride) * sizeof(P), pack);
-    }
+    // Dispatch remote NVLink broadcasts first before clearing local sentinels.
     P published = sum;
 #pragma unroll
     for (int i = 0; i < 8; ++i) sm70_push_escape_sentinel(published.data[i]);
@@ -1973,6 +1992,12 @@ __launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
             published, destination + (epoch + peer * Stride) * sizeof(P), pack);
       }
     }
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      if (peer != Rank)
+        sm70_push_store_volatile_16b(
+            empty, data + (epoch + peer * Stride) * sizeof(P), pack);
+    }
   } else {
     while (true) {
       sm70_push_load_volatile_16b(
@@ -1985,8 +2010,6 @@ __launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
     sm70_push_store_volatile_16b(
         empty, data + (epoch + Rank * Stride) * sizeof(P), pack);
   }
-  const float4 ra = reinterpret_cast<const float4*>(residual)[pack * 2];
-  const float4 rb = reinterpret_cast<const float4*>(residual)[pack * 2 + 1];
   const float rv[8] = {ra.x, ra.y, ra.z, ra.w, rb.x, rb.y, rb.z, rb.w};
   float values[8];
   __shared__ __align__(16) float shared_values[Width];
@@ -1996,38 +2019,18 @@ __launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
   for (int i = 0; i < 8; ++i) {
     values[i] = __fadd_rn(__half2float(sum.data[i]), rv[i]);
   }
-  reinterpret_cast<float4*>(shared_values)[tid * 2] =
-      make_float4(values[0], values[1], values[2], values[3]);
-  reinterpret_cast<float4*>(shared_values)[tid * 2 + 1] =
-      make_float4(values[4], values[5], values[6], values[7]);
-  reinterpret_cast<float4*>(residual_out)[pack * 2] =
-      make_float4(values[0], values[1], values[2], values[3]);
-  reinterpret_cast<float4*>(residual_out)[pack * 2 + 1] =
-      make_float4(values[4], values[5], values[6], values[7]);
+  const float4 v0 = make_float4(values[0], values[1], values[2], values[3]);
+  const float4 v1 = make_float4(values[4], values[5], values[6], values[7]);
+  reinterpret_cast<float4*>(shared_values)[tid * 2] = v0;
+  reinterpret_cast<float4*>(shared_values)[tid * 2 + 1] = v1;
   __syncthreads();
+  reinterpret_cast<float4*>(residual_out)[pack * 2] = v0;
+  reinterpret_cast<float4*>(residual_out)[pack * 2 + 1] = v1;
   sm70_gemma_eight_warp_inverse(shared_values, warp_sum, inverse, epsilon);
   if (tid == 0) {
     meta->generation[row] = generation;
   }
   __syncthreads();
-  float weights[8];
-  if constexpr (std::is_same_v<Weight, float>) {
-    float4 w0 = reinterpret_cast<const float4*>(weight + column)[0];
-    float4 w1 = reinterpret_cast<const float4*>(weight + column)[1];
-    weights[0] = w0.x;
-    weights[1] = w0.y;
-    weights[2] = w0.z;
-    weights[3] = w0.w;
-    weights[4] = w1.x;
-    weights[5] = w1.y;
-    weights[6] = w1.z;
-    weights[7] = w1.w;
-  } else {
-    P packed_weight = reinterpret_cast<const P*>(weight)[tid];
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-      weights[i] = __half2float(packed_weight.data[i]);
-  }
   P normalized;
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
@@ -2078,36 +2081,43 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
       vllm::sm70_push_escape_sentinel(value.data[i]);
 #pragma unroll
     for (int peer = 0; peer < 4; ++peer) {
-      auto* base =
-          const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[peer])) +
-          kSm70PushNormOffset;
-      vllm::sm70_push_store_volatile_16b(
-          value,
-          base + kSm70PushNormMetaBytes +
-              (epoch_offset + rank * (Elements / P::size)) * sizeof(P),
-          pack);
-    }
-    P peers[4];
-    while (true) {
-      bool missing = false;
-#pragma unroll
-      for (int peer = 0; peer < 4; ++peer) {
-        vllm::sm70_push_load_volatile_16b(
-            peers[peer],
-            local + kSm70PushNormMetaBytes +
-                (epoch_offset + peer * (Elements / P::size)) * sizeof(P),
+      if (peer != rank) {
+        auto* base = const_cast<char*>(
+                         reinterpret_cast<const char*>(buffers.ptrs[peer])) +
+                     kSm70PushNormOffset;
+        vllm::sm70_push_store_volatile_16b(
+            value,
+            base + kSm70PushNormMetaBytes +
+                (epoch_offset + rank * (Elements / P::size)) * sizeof(P),
             pack);
-#pragma unroll
-        for (int i = 0; i < P::size; ++i)
-          missing |= vllm::sm70_push_is_sentinel(peers[peer].data[i]);
       }
-      if (!missing) break;
     }
-    const P sum = vllm::sm70_push_reduce<P, 4, A>(peers);
     const float4 residual_a =
         reinterpret_cast<const float4*>(residual)[pack * 2];
     const float4 residual_b =
         reinterpret_cast<const float4*>(residual)[pack * 2 + 1];
+    P peers[4];
+    peers[rank] = value;
+    uint32_t arrived = (1u << rank);
+    while (true) {
+#pragma unroll
+      for (int peer = 0; peer < 4; ++peer) {
+        if (peer != rank && !(arrived & (1u << peer))) {
+          vllm::sm70_push_load_volatile_16b(
+              peers[peer],
+              local + kSm70PushNormMetaBytes +
+                  (epoch_offset + peer * (Elements / P::size)) * sizeof(P),
+              pack);
+          bool peer_missing = false;
+#pragma unroll
+          for (int i = 0; i < P::size; ++i)
+            peer_missing |= vllm::sm70_push_is_sentinel(peers[peer].data[i]);
+          if (!peer_missing) arrived |= (1u << peer);
+        }
+      }
+      if (arrived == 0xfu) break;
+    }
+    const P sum = vllm::sm70_push_reduce<P, 4, A>(peers);
     const float residual_values[8] = {residual_a.x, residual_a.y, residual_a.z,
                                       residual_a.w, residual_b.x, residual_b.y,
                                       residual_b.z, residual_b.w};
@@ -2126,12 +2136,14 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
       *reinterpret_cast<uint16_t*>(&empty.data[i]) =
           vllm::kSm70Tp4PushAllreduceSentinel;
 #pragma unroll
-    for (int peer = 0; peer < 4; ++peer)
-      vllm::sm70_push_store_volatile_16b(
-          empty,
-          local + kSm70PushNormMetaBytes +
-              (epoch_offset + peer * (Elements / P::size)) * sizeof(P),
-          pack);
+    for (int peer = 0; peer < 4; ++peer) {
+      if (peer != rank)
+        vllm::sm70_push_store_volatile_16b(
+            empty,
+            local + kSm70PushNormMetaBytes +
+                (epoch_offset + peer * (Elements / P::size)) * sizeof(P),
+            pack);
+    }
   }
   using Reduce = cub::BlockReduce<float, Threads>;
   __shared__ typename Reduce::TempStorage storage;

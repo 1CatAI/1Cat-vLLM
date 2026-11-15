@@ -217,11 +217,12 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             and self.config.policy.prefill
             and self.config.policy.shared_weight
             and self.config.policy.shared_scales
-            and sm70_tm.use_native_qpn_layouts()
+            and sm70_tm.use_native_qpn_layouts(allow_large_batches=True)
             # QPN4's FP4 representation scales FP16 group factors by 2**14.
             # Preserve generic fallback if even the largest E4M3 scale could
             # overflow that representation.
             and 0 < float(layer.weight_global_scale.item()) < 65504 / (448 * 16384)
+            and layer.weight.is_cuda
             and current_platform.is_device_capability(70)
             and hasattr(torch.ops._C, "nvfp4_qpn4_prefill_sm70_out")
         ):
@@ -240,18 +241,10 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                     layer.weight, k * n
                 )
             if workspace is not None and workspace.numel() >= k * n:
-                bundle_scales = (
-                    k % 64 == 0
-                    and n % 32 == 0
-                    and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
-                    and sm70_nvfp4_native._get_bundled_prefill_code_workspace(
-                        layer.weight, workspace
-                    )
-                    is not None
-                )
-                sm70_tm.prepare_nvfp4_qpn2_dense_linear(
-                    layer, bundle_scales=bundle_scales
-                )
+                # Unbundled native QPN2 keeps 256-byte code groups aligned to
+                # 128-byte DRAM sectors (unlike 288-byte bundled groups) and
+                # avoids repacking codes during bounded prefill.
+                sm70_tm.prepare_nvfp4_qpn2_dense_linear(layer, bundle_scales=False)
                 layer.sm70_nvfp4_qpn2_native = True
                 layer.sm70_nvfp4_qpn2_output_size = n
                 layer.sm70_nvfp4_qpn2_gated_silu = self.config.gated_silu

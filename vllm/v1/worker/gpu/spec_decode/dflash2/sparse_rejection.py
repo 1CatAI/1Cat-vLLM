@@ -204,6 +204,8 @@ def _compact_target_reference_flags(
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
     floors: torch.Tensor | None = None,
+    *,
+    target_top_k: int = _TARGET_TOP_K,
 ) -> torch.Tensor:
     """Compute graph-capturable fallback flags with the request-slot map."""
     rows, width = probe.shape
@@ -217,7 +219,7 @@ def _compact_target_reference_flags(
         probe if floors is None else floors,
         probe.stride(0),
         width,
-        _TARGET_TOP_K,
+        target_top_k,
         triton.next_power_of_2(width),
         floors is not None,
         num_warps=1,
@@ -231,11 +233,18 @@ def _compact_target_reference_rows_gpu(
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
     floors: torch.Tensor | None = None,
+    *,
+    target_top_k: int = _TARGET_TOP_K,
 ) -> np.ndarray:
     """Copy only fallback decisions, preserving the request-slot parameter map."""
     return (
         _compact_target_reference_flags(
-            probe, temperatures, top_ps, row_to_request, floors
+            probe,
+            temperatures,
+            top_ps,
+            row_to_request,
+            floors,
+            target_top_k=target_top_k,
         )
         .cpu()
         .numpy()
@@ -248,10 +257,11 @@ def _compact_target_reference_rows(
     top_p: float | np.ndarray,
     *,
     vocab_ordered: bool = False,
+    target_top_k: int = _TARGET_TOP_K,
 ) -> np.ndarray:
     """Keep ambiguous cutoffs on the full-vocabulary sampling contract.
 
-    The 21st candidate detects a tie crossing top-20. Ties wholly inside the
+    The (k+1)-th candidate detects a tie crossing top-k. Ties wholly inside the
     retained nucleus are harmless; ties split by top-p need the reference's
     vocabulary tie order. The small CDF guard also covers FP32 scan rounding.
     Sampling parameters are scalar or per-logit-row arrays. This is called
@@ -267,8 +277,8 @@ def _compact_target_reference_rows(
         # reaches the top-k boundary. Descending vocabulary order also
         # reproduces a split top-p tie in the reference's retained suffix.
         logits = probe / temperature
-        truncated = probe[:, -1] >= probe[:, _TARGET_TOP_K - 1]
-        keep_k = logits >= logits[:, _TARGET_TOP_K - 1 : _TARGET_TOP_K]
+        truncated = probe[:, -1] >= probe[:, target_top_k - 1]
+        keep_k = logits >= logits[:, target_top_k - 1 : target_top_k]
         logits = np.where(keep_k, logits, -np.inf)
         with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
             probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
@@ -284,7 +294,7 @@ def _compact_target_reference_rows(
             | underflow
             | (near_cutoff & (top_p[:, 0] < 1.0))
         )
-    logits = probe[:, :_TARGET_TOP_K] / temperature
+    logits = probe[:, :target_top_k] / temperature
     exp_logits = np.exp(logits - logits.max(axis=-1, keepdims=True))
     probs = exp_logits / exp_logits.sum(axis=-1, keepdims=True)
     before = probs.cumsum(axis=-1) - probs
@@ -474,6 +484,7 @@ def _supports_sparse_sampling_contract(
     input_batch: InputBatch,
     *,
     allow_penalties: bool = False,
+    max_top_k: int | None = None,
 ) -> bool:
     """Whether compact logits preserve every requested sampling transform.
 
@@ -496,8 +507,13 @@ def _supports_sparse_sampling_contract(
     top_p = states.top_p.np[idx]
     if np.any(temperatures <= 0.0):
         return False
-    if np.any(top_k != _TARGET_TOP_K):
-        return False
+    if max_top_k is None:
+        if np.any(top_k != _TARGET_TOP_K):
+            return False
+    else:
+        first_k = int(top_k[0])
+        if not (1 <= first_k <= max_top_k) or np.any(top_k != first_k):
+            return False
     if np.any((top_p <= 0.0) | (top_p > 1.0)):
         return False
     if np.any(states.min_p.np[idx] != 0.0):

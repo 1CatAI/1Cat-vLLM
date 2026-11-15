@@ -217,3 +217,87 @@ def test_bounded_target_dynamic_fallback(monkeypatch, rows, vocab, ranks):
             assert bool((flags == 1).all())
         if scenario == "zero":
             assert bool((flags == 0).all())
+
+
+@pytest.mark.parametrize("rows,k_req", [(1, 21), (5, 64), (40, 64)])
+@pytest.mark.parametrize("vocab,num_pad", [(62080, 0), (62080, 17)])
+def test_bounded_local_topk_exactness(rows, k_req, vocab, num_pad):
+    require_native()
+    torch.manual_seed(91823 + rows + k_req + num_pad)
+    weight = torch.randn(vocab, 5120, device="cuda", dtype=torch.float16) * 0.02
+    # Create a clear cluster of 80 high-scoring rows so certified path triggers,
+    # while also testing uncertified zero/mixed batches.
+    anchor = torch.randn(1, 5120, device="cuda", dtype=torch.float16)
+    weight[100:180] = anchor * (
+        0.04 + torch.linspace(0, 0.02, 80, device="cuda", dtype=torch.float16)[:, None]
+    )
+    if num_pad > 0:
+        weight[-num_pad:] = anchor * 0.5  # Must be ignored due to padding mask!
+    head = torch.nn.Module()
+    head.weight = torch.nn.Parameter(weight, requires_grad=False)
+    head.shard_indices = SimpleNamespace(
+        org_vocab_start_index=62080,
+        num_org_vocab_padding=num_pad,
+    )
+    head.num_embeddings_padded = vocab * 4
+    bounded_head = bounded.MTPBoundedTargetHead(head)
+
+    for scenario in ("certified", "zero", "mixed"):
+        x = anchor.expand(rows, -1).clone()
+        if scenario == "zero":
+            x.zero_()
+        elif scenario == "mixed" and rows > 1:
+            x[1::2].zero_()
+        result = bounded_head.maybe_get_sm70_dflash2_top20(x, k_req)
+        assert result is not None
+        vals, ids = result
+        assert vals.shape == (rows, k_req) and vals.dtype == torch.float32
+        assert ids.shape == (rows, k_req) and ids.dtype == torch.int64
+
+        ref_logits = torch.nn.functional.linear(x, weight).float()
+        if num_pad > 0:
+            ref_logits[:, -num_pad:] = -float("inf")
+        # Sort descending by value, breaking ties by ascending vocab index.
+        order = torch.argsort(-ref_logits, dim=-1, stable=True)[:, :k_req]
+        ref_vals = torch.gather(ref_logits, -1, order)
+        torch.testing.assert_close(vals, ref_vals, rtol=0, atol=0)
+        assert torch.equal(ids, order + 62080)
+
+
+def test_bounded_local_topk_engine_owner_outside_forward_context():
+    require_native()
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.forward_context import is_forward_context_available
+    from vllm.runtime_resources import release_runtime_resources
+
+    torch.manual_seed(77419)
+    vocab, hidden = 62080, 5120
+    weight = torch.randn(vocab, hidden, device="cuda", dtype=torch.float16) * 0.02
+    anchor = torch.randn(1, hidden, device="cuda", dtype=torch.float16)
+    weight[200:360] = anchor * (
+        0.04 + torch.linspace(0, 0.02, 160, device="cuda", dtype=torch.float16)[:, None]
+    )
+    head = torch.nn.Module()
+    head.weight = torch.nn.Parameter(weight, requires_grad=False)
+    head.shard_indices = SimpleNamespace(
+        org_vocab_start_index=0,
+        num_org_vocab_padding=0,
+    )
+    head.num_embeddings_padded = vocab * 4
+    cfg = VllmConfig()
+    try:
+        with set_current_vllm_config(cfg):
+            bounded_head = bounded.MTPBoundedTargetHead(head)
+        assert bounded_head.native_ops.owner is not None
+        assert not is_forward_context_available()
+        x = anchor.expand(5, -1).clone()
+        result = bounded_head.maybe_get_sm70_dflash2_top20(x, 20)
+        assert result is not None
+        vals, ids = result
+        ref_logits = torch.nn.functional.linear(x, weight).float()
+        order = torch.argsort(-ref_logits, dim=-1, stable=True)[:, :20]
+        ref_vals = torch.gather(ref_logits, -1, order)
+        torch.testing.assert_close(vals, ref_vals, rtol=0, atol=0)
+        assert torch.equal(ids, order)
+    finally:
+        release_runtime_resources(cfg)
