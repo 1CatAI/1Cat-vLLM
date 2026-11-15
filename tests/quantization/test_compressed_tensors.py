@@ -17,6 +17,7 @@ from compressed_tensors.quantization import (
 
 from tests.models.utils import check_logprobs_close
 from tests.utils import create_new_process_for_each_test
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.device import DeviceConfig
 from vllm.model_executor.kernels.linear import (
@@ -82,13 +83,53 @@ def _cuda_below(capability: int) -> bool:
 
 # Each scheme states the oldest CUDA GPU it admits. Volta (SM70) has no INT8 or
 # FP8 GEMM and admits weight-only INT4/INT8 only through opt-in SM70 backends.
-requires_int8_w8a8 = pytest.mark.skipif(
+_requires_int8_gemm_capability = pytest.mark.skipif(
     _cuda_below(CompressedTensorsW8A8Int8.get_min_capability()),
     reason="INT8 W8A8 needs a GPU with INT8 GEMM (SM75 or newer).",
 )
+
+
+@pytest.fixture
+def cutlass_int8_gemm_build():
+    """Skip when this build has no CUTLASS INT8 GEMM kernel for the device.
+
+    The op is always registered, but a build without the SM75+ CUTLASS kernels
+    (an SM70-only build) rejects every call with "No compiled
+    cutlass_scaled_mm". vLLM has no build query for the INT8 kernels (unlike
+    cutlass_scaled_mm_supports_fp8), so the op itself is asked, at test time
+    and not at collection, to keep CUDA out of the collecting process.
+    """
+    a = torch.zeros(16, 16, dtype=torch.int8, device="cuda")
+    scale = torch.ones(1, 1, dtype=torch.float32, device="cuda")
+    try:
+        ops.cutlass_scaled_mm(a, a.t(), scale, scale, torch.float16)
+    except RuntimeError as error:
+        if "No compiled cutlass_scaled_mm" not in str(error):
+            raise
+        pytest.skip("The build has no compiled CUTLASS INT8 GEMM for this GPU.")
+
+
+def requires_int8_w8a8(test):
+    return _requires_int8_gemm_capability(
+        pytest.mark.usefixtures("cutlass_int8_gemm_build")(test)
+    )
+
+
 requires_wna16 = pytest.mark.skipif(
     _cuda_below(CompressedTensorsWNA16.get_min_capability()),
     reason="The weight-only INT4/INT8 scheme does not admit this GPU.",
+)
+# An SM70-only build routes every Marlin GEMM through the SM70 dispatcher, which
+# rejects act_order and any FP8 scale type other than float16 (FP4 excepted).
+requires_generic_marlin_build = pytest.mark.skipif(
+    ops.sm70_marlin_available(),
+    reason="The SM70 Marlin dispatcher rejects act_order and non-float16 scales.",
+)
+requires_hadacore_build = pytest.mark.skipif(
+    not torch._C._dispatch_has_kernel_for_dispatch_key(
+        "_C::hadacore_transform", "CUDA"
+    ),
+    reason="The build has no hadacore kernel (built for SM80+ only).",
 )
 requires_fp8_w8a8 = pytest.mark.skipif(
     _cuda_below(CompressedTensorsW8A8Fp8.get_min_capability()),
@@ -321,13 +362,16 @@ def test_compressed_tensors_w8a8_dynamic_per_token(
             True,
             False,
         ),
-        (
-            "nm-testing/TinyLlama-1.1B-Chat-v1.0-W4A16-G128-Asym-Updated-ActOrder",
-            "group",
-            128,
-            8,
-            False,
-            True,
+        pytest.param(
+            (
+                "nm-testing/TinyLlama-1.1B-Chat-v1.0-W4A16-G128-Asym-Updated-ActOrder",
+                "group",
+                128,
+                8,
+                False,
+                True,
+            ),
+            marks=requires_generic_marlin_build,
         ),
     ],
 )
@@ -495,10 +539,11 @@ def test_compressed_tensors_w4a8_fp8(vllm_runner, args):
             "Flat is better than nested.\nSparse is better than dense.",
             150.0,
         ),
-        (
+        pytest.param(
             "nm-testing/Llama-3.2-1B-Instruct-quip-w4a16",
             "Flat is better than nested.\nSparse is better than dense.",
             150.0,
+            marks=requires_hadacore_build,
         ),
     ],
 )
@@ -791,6 +836,7 @@ def test_get_scheme_dict_returns_none_on_no_match():
     not current_platform.is_cuda() or not current_platform.has_device_capability(75),
     reason="MXFP8 requires Turing (sm_75+) or newer.",
 )
+@requires_generic_marlin_build
 def test_compressed_tensors_mxfp8_moe_setup(vllm_runner):
     """Verify MXFP8 scheme, dtypes, and generation for a MoE model."""
     model_path = "AliEdalati97/Qwen3-30B-A3B-MXFP8"
