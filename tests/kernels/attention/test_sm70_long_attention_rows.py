@@ -131,12 +131,17 @@ def test_request_rows_graph_matches_independent_requests(batch, width):
     statistics = torch.empty(batch, 80, 8, 6, 2, device="cuda")
     actual = torch.empty_like(q)
     expected = torch.empty_like(q)
+    single = torch.empty_like(q)
     graph = torch.cuda.CUDAGraph()
     operator(q, k, v, actual, table, lengths, partial, statistics, 0.0625, 0.5, 1.25)
     with torch.cuda.graph(graph):
         operator(
             q, k, v, actual, table, lengths, partial, statistics, 0.0625, 0.5, 1.25
         )
+    # The kernel picks its number of KV splits from the batch size, and the fp32
+    # partial sums are combined in split order. Bit-exact references therefore
+    # must be computed with the same batch shape as the graph run: eager over the
+    # whole batch, and per request by replicating that request across the batch.
     for state in ("live", "padded_rows", "padded_request", "empty", "restore"):
         lengths.copy_(initial)
         if state == "padded_rows":
@@ -146,22 +151,27 @@ def test_request_rows_graph_matches_independent_requests(batch, width):
         elif state == "empty":
             lengths.zero_()
         graph.replay()
+        operator(
+            q, k, v, expected, table, lengths, partial, statistics, 0.0625, 0.5, 1.25
+        )
+        assert torch.equal(actual, expected)
         for request in range(batch):
             rows = slice(request * width, (request + 1) * width)
             operator(
-                q[rows],
+                q[rows].repeat(batch, 1, 1),
                 k,
                 v,
-                expected[rows],
-                table[request : request + 1],
-                lengths[rows],
-                partial[request],
-                statistics[request],
+                single,
+                table[request : request + 1].repeat(batch, 1),
+                lengths[rows].repeat(batch),
+                partial,
+                statistics,
                 0.0625,
                 0.5,
                 1.25,
             )
-        assert torch.equal(actual, expected)
+            assert torch.equal(actual[rows], single[:width])
+            assert torch.equal(actual[rows], single[rows])
 
 
 @pytest.mark.parametrize("query_rows", [1, 5, 8])
