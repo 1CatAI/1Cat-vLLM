@@ -326,10 +326,11 @@ def test_compact_changed_inputs_strides_and_large_k(mask_value):
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.parametrize("width", [21, 64, 128])
+@pytest.mark.parametrize("width", [21, 64, 128, 256])
+@pytest.mark.parametrize("top_k", [None, 64])
 @pytest.mark.parametrize("descending", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_shortlist_order_preserves_radix_ties_and_value_bits(width, descending):
+def test_shortlist_order_preserves_radix_ties_and_value_bits(width, top_k, descending):
     torch.manual_seed(1540)
     ids = torch.stack(
         [torch.randperm(248320, device="cuda")[: width + 3] for _ in range(8)]
@@ -337,16 +338,19 @@ def test_shortlist_order_preserves_radix_ties_and_value_bits(width, descending):
     storage = torch.randn(8, width + 3, device="cuda")
     values = storage[:, :width]
     output = sort_topk_with_vocab_ties(
-        values, ids, vocab_size=248320, descending=descending
+        values, ids, vocab_size=248320, descending=descending, top_k=top_k
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = sort_topk_with_vocab_ties(
-            values, ids, vocab_size=248320, descending=descending
+            values, ids, vocab_size=248320, descending=descending, top_k=top_k
         )
+    out_w = width if top_k is None else min(top_k, width)
     for amplitude in (0.1, 2.0):
         values.normal_(0, amplitude)
         values[:, :12] = 1.0
+        if width >= 72:
+            values[:, 60:70] = 0.25
         values[:, 12:18] = torch.tensor(
             [-0.0, 0.0, -float("inf"), float("inf"), float("nan"), -float("nan")],
             device="cuda",
@@ -356,7 +360,8 @@ def test_shortlist_order_preserves_radix_ties_and_value_bits(width, descending):
         ordered_values, permutation = ordered_values.sort(
             dim=-1, descending=descending, stable=True
         )
-        ordered_ids = ordered_ids.gather(1, permutation)
+        ordered_ids = ordered_ids.gather(1, permutation)[:, :out_w]
+        ordered_values = ordered_values[:, :out_w]
         graph.replay()
         assert torch.equal(output[1], ordered_ids)
         assert torch.equal(

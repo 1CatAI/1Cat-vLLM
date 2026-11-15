@@ -33,6 +33,7 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode import sm70_sparse_target as _sparse_target
 from vllm.v1.worker.gpu.spec_decode.draft_vocab import DraftVocab, make_draft_vocab
 from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     DecodeEagleCudaGraphManager,
@@ -271,11 +272,7 @@ class EagleSpeculator(TargetSamplingHooks):
         self.draft_attn_layer_names = set(all_attn_layers) - set(
             target_attn_layer_names
         )
-        from vllm.v1.worker.gpu.spec_decode.sm70_sparse_target import (
-            maybe_warmup_sparse_target,
-        )
-
-        maybe_warmup_sparse_target(self)
+        _sparse_target.maybe_warmup_sparse_target(self)
 
     def set_attn(
         self,
@@ -406,6 +403,12 @@ class EagleSpeculator(TargetSamplingHooks):
             hidden_states = ret_hidden_states
         return last_hidden_states, hidden_states
 
+    def capture_target_sampler(self, model: nn.Module, rejection_sampler) -> None:
+        if rejection_sampler is not None:
+            _sparse_target.maybe_capture_sparse_target_graphs(
+                self, model, rejection_sampler
+            )
+
     def try_sample_target(
         self,
         model,
@@ -417,17 +420,14 @@ class EagleSpeculator(TargetSamplingHooks):
         allow_graph: bool = True,
     ):
         """Compact top-k target sampling for argmax drafts."""
-        from vllm.v1.worker.gpu.spec_decode.sm70_sparse_target import (
-            maybe_sample_sparse_target,
-        )
-
-        return maybe_sample_sparse_target(
+        return _sparse_target.maybe_sample_sparse_target(
             self,
             model,
             rejection_sampler,
             hidden_states,
             input_batch,
             grammar_output,
+            allow_graph=allow_graph,
         )
 
     def _validate_local_argmax_reduction(self) -> None:

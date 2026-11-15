@@ -987,6 +987,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.capture()
                 else:
                     self.speculator.capture(captured_attn_states)
+                capture_target_sampler = getattr(
+                    self.speculator, "capture_target_sampler", None
+                )
+                if capture_target_sampler is not None and self.lora_config is None:
+                    capture_target_sampler(self.model, self.rejection_sampler)
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
 

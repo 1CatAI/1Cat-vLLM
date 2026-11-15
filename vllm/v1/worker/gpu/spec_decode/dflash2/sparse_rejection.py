@@ -206,10 +206,13 @@ def _compact_target_reference_flags(
     floors: torch.Tensor | None = None,
     *,
     target_top_k: int = _TARGET_TOP_K,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute graph-capturable fallback flags with the request-slot map."""
     rows, width = probe.shape
-    result = torch.empty(rows, device=probe.device, dtype=torch.bool)
+    result = (
+        torch.empty(rows, device=probe.device, dtype=torch.bool) if out is None else out
+    )
     _compact_target_reference_rows_kernel[(rows,)](
         probe,
         temperatures,
