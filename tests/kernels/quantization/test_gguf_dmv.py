@@ -7,6 +7,11 @@ import numpy as np
 import pytest
 import torch
 
+from tests.kernels.quantization.gguf_turbomind_support import (
+    REQUIRES_SM70_REASON,
+    requires_turbomind_gguf,
+    turbomind_gguf_supported,
+)
 from vllm.model_executor.layers.quantization import gguf_dmv_formats as iq
 from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import decode, pack
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
@@ -18,8 +23,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 def planes(kind, k=512):
-    if torch.cuda.get_device_capability() != (7, 0):
-        pytest.skip("SM70 required")
+    if not turbomind_gguf_supported():
+        pytest.skip(REQUIRES_SM70_REASON)
     import vllm._C  # noqa: F401
 
     n = 64
@@ -268,6 +273,7 @@ def test_gdn_heads_are_loaded_in_original_gguf_order(kind, k):
     assert (out.float() - reference).norm() / reference.norm() < 0.003
 
 
+@requires_turbomind_gguf
 @pytest.mark.parametrize("kind", [12, 21])
 def test_tp2_coalesced_bank_restores_large_canonical_fallback(kind):
     from vllm.model_executor.layers.quantization.gguf_turbomind import (

@@ -8,6 +8,11 @@ import gguf
 import pytest
 import torch
 
+from tests.kernels.quantization.gguf_turbomind_support import (
+    REQUIRES_SM70_REASON,
+    requires_turbomind_gguf,
+    turbomind_gguf_supported,
+)
 from tests.kernels.quantization.test_gguf_dense_segments import raw_weights
 from tools.sm70.native_trace import NativeDispatchTrace
 from vllm.config import set_current_vllm_config
@@ -36,8 +41,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
     ],
 )
 def test_segment_storage_prefill_and_decode(source, k, n, minimum):
-    if torch.cuda.get_device_capability() != (7, 0):
-        pytest.skip("SM70 required")
+    if not turbomind_gguf_supported():
+        pytest.skip(REQUIRES_SM70_REASON)
     torch._dynamo.reset()
     config = SimpleNamespace(
         kernel_config=KernelConfig(),
@@ -102,6 +107,7 @@ def test_segment_storage_prefill_and_decode(source, k, n, minimum):
                 check(graph_out)
 
 
+@requires_turbomind_gguf
 @pytest.mark.parametrize("segments", [((14, 1536), (12, 128)), ((13, 3328), (14, 256))])
 def test_mixed_segment_output_views_and_unqualified_fallback(segments):
     config = SimpleNamespace(

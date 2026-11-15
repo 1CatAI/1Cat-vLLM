@@ -6,6 +6,9 @@ import numpy as np
 import pytest
 import torch
 
+from tests.kernels.quantization.gguf_turbomind_support import (
+    requires_turbomind_gguf,
+)
 from vllm.model_executor.layers.quantization import gguf_device_transcode as dev
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
     transcode_lattice,
@@ -109,6 +112,7 @@ native = pytest.mark.skipif(
 
 
 @native
+@requires_turbomind_gguf
 @pytest.mark.parametrize(
     "weight_type,rows,k,axis",
     [
