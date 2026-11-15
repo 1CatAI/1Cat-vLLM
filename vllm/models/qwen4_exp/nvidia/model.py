@@ -741,7 +741,7 @@ def _maybe_enable_sm70_peer_paths(vllm_config: VllmConfig, model: nn.Module) -> 
             device,
             fuse_output_projection=kernel_config.sm70_hcx_output_projection,
             diagnostic=kernel_config.sm70_hcx_diagnostics,
-            local_schedule=kernel_config.sm70_hcx_local_schedule,
+            local_schedule=bool(kernel_config.sm70_hcx_local_schedule),
         )
         kernel_config.collective_kernel_selections["hcx:target"] = model.sm70_hcx_status
 
@@ -1252,6 +1252,7 @@ class Qwen4ExpForCausalLM(
         )
         object.__setattr__(self, "_sm70_decode_graph_model", None)
         object.__setattr__(self, "_hc_prefill_sequence_model", None)
+        object.__setattr__(self, "_sm70_target_head", None)
         self._hc_prefill_sequence_qualified = bool(
             self.vllm_config.kernel_config.layer_execution.hc_prefill_sequence_parallel
             and not is_offload_process()
@@ -1301,6 +1302,16 @@ class Qwen4ExpForCausalLM(
         from .sm70_fp16_hc import prepare_sharded_hc_storage
 
         prepare_sharded_hc_storage(self, self.vllm_config)
+        if self.vllm_config.kernel_config.sm70_mtp_bounded_target_head:
+            from vllm.model_executor.models.qwen3_5_mtp_bounded_head import (
+                prepare_mtp_bounded_target_head,
+            )
+
+            object.__setattr__(
+                self,
+                "_sm70_target_head",
+                prepare_mtp_bounded_target_head(self.lm_head, self.vllm_config),
+            )
         if self.vllm_config.kernel_config.hc_weight_storage == "sharded":
             # Return released replicated-bank pages before native IPC allocation
             # and draft construction. This is a loading boundary only.
@@ -1380,8 +1391,19 @@ class Qwen4ExpForCausalLM(
                     )
                 object.__setattr__(self, "_hc_prefill_sequence_model", view)
             backbone = self._hc_prefill_sequence_model
-        from .sm70_hcx import hc_prefill_sequence_parallel_context
+        from .sm70_hcx import (
+            hc_prefill_sequence_parallel_active,
+            hc_prefill_sequence_parallel_context,
+        )
 
+        if not sequence_parallel and not hc_prefill_sequence_parallel_active():
+            return backbone(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                **kwargs,
+            )
         with hc_prefill_sequence_parallel_context(sequence_parallel):
             return backbone(
                 input_ids,
@@ -1548,7 +1570,12 @@ class Qwen4ExpForCausalLM(
         return self.logits_processor(self.lm_head, hidden_states)
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+        head = (
+            self._sm70_target_head
+            if self._sm70_target_head is not None
+            else self.lm_head
+        )
+        return self.logits_processor.get_top_tokens(head, hidden_states)
 
     def get_topk_tokens_and_logits(self, hidden_states: torch.Tensor, top_k: int):
         return self.logits_processor.get_topk_tokens_and_logits(

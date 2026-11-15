@@ -217,3 +217,36 @@ def test_bounded_target_dynamic_fallback(monkeypatch, rows, vocab, ranks):
             assert bool((flags == 1).all())
         if scenario == "zero":
             assert bool((flags == 0).all())
+
+
+@pytest.mark.parametrize("rows", [5, 20, 40])
+@pytest.mark.parametrize("vocab,ranks", [(62080, 4), (124160, 2)])
+def test_bounded_target_width_2560_and_shared_qpn8(monkeypatch, rows, vocab, ranks):
+    require_native()
+    rev = getattr(torch.ops._C, "sm70_fp16_head_vocab_revision", None)
+    if rev is None or int(rev()) < 2:
+        pytest.skip("requires sm70_fp16_head_vocab_revision >= 2")
+    torch.manual_seed(78450 + vocab + rows)
+    weight = torch.randn(vocab, 2560, device="cuda", dtype=torch.float16) * 0.02
+    codes, scales, coefficients = bounded._prepare_proposal(weight, NativeBindings())
+    monkeypatch.setattr(
+        bounded,
+        "tensor_model_parallel_all_gather",
+        lambda packet, dim: torch.cat([packet] * ranks, dim=dim),
+    )
+    x = weight[vocab - 33].expand(rows, -1).contiguous()
+    for scenario in ("certified", "zero", "mixed"):
+        x.copy_(weight[vocab - 33].expand_as(x))
+        if scenario == "zero":
+            x.zero_()
+        elif scenario == "mixed":
+            x[1::2].zero_()
+        pairs, flags, _ = bounded._bounded_pair(
+            x, weight, codes, scales, coefficients, 0, return_upper=False
+        )
+        reference = torch.nn.functional.linear(x, weight)
+        assert torch.equal(pairs[:, 1].long(), reference.argmax(-1))
+        if scenario == "certified":
+            assert bool((flags == 1).all())
+        elif scenario == "zero":
+            assert bool((flags == 0).all())

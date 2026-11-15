@@ -77,3 +77,74 @@ def test_cuda_verify_matches_triton(tokens, accepted):
         out.float(), ref.reshape(tokens, HV, K).float(), atol=2e-3, rtol=2e-3
     )
     torch.testing.assert_close(new_state, ref_state, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("requests", [1, 2, 4, 8])
+@pytest.mark.parametrize("hv", [12, 24])
+def test_cuda_verify_qwen4_hv12_and_batches(requests, hv):
+    """Exercise HV=12 (TP4 96-CTA launch) and HV=24 (TP2) across N=1..8."""
+    torch.manual_seed(100 + requests * 13 + hv)
+    dev = "cuda"
+    h = 4 if hv == 12 else 8
+    per_req = 5
+    tokens = requests * per_req
+    slots = requests * per_req + 4
+    qkv = (torch.randn(tokens, 2 * h * K + hv * K, device=dev) * 0.5).half()
+    a = torch.randn(tokens, hv, device=dev).half()
+    b = torch.randn(tokens, hv, device=dev).half()
+    A_log = torch.randn(hv, device=dev) * 0.5
+    dt_bias = torch.randn(hv, device=dev) * 0.5
+    state = torch.randn(slots, hv, K, K, device=dev) * 0.1
+    cu = torch.arange(0, tokens + 1, per_req, device=dev, dtype=torch.int32)
+    idx = (
+        torch.arange(1, requests * per_req + 1, device=dev, dtype=torch.int32)
+        .view(requests, per_req)
+        .contiguous()
+    )
+    nacc = torch.tensor(
+        [(r % per_req) + 1 for r in range(requests)], device=dev, dtype=torch.int32
+    )
+    ref_state = state.clone()
+    ref, _ = fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        mixed_qkv=qkv,
+        num_q_heads=h,
+        num_v_heads=hv,
+        head_k_dim=K,
+        head_v_dim=K,
+        initial_state=ref_state,
+        inplace_final_state=True,
+        cu_seqlens=cu,
+        ssm_state_indices=idx,
+        num_accepted_tokens=nacc,
+        use_qk_l2norm_in_kernel=True,
+    )
+    out = torch.empty(tokens, hv, K, device=dev, dtype=torch.half)
+    new_state = state.clone()
+    torch.ops._C.sm70_gdn_verify_out(
+        qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        new_state,
+        out,
+        cu,
+        idx,
+        nacc,
+        h,
+        hv,
+        K**-0.5,
+        1,
+        None,
+        None,
+        None,
+        per_req,
+    )
+    torch.testing.assert_close(
+        out.float(), ref.reshape(tokens, hv, K).float(), atol=2e-3, rtol=2e-3
+    )
+    torch.testing.assert_close(new_state, ref_state, atol=1e-5, rtol=1e-4)

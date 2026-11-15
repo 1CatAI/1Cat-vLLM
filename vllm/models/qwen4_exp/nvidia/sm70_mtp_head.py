@@ -27,7 +27,17 @@ class MTPQPN8Head(nn.Module):
         super().__init__()
         self.head = head
         self.shard_indices = head.shard_indices
-        codes, scales = prepare_channel_qpn8_weight(head.weight)
+        shared = getattr(head.weight, "_sm70_shared_qpn8", None)
+        if (
+            isinstance(shared, tuple)
+            and len(shared) == 2
+            and shared[0].device == head.weight.device
+            and shared[0].numel() == head.weight.numel()
+        ):
+            codes, scales = shared
+        else:
+            codes, scales = prepare_channel_qpn8_weight(head.weight)
+            head.weight._sm70_shared_qpn8 = (codes, scales)
         self.register_buffer("codes", codes, persistent=False)
         self.register_buffer("scales", scales, persistent=False)
         self.hot_ids: torch.Tensor | None = None
@@ -78,11 +88,13 @@ class MTPQPN8Head(nn.Module):
 
     def apply(self, layer, x, bias=None):
         rows = x.numel() // x.shape[-1]
-        if x.dtype != torch.float16 or not 1 <= rows <= 8:
+        if x.dtype != torch.float16 or not 1 <= rows <= 32:
             return self.head.quant_method.apply(self.head, x, bias)
         x2 = x.reshape(rows, 2560).contiguous()
         out = x.new_empty(rows, self.weight.shape[0])
-        ops.fp8_qpn8_gemm_sm70_out(out, x2, self.codes, self.scales, 8, 2, True, False)
+        ops.fp8_qpn8_gemm_sm70_out(
+            out, x2, self.codes, self.scales, 8 if rows <= 16 else 16, 2, True, False
+        )
         if bias is not None:
             out.add_(bias)
         return out.reshape(*x.shape[:-1], self.weight.shape[0])
@@ -93,7 +105,7 @@ class MTPQPN8Head(nn.Module):
             hidden_states.ndim != 2
             or hidden_states.dtype != torch.float16
             or not hidden_states.is_cuda
-            or not 1 <= hidden_states.shape[0] <= 8
+            or not 1 <= hidden_states.shape[0] <= 32
             or getattr(self.shard_indices, "num_added_elements", 0)
             or not hasattr(torch.ops._C, "qwen38_mtp_local_top1_sm70_out")
         ):
@@ -111,7 +123,7 @@ class MTPQPN8Head(nn.Module):
                 hidden_states.contiguous(),
                 self.hot_codes,
                 self.hot_scales,
-                8,
+                8 if rows <= 16 else 16,
                 2,
                 True,
                 False,
@@ -339,10 +351,12 @@ def prepare_mtp_qpn8_head(head, hot: int = 0, ranking_path: str = ""):
         envs.VLLM_BATCH_INVARIANT
         or not current_platform.is_cuda()
         or not current_platform.is_device_capability(70)
-        or get_tensor_model_parallel_world_size() != 4
         or not weight.is_cuda
         or weight.dtype != torch.float16
-        or tuple(weight.shape) != (62080, 2560)
+        or weight.ndim != 2
+        or weight.shape[1] != 2560
+        or weight.shape[0] < 32
+        or weight.shape[0] % 32 != 0
         or any(
             not hasattr(torch.ops._C, name)
             for name in ("fp8_qpn8_prepare_sm70", "fp8_qpn8_gemm_sm70_out")
@@ -350,7 +364,7 @@ def prepare_mtp_qpn8_head(head, hot: int = 0, ranking_path: str = ""):
     ):
         return None
     view = MTPQPN8Head(head)
-    logger.info_once("SM70 Flash-Next draft-only channel-QPN8 head prepared (M1..8).")
+    logger.info_once("SM70 Flash-Next draft-only channel-QPN8 head prepared (M1..32).")
     if hot > 0:
         view.prepare_hot_vocabulary(hot)
     return view

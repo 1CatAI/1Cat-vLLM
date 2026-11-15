@@ -118,3 +118,23 @@ def test_prefill_fc_owns_rows_and_only_gathers_weights(monkeypatch, rows):
         assert torch.equal(h, before)
         layers[0].gather_output = False
         assert route.maybe_sequence_rows_fc(model, e, h) is None
+
+
+@pytest.mark.parametrize("tp_size,accepted", [(1, False), (2, True), (4, True)])
+def test_fc_shard_ready_admits_qpn8_draft_across_tp(tp_size, accepted):
+    layer = object.__new__(ColumnParallelLinear)
+    nn.Module.__init__(layer)
+    layer.bias = None
+    layer.tp_size = tp_size
+    layer.gather_output = True
+    layer.return_bias = False
+    layer.quant_method = UnquantizedLinearMethod()
+    layer._sm70_mtp_draft_qpn8_ready = True
+    layer._sm70_mtp_draft_qpn8_shape = (2560 // tp_size, 2560)
+    layer.weight = nn.Parameter(
+        torch.empty(0, dtype=torch.float16), requires_grad=False
+    )
+    assert route._fc_shard_ready(layer) is accepted
+    if accepted:
+        layer._sm70_mtp_draft_qpn8_shape = (123, 2560)
+        assert not route._fc_shard_ready(layer)

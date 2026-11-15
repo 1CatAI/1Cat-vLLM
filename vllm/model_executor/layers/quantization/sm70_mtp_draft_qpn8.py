@@ -22,7 +22,17 @@ logger = init_logger(__name__)
 
 _MARK = "_sm70_mtp_draft_qpn8"
 _READY = "_sm70_mtp_draft_qpn8_ready"
-_SUFFIXES = frozenset({"fc", "qkv_proj", "o_proj", "gate_up_proj", "down_proj"})
+_SUFFIXES = frozenset(
+    {
+        "fc",
+        "fc_embedding",
+        "fc_hidden",
+        "qkv_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+    }
+)
 _REQUIRED_OPS = ("fp8_qpn8_prepare_sm70", "fp8_qpn8_dispatch_sm70_out")
 
 

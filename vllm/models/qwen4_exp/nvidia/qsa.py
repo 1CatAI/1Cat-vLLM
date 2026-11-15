@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -1523,7 +1524,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             qkv, indexer_input = side(hidden_states)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
-        if self._sm70_qsa_prep and num_tokens <= 32:
+
+        if self._sm70_qsa_prep and (
+            is_sm70_decode_graph_compiling()
+            or (not torch.compiler.is_compiling() and num_tokens <= 64)
+        ):
             # Raw rows go to the attention op, which normalizes, rotates and
             # caches them in one launch; the gate stays strided in q_gate.
             q_gate = qkv[:, : self.q_size * 2].view(
