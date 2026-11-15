@@ -43,6 +43,13 @@ def test_candidate_guards_reject_unsupported_layouts(tp: int) -> None:
     ids = torch.zeros_like(values, dtype=torch.int64)
     kwargs = dict(vocab_size=248320, tp_size=tp)
     assert packed_topk_reason(values, ids, **kwargs) is None
+    for mtp_rows in (5, 10, 20, 40, 64):
+        mtp_vals = torch.zeros((mtp_rows, 64), device="cuda", dtype=torch.float32)
+        mtp_ids = torch.zeros_like(mtp_vals, dtype=torch.int64)
+        assert packed_topk_reason(mtp_vals, mtp_ids, **kwargs) is None
+    over_vals = torch.zeros((65, 64), device="cuda", dtype=torch.float32)
+    over_ids = torch.zeros_like(over_vals, dtype=torch.int64)
+    assert packed_topk_reason(over_vals, over_ids, **kwargs) == "unmeasured_row_count"
     assert packed_topk_reason(values, ids, vocab_size=2**31, tp_size=tp) == (
         "vocabulary_exceeds_int32"
     )

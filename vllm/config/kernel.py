@@ -922,10 +922,11 @@ class KernelConfig:
     Explicit false keeps dense verification."""
 
     sm70_sparse_target_sampling: bool | None = None
-    """Verify argmax drafts of top-k 20 sampled requests from TP-local target
+    """Verify argmax drafts of top-k sampled requests from TP-local target
     candidates (merged global top-k) instead of full-vocabulary logits and the
-    dense sampler. Exact: requests with an ambiguous top-k/top-p cutoff fall
-    back to the full-vocabulary sampler."""
+    dense sampler. By default, enable this for the SM70 Qwen3.5/3.8 native MTP
+    contract. Exact: requests with an ambiguous top-k/top-p cutoff fall back to
+    the full-vocabulary sampler."""
 
     sm70_sparse_target_reference_check: bool | None = None
     """With sparse target sampling, copy the candidates to the host each round
@@ -1189,7 +1190,7 @@ class KernelConfig:
         if self.sm70_sparse_target_sampling is None:
             self.sm70_sparse_target_sampling = prefer
         if self.sm70_sparse_target_reference_check is None:
-            self.sm70_sparse_target_reference_check = not prefer
+            self.sm70_sparse_target_reference_check = not qwen4_sm70
         if self.sm70_draft_single_graph is None:
             self.sm70_draft_single_graph = prefer
         if self.sm70_mtp_refined_head is None:

@@ -103,8 +103,10 @@ def _dispatch(
         if (
             x.shape[0] <= 8
             and gated_silu
-            and x.shape[1] == 5120
-            and out.shape[1] in (4352, 8704)
+            and x.shape[1] >= 1024
+            and x.shape[1] % 128 == 0
+            and out.shape[1] >= 1024
+            and out.shape[1] % 32 == 0
         ):
             accumulator_chains = 1
         op = (
@@ -133,6 +135,20 @@ def _dispatch(
         raise RuntimeError("Native QPN2 prefill workspace is unavailable")
     device = codes.device.index
     assert device is not None
+    if codes.is_contiguous() and scales.is_contiguous():
+        call_native(
+            sm70_ops.nvfp4_qpn4_prefill_sm70_out,
+            native_policy,
+            out,
+            workspace.data_ptr(),
+            x,
+            codes.view(k, n // 2),
+            scales.view(torch.float8_e4m3fn).view(k // 16, n),
+            global_scale,
+            False,
+            gated_silu,
+        )
+        return
     scale_workspace = _scale_workspaces.get(device)
     if scale_workspace is None or scale_workspace.numel() < workspace.numel() // 16:
         scale_workspace = torch.empty(

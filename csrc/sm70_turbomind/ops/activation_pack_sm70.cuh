@@ -47,6 +47,12 @@ inline half* k16_twin_for(const torch::Tensor& output, torch::Tensor& twin) {
   return reinterpret_cast<half*>(twin.data_ptr<at::Half>());
 }
 
+inline void k16_clear() {
+  auto& slot = k16_handoff();
+  slot.raw.reset();
+  slot.packed.reset();
+}
+
 inline void k16_publish(const torch::Tensor& raw, const torch::Tensor& twin) {
   auto& slot = k16_handoff();
   slot.raw = raw;
@@ -54,7 +60,8 @@ inline void k16_publish(const torch::Tensor& raw, const torch::Tensor& twin) {
 }
 
 // The K16 activations of `input`, from the handoff slot or from a pack launch.
-// `holder` keeps a freshly packed buffer alive for the caller.
+// `holder` keeps the selected buffer alive for the caller; consuming a handoff
+// clears the slot immediately so reused addresses never see stale activations.
 inline half* k16_packed_input(const torch::Tensor& input, torch::Tensor& holder,
                               cudaStream_t stream) {
   constexpr int kThreads = 256;
@@ -68,8 +75,12 @@ inline half* k16_packed_input(const torch::Tensor& input, torch::Tensor& holder,
   auto& slot = k16_handoff();
   if (slot.raw.defined() && slot.raw.data_ptr() == input.data_ptr() &&
       slot.raw.sizes() == input.sizes()) {
-    return reinterpret_cast<half*>(slot.packed.data_ptr<at::Half>());
+    holder = std::move(slot.packed);
+    slot.raw.reset();
+    return reinterpret_cast<half*>(holder.data_ptr<at::Half>());
   }
+  slot.raw.reset();
+  slot.packed.reset();
   holder = torch::empty_like(input);
   launch(holder);
   return reinterpret_cast<half*>(holder.data_ptr<at::Half>());

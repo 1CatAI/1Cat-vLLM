@@ -1023,9 +1023,10 @@ def _sort_topk_with_vocab_ties_kernel(
     indices,
     out_values,
     out_indices,
-    value_stride: tl.constexpr,
-    index_stride: tl.constexpr,
+    value_stride,
+    index_stride,
     width: tl.constexpr,
+    out_width: tl.constexpr,
     block: tl.constexpr,
     descending: tl.constexpr,
 ):
@@ -1046,11 +1047,12 @@ def _sort_topk_with_vocab_ties_kernel(
     ordered = tl.sort(key, descending=descending)
     source_col = tl.minimum((ordered & 255).to(tl.int32), block - 1)
     ordered_value = tl.gather(value, source_col, axis=0)
-    tl.store(out_values + row * width + col, ordered_value, valid)
+    out_valid = col < out_width
+    tl.store(out_values + row * out_width + col, ordered_value, out_valid)
     tl.store(
-        out_indices + row * width + col,
+        out_indices + row * out_width + col,
         ((ordered >> 8) & 0xFFFFFF).to(tl.int64),
-        valid,
+        out_valid,
     )
 
 
@@ -1060,12 +1062,16 @@ def sort_topk_with_vocab_ties(
     *,
     vocab_size: int,
     descending: bool = False,
+    top_k: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Order a shortlist by score, then vocabulary ID, retaining value bits."""
+    out_width = values.shape[1] if top_k is None else min(int(top_k), values.shape[1])
+    if out_width <= 0:
+        raise ValueError("top_k must be positive")
     if (
         not values.is_cuda
         or values.dtype != torch.float32
-        or not 0 < values.shape[1] <= 128
+        or not 0 < values.shape[1] <= 256
         or vocab_size >= 1 << 24
         or values.stride(-1) != 1
         or indices.stride(-1) != 1
@@ -1073,9 +1079,16 @@ def sort_topk_with_vocab_ties(
         indices, permutation = indices.sort(dim=-1, descending=descending)
         values = values.gather(1, permutation)
         values, permutation = values.sort(dim=-1, descending=descending, stable=True)
-        return values, indices.gather(1, permutation)
-    out_values = values.new_empty(values.shape)
-    out_indices = indices.new_empty(indices.shape)
+        indices = indices.gather(1, permutation)
+        if out_width < values.shape[1]:
+            return (
+                values[:, :out_width].contiguous(),
+                indices[:, :out_width].contiguous(),
+            )
+        return values, indices
+    block = triton.next_power_of_2(values.shape[1])
+    out_values = values.new_empty((values.shape[0], out_width))
+    out_indices = indices.new_empty((indices.shape[0], out_width))
     _sort_topk_with_vocab_ties_kernel[(values.shape[0],)](
         values,
         indices,
@@ -1084,9 +1097,10 @@ def sort_topk_with_vocab_ties(
         values.stride(0),
         indices.stride(0),
         values.shape[1],
-        triton.next_power_of_2(values.shape[1]),
+        out_width,
+        block,
         descending,
-        num_warps=1,
+        num_warps=2 if block == 256 else 1,
     )
     return out_values, out_indices
 

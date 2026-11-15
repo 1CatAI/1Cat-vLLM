@@ -13,9 +13,7 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _pack(
-    values, ids, wire, COUNT: tl.constexpr, HALF: tl.constexpr, BLOCK: tl.constexpr
-):
+def _pack(values, ids, wire, COUNT, HALF: tl.constexpr, BLOCK: tl.constexpr):
     index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = index < COUNT
     value = tl.load(values + index, mask, 0)
@@ -30,9 +28,7 @@ def _pack(
 
 
 @triton.jit
-def _unpack(
-    wire, values, ids, COUNT: tl.constexpr, HALF: tl.constexpr, BLOCK: tl.constexpr
-):
+def _unpack(wire, values, ids, COUNT, HALF: tl.constexpr, BLOCK: tl.constexpr):
     index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = index < COUNT
     bits = tl.load(wire + index * 2, mask, 0)
@@ -57,7 +53,7 @@ def packed_topk_reason(
         return "requires_sm70_cuda"
     if tp_size not in (2, 4):
         return "unmeasured_tp_size"
-    if values.ndim != 2 or values.shape[0] not in (1, 7, 8, 28, 32):
+    if values.ndim != 2 or not 1 <= values.shape[0] <= 64:
         return "unmeasured_row_count"
     if values.shape[1] not in (20, 64):
         return "unmeasured_candidate_count"

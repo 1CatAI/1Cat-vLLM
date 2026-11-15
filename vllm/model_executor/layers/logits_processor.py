@@ -684,12 +684,30 @@ class LogitsProcessor(PluggableLayer):
 
             effective_k = min(top_k, gathered_vals.shape[-1])
             stage_start = _cuda_stage_start(profile_enabled)
-            top_vals, top_positions = torch.topk(
-                gathered_vals.float(),
-                k=effective_k,
-                dim=-1,
-            )
-            top_indices = gathered_indices.gather(-1, top_positions)
+            if (
+                compact_target_probe
+                and gathered_vals.dtype == torch.float32
+                and 0 < gathered_vals.shape[-1] <= 256
+                and lm_head.num_embeddings_padded < (1 << 24)
+            ):
+                from vllm.v1.sample.ops.topk_topp_triton import (
+                    sort_topk_with_vocab_ties,
+                )
+
+                top_vals, top_indices = sort_topk_with_vocab_ties(
+                    gathered_vals,
+                    gathered_indices,
+                    vocab_size=lm_head.num_embeddings_padded,
+                    descending=True,
+                    top_k=effective_k,
+                )
+            else:
+                top_vals, top_positions = torch.topk(
+                    gathered_vals.float(),
+                    k=effective_k,
+                    dim=-1,
+                )
+                top_indices = gathered_indices.gather(-1, top_positions)
             merge_topk_ms = _cuda_stage_ms(profile_enabled, stage_start)
         else:
             top_vals = local_vals

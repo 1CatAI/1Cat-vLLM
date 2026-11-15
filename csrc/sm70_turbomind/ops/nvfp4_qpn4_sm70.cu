@@ -190,13 +190,23 @@ __global__ void nvfp4_qpn4_dequantize_sm70_kernel(
   }
 }
 
+__device__ __forceinline__ half
+nvfp4_e4m3fn_prefill_scale(uint8_t raw, float global_scale_f32) {
+  const unsigned short bits =
+      ((static_cast<unsigned short>(raw) & 0x80u) << 8) |
+      ((static_cast<unsigned short>(raw) & 0x7fu) << 7);
+  const half decoded = __hmul(__ushort_as_half(bits), __ushort_as_half(0x5c00));
+  const half eff = __float2half_rn(__half2float(decoded) * global_scale_f32);
+  return __float2half_rn(__half2float(eff) * kFp4Bias);
+}
+
 // Materialize the same FP16 values using aligned vectors. Small prefill GEMMs
 // are sensitive to the scalar stores in the original dequantization kernel.
-template <bool UseScaleCode, bool TurboMindLayout>
+template <bool UseScaleCode, bool TurboMindLayout, bool ExactE4M3Scale = false>
 __global__ void nvfp4_qpn4_dequantize_vector_sm70_kernel(
     half* __restrict__ output, const uint8_t* __restrict__ codes,
     const void* __restrict__ packed_scales, half scale_hi, half scale_lo, int n,
-    int k) {
+    int k, float global_scale_f32 = 0.0f) {
   __shared__ __align__(16) half tile[128 * 32];
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -206,7 +216,11 @@ __global__ void nvfp4_qpn4_dequantize_vector_sm70_kernel(
   const size_t word =
       (static_cast<size_t>(blockIdx.x) * (k / 16) + group) * 32 + lane;
   half scale;
-  if constexpr (UseScaleCode) {
+  if constexpr (ExactE4M3Scale) {
+    scale = nvfp4_e4m3fn_prefill_scale(
+        reinterpret_cast<const uint8_t*>(packed_scales)[word],
+        global_scale_f32);
+  } else if constexpr (UseScaleCode) {
     scale = nvfp4_scale_code_to_half(
         reinterpret_cast<const uint8_t*>(packed_scales)[word], scale_hi,
         scale_lo);
@@ -246,6 +260,27 @@ __global__ void nvfp4_qpn4_silu_and_mul_sm70_kernel(
   }
   const half* row_input = gate_up + static_cast<size_t>(row) * hidden * 2;
   half* row_output = output + static_cast<size_t>(row) * hidden;
+  if ((hidden & 7) == 0 &&
+      (reinterpret_cast<uintptr_t>(row_input) & 15u) == 0 &&
+      (reinterpret_cast<uintptr_t>(row_output) & 15u) == 0) {
+    const int vec_hidden = hidden >> 3;
+    for (int v = threadIdx.x; v < vec_hidden; v += blockDim.x) {
+      const uint4 g4 = reinterpret_cast<const uint4*>(row_input)[v];
+      const uint4 u4 = reinterpret_cast<const uint4*>(row_input + hidden)[v];
+      const half* gh = reinterpret_cast<const half*>(&g4);
+      const half* uh = reinterpret_cast<const half*>(&u4);
+      uint4 out4;
+      half* oh = reinterpret_cast<half*>(&out4);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float gate = __half2float(gh[i]);
+        const float silu = gate / (1.0f + __expf(-gate));
+        oh[i] = __hmul(__float2half(silu), uh[i]);
+      }
+      reinterpret_cast<uint4*>(row_output)[v] = out4;
+    }
+    return;
+  }
   for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
     const float gate = __half2float(row_input[col]);
     const float silu = gate / (1.0f + __expf(-gate));
@@ -621,9 +656,13 @@ void nvfp4_qpn4_dequantize_sm70_impl(torch::Tensor out, torch::Tensor codes,
                   codes.scalar_type() == torch::kUInt8,
               "nvfp4_qpn4_dequantize_sm70_out: output must be FP16 and codes "
               "must be uint8");
-  TORCH_CHECK((use_scale_code && scales.scalar_type() == torch::kUInt8) ||
-                  (!use_scale_code && scales.scalar_type() == torch::kFloat16),
-              "nvfp4_qpn4_dequantize_sm70_out: scale dtype mismatch");
+  const bool exact_e4m3 =
+      !use_scale_code && scales.scalar_type() == at::ScalarType::Float8_e4m3fn;
+  TORCH_CHECK(
+      (use_scale_code && scales.scalar_type() == torch::kUInt8) ||
+          (!use_scale_code && scales.scalar_type() == torch::kFloat16) ||
+          exact_e4m3,
+      "nvfp4_qpn4_dequantize_sm70_out: scale dtype mismatch");
   TORCH_CHECK(out.dim() == 2 && codes.dim() == 2 && scales.dim() == 2 &&
                   out.is_contiguous() && codes.is_contiguous() &&
                   scales.is_contiguous(),
@@ -646,10 +685,17 @@ void nvfp4_qpn4_dequantize_sm70_impl(torch::Tensor out, torch::Tensor codes,
   const SplitHalfScale split_scale =
       split_half_scale(static_cast<float>(global_scale) * kFp4Bias);
   const half zero_scale = __float2half_rn(0.0f);
-  if (vector_stores) {
+  if (vector_stores || exact_e4m3) {
     const dim3 grid(static_cast<unsigned>(n / 32),
                     static_cast<unsigned>(k / 128));
-    if (use_scale_code) {
+    if (exact_e4m3) {
+      nvfp4_qpn4_dequantize_vector_sm70_kernel<false, TurboMindLayout, true>
+          <<<grid, kPrepareThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+              reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+              codes.data_ptr<uint8_t>(), scales.data_ptr(), zero_scale,
+              zero_scale, static_cast<int>(n), static_cast<int>(k),
+              static_cast<float>(global_scale));
+    } else if (use_scale_code) {
       nvfp4_qpn4_dequantize_vector_sm70_kernel<true, TurboMindLayout>
           <<<grid, kPrepareThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
               reinterpret_cast<half*>(out.data_ptr<at::Half>()),
@@ -747,7 +793,7 @@ void nvfp4_qpn4_prefill_sm70_impl(torch::Tensor out, int64_t dense_weight_ptr,
           : torch::from_blob(reinterpret_cast<void*>(dense_weight_ptr), {k, n},
                              input.options());
   nvfp4_qpn4_dequantize_sm70_impl<TurboMindLayout>(
-      dense_weight, codes, scales, global_scale, use_scale_code, m <= 1024);
+      dense_weight, codes, scales, global_scale, use_scale_code, true);
   if (!gated_silu) {
     if (m <= 1024) {
       nvfp4_prefill_fp32_mm_out(out, input, dense_weight);

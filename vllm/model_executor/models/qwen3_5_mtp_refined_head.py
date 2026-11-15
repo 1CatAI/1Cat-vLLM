@@ -232,7 +232,14 @@ def _refined_head(
     logits = torch.empty(
         x.shape[0], weight.shape[0], device=x.device, dtype=torch.float16
     )
-    split_k = 8 if (x.shape[0] <= 16 and (x.shape[1] // 16) % 8 == 0) else 16
+    split_k = (
+        16
+        if (
+            (x.shape[1] // 16) % 16 == 0
+            and (x.shape[0] > 16 or weight.shape[0] >= 16384)
+        )
+        else 8
+    )
     call_native(
         sm70_ops.nvfp4_qpn2_gemm_sm70_out,
         native_policy,
@@ -318,7 +325,8 @@ class MTPRefinedHead(nn.Module):
             raw_scales[begin : begin + 512] = scale
         codes, scales = torch.ops._C.nvfp4_qpn2_prepare_sm70(packed, raw_scales)
         if (
-            hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
+            rows < 16384
+            and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
             and rows % 32 == 0
             and width % 64 == 0
         ):
