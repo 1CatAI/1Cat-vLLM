@@ -312,12 +312,18 @@ def _verify_rows(rows: int) -> bool:
     return rows % 5 == 0 and 5 <= rows <= 40
 
 
+def _batch_rows_ok(rows: int) -> bool:
+    if torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction:
+        return _verify_rows(rows)
+    return 2 <= rows <= 40
+
+
 def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
     return bool(
         mtp_batch_enabled("shared_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
-        and _verify_rows(x.shape[0])
+        and _batch_rows_ok(x.shape[0])
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -332,6 +338,8 @@ _BATCH_PIECE = 10  # verification rows per batch-kernel launch (2 requests)
 # beyond that cuBLAS streams the weights once (42/67/83 us at 20/40/80 rows)
 # while 10-row pieces re-read all 21 MB per piece (55/110/221 us).
 _GDN_BATCH_ROWS = 16
+_EMPTY_PARTIAL_FP16: dict[int, torch.Tensor] = {}
+_EMPTY_PARTIAL_FP32: dict[int, torch.Tensor] = {}
 
 
 def _in_pieces(x: torch.Tensor, width: int, fn) -> torch.Tensor:
@@ -363,11 +371,18 @@ def _qwen38_sm70_shared_up(
     if _shared_batch_runtime_ok(x) and packed is not None:
         out = x.new_empty((x.shape[0], 160))
         reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        dev_idx = x.device.index or 0
         if reduced:
-            partial = x.new_empty((8, x.shape[0], 320))
+            partial = _EMPTY_PARTIAL_FP16.get(dev_idx)
+            if partial is None or partial.device != x.device:
+                partial = torch.empty(8, dtype=torch.float16, device=x.device)[:0]
+                _EMPTY_PARTIAL_FP16[dev_idx] = partial
             torch.ops._C.qwen38_shared_up_batch_sm70_out(out, partial, x, packed)
         else:
-            partial = x.new_empty((8, x.shape[0], 320), dtype=torch.float32)
+            partial = _EMPTY_PARTIAL_FP32.get(dev_idx)
+            if partial is None or partial.device != x.device:
+                partial = torch.empty(8, dtype=torch.float32, device=x.device)[:0]
+                _EMPTY_PARTIAL_FP32[dev_idx] = partial
             torch.ops._C.qwen38_shared_up_batch_fp32_sm70_out(out, partial, x, packed)
         logger.info_once(
             "SM70 MTP4 shared-expert batch projection enabled (partials=%s).",
@@ -429,7 +444,7 @@ def _router_batch_runtime_ok(x, packed) -> bool:
         mtp_batch_enabled("router_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
-        and _verify_rows(x.shape[0])
+        and _batch_rows_ok(x.shape[0])
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16

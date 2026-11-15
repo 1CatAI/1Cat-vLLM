@@ -728,6 +728,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
 
         mm_config = model_config.multimodal_config
         text_only = mm_config is None or mm_config.language_model_only
+        self._text_only = text_only
         mrope_section = getattr(self.rotary_emb, "mrope_section", None)
         supports_mrope = bool(
             type(self.rotary_emb) is MRotaryEmbedding
@@ -860,6 +861,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             and self.head_dim == 256
             and self.num_kv_heads == 1
             and cache_config.cache_dtype in ("auto", "float16")
+            and model_config.dtype == torch.float16
+            and self.attn_output_gate
+        )
+        self._sm70_qsa_host_prep = bool(
+            vllm_config.kernel_config.sm70_qsa_prep
+            and self.host_kv_enabled
+            and current_platform.is_device_capability(70)
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and self.head_dim == 256
+            and self.num_kv_heads == 1
+            and 1 <= self.num_heads <= 24
             and model_config.dtype == torch.float16
             and self.attn_output_gate
         )
@@ -1020,6 +1032,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 device_reference=self.host_kv_device_reference,
                 direct_device=self.host_kv_direct_device,
                 is_speculative_draft=self.host_kv_is_draft,
+                resolve_rows=max(32, min(64, self.host_kv_decode_rows)),
                 hot_fp8=self.host_kv_hot_fp8,
             )
             if not self.host_kv_is_draft:
@@ -1188,6 +1201,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     state.write_staged(
                         new_key, new_value, new_slots, plan, history, scales
                     )
+                if state.device_history_hot:
+                    state.warm_hot_staged(table, staged_table, history, scales, lengths)
                 gate_rows = gate.view_as(query) if gate is not None else None
                 if history.dtype == torch.uint8:
                     # One CTA per row over all its keys (tensor-core QK/PV,
@@ -1456,9 +1471,51 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         if self.host_kv_enabled:
-            self.host_kv.write(key, value, main_metadata.slot_mapping)
-            # A staged prefill writes these rows into its stage buffer too.
-            self._host_kv_new = (key, value, main_metadata.slot_mapping)
+            if query.dim() == 2:
+                raw_qkv = query[:num_tokens]
+                prepared_q = raw_qkv.new_empty(
+                    (num_tokens, self.num_heads, self.head_dim)
+                )
+                prepared_k = raw_qkv.new_empty((num_tokens, 1, self.head_dim))
+                text_positions = positions[0] if positions.dim() == 2 else positions
+                pos_slice = text_positions[:num_tokens]
+                if not pos_slice.is_contiguous():
+                    pos_slice = pos_slice.contiguous()
+                slot_slice = main_metadata.slot_mapping[:num_tokens]
+                if not slot_slice.is_contiguous():
+                    slot_slice = slot_slice.contiguous()
+                state = self.host_kv
+                if num_tokens > 0:
+                    torch.ops.vllm_sm70_qsa_device.prep_write(
+                        raw_qkv,
+                        pos_slice,
+                        self.rotary_emb.cos_sin_cache,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        self.q_norm.variance_epsilon,
+                        prepared_q,
+                        prepared_k,
+                        slot_slice,
+                        state.history,
+                        state.scales,
+                        state.tags,
+                        state.page_slots,
+                        state.hot_values,
+                        state.hot_scales if state.hot_fp8 else None,
+                        state.epoch,
+                    )
+                prepared_v = raw_qkv[
+                    :,
+                    self.q_size * 2 + self.kv_size : self.q_size * 2 + 2 * self.kv_size,
+                ].unsqueeze(1)
+                self._host_kv_new = (prepared_k, prepared_v, slot_slice)
+                query = prepared_q
+                key = prepared_k
+                value = prepared_v
+            else:
+                self.host_kv.write(key, value, main_metadata.slot_mapping)
+                # A staged prefill writes these rows into its stage buffer too.
+                self._host_kv_new = (key, value, main_metadata.slot_mapping)
         elif query.dim() == 2:
             # SM70 prep: raw qkv rows -> normalized/rotated query + cache write.
             key_cache, value_cache = self.kv_cache.unbind(1)
@@ -1525,16 +1582,25 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         else:
             qkv, _ = self.qkv_proj(hidden_states)
 
-        if self._sm70_qsa_prep and (
+        use_host_prep = self._sm70_qsa_host_prep and _sm70_qsa_host_prep_ready()
+        if (self._sm70_qsa_prep or use_host_prep) and (
             is_sm70_decode_graph_compiling()
-            or (not torch.compiler.is_compiling() and num_tokens <= 64)
+            or (
+                not torch.compiler.is_compiling()
+                and num_tokens <= 64
+                and (not use_host_prep or self._text_only or positions.dim() == 1)
+            )
         ):
             # Raw rows go to the attention op, which normalizes, rotates and
             # caches them in one launch; the gate stays strided in q_gate.
             q_gate = qkv[:, : self.q_size * 2].view(
                 num_tokens, self.num_heads, 2 * self.head_dim
             )
-            gate = q_gate[..., self.head_dim :].reshape(num_tokens, self.q_size)
+            gate = (
+                q_gate[..., self.head_dim :]
+                if use_host_prep
+                else q_gate[..., self.head_dim :].reshape(num_tokens, self.q_size)
+            )
             query = qkv
             key = value = qkv
             attn_output = qkv.new_empty((num_tokens, self.num_heads, self.head_dim))
@@ -1580,6 +1646,22 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if output is not None:
             output.copy_(projected_output)
         return projected_output
+
+
+@torch.compiler.assume_constant_result
+def _sm70_qsa_host_prep_ready() -> bool:
+    from vllm.diagnostics import diagnostic_channel
+
+    if diagnostic_channel("qsa_calibration").policy.directory:
+        return False
+    try:
+        import importlib
+
+        importlib.import_module("vllm._sm70_qsa_device_C")
+    except ImportError:
+        return False
+    ns = getattr(torch.ops, "vllm_sm70_qsa_device", None)
+    return ns is not None and hasattr(ns, "prep_write")
 
 
 def qwen4_exp_qsa_with_output(

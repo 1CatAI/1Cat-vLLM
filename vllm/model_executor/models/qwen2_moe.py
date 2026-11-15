@@ -53,6 +53,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -134,10 +135,12 @@ def _sm70_fused_shared_expert_gate_module_supported(
     down_proj: torch.nn.Module,
 ) -> bool:
     """Match the local TP projection shape used by the native gate kernel."""
+    k_down = int(getattr(down_proj, "input_size_per_partition", 0))
     return bool(
         int(getattr(gate_up_proj, "input_size_per_partition", 0)) == 2560
-        and tuple(getattr(gate_up_proj, "output_partition_sizes", ())) == (160, 160)
-        and int(getattr(down_proj, "input_size_per_partition", 0)) == 160
+        and k_down in (160, 320, 640)
+        and tuple(getattr(gate_up_proj, "output_partition_sizes", ()))
+        == (k_down, k_down)
         and int(getattr(down_proj, "output_size_per_partition", 0)) == 2560
     )
 
@@ -220,12 +223,70 @@ class Qwen2MoeMLP(nn.Module):
             gate_up = _sm70_dump_qwen_mlp_tensor("mlp_gate_up", self.layer_idx, gate_up)
             out = self.act_fn(gate_up)
         out = _sm70_dump_qwen_mlp_tensor("mlp_silu_out", self.layer_idx, out)
-        out, _ = self.down_proj(out)
-        out = _sm70_dump_qwen_mlp_tensor("mlp_down_out", self.layer_idx, out)
-
         used_exact_gate = False
+        down_weight = getattr(self.down_proj, "weight", None)
         if (
             self._sm70_exact_shared_expert_gate
+            and type(getattr(self.down_proj, "quant_method", None))
+            is UnquantizedLinearMethod
+            and getattr(self.down_proj, "bias", None) is None
+            and isinstance(down_weight, torch.Tensor)
+            and not torch.backends.cuda.matmul.allow_fp16_accumulation
+            and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+            and not capture_runtime_trace().qwen_mlp_internals
+            and (
+                x.shape[0] == 1
+                or (
+                    self._sm70_batch_shared_expert_gate
+                    and use_sm70_decode_graph_semantics()
+                    and x.shape[0] <= 24
+                )
+            )
+            and x.ndim == 2
+            and out.ndim == 2
+            and 0 < x.shape[0] <= 24
+            and out.shape[0] == x.shape[0]
+            and x.shape[1] == 2560
+            and out.shape[1] in (160, 320, 640)
+            and down_weight.shape == (2560, out.shape[1])
+            and x.is_cuda
+            and out.is_cuda
+            and down_weight.is_cuda
+            and x.dtype == out.dtype == down_weight.dtype == torch.float16
+            and x.is_contiguous()
+            and out.is_contiguous()
+            and down_weight.is_contiguous()
+            and x.data_ptr() % 16 == 0
+            and out.data_ptr() % 16 == 0
+            and down_weight.data_ptr() % 16 == 0
+        ):
+            from vllm import _sm70_ops as sm70_ops
+
+            if sm70_ops.has_qwen38_shared_down_gated():
+                assert self.expert_gate is not None
+                gate_weight = self.expert_gate.weight
+                if (
+                    gate_weight.dtype == torch.float16
+                    and gate_weight.is_contiguous()
+                    and gate_weight.shape == (1, 2560)
+                    and gate_weight.data_ptr() % 16 == 0
+                ):
+                    down_out = x.new_empty((x.shape[0], 2560))
+                    sm70_ops.qwen38_shared_down_gated_sm70_out(
+                        down_out, x, out, down_weight, gate_weight
+                    )
+                    logger.info_once(
+                        "SM70 Qwen3.8 fused shared-expert down+gate path enabled."
+                    )
+                    out = down_out
+                    used_exact_gate = True
+        if not used_exact_gate:
+            out, _ = self.down_proj(out)
+            out = _sm70_dump_qwen_mlp_tensor("mlp_down_out", self.layer_idx, out)
+
+        if (
+            not used_exact_gate
+            and self._sm70_exact_shared_expert_gate
             and (
                 x.shape[0] == 1
                 or (

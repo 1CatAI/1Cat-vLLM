@@ -363,17 +363,13 @@ def _gather(
     pages = tl.reshape(tokens // 4, (4, 4))
     page_lanes = tl.arange(0, 4)
     first = tl.sum(tl.where(page_lanes[None, :] == 0, pages, 0), 1)
-    aligned = (
-        tl.sum(
-            tl.reshape(valid, (4, 4)).to(tl.int32)
-            * (
-                (pages == first[:, None])
-                & (tl.reshape(tokens % 4, (4, 4)) == page_lanes[None, :])
-            ),
-            1,
-        )
-        == 4
+    valid4 = tl.reshape(valid, (4, 4))
+    valid0 = tl.sum(tl.where(page_lanes[None, :] == 0, valid4.to(tl.int32), 0), 1) > 0
+    lane_match = ~valid4 | (
+        (pages == first[:, None])
+        & (tl.reshape(tokens % 4, (4, 4)) == page_lanes[None, :])
     )
+    aligned = valid0 & (tl.sum(lane_match.to(tl.int32), 1) == 4)
     registered = tl.load(PageSlots + first)
     slots = tl.maximum(registered, 0)
     tags = tl.load(Tags + slots, registered >= 0, other=-1)
@@ -456,9 +452,17 @@ def _gather(
     # A failed direct installation has no values to materialize.
     if STAGE > 0 or tl.sum(install.to(tl.int32), 0) > 0:
         need_cached = token_hits & (STAGE > 0)
-        need_history = valid & ~token_hits
-        if STAGE == 0:
-            need_history &= token_installs
+        phys_tokens = tl.reshape(first[:, None] * 4 + page_lanes[None, :], (16,))
+        hist_tokens = tl.where(token_installs, phys_tokens, tokens)
+        hist_blocks = tl.where(
+            token_installs, hist_tokens // Page, tl.maximum(blocks, 0)
+        )
+        hist_offsets = tl.where(
+            token_installs, hist_tokens % Page, tl.maximum(logical, 0) % Page
+        )
+        need_history = (
+            token_installs if STAGE == 0 else (token_installs | (valid & ~token_hits))
+        )
         cached = tl.load(
             Hot
             + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
@@ -478,12 +482,8 @@ def _gather(
         codes = tl.load(
             History
             + (
-                (
-                    tl.maximum(blocks, 0).to(tl.int64)[:, None, None] * 2
-                    + kv[None, :, None]
-                )
-                * Page
-                + (tl.maximum(logical, 0) % Page)[:, None, None]
+                (hist_blocks.to(tl.int64)[:, None, None] * 2 + kv[None, :, None]) * Page
+                + hist_offsets[:, None, None]
             )
             * Dim
             + dims[None, None, :],
@@ -492,7 +492,7 @@ def _gather(
         )
         if FP8:
             scales = tl.load(
-                Scales + tokens[:, None] * 2 + kv[None, :],
+                Scales + hist_tokens[:, None] * 2 + kv[None, :],
                 need_history[:, None],
                 other=0,
             )
@@ -519,12 +519,13 @@ def _gather(
             store_values = columns < Padded
             if STAGE == 2:
                 store_values &= valid & ~(token_hits | token_installs)
+            out_values = tl.where(valid[:, None, None], values, 0)
             tl.store(
                 Out
                 + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None])
                 * Dim
                 + dims[None, None, :],
-                values,
+                out_values,
                 store_values[:, None, None],
             )
         tl.debug_barrier()
@@ -688,6 +689,22 @@ class HostQSAKV:
         self.device_history_reason: str | None = None
         self.device_history_hot = False
         initialize_device_history_attention(self, direct_device)
+        self._miss_queue = torch.zeros(
+            self.resolve_rows * triton.cdiv(width, 16) + 2,
+            dtype=torch.int32,
+            device=device,
+        )
+        qsa_ns = (
+            getattr(torch.ops, "vllm_sm70_qsa_device", None)
+            if self._stage_host_run is not None
+            else None
+        )
+        self._resolve_hot_op = (
+            getattr(qsa_ns, "resolve_hot", None) if qsa_ns is not None else None
+        )
+        self._warm_hot_staged_op = (
+            getattr(qsa_ns, "warm_hot_staged", None) if qsa_ns is not None else None
+        )
 
     def write(self, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor):
         if key.shape[1:] != (1, self.dim) or value.shape != key.shape:
@@ -993,6 +1010,32 @@ class HostQSAKV:
         self._resolve(indices, block_table, token_to_req, positions, lengths, 0)
         return self.resolved[: indices.shape[0]]
 
+    def warm_hot_staged(self, block_table, staged_table, history, scales, lengths):
+        """Warm the hot cache directly from device-staged prefill history."""
+        if (
+            self._warm_hot_staged_op is None
+            or not self.device_history_hot
+            or block_table.stride(1) != 1
+            or staged_table.stride(1) != 1
+            or not lengths.is_contiguous()
+        ):
+            return
+        self._warm_hot_staged_op(
+            history,
+            scales,
+            self.hot_values,
+            self.hot_scales if self.hot_fp8 else None,
+            self.tags,
+            self.stamps,
+            self.epoch,
+            self.hands,
+            self.page_slots,
+            block_table,
+            staged_table,
+            lengths,
+            self.blocks,
+        )
+
     def _resolve(self, indices, block_table, token_to_req, positions, lengths, stage):
         rows = indices.shape[0]
         capacity = self.rows if stage else self.resolve_rows
@@ -1001,6 +1044,38 @@ class HostQSAKV:
         if block_table.shape[0] != lengths.numel():
             raise ValueError("Host KV request metadata disagrees")
         if rows:
+            if (
+                stage == 0
+                and self._resolve_hot_op is not None
+                and indices.stride(1) == 1
+                and block_table.stride(1) == 1
+                and token_to_req.is_contiguous()
+                and positions.is_contiguous()
+                and lengths.is_contiguous()
+                and positions.dtype in (torch.int32, torch.int64)
+            ):
+                self._resolve_hot_op(
+                    self.history,
+                    self.scales,
+                    self.hot_values,
+                    self.hot_scales if self.hot_fp8 else None,
+                    self.tags,
+                    self.stamps,
+                    self.epoch,
+                    self.hands,
+                    self.page_slots,
+                    self._stats,
+                    self._miss_queue,
+                    indices,
+                    block_table,
+                    token_to_req,
+                    positions,
+                    lengths,
+                    self.positions,
+                    self.lengths,
+                    self.resolved,
+                )
+                return
             _protect[(rows, triton.cdiv(self.width, 256))](
                 indices,
                 block_table,

@@ -120,6 +120,10 @@ def _sm70_qwen38_router_topk(
     token_expert_indices: torch.Tensor,
     gating_output: torch.Tensor,
 ) -> None:
+    if ops.try_native_router_top10(
+        topk_weights, topk_ids, token_expert_indices, gating_output
+    ):
+        return
     num_tokens = gating_output.shape[0]
     _sm70_qwen38_router_topk_kernel[(num_tokens,)](
         gating_output,

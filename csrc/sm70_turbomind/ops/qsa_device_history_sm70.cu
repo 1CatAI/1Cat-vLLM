@@ -1,7 +1,7 @@
-#include <algorithm>
-#include <type_traits>
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#include <algorithm>
+#include <type_traits>
 // Direct device E4M3/FP16 history: FP16 QK operands, FP32 QK/PV,
 // probability and merge. No protected-hot ownership or staging is required.
 #include <cuda_runtime.h>
@@ -124,6 +124,31 @@ __device__ __forceinline__ uint4 decode8_bits(const uint2 packed, float scale) {
   return result;
 }
 
+__device__ __forceinline__ float e4m3_exact(unsigned c, bool hot_src) {
+  if (!hot_src && (c & 0x7fu) == 0x7fu)
+    return __uint_as_float(((c & 0x80u) << 24) | 0x7fc00000u);
+  return e4m3_bits(c);
+}
+
+__device__ __forceinline__ uint4 decode8_exact(const uint2 packed, float scale,
+                                               bool hot_src) {
+  uint4 result;
+  unsigned* words = reinterpret_cast<unsigned*>(&result);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const unsigned p = j < 2 ? packed.x : packed.y;
+    const unsigned code0 = (p >> (16 * (j & 1))) & 255u;
+    const unsigned code1 = (p >> (16 * (j & 1) + 8)) & 255u;
+    const half lo =
+        __float2half_rn(__fmul_rn(e4m3_exact(code0, hot_src), scale));
+    const half hi =
+        __float2half_rn(__fmul_rn(e4m3_exact(code1, hot_src), scale));
+    words[j] =
+        unsigned(__half_as_ushort(lo)) | (unsigned(__half_as_ushort(hi)) << 16);
+  }
+  return result;
+}
+
 // Two E4M3 codes (bytes `lo`, `hi` of `word`, selected by __byte_perm) as an
 // FP16 pair holding value * 2^-8 exactly: sign to bit 15, the 7 magnitude
 // bits to bits 7..13. Normals and subnormals alike; no rounding.
@@ -232,12 +257,11 @@ __global__ __launch_bounds__(256) void partial(Args a) {
           load_kv<FP8, HOT, HOT_FP8>(a, slots[token], hots[token], 0, dim, lut);
     }
     __syncthreads();
-    // Without the hot cache, issue this thread's V loads now so their
-    // latency overlaps QK and the softmax; they are decoded into the
-    // retired K tile.
+    // Issue V loads ahead of QK and softmax so global/PCIe latency overlaps
+    // tensor-core QK and score reduction (including FP16 hot-cache readers).
     Raw raw[kChunks];
     float raw_scale[kChunks];
-    if constexpr (!HOT) {
+    if constexpr (!HOT || !FP8) {
 #pragma unroll
       for (int i = 0; i < kChunks; ++i) {
         const int v = t + i * 256, token = v / 32, dim = (v % 32) * 8;
@@ -245,15 +269,30 @@ __global__ __launch_bounds__(256) void partial(Args a) {
         raw[i] = Raw{};
         raw_scale[i] = 0.f;
         if (slot >= 0) {
-          const int block = slot / a.page, off = slot % a.page;
-          const int64_t element =
-              ((int64_t(block) * 2 + 1) * a.page + off) * D + dim;
-          if constexpr (FP8) {
-            raw[i] = __ldg(reinterpret_cast<const uint2*>(a.history + element));
-            raw_scale[i] = __ldg(a.scales + slot * 2 + 1);
+          if constexpr (HOT && !FP8) {
+            const int hot = hots[token];
+            if (hot >= 0) {
+              raw[i] = __ldg(reinterpret_cast<const uint4*>(
+                  a.hot + (int64_t(hot) * 2 + 1) * D + dim));
+            } else {
+              const int block = slot / a.page, off = slot % a.page;
+              const int64_t element =
+                  ((int64_t(block) * 2 + 1) * a.page + off) * D + dim;
+              raw[i] = __ldg(reinterpret_cast<const uint4*>(
+                  reinterpret_cast<const half*>(a.history) + element));
+            }
           } else {
-            raw[i] = __ldg(reinterpret_cast<const uint4*>(
-                reinterpret_cast<const half*>(a.history) + element));
+            const int block = slot / a.page, off = slot % a.page;
+            const int64_t element =
+                ((int64_t(block) * 2 + 1) * a.page + off) * D + dim;
+            if constexpr (FP8) {
+              raw[i] =
+                  __ldg(reinterpret_cast<const uint2*>(a.history + element));
+              raw_scale[i] = __ldg(a.scales + slot * 2 + 1);
+            } else {
+              raw[i] = __ldg(reinterpret_cast<const uint4*>(
+                  reinterpret_cast<const half*>(a.history) + element));
+            }
           }
         }
       }
@@ -311,7 +350,7 @@ __global__ __launch_bounds__(256) void partial(Args a) {
     // The shared key tile is retired. Reuse its storage for values, keeping
     // FP32 probabilities and PV FMAs instead of rounding probabilities to
     // half.
-    if constexpr (HOT) {
+    if constexpr (HOT && FP8) {
       for (int v = t; v < C * 32; v += 256) {
         const int token = v / 32, dim = (v % 32) * 8;
         *reinterpret_cast<uint4*>(&kv[token][dim]) = load_kv<FP8, HOT, HOT_FP8>(
@@ -538,6 +577,176 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
 #pragma unroll
     for (int h = 0; h < H; ++h)
       result[h] = __fmaf_rn(scores[0][h][k], value, result[h]);
+  }
+#pragma unroll
+  for (int h = 0; h < H; ++h)
+    a.partial[((row * H + h) * a.splits + split) * D + t] = result[h];
+}
+
+// Decode/verify over encoded E4M3 hot cache + mapped host history: keep K/V
+// tiles as raw E4M3 bytes in shared memory (half the footprint -> up to 3 CTAs
+// per SM instead of 1), preload per-token K/V scales once in `t < C`, prefetch
+// V bytes in registers before QK MMA + softmax, and decode with conflict-free
+// bit arithmetic matching `partial<true, true, true>` bit-for-bit.
+__global__ __launch_bounds__(256, 3) void partial_hot_fp8_lite(Args a) {
+  const int row = blockIdx.y, split = blockIdx.x;
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  __shared__ __align__(16) half query[8][PAD];
+  __shared__ __align__(16) unsigned char tile[C][KP];
+  __shared__ float scores[4][8][C];
+  __shared__ int64_t slots[C];
+  __shared__ int hots[C];
+  __shared__ float kscale[C], vscale[C];
+  __shared__ float alpha[8];
+  const int req = a.requests[row];
+  const int64_t position = a.positions[row];
+  const int length = req >= 0 && req < a.num_requests ? a.lengths[req] : 0;
+  const int head = t / 32, d8 = (t % 32) * 8;
+  const uint4 qv = head < H ? __ldg(reinterpret_cast<const uint4*>(
+                                  a.q + row * a.qs0 + head * a.qs1 + d8))
+                            : make_uint4(0, 0, 0, 0);
+  *reinterpret_cast<uint4*>(&query[head][d8]) = qv;
+  const int nt = warp & 1, kw = warp >> 1;
+  const int r8 = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int nr =
+      nt * 32 + ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+  constexpr int kChunks = C * 32 / 256;
+  float running_max = __int_as_float(0xff800000), running_sum = 0.f;
+  float result[H] = {};
+  for (int tl = 0; tl < a.tiles; ++tl) {
+    const int base = (split * a.tiles + tl) * C;
+    if (base >= a.width) break;
+    __syncthreads();
+    if (t < C) {
+      const int col = base + t;
+      const int logical = col < a.width ? a.indices[row * a.is0 + col] : -1;
+      int64_t slot = -1;
+      if (req >= 0 && req < a.num_requests && logical >= 0 &&
+          logical <= position && logical < length &&
+          logical / a.page < a.table_width) {
+        const int physical = a.table[req * a.ts0 + logical / a.page];
+        if (physical >= 0 && physical < a.blocks)
+          slot = int64_t(physical) * a.page + logical % a.page;
+      }
+      const int hot = slot >= 0 ? a.resolved[row * a.rs0 + col] : -1;
+      slots[t] = slot;
+      hots[t] = hot;
+      if (slot < 0) {
+        kscale[t] = 0.f;
+        vscale[t] = 0.f;
+      } else if (hot >= 0) {
+        const float2 hs =
+            *reinterpret_cast<const float2*>(a.hot_scales + int64_t(hot) * 2);
+        kscale[t] = hs.x;
+        vscale[t] = hs.y;
+      } else {
+        const float2 ms = *reinterpret_cast<const float2*>(a.scales + slot * 2);
+        kscale[t] = ms.x;
+        vscale[t] = ms.y;
+      }
+    }
+    __syncthreads();
+    uint2 vraw[kChunks];
+#pragma unroll
+    for (int i = 0; i < kChunks; ++i) {
+      const int v = t + i * 256, token = v / 32, dim = (v % 32) * 8;
+      const int64_t slot = slots[token];
+      uint2 kraw = make_uint2(0, 0);
+      vraw[i] = make_uint2(0, 0);
+      if (slot >= 0) {
+        const int hot = hots[token];
+        if (hot >= 0) {
+          const auto* hb = reinterpret_cast<const unsigned char*>(a.hot) +
+                           int64_t(hot) * 2 * D + dim;
+          kraw = __ldg(reinterpret_cast<const uint2*>(hb));
+          vraw[i] = __ldg(reinterpret_cast<const uint2*>(hb + D));
+        } else {
+          const int block = slot / a.page, off = slot % a.page;
+          const auto* mb =
+              a.history + (int64_t(block) * 2 * a.page + off) * D + dim;
+          kraw = __ldg(reinterpret_cast<const uint2*>(mb));
+          vraw[i] =
+              __ldg(reinterpret_cast<const uint2*>(mb + int64_t(a.page) * D));
+        }
+      }
+      *reinterpret_cast<uint2*>(&tile[token][dim]) = kraw;
+    }
+    __syncthreads();
+    const float ks = kscale[nr];
+    const bool hot_nr = hots[nr] >= 0;
+    float acc[8] = {};
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const int k = kw * 64 + s * 16;
+      const uint4 q0 = *reinterpret_cast<const uint4*>(&query[r8][k]);
+      const uint4 q1 = *reinterpret_cast<const uint4*>(&query[r8][k + 8]);
+      const uint4 k0 = decode8_exact(
+          *reinterpret_cast<const uint2*>(&tile[nr][k]), ks, hot_nr);
+      const uint4 k1 = decode8_exact(
+          *reinterpret_cast<const uint2*>(&tile[nr][k + 8]), ks, hot_nr);
+      mma(acc, q0.x, q0.y, k0.x, k0.y);
+      mma(acc, q0.z, q0.w, k0.z, k0.w);
+      mma(acc, q1.x, q1.y, k1.x, k1.y);
+      mma(acc, q1.z, q1.w, k1.z, k1.w);
+    }
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int h = (e & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int col = nt * 32 + ((lane >> 2) & 3) * 8 +
+                      ((e & 1) | (((lane >> 1) & 1) << 1) | ((e >> 2) << 2));
+      scores[kw][h][col] = acc[e];
+    }
+    __syncthreads();
+    for (int v = t; v < 8 * C; v += 256) {
+      const int h = v / C, k = v % C;
+      const float sum =
+          ((scores[0][h][k] + scores[1][h][k]) + scores[2][h][k]) +
+          scores[3][h][k];
+      scores[0][h][k] =
+          slots[k] >= 0 ? sum * (0.0625f * 1.4426950408889634f) : -1e20f;
+    }
+    __syncthreads();
+    float maximum = fmaxf(scores[0][warp][lane], scores[0][warp][lane + 32]);
+#pragma unroll
+    for (int s = 16; s; s >>= 1)
+      maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, s));
+    maximum = fmaxf(running_max, maximum);
+    const float p0 =
+        slots[lane] >= 0 ? fast_exp2(scores[0][warp][lane] - maximum) : 0.f;
+    const float p1 = slots[lane + 32] >= 0
+                         ? fast_exp2(scores[0][warp][lane + 32] - maximum)
+                         : 0.f;
+    scores[0][warp][lane] = p0;
+    scores[0][warp][lane + 32] = p1;
+    float sum = p0 + p1;
+#pragma unroll
+    for (int s = 16; s; s >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, s);
+    const float scale = fast_exp2(running_max - maximum);
+    running_sum = __fmaf_rn(running_sum, scale, sum);
+    running_max = maximum;
+    if (lane == 0) alpha[warp] = scale;
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < kChunks; ++i) {
+      const int v = t + i * 256, token = v / 32, dim = (v % 32) * 8;
+      *reinterpret_cast<uint2*>(&tile[token][dim]) = vraw[i];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < H; ++h) result[h] *= alpha[h];
+#pragma unroll 4
+    for (int k = 0; k < C; ++k) {
+      const float dec = e4m3_exact(tile[k][t], hots[k] >= 0);
+      const float value =
+          __half2float(__float2half_rn(__fmul_rn(dec, vscale[k])));
+#pragma unroll
+      for (int h = 0; h < H; ++h)
+        result[h] = __fmaf_rn(scores[0][h][k], value, result[h]);
+    }
+  }
+  if (lane == 0 && warp < H) {
+    a.state[((row * H + warp) * a.splits + split) * 2] = running_max;
+    a.state[((row * H + warp) * a.splits + split) * 2 + 1] = running_sum;
   }
 #pragma unroll
   for (int h = 0; h < H; ++h)
@@ -963,18 +1172,26 @@ void device_qsa_out(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
-  if (prefill && fp8 && !hot && a.tiles == 1)
+  if (prefill && fp8 && !hot && a.tiles == 1) {
     device_qsa::partial_fp8_lite<<<grid, 256, 0, stream>>>(a);
-  else if (fp8 && hot_scales)
-    device_qsa::partial<true, true, true><<<grid, 256, 0, stream>>>(a);
-  else if (fp8 && hot)
+  } else if (fp8 && hot_scales) {
+    static int configured_dev = -1;
+    const int cur_dev = q.device().index();
+    if (configured_dev != cur_dev) {
+      cudaFuncSetAttribute(device_qsa::partial_hot_fp8_lite,
+                           cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+      configured_dev = cur_dev;
+    }
+    device_qsa::partial_hot_fp8_lite<<<grid, 256, 0, stream>>>(a);
+  } else if (fp8 && hot) {
     device_qsa::partial<true, true><<<grid, 256, 0, stream>>>(a);
-  else if (fp8)
+  } else if (fp8) {
     device_qsa::partial<true, false><<<grid, 256, 0, stream>>>(a);
-  else if (hot)
+  } else if (hot) {
     device_qsa::partial<false, true><<<grid, 256, 0, stream>>>(a);
-  else
+  } else {
     device_qsa::partial<false, false><<<grid, 256, 0, stream>>>(a);
+  }
   device_qsa::merge<<<a.M * 6, 256, 0, stream>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -1049,6 +1266,1027 @@ bool stage_host_run(torch::Tensor history, torch::Tensor scales,
         pages * scale_stride * sizeof(float), cudaMemcpyHostToDevice, stream));
   }
   return true;
+}
+
+namespace host_prep {
+
+__device__ __forceinline__ float to_f32(float v) { return v; }
+__device__ __forceinline__ float to_f32(half v) { return __half2float(v); }
+
+__device__ __forceinline__ uint8_t fp32_to_e4m3fn_rne(float x) {
+  const uint32_t xbits = __float_as_uint(x);
+  const uint32_t sign = (xbits >> 24) & 0x80u;
+  const float value = fminf(fabsf(x), 448.0f);
+  if (value == 0.0f) return static_cast<uint8_t>(sign);
+  if (value < 0x1p-6f) {
+    int sub;
+    asm("cvt.rni.s32.f32 %0, %1;" : "=r"(sub) : "f"(value * 512.0f));
+    sub = min(max(sub, 0), 8);
+    return static_cast<uint8_t>(sign | static_cast<uint32_t>(sub));
+  }
+  const uint32_t vbits = __float_as_uint(value);
+  const uint32_t rounded = (vbits + 0x7ffffu + ((vbits >> 20) & 1u)) >> 20;
+  const int normal = min(max(static_cast<int>(rounded) - 960, 8), 126);
+  return static_cast<uint8_t>(sign | static_cast<uint32_t>(normal));
+}
+
+template <bool FP8, bool HOT_FP8>
+__device__ __forceinline__ void write_host_hot_kv(
+    const uint4& val_u4, int64_t slot, int kv, int lane, int blocks,
+    int page_size, int hot_pages, int64_t page_slots_len, void* history_raw,
+    float* scales, const int32_t* tags, const int32_t* page_slots,
+    void* hot_raw, float* hot_scales) {
+  if (slot < 0 || slot >= static_cast<int64_t>(blocks) * page_size) return;
+  const int64_t block = slot / page_size, tok = slot % page_size;
+  const int64_t hist_elem =
+      ((block * 2 + kv) * page_size + tok) * 256 + lane * 8;
+  const int64_t page = slot >> 2;
+  const int32_t resident =
+      (page >= 0 && page < page_slots_len) ? page_slots[page] : -1;
+  const bool update_hot = (resident >= 0 && resident < hot_pages) &&
+                          (tags[resident] == static_cast<int32_t>(page));
+  const int64_t hot_elem =
+      ((static_cast<int64_t>(resident) * 4 + (slot & 3)) * 2 + kv) * 256 +
+      lane * 8;
+
+  if constexpr (FP8) {
+    const half* vh = reinterpret_cast<const half*>(&val_u4);
+    float vf[8];
+    float m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      vf[j] = __half2float(vh[j]);
+      m = fmaxf(m, fabsf(vf[j]));
+    }
+#pragma unroll
+    for (int s = 16; s > 0; s >>= 1)
+      m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, s));
+    const float scale = fmaxf(__fdiv_rn(m, 448.0f), 0x1p-126f);
+    if (lane == 0) scales[slot * 2 + kv] = scale;
+
+    uint2 packed;
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(&packed);
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      bytes[j] = fp32_to_e4m3fn_rne(__fdiv_rn(vf[j], scale));
+    *reinterpret_cast<uint2*>(static_cast<uint8_t*>(history_raw) + hist_elem) =
+        packed;
+    if (update_hot) {
+      if constexpr (HOT_FP8) {
+        *reinterpret_cast<uint2*>(static_cast<uint8_t*>(hot_raw) + hot_elem) =
+            packed;
+        if (lane == 0) hot_scales[resident * 8 + (slot & 3) * 2 + kv] = scale;
+      } else {
+        *reinterpret_cast<uint4*>(static_cast<half*>(hot_raw) + hot_elem) =
+            device_qsa::decode8_bits(packed, scale);
+      }
+    }
+  } else {
+    *reinterpret_cast<uint4*>(static_cast<half*>(history_raw) + hist_elem) =
+        val_u4;
+    if (update_hot) {
+      *reinterpret_cast<uint4*>(static_cast<half*>(hot_raw) + hot_elem) =
+          val_u4;
+    }
+  }
+}
+
+template <typename CS, typename PosT, typename SlotT, bool FP8, bool HOT_FP8>
+__global__ void prep_write_kernel(
+    const half* __restrict__ qkv, int64_t ld_qkv, const PosT* __restrict__ pos,
+    const CS* __restrict__ cos_sin, int rot, const half* __restrict__ qw,
+    const half* __restrict__ kw, float eps, half* __restrict__ query_out,
+    half* __restrict__ key_out, const SlotT* __restrict__ slots,
+    void* __restrict__ history_raw, float* __restrict__ scales,
+    const int32_t* __restrict__ tags, const int32_t* __restrict__ page_slots,
+    void* __restrict__ hot_raw, float* __restrict__ hot_scales,
+    int32_t* __restrict__ epoch, int HQ, int blocks, int page_size,
+    int hot_pages, int64_t page_slots_len) {
+  const int t = blockIdx.x;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp > HQ + 1) return;
+
+  if (warp == HQ + 1) {
+    const int64_t sl = static_cast<int64_t>(slots[t]);
+    const uint4 v = *reinterpret_cast<const uint4*>(
+        qkv + static_cast<int64_t>(t) * ld_qkv + HQ * 512 + 256 + lane * 8);
+    write_host_hot_kv<FP8, HOT_FP8>(
+        v, sl, 1, lane, blocks, page_size, hot_pages, page_slots_len,
+        history_raw, scales, tags, page_slots, hot_raw, hot_scales);
+    return;
+  }
+
+  const bool is_k = (warp == HQ);
+  const half* src = qkv + static_cast<int64_t>(t) * ld_qkv +
+                    (is_k ? HQ * 512 : warp * 512) + lane * 8;
+  const uint4 raw = *reinterpret_cast<const uint4*>(src);
+  const half* xh = reinterpret_cast<const half*>(&raw);
+  const half* w = (is_k ? kw : qw) + lane * 8;
+  const uint4 wraw = *reinterpret_cast<const uint4*>(w);
+  const half* wh = reinterpret_cast<const half*>(&wraw);
+  float x[8], ss = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    x[j] = __half2float(xh[j]);
+    ss += x[j] * x[j];
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  const float inv = rsqrtf(ss * (1.0f / 256.0f) + eps);
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    x[j] = __half2float(
+        __float2half_rn(x[j] * inv * (1.0f + __half2float(wh[j]))));
+  }
+  const int half_rot = rot / 2, d0 = lane * 8;
+  float px[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const int off = half_rot / 8;
+    const float up = __shfl_down_sync(0xffffffffu, x[j], off);
+    const float dn = __shfl_up_sync(0xffffffffu, x[j], off);
+    px[j] = (d0 < half_rot) ? up : dn;
+  }
+  if (d0 < rot) {
+    const int64_t p = static_cast<int64_t>(pos[t]);
+    const CS* cs = cos_sin + p * rot;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int d = d0 + j;
+      const bool first = d < half_rot;
+      const int i = first ? d : d - half_rot;
+      const float c = to_f32(cs[i]), s = to_f32(cs[half_rot + i]);
+      x[j] = first ? x[j] * c - px[j] * s : x[j] * c + px[j] * s;
+    }
+  }
+  uint4 outv;
+  half* oh = reinterpret_cast<half*>(&outv);
+#pragma unroll
+  for (int j = 0; j < 8; ++j) oh[j] = __float2half_rn(x[j]);
+  if (!is_k) {
+    *reinterpret_cast<uint4*>(
+        query_out + (static_cast<int64_t>(t) * HQ + warp) * 256 + lane * 8) =
+        outv;
+  } else {
+    *reinterpret_cast<uint4*>(key_out + static_cast<int64_t>(t) * 256 +
+                              lane * 8) = outv;
+    if (t == 0 && lane == 0) atomicAdd(epoch, 1);
+    const int64_t sl = static_cast<int64_t>(slots[t]);
+    write_host_hot_kv<FP8, HOT_FP8>(
+        outv, sl, 0, lane, blocks, page_size, hot_pages, page_slots_len,
+        history_raw, scales, tags, page_slots, hot_raw, hot_scales);
+  }
+}
+
+}  // namespace host_prep
+
+void prep_write_out(torch::Tensor qkv, torch::Tensor pos, torch::Tensor cos_sin,
+                    torch::Tensor qw, torch::Tensor kw, double eps,
+                    torch::Tensor query_out, torch::Tensor key_out,
+                    torch::Tensor slots, torch::Tensor history,
+                    torch::Tensor scales, torch::Tensor tags,
+                    torch::Tensor page_slots, torch::Tensor hot,
+                    std::optional<torch::Tensor> hot_scales,
+                    torch::Tensor epoch) {
+  const c10::cuda::CUDAGuard guard(qkv.device());
+  const int64_t M = qkv.size(0);
+  if (M == 0) return;
+  const int HQ = static_cast<int>(query_out.size(1));
+  const int rot = static_cast<int>(cos_sin.size(1));
+  TORCH_CHECK(qkv.is_cuda() && qkv.scalar_type() == at::kHalf &&
+              qkv.dim() == 2 && M <= 64 && qkv.stride(1) == 1 &&
+              qkv.size(1) >= HQ * 512 + 512);
+  TORCH_CHECK(HQ >= 1 && HQ <= 24 && query_out.is_cuda() &&
+              query_out.scalar_type() == at::kHalf &&
+              query_out.sizes() == at::IntArrayRef({M, HQ, 256}) &&
+              query_out.is_contiguous() && key_out.is_cuda() &&
+              key_out.scalar_type() == at::kHalf &&
+              key_out.sizes() == at::IntArrayRef({M, 1, 256}) &&
+              key_out.is_contiguous());
+  TORCH_CHECK(rot > 0 && rot <= 256 && rot % 16 == 0 &&
+              cos_sin.is_contiguous() &&
+              (cos_sin.scalar_type() == at::kFloat ||
+               cos_sin.scalar_type() == at::kHalf));
+  TORCH_CHECK(qw.scalar_type() == at::kHalf && qw.numel() == 256 &&
+              qw.is_contiguous() && kw.scalar_type() == at::kHalf &&
+              kw.numel() == 256 && kw.is_contiguous());
+  TORCH_CHECK(
+      pos.is_contiguous() && pos.numel() >= M &&
+      (pos.scalar_type() == at::kLong || pos.scalar_type() == at::kInt));
+  TORCH_CHECK(
+      slots.is_contiguous() && slots.numel() >= M &&
+      (slots.scalar_type() == at::kLong || slots.scalar_type() == at::kInt));
+  const bool fp8 = history.scalar_type() == at::kByte;
+  const bool hot_fp8 = hot_scales.has_value() && hot_scales->defined() &&
+                       hot_scales->numel() > 0;
+  TORCH_CHECK((fp8 || history.scalar_type() == at::kHalf) &&
+              history.dim() == 5 && history.size(1) == 2 &&
+              history.size(3) == 1 && history.size(4) == 256 &&
+              history.is_contiguous() && scales.scalar_type() == at::kFloat &&
+              scales.is_contiguous());
+  TORCH_CHECK(!hot_fp8 || fp8);
+  TORCH_CHECK(hot.is_cuda() &&
+              hot.scalar_type() == (hot_fp8 ? at::kByte : at::kHalf) &&
+              hot.dim() == 3 && hot.size(1) == 2 && hot.size(2) == 256 &&
+              hot.is_contiguous());
+  TORCH_CHECK(tags.scalar_type() == at::kInt && tags.is_contiguous() &&
+              page_slots.scalar_type() == at::kInt &&
+              page_slots.is_contiguous() && epoch.scalar_type() == at::kInt &&
+              epoch.is_contiguous() && epoch.numel() >= 1);
+  auto st = at::cuda::getCurrentCUDAStream();
+  const int blocks = static_cast<int>(history.size(0));
+  const int page_size = static_cast<int>(history.size(2));
+  const int hot_pages = static_cast<int>(tags.numel());
+  const int64_t page_slots_len = page_slots.numel();
+  float* hs_ptr = hot_fp8 ? hot_scales->data_ptr<float>() : nullptr;
+
+#define LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, IS_FP8, IS_HOT_FP8) \
+  host_prep::prep_write_kernel<CS_T, POS_T, SLOT_T, IS_FP8, IS_HOT_FP8>  \
+      <<<static_cast<int>(M), 32 * (HQ + 2), 0, st>>>(                   \
+          reinterpret_cast<const half*>(qkv.data_ptr()), qkv.stride(0),  \
+          pos.data_ptr<POS_T>(), CS_P, rot,                              \
+          reinterpret_cast<const half*>(qw.data_ptr()),                  \
+          reinterpret_cast<const half*>(kw.data_ptr()),                  \
+          static_cast<float>(eps),                                       \
+          reinterpret_cast<half*>(query_out.data_ptr()),                 \
+          reinterpret_cast<half*>(key_out.data_ptr()),                   \
+          slots.data_ptr<SLOT_T>(), history.data_ptr(),                  \
+          scales.data_ptr<float>(), tags.data_ptr<int32_t>(),            \
+          page_slots.data_ptr<int32_t>(), hot.data_ptr(), hs_ptr,        \
+          epoch.data_ptr<int32_t>(), HQ, blocks, page_size, hot_pages,   \
+          page_slots_len)
+
+#define DISPATCH_QUANTS(CS_T, CS_P, POS_T, SLOT_T)              \
+  if (fp8 && hot_fp8) {                                         \
+    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, true, true);   \
+  } else if (fp8) {                                             \
+    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, true, false);  \
+  } else {                                                      \
+    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, false, false); \
+  }
+
+#define DISPATCH_SLOTS(CS_T, CS_P, POS_T)       \
+  if (slots.scalar_type() == at::kLong) {       \
+    DISPATCH_QUANTS(CS_T, CS_P, POS_T, int64_t) \
+  } else {                                      \
+    DISPATCH_QUANTS(CS_T, CS_P, POS_T, int32_t) \
+  }
+
+#define DISPATCH_POS(CS_T, CS_P)        \
+  if (pos.scalar_type() == at::kLong) { \
+    DISPATCH_SLOTS(CS_T, CS_P, int64_t) \
+  } else {                              \
+    DISPATCH_SLOTS(CS_T, CS_P, int32_t) \
+  }
+
+  if (cos_sin.scalar_type() == at::kFloat) {
+    DISPATCH_POS(float, cos_sin.data_ptr<float>())
+  } else {
+    DISPATCH_POS(half, reinterpret_cast<const half*>(cos_sin.data_ptr()))
+  }
+#undef DISPATCH_POS
+#undef DISPATCH_SLOTS
+#undef DISPATCH_QUANTS
+#undef LAUNCH_PREP_WRITE
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+namespace hot_resolve {
+
+template <typename PosT>
+__global__ __launch_bounds__(256) void protect_hot_kernel(
+    const int32_t* __restrict__ indices, const int32_t* __restrict__ table,
+    const int32_t* __restrict__ requests, const PosT* __restrict__ positions,
+    const int32_t* __restrict__ lengths, const int32_t* __restrict__ tags,
+    const int32_t* __restrict__ page_slots, int32_t* __restrict__ stamps,
+    const int32_t* __restrict__ epoch, int64_t* __restrict__ virtual_positions,
+    int32_t* __restrict__ virtual_lengths, int32_t* __restrict__ resolved,
+    int64_t* __restrict__ stats, int32_t* __restrict__ miss_queue, int width,
+    int num_tiles, int table_width, int64_t table_stride, int64_t index_stride,
+    int64_t resolved_stride, int num_requests, int num_blocks, int page_size,
+    int hot_pages) {
+  const int row = blockIdx.y;
+  const int col = blockIdx.x * 256 + threadIdx.x;
+  const int32_t req = requests[row];
+  const int64_t pos = static_cast<int64_t>(positions[row]);
+  const bool valid_req = (req >= 0 && req < num_requests);
+  const int64_t len = valid_req ? static_cast<int64_t>(lengths[req]) : 0;
+
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const int64_t visible = max(min(pos + 1, len), static_cast<int64_t>(0));
+    const int64_t selected_count =
+        min(visible / 4, static_cast<int64_t>(width / 4)) * 4 +
+        min(visible % 4, static_cast<int64_t>(width % 4));
+    virtual_positions[row] = selected_count - 1;
+    virtual_lengths[row] = static_cast<int32_t>(selected_count);
+  }
+
+  int32_t out_val = -2;
+  if (col < width) {
+    const int32_t logical =
+        indices[static_cast<int64_t>(row) * index_stride + col];
+    bool valid = valid_req && logical >= 0 &&
+                 static_cast<int64_t>(logical) <= pos &&
+                 static_cast<int64_t>(logical) < len &&
+                 (logical / page_size) < table_width;
+    int32_t blk = -1;
+    if (valid) {
+      blk = table[static_cast<int64_t>(req) * table_stride +
+                  (logical / page_size)];
+      valid = (blk >= 0 && blk < num_blocks);
+    }
+    if (valid) {
+      const int32_t token = blk * page_size + (logical % page_size);
+      const int32_t page = token >> 2;
+      const int32_t reg = page_slots[page];
+      if (reg >= 0 && reg < hot_pages && tags[reg] == page) {
+        stamps[reg] = *epoch;
+        out_val = (reg << 2) | (token & 3);
+      } else {
+        out_val = -1;
+      }
+    }
+    resolved[static_cast<int64_t>(row) * resolved_stride + col] = out_val;
+  }
+
+  const uint32_t miss32 =
+      __ballot_sync(0xffffffffu, col < width && out_val == -1);
+  const uint32_t hit32 =
+      __ballot_sync(0xffffffffu, col < width && out_val >= 0);
+  const int half_shift = threadIdx.x & 16;
+  const uint32_t miss16 = (miss32 >> half_shift) & 0xffffu;
+  const uint32_t hit16 = (hit32 >> half_shift) & 0xffffu;
+  const int tile = blockIdx.x * 16 + (threadIdx.x >> 4);
+  if (tile < num_tiles && (threadIdx.x & 15) == 0) {
+    if (miss16 == 0u) {
+      if (hit16 != 0u) {
+        const int64_t counter =
+            (static_cast<int64_t>(row) * num_tiles + tile) * 3;
+        stats[counter] += __popc(hit16);
+      }
+    } else {
+      const int idx = atomicAdd(&miss_queue[0], 1);
+      miss_queue[2 + idx] = (row << 16) | tile;
+    }
+  }
+}
+
+template <typename PosT, bool FP8, bool HOT_FP8>
+__global__ __launch_bounds__(128) void install_hot_misses_kernel(
+    const void* __restrict__ history_raw, const float* __restrict__ scales,
+    void* __restrict__ hot_raw, float* __restrict__ hot_scales,
+    int32_t* __restrict__ tags, int32_t* __restrict__ stamps,
+    const int32_t* __restrict__ epoch, int32_t* __restrict__ hands,
+    int32_t* __restrict__ page_slots, int64_t* __restrict__ stats,
+    int32_t* __restrict__ miss_queue, const int32_t* __restrict__ indices,
+    const int32_t* __restrict__ table, const int32_t* __restrict__ requests,
+    const PosT* __restrict__ positions, const int32_t* __restrict__ lengths,
+    int32_t* __restrict__ resolved, int width, int num_tiles, int table_width,
+    int64_t table_stride, int64_t index_stride, int64_t resolved_stride,
+    int num_requests, int num_blocks, int page_size, int hot_pages,
+    int num_hands) {
+  const int total_misses =
+      *reinterpret_cast<const volatile int32_t*>(&miss_queue[0]);
+  if (blockIdx.x >= total_misses) return;
+
+  __shared__ int32_t smem_counts[4][3];
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int32_t epoch_val = *epoch;
+
+  for (int item = blockIdx.x; item < total_misses; item += gridDim.x) {
+    const int32_t packed = miss_queue[2 + item];
+    const int row = packed >> 16;
+    const int tile = packed & 0xffff;
+    const int col_base = tile * 16 + warp * 4;
+    const int col = col_base + lane;
+
+    const int32_t req = requests[row];
+    const int64_t pos = static_cast<int64_t>(positions[row]);
+    const bool valid_req = (req >= 0 && req < num_requests);
+    const int64_t len = valid_req ? static_cast<int64_t>(lengths[req]) : 0;
+
+    int32_t init_res = -2;
+    bool valid = false;
+    int32_t page = 0;
+    int32_t off4 = 0;
+    if (lane < 4 && col < width) {
+      init_res = resolved[static_cast<int64_t>(row) * resolved_stride + col];
+      const int32_t logical =
+          indices[static_cast<int64_t>(row) * index_stride + col];
+      valid = valid_req && logical >= 0 &&
+              static_cast<int64_t>(logical) <= pos &&
+              static_cast<int64_t>(logical) < len &&
+              (logical / page_size) < table_width;
+      if (valid) {
+        const int32_t blk = table[static_cast<int64_t>(req) * table_stride +
+                                  (logical / page_size)];
+        if (blk >= 0 && blk < num_blocks) {
+          const int32_t tok = blk * page_size + (logical % page_size);
+          page = tok >> 2;
+          off4 = tok & 3;
+        } else {
+          valid = false;
+        }
+      }
+    }
+
+    const uint32_t group_miss_mask =
+        __ballot_sync(0xffffffffu, lane < 4 && init_res == -1);
+    int32_t grp_hits = 0, grp_misses = 0, grp_contended = 0;
+
+    if (group_miss_mask == 0u) {
+      grp_hits = __popc(__ballot_sync(0xffffffffu, lane < 4 && init_res >= 0));
+    } else {
+      const int32_t first = __shfl_sync(0xffffffffu, page, 0);
+      const int32_t v0 = __shfl_sync(0xffffffffu, valid ? 1 : 0, 0);
+      const bool lane_ok = !valid || (page == first && off4 == lane);
+      const bool aligned =
+          (v0 != 0) &&
+          (__ballot_sync(0xffffffffu, lane >= 4 || lane_ok) == 0xffffffffu);
+
+      if (!aligned) {
+        grp_hits =
+            __popc(__ballot_sync(0xffffffffu, lane < 4 && init_res >= 0));
+        grp_misses =
+            __popc(__ballot_sync(0xffffffffu, lane < 4 && init_res == -1));
+      } else {
+        int32_t slot = -1;
+        int hit_flag = 0, claim_flag = 0;
+        if (lane == 0) {
+          const int32_t reg = atomicAdd(&page_slots[first], 0);
+          if (reg >= 0 && reg < hot_pages) {
+            const int32_t t =
+                *reinterpret_cast<const volatile int32_t*>(&tags[reg]);
+            if (t == first && atomicCAS(&page_slots[first], reg, reg) == reg) {
+              stamps[reg] = epoch_val;
+              __threadfence();
+              if (*reinterpret_cast<const volatile int32_t*>(&tags[reg]) ==
+                      first &&
+                  *reinterpret_cast<const volatile int32_t*>(
+                      &page_slots[first]) == reg) {
+                slot = reg;
+                hit_flag = 1;
+              }
+            }
+          }
+          if (!hit_flag) {
+            claim_flag = (atomicCAS(&page_slots[first], -1, -2) == -1) ? 1 : 0;
+          }
+        }
+        const bool hit = __shfl_sync(0xffffffffu, hit_flag, 0) != 0;
+        const bool claim = __shfl_sync(0xffffffffu, claim_flag, 0) != 0;
+        slot = __shfl_sync(0xffffffffu, slot, 0);
+
+        bool install = false;
+        int32_t old_tag = -1;
+        if (claim) {
+          const uint32_t lane_hand =
+              static_cast<uint32_t>((row * num_tiles + tile) % num_hands);
+          const uint32_t span = static_cast<uint32_t>(hot_pages / num_hands);
+          const uint32_t base = lane_hand * span;
+          for (int probe_iter = 0; probe_iter < 4 && !install; ++probe_iter) {
+            uint32_t hand = 0;
+            if (lane == 0) {
+              hand = atomicAdd(reinterpret_cast<uint32_t*>(&hands[lane_hand]),
+                               16u);
+            }
+            hand = __shfl_sync(0xffffffffu, hand, 0);
+            int32_t age = -1;
+            if (lane < 16) {
+              const uint32_t cand =
+                  base + ((hand + static_cast<uint32_t>(lane)) % span);
+              const int32_t st =
+                  *reinterpret_cast<const volatile int32_t*>(&stamps[cand]);
+              age = (st != epoch_val) ? (epoch_val - st) : -1;
+            }
+            int32_t best_age = age;
+#pragma unroll
+            for (int off = 8; off >= 1; off >>= 1) {
+              const int32_t other = __shfl_xor_sync(0xffffffffu, best_age, off);
+              if (other > best_age) best_age = other;
+            }
+            best_age = __shfl_sync(0xffffffffu, best_age, 0);
+            if (best_age >= 0) {
+              const uint32_t win_mask =
+                  __ballot_sync(0xffffffffu, lane < 16 && age == best_age);
+              const int chosen = __ffs(win_mask) - 1;
+              const int32_t chosen_slot = static_cast<int32_t>(
+                  base + ((hand + static_cast<uint32_t>(chosen)) % span));
+              int won = 0;
+              if (lane == 0) {
+                const int32_t obs = *reinterpret_cast<const volatile int32_t*>(
+                    &stamps[chosen_slot]);
+                if (obs != epoch_val &&
+                    atomicCAS(&stamps[chosen_slot], obs, epoch_val) == obs) {
+                  won = 1;
+                  slot = chosen_slot;
+                  old_tag = *reinterpret_cast<const volatile int32_t*>(
+                      &tags[chosen_slot]);
+                  if (old_tag >= 0) {
+                    atomicCAS(&page_slots[old_tag], chosen_slot, -1);
+                  }
+                }
+              }
+              if (__shfl_sync(0xffffffffu, won, 0)) {
+                slot = __shfl_sync(0xffffffffu, slot, 0);
+                old_tag = __shfl_sync(0xffffffffu, old_tag, 0);
+                install = true;
+              }
+            }
+          }
+        }
+
+        if (install) {
+          const int32_t phys_blk = (first * 4) / page_size;
+          const int32_t phys_off = (first * 4) % page_size;
+          if constexpr (HOT_FP8) {
+            const auto* src_bytes =
+                static_cast<const unsigned char*>(history_raw);
+            auto* dst_bytes = static_cast<unsigned char*>(hot_raw);
+            const int tok_idx = lane >> 3;
+            const int sub8 = lane & 7;
+#pragma unroll
+            for (int kv = 0; kv < 2; ++kv) {
+              const unsigned char* s_ptr =
+                  src_bytes +
+                  ((static_cast<int64_t>(phys_blk) * 2 + kv) * page_size +
+                   phys_off + tok_idx) *
+                      256;
+              unsigned char* d_ptr =
+                  dst_bytes +
+                  (static_cast<int64_t>(slot * 4 + tok_idx) * 2 + kv) * 256;
+#pragma unroll
+              for (int j = 0; j < 4; ++j) {
+                reinterpret_cast<uint2*>(d_ptr)[sub8 + j * 8] =
+                    reinterpret_cast<const uint2*>(s_ptr)[sub8 + j * 8];
+              }
+            }
+            if (lane < 8) {
+              hot_scales[slot * 8 + lane] = scales[first * 8 + lane];
+            }
+          } else if constexpr (FP8) {
+            const auto* src_bytes =
+                static_cast<const unsigned char*>(history_raw);
+            auto* dst_half = static_cast<half*>(hot_raw);
+#pragma unroll
+            for (int tok_idx = 0; tok_idx < 4; ++tok_idx) {
+#pragma unroll
+              for (int kv = 0; kv < 2; ++kv) {
+                const unsigned char* s_ptr =
+                    src_bytes +
+                    ((static_cast<int64_t>(phys_blk) * 2 + kv) * page_size +
+                     phys_off + tok_idx) *
+                        256;
+                half* d_ptr =
+                    dst_half +
+                    (static_cast<int64_t>(slot * 4 + tok_idx) * 2 + kv) * 256;
+                const uint2 packed_codes =
+                    reinterpret_cast<const uint2*>(s_ptr)[lane];
+                const float sc = scales[(first * 4 + tok_idx) * 2 + kv];
+                reinterpret_cast<uint4*>(d_ptr)[lane] =
+                    device_qsa::decode8_bits(packed_codes, sc);
+              }
+            }
+          } else {
+            const auto* src_half = static_cast<const half*>(history_raw);
+            auto* dst_half = static_cast<half*>(hot_raw);
+#pragma unroll
+            for (int tok_idx = 0; tok_idx < 4; ++tok_idx) {
+#pragma unroll
+              for (int kv = 0; kv < 2; ++kv) {
+                const half* s_ptr =
+                    src_half +
+                    ((static_cast<int64_t>(phys_blk) * 2 + kv) * page_size +
+                     phys_off + tok_idx) *
+                        256;
+                half* d_ptr =
+                    dst_half +
+                    (static_cast<int64_t>(slot * 4 + tok_idx) * 2 + kv) * 256;
+                reinterpret_cast<uint4*>(d_ptr)[lane] =
+                    reinterpret_cast<const uint4*>(s_ptr)[lane];
+              }
+            }
+          }
+        }
+
+        __syncwarp();
+        if (lane == 0) {
+          if (install) {
+            __threadfence();
+            atomicCAS(&tags[slot], old_tag, first);
+            __threadfence();
+            atomicCAS(&page_slots[first], -2, slot);
+          } else if (claim) {
+            atomicCAS(&page_slots[first], -2, -1);
+          }
+        }
+        __syncwarp();
+
+        if (lane < 4 && col < width) {
+          resolved[static_cast<int64_t>(row) * resolved_stride + col] =
+              valid ? ((hit || install) ? ((slot << 2) | lane) : -1) : -2;
+        }
+        const int valid_cnt = __popc(
+            __ballot_sync(0xffffffffu, lane < 4 && col < width && valid));
+        grp_hits = hit ? valid_cnt : 0;
+        grp_misses = hit ? 0 : valid_cnt;
+        grp_contended = (!hit && !install) ? 1 : 0;
+      }
+    }
+
+    if (lane == 0) {
+      smem_counts[warp][0] = grp_hits;
+      smem_counts[warp][1] = grp_misses;
+      smem_counts[warp][2] = grp_contended;
+    }
+    __syncthreads();
+    if (threadIdx.x < 3) {
+      const int64_t sum = static_cast<int64_t>(smem_counts[0][threadIdx.x]) +
+                          smem_counts[1][threadIdx.x] +
+                          smem_counts[2][threadIdx.x] +
+                          smem_counts[3][threadIdx.x];
+      if (sum != 0) {
+        const int64_t counter =
+            (static_cast<int64_t>(row) * num_tiles + tile) * 3 + threadIdx.x;
+        stats[counter] += sum;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    __threadfence();
+    const int active_blocks = min(total_misses, static_cast<int>(gridDim.x));
+    const int done = atomicAdd(&miss_queue[1], 1) + 1;
+    if (done == active_blocks) {
+      miss_queue[1] = 0;
+      __threadfence();
+      *reinterpret_cast<volatile int32_t*>(&miss_queue[0]) = 0;
+    }
+  }
+}
+
+template <bool FP8, bool HOT_FP8>
+__global__ __launch_bounds__(128) void warm_hot_staged_kernel(
+    const void* __restrict__ staged_raw,
+    const float* __restrict__ staged_scales, void* __restrict__ hot_raw,
+    float* __restrict__ hot_scales, int32_t* __restrict__ tags,
+    int32_t* __restrict__ stamps, const int32_t* __restrict__ epoch,
+    int32_t* __restrict__ hands, int32_t* __restrict__ page_slots,
+    const int32_t* __restrict__ table, const int32_t* __restrict__ staged_table,
+    const int32_t* __restrict__ lengths, int num_requests, int table_width,
+    int64_t table_stride, int64_t staged_stride, int num_blocks,
+    int staged_blocks, int page_size, int hot_pages, int num_hands,
+    int per_req_budget) {
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int global_warp = blockIdx.x * 4 + warp;
+  const int total_warps = gridDim.x * 4;
+  const int total_items = num_requests * per_req_budget;
+  const int32_t epoch_val = *epoch;
+  constexpr int kSinkPages = 64;
+
+  for (int item = global_warp; item < total_items; item += total_warps) {
+    const int req = item / per_req_budget;
+    const int idx_in_budget = item % per_req_budget;
+    const int full_p4 = lengths[req] / 4;
+    if (idx_in_budget >= full_p4) continue;
+
+    int lp4 = idx_in_budget;
+    if (full_p4 > per_req_budget && idx_in_budget >= kSinkPages) {
+      lp4 = (full_p4 - (per_req_budget - kSinkPages)) +
+            (idx_in_budget - kSinkPages);
+    }
+    const int logical0 = lp4 * 4;
+    const int blk_col = logical0 / page_size;
+    const int off_in_page = logical0 % page_size;
+    if (blk_col >= table_width) continue;
+
+    const int32_t phys_blk =
+        table[static_cast<int64_t>(req) * table_stride + blk_col];
+    const int32_t stg_blk =
+        staged_table[static_cast<int64_t>(req) * staged_stride + blk_col];
+    if (phys_blk < 0 || phys_blk >= num_blocks || stg_blk < 0 ||
+        stg_blk >= staged_blocks) {
+      continue;
+    }
+
+    const int32_t first = (phys_blk * page_size + off_in_page) >> 2;
+    int32_t slot = -1;
+    int hit_flag = 0, claim_flag = 0;
+    if (lane == 0) {
+      const int32_t reg = atomicAdd(&page_slots[first], 0);
+      if (reg >= 0 && reg < hot_pages &&
+          *reinterpret_cast<const volatile int32_t*>(&tags[reg]) == first) {
+        stamps[reg] = epoch_val;
+        hit_flag = 1;
+      } else if (reg == -1) {
+        claim_flag = (atomicCAS(&page_slots[first], -1, -2) == -1) ? 1 : 0;
+      }
+    }
+    if (__shfl_sync(0xffffffffu, hit_flag, 0) != 0) continue;
+    const bool claim = __shfl_sync(0xffffffffu, claim_flag, 0) != 0;
+    if (!claim) continue;
+
+    bool install = false;
+    int32_t old_tag = -1;
+    const uint32_t lane_hand = static_cast<uint32_t>(item % num_hands);
+    const uint32_t span = static_cast<uint32_t>(hot_pages / num_hands);
+    const uint32_t base = lane_hand * span;
+    for (int probe_iter = 0; probe_iter < 2 && !install; ++probe_iter) {
+      uint32_t hand = 0;
+      if (lane == 0) {
+        hand = atomicAdd(reinterpret_cast<uint32_t*>(&hands[lane_hand]), 16u);
+      }
+      hand = __shfl_sync(0xffffffffu, hand, 0);
+      int32_t age = -1;
+      if (lane < 16) {
+        const uint32_t cand =
+            base + ((hand + static_cast<uint32_t>(lane)) % span);
+        const int32_t st =
+            *reinterpret_cast<const volatile int32_t*>(&stamps[cand]);
+        age = (st != epoch_val) ? (epoch_val - st) : -1;
+      }
+      int32_t best_age = age;
+#pragma unroll
+      for (int off = 8; off >= 1; off >>= 1) {
+        const int32_t other = __shfl_xor_sync(0xffffffffu, best_age, off);
+        if (other > best_age) best_age = other;
+      }
+      best_age = __shfl_sync(0xffffffffu, best_age, 0);
+      if (best_age >= 0) {
+        const uint32_t win_mask =
+            __ballot_sync(0xffffffffu, lane < 16 && age == best_age);
+        const int chosen = __ffs(win_mask) - 1;
+        const int32_t chosen_slot = static_cast<int32_t>(
+            base + ((hand + static_cast<uint32_t>(chosen)) % span));
+        int won = 0;
+        if (lane == 0) {
+          const int32_t obs =
+              *reinterpret_cast<const volatile int32_t*>(&stamps[chosen_slot]);
+          if (obs != epoch_val &&
+              atomicCAS(&stamps[chosen_slot], obs, epoch_val) == obs) {
+            won = 1;
+            slot = chosen_slot;
+            old_tag =
+                *reinterpret_cast<const volatile int32_t*>(&tags[chosen_slot]);
+            if (old_tag >= 0) {
+              atomicCAS(&page_slots[old_tag], chosen_slot, -1);
+            }
+          }
+        }
+        if (__shfl_sync(0xffffffffu, won, 0)) {
+          slot = __shfl_sync(0xffffffffu, slot, 0);
+          old_tag = __shfl_sync(0xffffffffu, old_tag, 0);
+          install = true;
+        }
+      }
+    }
+
+    if (install) {
+      const int32_t stg_first = (stg_blk * page_size + off_in_page) >> 2;
+      if constexpr (HOT_FP8) {
+        const auto* src_bytes = static_cast<const unsigned char*>(staged_raw);
+        auto* dst_bytes = static_cast<unsigned char*>(hot_raw);
+        const int tok_idx = lane >> 3;
+        const int sub8 = lane & 7;
+#pragma unroll
+        for (int kv = 0; kv < 2; ++kv) {
+          const unsigned char* s_ptr =
+              src_bytes +
+              ((static_cast<int64_t>(stg_blk) * 2 + kv) * page_size +
+               off_in_page + tok_idx) *
+                  256;
+          unsigned char* d_ptr =
+              dst_bytes +
+              (static_cast<int64_t>(slot * 4 + tok_idx) * 2 + kv) * 256;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            reinterpret_cast<uint2*>(d_ptr)[sub8 + j * 8] =
+                reinterpret_cast<const uint2*>(s_ptr)[sub8 + j * 8];
+          }
+        }
+        if (lane < 8) {
+          hot_scales[slot * 8 + lane] = staged_scales[stg_first * 8 + lane];
+        }
+      } else if constexpr (FP8) {
+        const auto* src_bytes = static_cast<const unsigned char*>(staged_raw);
+        auto* dst_half = static_cast<half*>(hot_raw);
+#pragma unroll
+        for (int tok_idx = 0; tok_idx < 4; ++tok_idx) {
+#pragma unroll
+          for (int kv = 0; kv < 2; ++kv) {
+            const unsigned char* s_ptr =
+                src_bytes +
+                ((static_cast<int64_t>(stg_blk) * 2 + kv) * page_size +
+                 off_in_page + tok_idx) *
+                    256;
+            half* d_ptr =
+                dst_half +
+                (static_cast<int64_t>(slot * 4 + tok_idx) * 2 + kv) * 256;
+            const uint2 packed_codes =
+                reinterpret_cast<const uint2*>(s_ptr)[lane];
+            const float sc = staged_scales[(stg_first * 4 + tok_idx) * 2 + kv];
+            reinterpret_cast<uint4*>(d_ptr)[lane] =
+                device_qsa::decode8_bits(packed_codes, sc);
+          }
+        }
+      } else {
+        const auto* src_half = static_cast<const half*>(staged_raw);
+        auto* dst_half = static_cast<half*>(hot_raw);
+#pragma unroll
+        for (int tok_idx = 0; tok_idx < 4; ++tok_idx) {
+#pragma unroll
+          for (int kv = 0; kv < 2; ++kv) {
+            const half* s_ptr =
+                src_half +
+                ((static_cast<int64_t>(stg_blk) * 2 + kv) * page_size +
+                 off_in_page + tok_idx) *
+                    256;
+            half* d_ptr =
+                dst_half +
+                (static_cast<int64_t>(slot * 4 + tok_idx) * 2 + kv) * 256;
+            reinterpret_cast<uint4*>(d_ptr)[lane] =
+                reinterpret_cast<const uint4*>(s_ptr)[lane];
+          }
+        }
+      }
+    }
+
+    __syncwarp();
+    if (lane == 0) {
+      if (install) {
+        __threadfence();
+        atomicCAS(&tags[slot], old_tag, first);
+        __threadfence();
+        atomicCAS(&page_slots[first], -2, slot);
+      } else {
+        atomicCAS(&page_slots[first], -2, -1);
+      }
+    }
+    __syncwarp();
+  }
+}
+
+}  // namespace hot_resolve
+
+void resolve_hot_out(torch::Tensor history, torch::Tensor scales,
+                     torch::Tensor hot, std::optional<torch::Tensor> hot_scales,
+                     torch::Tensor tags, torch::Tensor stamps,
+                     torch::Tensor epoch, torch::Tensor hands,
+                     torch::Tensor page_slots, torch::Tensor stats,
+                     torch::Tensor miss_queue, torch::Tensor indices,
+                     torch::Tensor table, torch::Tensor requests,
+                     torch::Tensor positions, torch::Tensor lengths,
+                     torch::Tensor virtual_positions,
+                     torch::Tensor virtual_lengths, torch::Tensor resolved) {
+  const int rows = indices.size(0);
+  const int width = indices.size(1);
+  if (rows == 0) return;
+  const c10::cuda::CUDAGuard guard(indices.device());
+  const bool fp8 = history.scalar_type() == at::kByte;
+  const bool hot_fp8 = hot_scales.has_value() && hot_scales->numel() > 0;
+  TORCH_CHECK((fp8 || history.scalar_type() == at::kHalf) &&
+              history.dim() == 5 && history.size(1) == 2 &&
+              history.size(2) % 4 == 0 && history.size(3) == 1 &&
+              history.size(4) == 256 && history.is_contiguous());
+  TORCH_CHECK(!hot_fp8 || fp8,
+              "Encoded hot storage requires E4M3 authoritative history");
+  const int num_blocks = history.size(0);
+  const int page_size = history.size(2);
+  const int hot_pages = hot.size(0) / 4;
+  const int num_hands = hands.numel();
+  const int num_tiles = (width + 15) / 16;
+  const int table_width = table.size(1);
+  const int num_requests = table.size(0);
+  TORCH_CHECK(miss_queue.numel() >= rows * num_tiles + 2 &&
+              stats.numel() >= rows * num_tiles * 3);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const dim3 protect_grid(std::max(1, (width + 255) / 256), rows);
+  const dim3 install_grid(std::min(rows * std::max(1, num_tiles), 160));
+  float* hs_ptr = hot_fp8 ? hot_scales->data_ptr<float>() : nullptr;
+
+  auto launch = [&](auto pos_tag) {
+    using PosT = decltype(pos_tag);
+    hot_resolve::protect_hot_kernel<PosT><<<protect_grid, 256, 0, stream>>>(
+        indices.data_ptr<int32_t>(), table.data_ptr<int32_t>(),
+        requests.data_ptr<int32_t>(), positions.data_ptr<PosT>(),
+        lengths.data_ptr<int32_t>(), tags.data_ptr<int32_t>(),
+        page_slots.data_ptr<int32_t>(), stamps.data_ptr<int32_t>(),
+        epoch.data_ptr<int32_t>(), virtual_positions.data_ptr<int64_t>(),
+        virtual_lengths.data_ptr<int32_t>(), resolved.data_ptr<int32_t>(),
+        stats.data_ptr<int64_t>(), miss_queue.data_ptr<int32_t>(), width,
+        num_tiles, table_width, table.stride(0), indices.stride(0),
+        resolved.stride(0), num_requests, num_blocks, page_size, hot_pages);
+    if (hot_fp8) {
+      hot_resolve::install_hot_misses_kernel<PosT, true, true>
+          <<<install_grid, 128, 0, stream>>>(
+              history.data_ptr(), scales.data_ptr<float>(), hot.data_ptr(),
+              hs_ptr, tags.data_ptr<int32_t>(), stamps.data_ptr<int32_t>(),
+              epoch.data_ptr<int32_t>(), hands.data_ptr<int32_t>(),
+              page_slots.data_ptr<int32_t>(), stats.data_ptr<int64_t>(),
+              miss_queue.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
+              table.data_ptr<int32_t>(), requests.data_ptr<int32_t>(),
+              positions.data_ptr<PosT>(), lengths.data_ptr<int32_t>(),
+              resolved.data_ptr<int32_t>(), width, num_tiles, table_width,
+              table.stride(0), indices.stride(0), resolved.stride(0),
+              num_requests, num_blocks, page_size, hot_pages, num_hands);
+    } else if (fp8) {
+      hot_resolve::install_hot_misses_kernel<PosT, true, false>
+          <<<install_grid, 128, 0, stream>>>(
+              history.data_ptr(), scales.data_ptr<float>(), hot.data_ptr(),
+              nullptr, tags.data_ptr<int32_t>(), stamps.data_ptr<int32_t>(),
+              epoch.data_ptr<int32_t>(), hands.data_ptr<int32_t>(),
+              page_slots.data_ptr<int32_t>(), stats.data_ptr<int64_t>(),
+              miss_queue.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
+              table.data_ptr<int32_t>(), requests.data_ptr<int32_t>(),
+              positions.data_ptr<PosT>(), lengths.data_ptr<int32_t>(),
+              resolved.data_ptr<int32_t>(), width, num_tiles, table_width,
+              table.stride(0), indices.stride(0), resolved.stride(0),
+              num_requests, num_blocks, page_size, hot_pages, num_hands);
+    } else {
+      hot_resolve::install_hot_misses_kernel<PosT, false, false>
+          <<<install_grid, 128, 0, stream>>>(
+              history.data_ptr(), scales.data_ptr<float>(), hot.data_ptr(),
+              nullptr, tags.data_ptr<int32_t>(), stamps.data_ptr<int32_t>(),
+              epoch.data_ptr<int32_t>(), hands.data_ptr<int32_t>(),
+              page_slots.data_ptr<int32_t>(), stats.data_ptr<int64_t>(),
+              miss_queue.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
+              table.data_ptr<int32_t>(), requests.data_ptr<int32_t>(),
+              positions.data_ptr<PosT>(), lengths.data_ptr<int32_t>(),
+              resolved.data_ptr<int32_t>(), width, num_tiles, table_width,
+              table.stride(0), indices.stride(0), resolved.stride(0),
+              num_requests, num_blocks, page_size, hot_pages, num_hands);
+    }
+  };
+  if (positions.scalar_type() == at::kLong) {
+    launch(int64_t{});
+  } else {
+    TORCH_CHECK(positions.scalar_type() == at::kInt);
+    launch(int32_t{});
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void warm_hot_staged_out(torch::Tensor staged_history,
+                         torch::Tensor staged_scales, torch::Tensor hot,
+                         std::optional<torch::Tensor> hot_scales,
+                         torch::Tensor tags, torch::Tensor stamps,
+                         torch::Tensor epoch, torch::Tensor hands,
+                         torch::Tensor page_slots, torch::Tensor table,
+                         torch::Tensor staged_table, torch::Tensor lengths,
+                         int64_t num_blocks) {
+  const int num_requests = table.size(0);
+  const int staged_blocks = staged_history.size(0);
+  if (num_requests <= 0 || staged_blocks <= 0) return;
+  const c10::cuda::CUDAGuard guard(hot.device());
+  const bool fp8 = staged_history.scalar_type() == at::kByte;
+  const bool hot_fp8 = hot_scales.has_value() && hot_scales->numel() > 0;
+  const int page_size = staged_history.size(2);
+  const int hot_pages = hot.size(0) / 4;
+  if (hot_pages <= 0) return;
+  const int per_req_budget =
+      std::min(staged_blocks * (page_size / 4),
+               std::max(16, hot_pages / std::max(1, num_requests)));
+  const int total_items = num_requests * per_req_budget;
+  if (total_items <= 0) return;
+  const dim3 grid(std::min((total_items + 3) / 4, 160));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  float* hs_ptr = hot_fp8 ? hot_scales->data_ptr<float>() : nullptr;
+  if (hot_fp8) {
+    hot_resolve::warm_hot_staged_kernel<true, true><<<grid, 128, 0, stream>>>(
+        staged_history.data_ptr(), staged_scales.data_ptr<float>(),
+        hot.data_ptr(), hs_ptr, tags.data_ptr<int32_t>(),
+        stamps.data_ptr<int32_t>(), epoch.data_ptr<int32_t>(),
+        hands.data_ptr<int32_t>(), page_slots.data_ptr<int32_t>(),
+        table.data_ptr<int32_t>(), staged_table.data_ptr<int32_t>(),
+        lengths.data_ptr<int32_t>(), num_requests, table.size(1),
+        table.stride(0), staged_table.stride(0), static_cast<int>(num_blocks),
+        staged_blocks, page_size, hot_pages, hands.numel(), per_req_budget);
+  } else if (fp8) {
+    hot_resolve::warm_hot_staged_kernel<true, false><<<grid, 128, 0, stream>>>(
+        staged_history.data_ptr(), staged_scales.data_ptr<float>(),
+        hot.data_ptr(), nullptr, tags.data_ptr<int32_t>(),
+        stamps.data_ptr<int32_t>(), epoch.data_ptr<int32_t>(),
+        hands.data_ptr<int32_t>(), page_slots.data_ptr<int32_t>(),
+        table.data_ptr<int32_t>(), staged_table.data_ptr<int32_t>(),
+        lengths.data_ptr<int32_t>(), num_requests, table.size(1),
+        table.stride(0), staged_table.stride(0), static_cast<int>(num_blocks),
+        staged_blocks, page_size, hot_pages, hands.numel(), per_req_budget);
+  } else {
+    hot_resolve::warm_hot_staged_kernel<false, false><<<grid, 128, 0, stream>>>(
+        staged_history.data_ptr(), staged_scales.data_ptr<float>(),
+        hot.data_ptr(), nullptr, tags.data_ptr<int32_t>(),
+        stamps.data_ptr<int32_t>(), epoch.data_ptr<int32_t>(),
+        hands.data_ptr<int32_t>(), page_slots.data_ptr<int32_t>(),
+        table.data_ptr<int32_t>(), staged_table.data_ptr<int32_t>(),
+        lengths.data_ptr<int32_t>(), num_requests, table.size(1),
+        table.stride(0), staged_table.stride(0), static_cast<int>(num_blocks),
+        staged_blocks, page_size, hot_pages, hands.numel(), per_req_budget);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 TORCH_LIBRARY(vllm_sm70_qsa_device, m) {
@@ -1174,33 +2412,57 @@ TORCH_LIBRARY(vllm_sm70_qsa_device, m) {
       "run_hot(Tensor q, Tensor history, Tensor scales, Tensor indices, Tensor "
       "table, Tensor requests, Tensor positions, Tensor lengths, Tensor(a!) "
       "out, Tensor? gate, Tensor(b!) partial, Tensor(c!) state, Tensor hot, "
-      "Tensor resolved) -> ()");
+      "Tensor resolved, int tiles=1) -> ()");
   m.impl("run_hot", torch::kCUDA,
          [](torch::Tensor q, torch::Tensor history, torch::Tensor scales,
             torch::Tensor indices, torch::Tensor table, torch::Tensor requests,
             torch::Tensor positions, torch::Tensor lengths, torch::Tensor out,
             std::optional<torch::Tensor> gate, torch::Tensor partial,
-            torch::Tensor state, torch::Tensor hot, torch::Tensor resolved) {
+            torch::Tensor state, torch::Tensor hot, torch::Tensor resolved,
+            int64_t tiles) {
            device_qsa_out(q, history, scales, indices, table, requests,
                           positions, lengths, out, gate, partial, state, hot,
-                          resolved);
+                          resolved, tiles);
          });
   m.def(
       "run_hot_fp8(Tensor q, Tensor history, Tensor scales, Tensor indices, "
       "Tensor table, Tensor requests, Tensor positions, Tensor lengths, "
       "Tensor(a!) out, Tensor? gate, Tensor(b!) partial, Tensor(c!) state, "
-      "Tensor hot, Tensor resolved, Tensor hot_scales) -> ()");
+      "Tensor hot, Tensor resolved, Tensor hot_scales, int tiles=1) -> ()");
   m.impl("run_hot_fp8", torch::kCUDA,
          [](torch::Tensor q, torch::Tensor history, torch::Tensor scales,
             torch::Tensor indices, torch::Tensor table, torch::Tensor requests,
             torch::Tensor positions, torch::Tensor lengths, torch::Tensor out,
             std::optional<torch::Tensor> gate, torch::Tensor partial,
             torch::Tensor state, torch::Tensor hot, torch::Tensor resolved,
-            torch::Tensor hot_scales) {
+            torch::Tensor hot_scales, int64_t tiles) {
            device_qsa_out(q, history, scales, indices, table, requests,
                           positions, lengths, out, gate, partial, state, hot,
-                          resolved, 1, false, 0, hot_scales);
+                          resolved, tiles, false, 0, hot_scales);
          });
+  m.def(
+      "prep_write(Tensor qkv, Tensor pos, Tensor cos_sin, Tensor qw, Tensor "
+      "kw, "
+      "float eps, Tensor(a!) query_out, Tensor(b!) key_out, Tensor slots, "
+      "Tensor(c!) history, Tensor(d!) scales, Tensor tags, Tensor page_slots, "
+      "Tensor(e!) hot, Tensor(f!)? hot_scales, Tensor(g!) epoch) -> ()");
+  m.impl("prep_write", torch::kCUDA, &prep_write_out);
+  m.def(
+      "resolve_hot(Tensor history, Tensor scales, Tensor(a!) hot, "
+      "Tensor(b!)? hot_scales, Tensor(c!) tags, Tensor(d!) stamps, "
+      "Tensor epoch, Tensor(e!) hands, Tensor(f!) page_slots, "
+      "Tensor(g!) stats, Tensor(h!) miss_queue, Tensor indices, "
+      "Tensor table, Tensor requests, Tensor positions, Tensor lengths, "
+      "Tensor(i!) virtual_positions, Tensor(j!) virtual_lengths, "
+      "Tensor(k!) resolved) -> ()");
+  m.impl("resolve_hot", torch::kCUDA, &resolve_hot_out);
+  m.def(
+      "warm_hot_staged(Tensor staged_history, Tensor staged_scales, "
+      "Tensor(a!) hot, Tensor(b!)? hot_scales, Tensor(c!) tags, "
+      "Tensor(d!) stamps, Tensor epoch, Tensor(e!) hands, "
+      "Tensor(f!) page_slots, Tensor table, Tensor staged_table, "
+      "Tensor lengths, int num_blocks) -> ()");
+  m.impl("warm_hot_staged", torch::kCUDA, &warm_hot_staged_out);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

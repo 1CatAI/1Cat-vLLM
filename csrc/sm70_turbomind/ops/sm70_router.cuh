@@ -83,21 +83,32 @@ __device__ __forceinline__ void select_row(const half* logits, float* weights,
     for (int j = 0; j < 15; ++j) keys[j] = pop ? keys[j + 1] : keys[j];
     keys[15] = pop ? 0 : keys[15];
   }
-  float exponential =
-      lane < 10 ? exp2f((unpack(own_winner) - largest) * 1.4426950408889634f)
-                : 0;
-  const float denominator = warp_sum(exponential);
+  float exponential = 0.0f;
   if (lane < 10) {
-    weights[lane] = exponential / denominator;
+    const float scaled = (unpack(own_winner) - largest) * 1.4426950408889634f;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(exponential) : "f"(scaled));
+  }
+  const float e_even = __shfl_sync(0xffffffff, exponential, (lane * 2) & 31);
+  const float e_odd = __shfl_sync(0xffffffff, exponential, (lane * 2 + 1) & 31);
+  const float pair_sum = (lane < 5) ? (e_even + e_odd) : 0.0f;
+  float denominator = warp_sum(pair_sum);
+  denominator = __shfl_sync(0xffffffff, denominator, 0);
+  if (lane < 10) {
+    float norm_w;
+    asm("div.full.f32 %0, %1, %2;"
+        : "=f"(norm_w)
+        : "f"(exponential), "f"(denominator));
+    weights[lane] = norm_w;
     ids[lane] = 511 - (own_winner & 511);
     source[lane] = lane * m + row;
   }
 }
 __global__ void select_kernel(const half* logits, float* weights, int* ids,
                               int* source, int m) {
-  const int row = blockIdx.x;
-  select_row(logits + row * 512, weights + row * 10, ids + row * 10,
-             source + row * 10, m, row);
+  const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (row < m)
+    select_row(logits + row * 512, weights + row * 10, ids + row * 10,
+               source + row * 10, m, row);
 }
 
 // Preserve the quantizer's independent 256-column blocks. In the first
