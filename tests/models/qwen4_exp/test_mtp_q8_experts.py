@@ -142,3 +142,70 @@ def test_mmq_expert_capacity_graph_replay(weight_type, experts, selected):
         )
         assert torch.isfinite(output).all()
         torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+
+def test_mtp_q8_config_wraps_fallback_quant_config():
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+    from vllm.models.qwen4_exp.nvidia.mtp_q8_experts import MTPQ80Config
+
+    sentinel_linear = object()
+
+    class DummyFallback(QuantizationConfig):
+        def __init__(self):
+            super().__init__()
+            self.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+        def get_name(self):
+            return "compressed-tensors"
+
+        def get_supported_act_dtypes(self):
+            return [torch.float16]
+
+        @classmethod
+        def get_min_capability(cls):
+            return 70
+
+        @staticmethod
+        def get_config_filenames():
+            return []
+
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+        def get_cache_scale(self, name):
+            return f"scale:{name}"
+
+        def get_quant_method(self, layer, prefix):
+            if isinstance(layer, RoutedExperts):
+                return object.__new__(UnquantizedFusedMoEMethod)
+            return sentinel_linear
+
+    cfg = MTPQ80Config(fallback=DummyFallback())
+    assert cfg.get_name() == "compressed-tensors"
+    assert cfg.packed_modules_mapping == {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    assert (
+        cfg.get_cache_scale("mtp.layers.0.self_attn") == "scale:mtp.layers.0.self_attn"
+    )
+    assert cfg.get_quant_method(torch.nn.Module(), "mtp.layers.0.fc") is sentinel_linear
+
+    experts = object.__new__(RoutedExperts)
+    experts.moe_config = SimpleNamespace(
+        hidden_size=2560,
+        intermediate_size_per_partition=160,
+        is_lora_enabled=False,
+    )
+    dummy_vllm_cfg = SimpleNamespace(
+        compilation_config=SimpleNamespace(custom_ops=[]),
+        parallel_config=SimpleNamespace(enable_dbo=False),
+    )
+    with set_current_vllm_config(dummy_vllm_cfg):
+        method = cfg.get_quant_method(experts, "mtp.layers.0.mlp.experts")
+    assert isinstance(method, MTPQ80MoEMethod)

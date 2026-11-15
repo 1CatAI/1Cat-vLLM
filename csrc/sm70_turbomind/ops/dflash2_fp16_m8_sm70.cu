@@ -87,13 +87,13 @@ namespace {
 
 // Retain the dense head's FP32 partitions, including its final FP32 sum.
 // Changing that schedule can change FP16 rounding at close logits.
-template <int Partitions>
+template <int Width, int Partitions>
 __global__ void fp16_candidate_scores_sm70_kernel(
     half* __restrict__ scores, const half* __restrict__ input,
     const half* __restrict__ weight, const int* __restrict__ ids,
     int vocabulary, int candidates) {
-  constexpr int Width = 5120;
   constexpr int PrefetchGroups = 4;
+  static_assert((Width / 16) % (Partitions * PrefetchGroups) == 0);
   const int row = blockIdx.x;
   const int candidate = blockIdx.y;
   const int lane = threadIdx.x;
@@ -176,7 +176,8 @@ void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
               weight.is_contiguous() && ids.is_contiguous());
   TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 && ids.dim() == 2 &&
               scores.dim() == 2);
-  TORCH_CHECK(input.size(1) == 5120 && weight.size(1) == 5120 &&
+  const int64_t width = input.size(1);
+  TORCH_CHECK((width == 2560 || width == 5120) && weight.size(1) == width &&
               weight.size(0) > 0 && weight.size(0) <= INT_MAX);
   TORCH_CHECK(input.size(0) >= 1 && ids.size(0) == input.size(0) &&
               scores.sizes() == ids.sizes() && ids.size(1) >= 1 &&
@@ -200,9 +201,12 @@ void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
   }
   // The qualified wider shard's multirow cuBLAS projection uses two K
   // partitions; a single row and the narrower shard retain one chain.
-  auto kernel = input.size(0) > 1 && weight.size(0) > 65536
-                    ? fp16_candidate_scores_sm70_kernel<2>
-                    : fp16_candidate_scores_sm70_kernel<1>;
+  const bool two_part = input.size(0) > 1 && weight.size(0) > 65536;
+  auto kernel = width == 2560
+                    ? (two_part ? fp16_candidate_scores_sm70_kernel<2560, 2>
+                                : fp16_candidate_scores_sm70_kernel<2560, 1>)
+                    : (two_part ? fp16_candidate_scores_sm70_kernel<5120, 2>
+                                : fp16_candidate_scores_sm70_kernel<5120, 1>);
   kernel<<<dim3(input.size(0), ids.size(1)), 32, 0,
            at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<half*>(scores.data_ptr()),
@@ -281,13 +285,15 @@ namespace {
 // Certified rows preserve their output storage. Other rows execute the
 // complete original-weight projection with the qualified FP32 partitions.
 
-template <int Prefetch, int Partitions>
+template <int Width, int Prefetch, int Partitions>
 __global__ __launch_bounds__(32, 16) void fp16_masked_head_sm70_kernel(
     half* scores, const half* input, const half* weight, const int* certified,
     int rows, int vocab) {
   constexpr int kRowsPerTile = 8;
+  constexpr int kGroups = Width / 16;
+  static_assert(kGroups % (Partitions * Prefetch) == 0);
   const int row_base = blockIdx.x * kRowsPerTile;
-  input += static_cast<int64_t>(row_base) * 5120;
+  input += static_cast<int64_t>(row_base) * Width;
   scores += static_cast<int64_t>(row_base) * vocab;
   certified += row_base;
   rows = min(rows - row_base, kRowsPerTile);
@@ -302,12 +308,12 @@ __global__ __launch_bounds__(32, 16) void fp16_masked_head_sm70_kernel(
                ((lane & 16) ? 4 : 0);
   int input_row = (lane & 3) + ((lane & 16) ? 4 : 0);
   bool active = input_row < rows && certified[input_row] == 0;
-  const half* weight_row = weight + static_cast<int64_t>(column) * 5120;
+  const half* weight_row = weight + static_cast<int64_t>(column) * Width;
   float accum[Partitions][8] = {};
 #pragma unroll
   for (int part = 0; part < Partitions; ++part) {
-    for (int first = part * (320 / Partitions);
-         first < (part + 1) * (320 / Partitions); first += Prefetch) {
+    for (int first = part * (kGroups / Partitions);
+         first < (part + 1) * (kGroups / Partitions); first += Prefetch) {
       uint4 first_weight[Prefetch], second_weight[Prefetch];
 #pragma unroll
       for (int group = 0; group < Prefetch; ++group) {
@@ -320,7 +326,8 @@ __global__ __launch_bounds__(32, 16) void fp16_masked_head_sm70_kernel(
       for (int group = 0; group < Prefetch; ++group) {
         uint4 a0 = make_uint4(0, 0, 0, 0), a1 = make_uint4(0, 0, 0, 0);
         if (active) {
-          const half* address = input + input_row * 5120 + (first + group) * 16;
+          const half* address =
+              input + input_row * Width + (first + group) * 16;
           a0 = __ldg(reinterpret_cast<const uint4*>(address));
           a1 = __ldg(reinterpret_cast<const uint4*>(address + 8));
         }
@@ -357,8 +364,10 @@ void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
                                bool tiled_multirow) {
   TORCH_CHECK(scores.is_cuda() && input.is_cuda() && weight.is_cuda() &&
               certified.is_cuda());
-  TORCH_CHECK(input.dim() == 2 && input.size(0) >= 1 && input.size(1) == 5120);
-  TORCH_CHECK(weight.dim() == 2 && weight.size(1) == 5120 &&
+  const int64_t width = input.size(1);
+  TORCH_CHECK(input.dim() == 2 && input.size(0) >= 1 &&
+              (width == 2560 || width == 5120));
+  TORCH_CHECK(weight.dim() == 2 && weight.size(1) == width &&
               weight.size(0) > 0 && weight.size(0) % 32 == 0);
   const int64_t vocab = weight.size(0);
   TORCH_CHECK(scores.dim() == 2 && scores.size(0) == input.size(0) &&
@@ -383,9 +392,12 @@ void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
   const int64_t row_tiles = (input.size(0) + 7) / 8;
   TORCH_CHECK(row_tiles <= properties->maxGridSize[0]);
   TORCH_CHECK(vocab / 32 <= properties->maxGridSize[1]);
-  auto kernel = input.size(0) > 1 && vocab > 65536
-                    ? fp16_masked_head_sm70_kernel<8, 2>
-                    : fp16_masked_head_sm70_kernel<8, 1>;
+  const bool two_part = input.size(0) > 1 && vocab > 65536;
+  auto kernel = width == 2560
+                    ? (two_part ? fp16_masked_head_sm70_kernel<2560, 8, 2>
+                                : fp16_masked_head_sm70_kernel<2560, 8, 1>)
+                    : (two_part ? fp16_masked_head_sm70_kernel<5120, 8, 2>
+                                : fp16_masked_head_sm70_kernel<5120, 8, 1>);
   kernel<<<dim3(row_tiles, vocab / 32), 32, 0,
            at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<half*>(scores.data_ptr()),

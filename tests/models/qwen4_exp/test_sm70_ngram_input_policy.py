@@ -13,7 +13,8 @@ from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
     [
         (False, True, 1, "disabled_by_kernel_config"),
         (True, False, 1, "requires_sm70"),
-        (True, True, 5, "input_shape_has_no_calibration"),
+        (True, True, 65, "input_shape_has_no_calibration"),
+        (True, True, 8, "requires_contiguous_cuda_int32_inputs"),
         (True, True, 1, "requires_contiguous_cuda_int32_inputs"),
     ],
 )

@@ -185,7 +185,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
             reason = "disabled_by_kernel_config"
         elif not self._ple_input_hardware:
             reason = "requires_sm70"
-        elif num_reqs_padded > 4 or self.ngram_context_len > 8:
+        elif num_reqs_padded > 64 or self.ngram_context_len > 8:
             reason = "input_shape_has_no_calibration"
         elif any(
             t.dtype != torch.int32 or not t.is_cuda or not t.is_contiguous()

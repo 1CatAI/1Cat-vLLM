@@ -80,9 +80,14 @@ def try_greedy_draft_sparse_rejection(
     probe_k = _TARGET_PROBE_K if retain_ties else _TARGET_TOP_K + 1
     fallback = None
     if not reference_check:
-        target_ids, target_logits = model.get_topk_tokens_and_logits(
-            sample_hidden_states, probe_k
-        )
+        if retain_ties and hasattr(model, "get_compact_target_probe_with_fallback"):
+            target_ids, target_logits, _ = model.get_compact_target_probe_with_fallback(
+                sample_hidden_states, probe_k
+            )
+        else:
+            target_ids, target_logits = model.get_topk_tokens_and_logits(
+                sample_hidden_states, probe_k
+            )
     elif retain_ties and hasattr(model, "get_compact_target_probe_with_fallback"):
         target_ids, target_logits, fallback = (
             model.get_compact_target_probe_with_fallback(sample_hidden_states, probe_k)

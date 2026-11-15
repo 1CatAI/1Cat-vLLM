@@ -736,7 +736,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("sm70_fp16_masked_head_out", torch::kCUDA,
            &sm70_fp16_masked_head_out);
   ops.def("sm70_fp16_head_vocab_revision() -> int",
-          []() -> int64_t { return 1; });
+          []() -> int64_t { return 2; });
 
   ops.def(
       "fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales, str? "

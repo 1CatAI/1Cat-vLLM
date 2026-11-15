@@ -67,12 +67,12 @@ def test_draft_head_preserves_shared_target_and_uses_actual_probe_path(monkeypat
     assert view.weight is shared.weight
     assert shared.quant_method is method
     assert list(view.modules()) == [view, shared]  # No self-referential method child.
-    for rows in (1, 4, 8):
+    for rows in (1, 4, 8, 20, 32):
         x = torch.randn(rows, 2560, dtype=torch.float16)
         assert torch.equal(view.quant_method.apply(view, x), method.apply(shared, x))
         assert view.maybe_get_sm70_lm_head_top1(x) is None
-    assert calls == ["qpn8", "reference"] * 3
-    view.apply(view, torch.randn(9, 2560, dtype=torch.float16))
+    assert calls == ["qpn8", "reference"] * 5
+    view.apply(view, torch.randn(33, 2560, dtype=torch.float16))
     assert calls[-1] == "reference"
     assert torch.equal(shared.weight, original)
 

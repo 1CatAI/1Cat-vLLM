@@ -413,7 +413,7 @@ void sm70_gdn_verify_out(torch::Tensor qkv, torch::Tensor a, torch::Tensor b,
   };
   switch (cfg) {
     case 1:
-      if (N == 1 && HV > 12) {
+      if (N == 1 && HV >= 12) {
         go(std::pair<std::integral_constant<int, 8>,
                      std::integral_constant<int, 2>>{});
       } else {

@@ -35,12 +35,15 @@ _DEFAULT_RANKING = (
 )
 
 
-def _mtp_head_shard_rows(head: nn.Module) -> int | None:
-    """The qualified H5120 head, with a complete, unpadded vocabulary shard."""
+def _mtp_head_shard_rows(
+    head: nn.Module,
+    embedding_dims: tuple[int, ...] = (5120,),
+) -> int | None:
+    """A qualified LM head with a complete, unpadded vocabulary shard."""
     shard = getattr(head, "shard_indices", None)
     if (
         shard is None
-        or getattr(head, "embedding_dim", 0) != 5120
+        or getattr(head, "embedding_dim", 0) not in embedding_dims
         or getattr(head, "org_vocab_size", 0) != 248320
         or getattr(shard, "num_added_elements", 0)
         or getattr(shard, "num_org_vocab_padding", 0)

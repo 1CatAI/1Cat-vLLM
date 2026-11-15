@@ -13,6 +13,7 @@ class TopKTopPRuntime:
     policy: LayerExecutionPolicy
     buffers: dict = field(default_factory=dict)
     tables: dict = field(default_factory=dict)
+    no_host_sync: bool = False
 
     def close(self):
         # The graph branch uses the reference path before borrowing these buffers.

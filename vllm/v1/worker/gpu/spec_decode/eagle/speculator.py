@@ -420,13 +420,14 @@ class EagleSpeculator(TargetSamplingHooks):
             try_greedy_draft_sparse_rejection,
         )
 
+        ref_check = self.vllm_config.kernel_config.sm70_sparse_target_reference_check
         return try_greedy_draft_sparse_rejection(
             model,
             rejection_sampler,
             hidden_states,
             input_batch,
             grammar_output,
-            reference_check=self.vllm_config.kernel_config.sm70_sparse_target_reference_check,
+            reference_check=True if ref_check is None else bool(ref_check),
         )
 
     def _validate_local_argmax_reduction(self) -> None:
