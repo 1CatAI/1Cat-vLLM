@@ -323,7 +323,7 @@ def finalize_runtime_policy_hashes(cfg):
             or (pre_ampere and field == "tp4_push" and tp == 4)
             or (pre_ampere and field in ("tp8_hierarchical", "tp8_push") and tp == 8)
             or (pre_ampere and field == "moe_add_allreduce" and tp > 1)
-            or (pre_ampere and field == "long_prefill_norm" and tp == 4)
+            or (pre_ampere and field == "long_prefill_norm" and tp in (2, 4))
             or (pre_ampere and field.startswith("awq_") and tp == 2)
             or (pre_ampere and field == "top1_custom_ar" and tp > 1)
             or (pre_ampere and field == "gemma_rms_tp2" and tp == 2)

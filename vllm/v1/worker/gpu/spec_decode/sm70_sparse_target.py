@@ -512,10 +512,11 @@ def try_graph_greedy_draft_rejection(
         graphs = rejection._sm70_greedy_target_rejection_graphs = {}
     pools = getattr(rejection, "_sm70_greedy_target_graph_pools", None)
     if pools is None:
+        pool_branch = torch.cuda.graph_pool_handle()
         pools = rejection._sm70_greedy_target_graph_pools = (
             torch.cuda.graph_pool_handle(),
-            torch.cuda.graph_pool_handle(),
-            torch.cuda.graph_pool_handle(),
+            pool_branch,
+            pool_branch,
         )
     if key not in graphs:
         if len(graphs) >= _MAX_GRAPHS:
@@ -577,16 +578,18 @@ def maybe_capture_sparse_target_graphs(
 
     device = speculator.device
     width = int(rejection_sampler.num_speculative_steps) + 1
+    states = rejection_sampler.sampler.sampling_states
+    vocab_size = int(getattr(states, "vocab_size", 0))
+    precapture_limit = min(3, _MAX_GRAPH_REQUESTS)
     max_reqs = min(
-        _MAX_GRAPH_REQUESTS,
+        precapture_limit,
         int(getattr(speculator, "max_num_reqs", 0)),
         64 // max(width, 1),
     )
     if max_reqs < 1 or not 2 <= width <= 16:
         return
 
-    states = rejection_sampler.sampler.sampling_states
-    if getattr(states, "vocab_size", 0) < 32768 or states.max_num_reqs < max_reqs:
+    if vocab_size < 32768 or states.max_num_reqs < max_reqs:
         return
 
     hidden_size = int(speculator.vllm_config.model_config.get_hidden_size())

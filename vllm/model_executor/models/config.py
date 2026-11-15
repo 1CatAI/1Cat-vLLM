@@ -148,10 +148,27 @@ def sm70_dflash2_nvfp4_qualified(vllm_config: "VllmConfig") -> bool:
     )
     steps = int(getattr(spec, "num_speculative_tokens", 0) or 0)
     method = getattr(spec, "method", None)
-    # Native MTP verifies through the same NVFP4 projections as DFlash2's
-    # target; only the drafter differs.
-    workload = (method == "dflash" and steps == 7 and selector == 16) or (
-        method == "mtp" and 1 <= steps <= 7
+    # Native MTP and non-speculative forward passes verify/decode through the
+    # same NVFP4 projections as DFlash2's target; local K/N and capability
+    # checks remain inside Qpn2NvFp4LinearKernel.
+    model = getattr(vllm_config, "model_config", None)
+    architectures = set(getattr(model, "architectures", ()) or ())
+    non_spec_model = bool(
+        spec is None
+        and model is not None
+        and architectures
+        & {
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen4ExpForCausalLM",
+            "Qwen4ExpForConditionalGeneration",
+        }
+        and str(getattr(model, "dtype", "")) in ("torch.float16", "float16")
+    )
+    workload = (
+        (method == "dflash" and steps == 7 and selector == 16)
+        or (method == "mtp" and 1 <= steps <= 7)
+        or non_spec_model
     )
     return bool(
         workload
@@ -169,6 +186,7 @@ def sm70_nvfp4_projection_qualified(prefix: str) -> bool:
     """
     return prefix.rsplit(".", 1)[-1] in {
         "in_proj_qkvz",
+        "in_proj_qkvzba",
         "qkv_proj",
         "out_proj",
         "o_proj",

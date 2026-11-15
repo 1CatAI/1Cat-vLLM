@@ -198,3 +198,75 @@ def test_grouped_fp16_serves_two_kv_heads_per_rank(rows, context):
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
     torch.testing.assert_close(out.float(), reference, atol=0.0005, rtol=0.01)
+
+
+@pytest.mark.parametrize(
+    "groups,rows,kv_heads,page,context",
+    [
+        (1, 5, 2, 2048, 4096),
+        (2, 5, 2, 1024, 3072),
+        (1, 8, 4, 512, 2048),
+        (3, 8, 2, 800, 4096),
+    ],
+)
+def test_grouped_fp16_direct_multi_kv_heads_and_runtime_pages(
+    groups, rows, kv_heads, page, context
+):
+    """Single-launch zero-copy FP16 grouped verify across TP=1/2/4 KV heads & pages."""
+    from vllm.v1.attention.ops.sm70_fp16_grouped import load_grouped_fp16_fp32
+
+    grouped = load_grouped_fp16_fp32()
+    assert grouped is not None and grouped.multi_kv_heads and grouped.runtime_pages
+    pages = math.ceil(context / page)
+    generator = torch.Generator(device="cuda").manual_seed(456)
+    storage = torch.randn(
+        (groups * pages, 2, page, kv_heads, 264),
+        generator=generator,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    k, v = storage[:, 0, :, :, :256], storage[:, 1, :, :, :256]
+    q = torch.randn(
+        (groups * rows, 6 * kv_heads, 256),
+        generator=generator,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    table = torch.stack(
+        [
+            torch.randperm(pages, generator=generator, device="cuda") + g * pages
+            for g in range(groups)
+        ]
+    ).int()
+    lengths = torch.tensor(
+        [context - rows + i + 1 for g in range(groups) for i in range(rows)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    out = torch.empty_like(q)
+    grouped(q, k, v, table, lengths, out=out, softmax_scale=1 / 16)
+
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        reference = torch.empty_like(q, dtype=torch.float32)
+        for g in range(groups):
+            panel = slice(g * rows, (g + 1) * rows)
+            for head in range(kv_heads):
+                keys = k[:, :, head].index_select(0, table[g].long())
+                values = v[:, :, head].index_select(0, table[g].long())
+                keys = keys.reshape(-1, 256).float()
+                values = values.reshape(-1, 256).float()
+                q_heads = slice(6 * head, 6 * (head + 1))
+                scores = q[panel, q_heads].float() @ keys.T / 16
+                scores.masked_fill_(
+                    torch.arange(keys.shape[0], device=q.device)[None, None, :]
+                    >= lengths[panel, None, None],
+                    -torch.inf,
+                )
+                reference[panel, q_heads] = (
+                    torch.softmax(scores, dim=-1).nan_to_num() @ values
+                )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+    torch.testing.assert_close(out.float(), reference, atol=0.0005, rtol=0.01)

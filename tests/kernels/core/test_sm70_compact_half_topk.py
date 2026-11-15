@@ -14,7 +14,19 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize(
-    "rows,width", [(8, 62080), (32, 65535), (40, 62080), (64, 65535), (8, 1025)]
+    "rows,width",
+    [
+        (8, 62080),
+        (32, 65535),
+        (40, 62080),
+        (64, 65535),
+        (8, 1025),
+        (8, 65536),
+        (8, 124160),
+        (16, 124160),
+        (8, 248320),
+        (5, 524288),
+    ],
 )
 @torch.inference_mode()
 def test_half_source_values_and_live_graph(rows, width):
@@ -116,3 +128,38 @@ def test_target_probe_preserves_dense_token_mask(rows):
                     torch.tensor([top_p], device="cuda"),
                 )
                 assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("vocab_size", (124160, 248320))
+def test_stream_captured_topk_topp_compact_avoids_full_sort_workspace(vocab_size):
+    from vllm.config.execution_policy import layer_policy
+    from vllm.v1.sample.ops.topk_topp_runtime import TopKTopPRuntime
+    from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+
+    torch.manual_seed(20261115)
+    base = torch.randn((8, vocab_size), device="cuda", dtype=torch.float32)
+    base[2].fill_(-10.0)
+    base[2, :24] = 2.5
+    k = torch.full((8,), 20, device="cuda", dtype=torch.int32)
+    p = torch.full((8,), 0.85, device="cuda", dtype=torch.float32)
+
+    eager_logits = base.clone()
+    eager_rt = TopKTopPRuntime(layer_policy(), no_host_sync=True)
+    eager_out = apply_top_k_top_p_triton(eager_logits, k, p, runtime=eager_rt)
+
+    cap_in = base.clone()
+    cap_rt = TopKTopPRuntime(layer_policy())
+    # Warm up compact workspace outside capture so CUDA graph capture has no mallocs.
+    _ = apply_top_k_top_p_triton(cap_in.clone(), k, p, runtime=cap_rt)
+    assert len(cap_rt.buffers) == 0
+
+    g = torch.cuda.CUDAGraph()
+    torch.accelerator.synchronize()
+    with torch.cuda.graph(g):
+        cap_out = apply_top_k_top_p_triton(cap_in, k, p, runtime=cap_rt)
+
+    cap_in.copy_(base)
+    g.replay()
+    torch.accelerator.synchronize()
+    assert len(cap_rt.buffers) == 0
+    assert torch.equal(cap_out, eager_out)

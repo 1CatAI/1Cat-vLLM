@@ -267,6 +267,7 @@ class CustomAllreduce:
         self._IS_CAPTURING = False
         self.disabled = True
         self.long_prefill_output_ptrs: list[int] | None = None
+        self.tp2_push_buffer_ptrs: list[int] | None = None
         self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
         self.sm70_tp8_hierarchical_push_buffer_ptrs: list[int] | None = None
 
@@ -420,13 +421,22 @@ class CustomAllreduce:
             return
 
         self.disabled = False
+        self.max_size = max_size
+        # Provisioning the long-prefill fusion buffers must not widen ordinary
+        # custom-AR dispatch beyond its established 8-MiB policy. The fused
+        # predicate below uses the full allocation capacity explicitly.
+        self.dispatch_max_size = (
+            min(max_size, 8192 * 1024) if long_prefill_fusion_enabled else max_size
+        )
         # Buffers memory are owned by this Python class and passed to C++.
         # Metadata composes of two parts: metadata for synchronization and a
-        # temporary buffer for storing intermediate allreduce results.
+        # temporary buffer for storing intermediate 2-stage allreduce results
+        # (never used by long-prefill RS+Norm+AG, so cap by dispatch_max_size).
         meta_scratch_size = max(
-            max_size,
+            self.dispatch_max_size,
             _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES if tp8_hierarchical else 0,
         )
+        self.meta_scratch_size = meta_scratch_size
         self.meta_ptrs = self.create_shared_buffer(
             self._native.meta_size() + meta_scratch_size,
             group=group,
@@ -452,13 +462,6 @@ class CustomAllreduce:
         self.rank_data = torch.empty(
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
-        self.max_size = max_size
-        # Provisioning the long-prefill fusion buffers must not widen ordinary
-        # custom-AR dispatch beyond its established 8-MiB policy. The fused
-        # predicate below uses the full allocation capacity explicitly.
-        self.dispatch_max_size = (
-            min(max_size, 8192 * 1024) if long_prefill_fusion_enabled else max_size
-        )
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
@@ -473,6 +476,22 @@ class CustomAllreduce:
                 group=group,
             )
             self._native.register_buffer(self._ptr, self.long_prefill_output_ptrs)
+        if (
+            self._policy.tp4_push
+            and world_size == 2
+            and fully_connected
+            and current_platform.is_cuda()
+            and device_capability is not None
+            and device_capability.major == 7
+            and device_capability.minor == 0
+        ):
+            self.tp2_push_buffer_ptrs = ops.maybe_register_tp2_push_buffer(
+                self._native,
+                self._ptr,
+                self.create_shared_buffer,
+                group,
+                logger,
+            )
         if (
             self._policy.tp4_push
             and world_size == 4
@@ -545,7 +564,10 @@ class CustomAllreduce:
             tp8_hierarchical,
             self.dispatch_max_size,
             self.max_size,
-            self.sm70_tp4_push_buffer_ptrs is not None,
+            (
+                self.sm70_tp4_push_buffer_ptrs is not None
+                or self.tp2_push_buffer_ptrs is not None
+            ),
             self.long_prefill_output_ptrs is not None,
         )
 
@@ -762,6 +784,26 @@ class CustomAllreduce:
             )
         )
 
+    def _tp2_push_norm_active(self, inp: torch.Tensor, residual: torch.Tensor) -> bool:
+        return bool(
+            self.tp2_push_buffer_ptrs is not None
+            and self._policy.native.raw("custom_allreduce_algo") is None
+            and residual.dtype == torch.float32
+            and inp.ndim == 2
+            and 1 <= inp.shape[0] <= 64
+            and inp.shape[1] == 5120
+        )
+
+    def _tp2_push_ar_active(self, inp: torch.Tensor) -> bool:
+        nbytes = inp.numel() * inp.element_size()
+        return bool(
+            self.tp2_push_buffer_ptrs is not None
+            and self._policy.native.raw("custom_allreduce_algo") is None
+            and inp.dtype == torch.float16
+            and 0 < nbytes <= 64 * 5120 * 2
+            and nbytes % 16 == 0
+        )
+
     def all_reduce_gemma_rms_norm(
         self,
         inp: torch.Tensor,
@@ -773,8 +815,11 @@ class CustomAllreduce:
             raise RuntimeError("Ordered all-reduce RMSNorm is unavailable")
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual)
-        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
-        if registered:
+        direct_push = self._tp2_push_norm_active(inp, residual)
+        registered = direct_push or (
+            self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        )
+        if not direct_push and registered:
             safe_inp = self._ipc_graph_input(inp)
             registered = safe_inp is not None
             if safe_inp is not None:
@@ -803,8 +848,11 @@ class CustomAllreduce:
             raise RuntimeError("SM70 TP2 fused all-reduce RMSNorm is unavailable")
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual, dtype=torch.float32)
-        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
-        if registered:
+        direct_push = self._tp2_push_norm_active(inp, residual)
+        registered = direct_push or (
+            self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        )
+        if not direct_push and registered:
             safe_inp = self._ipc_graph_input(inp)
             registered = safe_inp is not None
             if safe_inp is not None:
@@ -941,8 +989,12 @@ class CustomAllreduce:
         residual: torch.Tensor,
         weight: torch.Tensor,
     ) -> bool:
-        return not self.disabled and self.capabilities.gemma_norm(
-            inp, residual, weight, world_size=4, long=True
+        return (
+            not self.disabled
+            and self.world_size in (2, 4)
+            and self.capabilities.gemma_norm(
+                inp, residual, weight, world_size=self.world_size, long=True
+            )
         )
 
     def top1_argmax(
@@ -1184,6 +1236,8 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                if self._tp2_push_ar_active(input):
+                    return self.all_reduce(input, registered=True)
                 safe_input = self._ipc_graph_input(input)
                 if safe_input is None:
                     # The pre-registered staging buffer is cudaMalloc-backed,
@@ -1213,6 +1267,8 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                if self._tp2_push_ar_active(input_a):
+                    return self.all_reduce_sum2(input_a, input_b)
                 safe_a = self._ipc_graph_input(input_a)
                 safe_b = None if safe_a is None else self._ipc_graph_input(input_b)
                 if safe_a is None or safe_b is None:
@@ -1235,6 +1291,9 @@ class CustomAllreduce:
                     rank=self.rank,
                 )
                 self.long_prefill_output_ptrs = None
+            if self.tp2_push_buffer_ptrs is not None:
+                self.free_shared_buffer(self.tp2_push_buffer_ptrs, rank=self.rank)
+                self.tp2_push_buffer_ptrs = None
             if self.sm70_tp4_push_buffer_ptrs is not None:
                 self.free_shared_buffer(self.sm70_tp4_push_buffer_ptrs, rank=self.rank)
                 self.sm70_tp4_push_buffer_ptrs = None

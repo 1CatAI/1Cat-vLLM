@@ -921,13 +921,14 @@ def test_sm70_layered_context_k_norm_uses_each_weight_row():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("tp_size", [2, 4])
 @pytest.mark.parametrize(("input_size", "output_size"), [(25600, 5120), (20480, 4096)])
 def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(
-    monkeypatch, input_size, output_size
+    monkeypatch, tp_size, input_size, output_size
 ):
     model = _bare_dflash2_model()
     config = SimpleNamespace(
-        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
         model_config=SimpleNamespace(dtype=torch.float16),
     )
     created = {}
@@ -967,7 +968,8 @@ def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(
     ("enabled", "tp_size", "input_size", "output_size"),
     [
         (False, 4, 25600, 5120),
-        (True, 2, 25600, 5120),
+        (True, 1, 25600, 5120),
+        (True, 3, 25600, 5120),
         (True, 4, 5120, 5120),
         (True, 4, 25600, 4096),
     ],

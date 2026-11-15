@@ -3376,6 +3376,10 @@ def meta_size() -> int:
     return _custom_ar_op("meta_size")()
 
 
+def sm70_tp2_push_allreduce_buffer_size() -> int:
+    return _custom_ar_op("sm70_tp2_push_allreduce_buffer_size")()
+
+
 def sm70_tp4_push_allreduce_buffer_size() -> int:
     return _custom_ar_op("sm70_tp4_push_allreduce_buffer_size")()
 
@@ -3388,6 +3392,10 @@ def sm70_tp8_hierarchical_push_allreduce_buffer_size() -> int:
 
 def register_buffer(fa: int, ipc_tensors: list[int]) -> None:
     return _custom_ar_op("register_buffer")(fa, ipc_tensors)
+
+
+def register_sm70_tp2_push_allreduce_buffer(fa: int, ipc_tensors: list[int]) -> None:
+    _custom_ar_op("register_sm70_tp2_push_allreduce_buffer")(fa, ipc_tensors)
 
 
 def register_sm70_tp4_push_allreduce_buffer(fa: int, ipc_tensors: list[int]) -> None:
@@ -4398,3 +4406,25 @@ if hasattr(torch.ops._C, "sm70_mtp_moe_bf16_out"):
     @register_fake("_C::sm70_mtp_moe_bf16_out")
     def _sm70_mtp_moe_bf16_fake(output, input, weight, ids, weights, padded, down):
         return None
+
+
+def maybe_register_tp2_push_buffer(
+    native,
+    ptr: int,
+    create_shared_buffer,
+    group,
+    logger_obj,
+) -> list[int] | None:
+    if not native.has(
+        "sm70_tp2_push_allreduce_buffer_size",
+        "register_sm70_tp2_push_allreduce_buffer",
+    ):
+        return None
+    push_buffer_size = native.sm70_tp2_push_allreduce_buffer_size()
+    ptrs = create_shared_buffer(push_buffer_size, group=group)
+    native.register_sm70_tp2_push_allreduce_buffer(ptr, ptrs)
+    logger_obj.info(
+        "SM70 TP2 1-stage push all-reduce enabled for FP16 payloads "
+        "through 640 KiB and 1..64-row fused Gemma RMSNorm."
+    )
+    return ptrs

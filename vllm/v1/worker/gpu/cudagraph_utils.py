@@ -12,7 +12,10 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
+from vllm.compilation.sm70_decode_graph import (
+    cudagraph_capture_stream_workspace_scope,
+    sm70_decode_graph_compilation,
+)
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.execution_policy import graph_policy
@@ -782,7 +785,10 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn, CapturedAttentionState(attn_metadata, slot_mappings)
 
-        return super().capture(create_forward_fn, progress_bar_desc)
+        with cudagraph_capture_stream_workspace_scope(
+            self.device, self.get_capture_context
+        ):
+            return super().capture(create_forward_fn, progress_bar_desc)
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

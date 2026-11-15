@@ -6,18 +6,27 @@ import copy
 import typing
 from collections.abc import Callable, Iterable
 
+import regex as re
 import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.config.execution_policy import layer_policy
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -26,6 +35,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
 from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
 from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
@@ -155,15 +165,49 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             if (quant_config and quant_config.get_name() == "modelopt_fp4")
             else quant_config
         )
-        self.fc = ColumnParallelLinear(
-            self.config.hidden_size * 2,
-            self.config.hidden_size,
-            gather_output=True,
-            bias=False,
-            return_bias=False,
-            quant_config=fc_quant,
-            prefix=f"{prefix}.fc",
+        if fc_quant is not None:
+            fc_method = fc_quant.get_quant_method(
+                nn.Linear(1, 1, bias=False, device="meta"),
+                prefix=f"{prefix}.fc",
+            )
+            if fc_method is None or isinstance(fc_method, UnquantizedLinearMethod):
+                fc_quant = None
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        self._fc_input_sharded = bool(
+            fc_quant is None
+            and current_platform.is_device_capability(70)
+            and tp_size >= 2
+            and tp_size % 2 == 0
+            and self.config.hidden_size % (tp_size // 2) == 0
         )
+        self._fc_tp_rank = tp_rank
+        self._fc_tp_size = tp_size
+        if self._fc_input_sharded:
+            self.register_buffer(
+                "_fc_use_embed",
+                torch.tensor(tp_rank < (tp_size // 2), dtype=torch.bool),
+                persistent=False,
+            )
+            self.fc = RowParallelLinear(
+                self.config.hidden_size * 2,
+                self.config.hidden_size,
+                input_is_parallel=True,
+                bias=False,
+                return_bias=False,
+                quant_config=fc_quant,
+                prefix=f"{prefix}.fc",
+            )
+        else:
+            self.fc = ColumnParallelLinear(
+                self.config.hidden_size * 2,
+                self.config.hidden_size,
+                gather_output=True,
+                bias=False,
+                return_bias=False,
+                quant_config=fc_quant,
+                prefix=f"{prefix}.fc",
+            )
 
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
@@ -209,10 +253,30 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-        hidden_states = self.pre_fc_norm_hidden(hidden_states)
-        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-        hidden_states = self.fc(hidden_states)
+        if getattr(self, "_fc_input_sharded", False):
+            half = self._fc_tp_size // 2
+            # Keep both inputs live in a rank-symmetric FX graph so compiler
+            # dead-code elimination and allreduce-RMSNorm fusion emit identical
+            # collective sequences on every TP worker.
+            fc_src = torch.where(self._fc_use_embed, inputs_embeds, hidden_states)
+            norm = (
+                self.pre_fc_norm_embedding
+                if self._fc_tp_rank < half
+                else self.pre_fc_norm_hidden
+            )
+            fc_in = norm(fc_src)
+            if half > 1:
+                shard_idx = self._fc_tp_rank % half
+                width = fc_in.shape[-1] // half
+                fc_in = fc_in[
+                    ..., shard_idx * width : (shard_idx + 1) * width
+                ].contiguous()
+            hidden_states = self.fc(fc_in)
+        else:
+            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+            hidden_states = self.fc(hidden_states)
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         hidden_states, residual = self.layers[current_step_idx](
@@ -452,19 +516,61 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
             if quant_cfg is None:
                 continue
 
-            modules_to_not_convert = None
-            if isinstance(quant_cfg, dict):
-                modules_to_not_convert = quant_cfg.get("modules_to_not_convert")
-            else:
-                modules_to_not_convert = getattr(
-                    quant_cfg, "modules_to_not_convert", None
+            for key in ("modules_to_not_convert", "ignore"):
+                entries = (
+                    quant_cfg.get(key)
+                    if isinstance(quant_cfg, dict)
+                    else getattr(quant_cfg, key, None)
                 )
+                if not entries:
+                    continue
+                for entry in entries:
+                    pattern = str(entry)
+                    if pattern in ("mtp", "model.mtp"):
+                        return True
+                    if pattern.startswith("re:"):
+                        expr = pattern[3:]
+                        if re.search(expr, "model.mtp.fc") and re.search(
+                            expr, "model.mtp.layers.0.mlp.down_proj"
+                        ):
+                            return True
 
-            if modules_to_not_convert and any(
-                str(module) in ("mtp", "model.mtp") for module in modules_to_not_convert
+        return False
+
+    @staticmethod
+    def _target_uses_nvfp4(vllm_config: VllmConfig) -> bool:
+        if not vllm_config.kernel_config.sm70_nvfp4.qpn2:
+            return False
+        quant_config = vllm_config.quant_config
+        if quant_config is not None:
+            name = quant_config.get_name()
+            if name == "modelopt_fp4":
+                return True
+            if (
+                name == "compressed-tensors"
+                and getattr(quant_config, "quant_format", None)
+                == "nvfp4-pack-quantized"
             ):
                 return True
-
+        for cfg in (
+            vllm_config.model_config.hf_text_config,
+            vllm_config.model_config.hf_config,
+        ):
+            quant_cfg = getattr(cfg, "quantization_config", None)
+            if quant_cfg is None:
+                continue
+            fmt = (
+                quant_cfg.get("format")
+                if isinstance(quant_cfg, dict)
+                else getattr(quant_cfg, "format", None)
+            )
+            algo = (
+                quant_cfg.get("quant_algo")
+                if isinstance(quant_cfg, dict)
+                else getattr(quant_cfg, "quant_algo", None)
+            )
+            if fmt == "nvfp4-pack-quantized" or str(algo).upper() == "NVFP4":
+                return True
         return False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -536,7 +642,10 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
                 mark_mtp_draft_qpn8,
             )
 
-            mark_mtp_draft_qpn8(self.model)
+            mark_mtp_draft_qpn8(
+                self.model,
+                prefer_nvfp4=self._target_uses_nvfp4(vllm_config),
+            )
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )

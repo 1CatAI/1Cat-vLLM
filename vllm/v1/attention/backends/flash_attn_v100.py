@@ -41,6 +41,7 @@ def _canonical_name(name: str) -> str:
 
 
 _MISSING = object()
+_PATCH_HISTORY: dict[str, list[list[tuple[types.ModuleType, str, object]]]] = {}
 
 
 class _ForwardingModule(types.ModuleType):
@@ -58,14 +59,28 @@ class _ForwardingModule(types.ModuleType):
             return
         module, target = bindings[0]
         current = getattr(module, target, _MISSING)
+        saved: list[tuple[types.ModuleType, str, object]] = []
         for module, target in bindings:
-            if getattr(module, target, _MISSING) is current:
+            prev = getattr(module, target, _MISSING)
+            if prev is current:
+                saved.append((module, target, prev))
                 setattr(module, target, value)
+        if saved:
+            _PATCH_HISTORY.setdefault(name, []).append(saved)
 
     def __delattr__(self, name: str) -> None:
         bindings = _package._compatibility_bindings(name)
         if not bindings:
             super().__delattr__(name)
+            return
+        history = _PATCH_HISTORY.get(name)
+        if history:
+            for module, target, prev in history.pop():
+                if prev is _MISSING:
+                    if hasattr(module, target):
+                        delattr(module, target)
+                else:
+                    setattr(module, target, prev)
             return
         for module, target in bindings:
             delattr(module, target)

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FP16 paged-KV verification with FP32 probability and PV arithmetic."""
 
+from typing import Any
+
 import torch
 
 from vllm.config import get_current_vllm_config_or_none
@@ -42,12 +44,25 @@ def load_grouped_fp16_fp32():
 
     ensure_fa2_library_loaded()
     operator = getattr(torch.ops._vllm_fa2_C, OPERATOR, None)
-    if operator is not None:
-        # Model initialization owns the config; forwards borrow its resources.
-        workspace_cache("grouped_fp16_context", {})["capacity"] = model_context_limit(
-            fallback=MAX_CONTEXT
-        )
-    return _run if operator is not None else None
+    if operator is None:
+        return None
+    # Model initialization owns the config; forwards borrow its resources.
+    workspace_cache("grouped_fp16_context", {})["capacity"] = model_context_limit(
+        fallback=MAX_CONTEXT
+    )
+    kv_rev = getattr(torch.ops._vllm_fa2_C, "sm70_grouped_fp16_kv_heads_revision", None)
+    page_rev = getattr(torch.ops._vllm_fa2_C, "sm70_grouped_fp16_page_revision", None)
+    rows_rev = getattr(
+        torch.ops._vllm_fa2_C, "sm70_grouped_fp16_query_rows_revision", None
+    )
+    runner: Any = _run
+    runner.multi_kv_heads = bool(kv_rev is not None and kv_rev() >= 1)
+    runner.runtime_pages = bool(page_rev is not None and page_rev() >= 1)
+    if rows_rev is not None and rows_rev() >= 1:
+        runner.request_query_rows = (2, 3, 4, 5, 6, 7, 8)
+    elif hasattr(runner, "request_query_rows"):
+        delattr(runner, "request_query_rows")
+    return runner
 
 
 def short_split_capability():
@@ -72,20 +87,20 @@ def short_split_capability():
 
 def _run(q, k, v, table, row_lengths, *, out, softmax_scale):
     cache = workspace_cache("grouped_fp16", _WORKSPACES)
-    groups = table.shape[0]
+    panels = table.shape[0] * k.shape[2]
     key = (q.device, torch.cuda.current_stream(q.device).cuda_stream)
     bank = cache.setdefault(key, [])
     for partial, lse in bank:
-        if partial.shape[0] >= groups:
+        if partial.shape[0] >= panels:
             break
     else:
         partial = torch.empty(
-            (groups, 80, 8, 6, 256), dtype=torch.float32, device=q.device
+            (panels, 80, 8, 6, 256), dtype=torch.float32, device=q.device
         )
-        lse = torch.empty((groups, 80, 8, 6, 2), dtype=torch.float32, device=q.device)
+        lse = torch.empty((panels, 80, 8, 6, 2), dtype=torch.float32, device=q.device)
         bank.append((partial, lse))
     partial, lse = (
-        (partial[0], lse[0]) if groups == 1 else (partial[:groups], lse[:groups])
+        (partial[0], lse[0]) if panels == 1 else (partial[:panels], lse[:panels])
     )
     capability = short_split_capability()
     arguments = (q, k, v, out, table, row_lengths, partial, lse, softmax_scale)

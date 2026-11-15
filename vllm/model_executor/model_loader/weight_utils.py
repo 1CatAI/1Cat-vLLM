@@ -800,6 +800,36 @@ def raise_on_missing_safetensors_shards(
         )
 
 
+_QUANT_COMPANION_SUFFIXES = frozenset(
+    {
+        "weight_scale",
+        "weight_scale_inv",
+        "weight_global_scale",
+        "weight_zero_point",
+        "weight_shape",
+        "input_scale",
+        "input_global_scale",
+        "input_zero_point",
+        "qzeros",
+        "scales",
+        "g_idx",
+        "q_scale",
+        "k_scale",
+        "v_scale",
+    }
+)
+
+
+def _is_indexed_quant_companion(name: str, indexed_weights: set[str]) -> bool:
+    prefix, sep, suffix = name.rpartition(".")
+    if sep != "." or suffix not in _QUANT_COMPANION_SUFFIXES:
+        return False
+    return any(
+        f"{prefix}.{primary}" in indexed_weights
+        for primary in ("weight", "weight_packed", "qweight")
+    )
+
+
 def get_safetensors_index_weights_by_file(
     hf_folder: str, index_file: str, hf_weights_files: list[str]
 ) -> dict[str, set[str]] | None:
@@ -811,12 +841,20 @@ def get_safetensors_index_weights_by_file(
     tensor from an otherwise referenced file can inject stale or incompatible
     weights into the model.
 
-    Almost every checkpoint stores in each shard exactly the tensors the index
-    assigns to it, and for those this returns ``None`` so that all loader paths
-    keep their current behavior, including the accelerated backends that cannot
-    filter within a shard.  An allowlist is returned only when a shard actually
-    stores tensors the index did not assign to it.  Detecting this reads
-    safetensors headers, not tensor data.
+    Some post-training quantization exporters rewrite shard tensors in place
+    while retaining the base checkpoint's ``weight_map``, omitting companion
+    scale/zero-point keys stored next to an indexed primary weight in the same
+    shard.  Such companion tensors belong to the indexed module in that shard,
+    whereas companion tensors of unindexed modules in a reused donor shard stay
+    excluded.
+
+    Almost every checkpoint stores in each shard only the tensors (and any
+    same-shard quantization companions) assigned to it, and for those this
+    returns ``None`` so that all loader paths keep their current behavior,
+    including accelerated backends that cannot filter within a shard.  An
+    allowlist is returned only when a shard actually stores foreign tensors the
+    index did not assign to it.  Detecting this reads safetensors headers, not
+    tensor data.
     """
     index_file_name = os.path.join(hf_folder, index_file)
     if not os.path.isfile(index_file_name):
@@ -830,16 +868,39 @@ def get_safetensors_index_weights_by_file(
         shard_path = os.path.normpath(os.path.join(hf_folder, filename))
         weights_by_file[shard_path].add(weight_name)
 
+    has_foreign_unindexed = False
+    retained_companions = 0
     for st_file in hf_weights_files:
-        indexed_weights = weights_by_file.get(os.path.normpath(st_file))
+        shard_path = os.path.normpath(st_file)
+        indexed_weights = weights_by_file.get(shard_path)
         if indexed_weights is None:
             # Shard is not covered by the index, so there is nothing to
             # enforce. Leave the existing behavior untouched.
             return None
         with safe_open(st_file, framework="pt") as f:
             stored_weights = set(f.keys())
-        if stored_weights - indexed_weights:
-            return dict(weights_by_file)
+        extra_weights = stored_weights - indexed_weights
+        if not extra_weights:
+            continue
+        companions = {
+            name
+            for name in extra_weights
+            if _is_indexed_quant_companion(name, indexed_weights)
+        }
+        if companions:
+            indexed_weights.update(companions)
+            retained_companions += len(companions)
+        if extra_weights - companions:
+            has_foreign_unindexed = True
+    if retained_companions:
+        logger.info_once(
+            "Retaining %d quantization companion tensor(s) omitted from %s "
+            "whose primary weights are assigned to the same shard.",
+            retained_companions,
+            index_file,
+        )
+    if has_foreign_unindexed:
+        return dict(weights_by_file)
     return None
 
 

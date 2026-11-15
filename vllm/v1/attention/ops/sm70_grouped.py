@@ -243,9 +243,11 @@ def grouped_fp32_reason(
             )
         ):
             return "request_query_layout"
+    multi_kv = getattr(operator, "multi_kv_heads", False)
+    runtime_pages = getattr(operator, "runtime_pages", False)
     if (
         q.shape[1:] != (contract.query_heads, 256)
-        if contract.query_heads is not None
+        if (contract.query_heads is not None and not multi_kv)
         else (q.shape[1] <= 0 or q.shape[2] != 256)
     ):
         return "head_shape"
@@ -257,7 +259,11 @@ def grouped_fp32_reason(
         k.ndim != 4
         or k.shape[1] <= 0
         or k.shape[1] % contract.page_alignment
-        or (contract.page_sizes is not None and k.shape[1] not in contract.page_sizes)
+        or (
+            contract.page_sizes is not None
+            and not runtime_pages
+            and k.shape[1] not in contract.page_sizes
+        )
         or k.shape[2] * 6 != q.shape[1]
         or k.shape[3] != 256
         or v.shape != k.shape

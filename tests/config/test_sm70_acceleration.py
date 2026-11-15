@@ -159,6 +159,8 @@ def test_tp2_reason(config):
     assert acc.build_report(config)["paths"]["profile_hardware"]["reason"] == (
         "contract_mismatch:tensor_parallel_size=2≠4"
     )
+    config.cache_config.cache_dtype = "auto"
+    assert acc.build_report(config)["paths"]["fp16_grouped_fp32"]["enabled"]
 
 
 def test_five_speculative_tokens_reason(config):
@@ -368,24 +370,25 @@ def test_release_status_counts_only_expected_paths(config, monkeypatch):
 @pytest.mark.parametrize("disabled_by", ["eager", "mode", "config", "torch"])
 def test_compile_cache_reports_effective_disable(config, monkeypatch, disabled_by):
     monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
-    monkeypatch.setattr(torch._inductor.config, "force_disable_caches", False)
-    assert acc.build_report(config)["paths"]["compile_cache"]["enabled"]
-    if disabled_by == "eager":
-        config.model_config.enforce_eager = True
-    elif disabled_by == "mode":
-        config.compilation_config.mode = CompilationMode.NONE
-    elif disabled_by == "config":
-        config.compilation_config.inductor_compile_config["force_disable_caches"] = True
-    else:
-        monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
-    row = acc.build_report(config)["paths"]["compile_cache"]
-    assert not row["enabled"]
-    assert row["switches"]["torch_force_disable_caches"] == (disabled_by == "torch")
-    assert row["reason"] == (
-        "compilation_disabled"
-        if disabled_by in ("eager", "mode")
-        else "inductor_cache_disabled"
-    )
+    with torch._inductor.config.patch(force_disable_caches=False):
+        assert acc.build_report(config)["paths"]["compile_cache"]["enabled"]
+        if disabled_by == "eager":
+            config.model_config.enforce_eager = True
+        elif disabled_by == "mode":
+            config.compilation_config.mode = CompilationMode.NONE
+        elif disabled_by == "config":
+            inductor_cfg = config.compilation_config.inductor_compile_config
+            inductor_cfg["force_disable_caches"] = True
+        else:
+            torch._inductor.config.force_disable_caches = True
+        row = acc.build_report(config)["paths"]["compile_cache"]
+        assert not row["enabled"]
+        assert row["switches"]["torch_force_disable_caches"] == (disabled_by == "torch")
+        assert row["reason"] == (
+            "compilation_disabled"
+            if disabled_by in ("eager", "mode")
+            else "inductor_cache_disabled"
+        )
 
 
 def test_resolved_linear_policy_is_reported_without_reparsing_env(config, monkeypatch):

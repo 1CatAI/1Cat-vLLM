@@ -239,12 +239,12 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             and vllm_config.speculative_config is not None
             and get_dflash_model_draft_tokens(vllm_config.speculative_config) == 7
             and vllm_config.model_config.dtype == torch.float16
-            and get_tensor_model_parallel_world_size() == 4
+            and get_tensor_model_parallel_world_size() in (2, 4)
             and current_platform.is_device_capability(
                 70, device_id=torch.accelerator.current_device_index()
             )
-            and self.self_attn.q_size == 1024
-            and self.self_attn.kv_size == 256
+            and (self.self_attn.q_size, self.self_attn.kv_size)
+            in {(1024, 256), (2048, 512)}
             and self.self_attn.head_dim == 128
             and self.self_attn.is_neox_style
             and self.self_attn.rotary_emb.rotary_dim == 128
@@ -280,7 +280,7 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
 
         if (
             self.use_sm70_bf16_emulation
-            and get_tensor_model_parallel_world_size() == 4
+            and get_tensor_model_parallel_world_size() in (2, 4)
             and current_platform.is_device_capability(
                 70, device_id=torch.accelerator.current_device_index()
             )
@@ -474,7 +474,8 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             and (self.quant_config is None or isinstance(self.quant_config, GGUFConfig))
             and current_platform.is_cuda()
             and current_platform.is_device_capability(70)
-            and vllm_config.parallel_config.tensor_parallel_size == 4
+            and vllm_config.parallel_config.tensor_parallel_size in (2, 4)
+            and output_size % vllm_config.parallel_config.tensor_parallel_size == 0
             and (input_size, output_size)
             in {
                 (25600, 5120),

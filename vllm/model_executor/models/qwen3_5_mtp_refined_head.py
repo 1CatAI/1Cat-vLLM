@@ -158,6 +158,49 @@ def _finish(
 def _select_candidates(logits, keep=_CANDIDATES):
     rows, vocab = logits.shape
     assert 32 <= vocab <= 2147483647
+    if (
+        logits.is_cuda
+        and logits.dtype == torch.float16
+        and logits.ndim == 2
+        and logits.stride(1) == 1
+        and 1 <= rows <= 64
+        and keep in (32, 64)
+        and keep <= vocab <= 524288
+        and logits.stride(0) <= (2**31 - 1) // rows
+        and hasattr(torch.ops._C, "sm70_compact_half_topk_ids_out")
+        and current_platform.is_device_capability(70, device_id=logits.device.index)
+    ):
+        if vocab <= 65535:
+            partial = torch.empty(
+                (rows, ((vocab + 1023) // 1024) * keep),
+                dtype=torch.uint32,
+                device=logits.device,
+            )
+        elif vocab <= 131072 and keep == 32:
+            partial = torch.empty(
+                (rows, ((vocab + 2047) // 2048) * keep),
+                dtype=torch.int64,
+                device=logits.device,
+            )
+        elif vocab <= 262144:
+            w1 = ((vocab + 2047) // 2048) * keep
+            w2 = ((w1 + 2047) // 2048) * keep
+            partial = torch.empty(
+                (rows, w1 + w2),
+                dtype=torch.int64,
+                device=logits.device,
+            )
+        else:
+            w1 = ((vocab + 1023) // 1024) * keep
+            w2 = ((w1 + 1023) // 1024) * keep
+            partial = torch.empty(
+                (rows, w1 + w2),
+                dtype=torch.int64,
+                device=logits.device,
+            )
+        ids = torch.empty((rows, keep), device=logits.device, dtype=torch.int32)
+        torch.ops._C.sm70_compact_half_topk_ids_out(logits, partial, ids, keep)
+        return ids
     wide_ids = vocab > 65536
     tile_block = 2048 if (keep <= 32 and vocab > 32768) else 1024
     tiles = triton.cdiv(vocab, tile_block)
@@ -418,3 +461,10 @@ def prepare_mtp_refined_head(
         logger.warning_once("SM70 MTP refined head requires the NVFP4 QPN2 operators.")
         return None
     return MTPRefinedHead(head)
+
+
+if hasattr(torch.ops._C, "sm70_compact_half_topk_ids_out"):
+
+    @torch.library.register_fake("_C::sm70_compact_half_topk_ids_out")
+    def _compact_half_topk_ids_fake(logits, partial, ids, k) -> None:
+        return None

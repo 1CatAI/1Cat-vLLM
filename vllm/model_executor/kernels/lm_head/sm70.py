@@ -54,6 +54,7 @@ class RerankShadow:
 
 _SM70_DFLASH2_QPN8_VOCAB_CHUNK = 62080
 _SM70_DFLASH2_QPN8_MAX_ROWS = 8
+_SM70_DFLASH2_QPN8_FP32_MAX_ROWS = 64
 _SM70_DFLASH2_QPN8_CANDIDATES = 64
 _SM70_DFLASH2_QPN8_SPLIT_K = 8
 _SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS = 1
@@ -211,7 +212,10 @@ def _prepare_sm70_dflash2_qpn8_rerank(state: Sm70LMHeadState) -> bool:
     fp32_logits = _sm70_dflash2_option("fp32_logits", state)
     state._sm70_dflash2_fp32_logits = fp32_logits
     rerank_dtype = torch.float32 if fp32_logits else torch.float16
-    max_rows = _SM70_DFLASH2_QPN8_MAX_ROWS
+    max_rows = (
+        _SM70_DFLASH2_QPN8_FP32_MAX_ROWS if fp32_logits else _SM70_DFLASH2_QPN8_MAX_ROWS
+    )
+    state._sm70_dflash2_qpn8_max_rows = max_rows
     # Keep the accepted support density when a worker owns more vocabulary.
     # A wider shard screens 64 candidates per original-sized vocabulary chunk,
     # preserving every candidate that separate TP4 shards would have retained.
@@ -584,7 +588,10 @@ def _maybe_sm70_dflash2_qpn8_rerank(
 
     x_2d = flatten_linear_input(x)
     num_rows = x_2d.size(0)
-    if not 1 <= num_rows <= _SM70_DFLASH2_QPN8_MAX_ROWS:
+    max_rows = int(
+        getattr(state, "_sm70_dflash2_qpn8_max_rows", _SM70_DFLASH2_QPN8_MAX_ROWS)
+    )
+    if not 1 <= num_rows <= max_rows:
         return None
     if not x_2d.is_contiguous():
         x_2d = x_2d.contiguous()
@@ -592,16 +599,62 @@ def _maybe_sm70_dflash2_qpn8_rerank(
     qpn8_logits = state._sm70_dflash2_qpn8_logits[:num_rows]
     qpn8_values = state._sm70_dflash2_qpn8_values[:num_rows]
     qpn8_ids = state._sm70_dflash2_qpn8_ids[:num_rows]
-    state.fp8_ops.fp8_qpn8_gemm_sm70_out(
-        qpn8_logits,
-        x_2d,
-        state._sm70_dflash2_qpn8_codes,
-        state._sm70_dflash2_qpn8_scales,
-        _SM70_DFLASH2_QPN8_SPLIT_K,
-        _SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS,
-        False,
-        False,
+    k_dim = x_2d.size(1)
+    policy_args = getattr(state.fp8_ops, "arguments", None) or ()
+    can_native_m32 = bool(
+        (k_dim // 16) % 16 == 0
+        and "fp8_qpn8_fast_decode=0" not in policy_args
+        and "fp8_qpn8_native_m32=0" not in policy_args
     )
+    if num_rows <= 16:
+        state.fp8_ops.fp8_qpn8_gemm_sm70_out(
+            qpn8_logits,
+            x_2d,
+            state._sm70_dflash2_qpn8_codes,
+            state._sm70_dflash2_qpn8_scales,
+            _SM70_DFLASH2_QPN8_SPLIT_K,
+            _SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS,
+            False,
+            False,
+        )
+    elif num_rows <= 40 and can_native_m32:
+        state.fp8_ops.fp8_qpn8_gemm_sm70_out(
+            qpn8_logits,
+            x_2d,
+            state._sm70_dflash2_qpn8_codes,
+            state._sm70_dflash2_qpn8_scales,
+            16,
+            2,
+            True,
+            False,
+        )
+    else:
+        step = 32 if can_native_m32 else 16
+        for begin in range(0, num_rows, step):
+            end = min(begin + step, num_rows)
+            sub_rows = end - begin
+            if sub_rows <= 16 or not can_native_m32:
+                state.fp8_ops.fp8_qpn8_gemm_sm70_out(
+                    qpn8_logits[begin:end],
+                    x_2d[begin:end],
+                    state._sm70_dflash2_qpn8_codes,
+                    state._sm70_dflash2_qpn8_scales,
+                    _SM70_DFLASH2_QPN8_SPLIT_K,
+                    _SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS,
+                    False,
+                    False,
+                )
+            else:
+                state.fp8_ops.fp8_qpn8_gemm_sm70_out(
+                    qpn8_logits[begin:end],
+                    x_2d[begin:end],
+                    state._sm70_dflash2_qpn8_codes,
+                    state._sm70_dflash2_qpn8_scales,
+                    16,
+                    2,
+                    True,
+                    False,
+                )
     # The exact FP16 rerank is permutation-invariant over this approximate
     # support, so skip the unnecessary 64-element result sort. This keeps the
     # official PyTorch multiblock selector while avoiding its final bitonic

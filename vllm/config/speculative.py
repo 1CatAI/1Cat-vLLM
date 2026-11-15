@@ -1230,7 +1230,7 @@ class SpeculativeConfig:
             and draft_config is not None
             and draft_config.hf_config.architectures == ["Qwen4ExpMTP"]
             and draft_config.dtype == torch.float16
-            and self.draft_parallel_config.tensor_parallel_size == 4
+            and self.draft_parallel_config.tensor_parallel_size in (2, 4)
             and current_platform.is_cuda()
             and current_platform.is_device_capability((7, 0))
         )

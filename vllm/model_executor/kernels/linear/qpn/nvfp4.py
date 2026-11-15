@@ -71,9 +71,10 @@ _SM70_NVFP4_QPN2_CONFIGS = {
     # (K, N, fused gated-SiLU): (split-K, independent accumulator chains)
     (1536, 5120, False): (8, 2),
     (5120, 3584, False): (16, 2),
-    # Qwen3.8 GDN qkvzba is logically N=4120 on TP4.  QPN2 consumes the
-    # zero-padded physical N=4128 layout and the caller crops the result.
+    # Qwen3.8 GDN qkvzba is logically N=4120 on TP4 and N=8240 on TP2. QPN2
+    # consumes the zero-padded physical N=4128 / N=8256 layout and crops rows.
     (5120, 4128, False): (16, 2),
+    (5120, 8256, False): (16, 2),
     (5120, 8704, False): (8, 2),
     (5120, 8704, True): (8, 2),
     (4352, 5120, False): (16, 2),
@@ -96,10 +97,11 @@ def _missing_sm70_nvfp4_qpn4_ops() -> list[str]:
 
 
 def _qpn2_config(k: int, n: int, gated: bool) -> tuple[int, int]:
-    # Keep existing tuned configurations; other aligned local projections use
-    # the same native kernels with a split count that divides K/16.
+    # Keep existing tuned configurations; avoid over-splitting wide local N
+    # (e.g. TP=2/TP=1 projections with N >= 8704) or short K <= 2048.
     return _SM70_NVFP4_QPN2_CONFIGS.get(
-        (k, n, gated), (8 if gated or k % 256 else 16, 2)
+        (k, n, gated),
+        (8 if (gated or k % 256 or k <= 2048 or n >= 8704) else 16, 2),
     )
 
 
@@ -226,38 +228,31 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             and current_platform.is_device_capability(70)
             and hasattr(torch.ops._C, "nvfp4_qpn4_prefill_sm70_out")
         ):
-            from vllm.model_executor.kernels.linear.qpn.fp8 import (
-                _get_sm70_fp8_prefill_exact_dense_workspace,
-            )
             from vllm.model_executor.layers.quantization.utils import (
                 sm70_nvfp4_native,  # noqa: F401
             )
 
             k = layer.input_size_per_partition
             n = (layer.weight.shape[0] + 31) // 32 * 32
-            workspace = _get_sm70_fp8_prefill_exact_dense_workspace(layer.weight)
-            if workspace is not None and workspace.numel() < k * n:
-                workspace = _get_sm70_fp8_prefill_exact_dense_workspace(
-                    layer.weight, k * n
-                )
-            if workspace is not None and workspace.numel() >= k * n:
-                # Unbundled native QPN2 keeps 256-byte code groups aligned to
-                # 128-byte DRAM sectors (unlike 288-byte bundled groups) and
-                # avoids repacking codes during bounded prefill.
-                sm70_tm.prepare_nvfp4_qpn2_dense_linear(layer, bundle_scales=False)
-                layer.sm70_nvfp4_qpn2_native = True
-                layer.sm70_nvfp4_qpn2_output_size = n
-                layer.sm70_nvfp4_qpn2_gated_silu = self.config.gated_silu
-                layer.sm70_nvfp4_qpn2_split_k, layer.sm70_nvfp4_qpn2_nacc = (
-                    _qpn2_config(k, n, self.config.gated_silu)
-                )
-                layer.sm70_nvfp4_qpn2 = True
-                logger.info_once(
-                    "SM70 NVFP4 retains one native QPN2 layout with shared "
-                    "bounded prefill scratch."
-                )
-                self._release_checkpoint_parameters(layer)
-                return
+            # Unbundled native QPN2 keeps 256-byte code groups aligned to
+            # 128-byte DRAM sectors (unlike 288-byte bundled groups) and
+            # avoids repacking codes during bounded prefill. Prefill scratch is
+            # provisioned lazily on first large-M dispatch so load-time weight
+            # residency carries zero extra workspace bytes.
+            sm70_tm.prepare_nvfp4_qpn2_dense_linear(layer, bundle_scales=False)
+            layer.sm70_nvfp4_qpn2_native = True
+            layer.sm70_nvfp4_qpn2_output_size = n
+            layer.sm70_nvfp4_qpn2_gated_silu = self.config.gated_silu
+            layer.sm70_nvfp4_qpn2_split_k, layer.sm70_nvfp4_qpn2_nacc = _qpn2_config(
+                k, n, self.config.gated_silu
+            )
+            layer.sm70_nvfp4_qpn2 = True
+            logger.info_once(
+                "SM70 NVFP4 retains one native QPN2 layout with shared "
+                "bounded prefill scratch."
+            )
+            self._release_checkpoint_parameters(layer)
+            return
         compact_scales = compact_scales_allowed(self.config.policy)
         qpn2_shared = bool(self.config.policy.shared_weight)
         if qpn2_shared and (missing_shared_ops := _missing_qpn2_shared_ops()):

@@ -66,6 +66,13 @@ _SM70_FP8_QPN8_CONFIGS = {
     (5120, 3584, False): (16, 2, False),
     (5120, 8704, False): (16, 1, True),
     (5120, 8704, True): (8, 2, True),
+    # TP=2 / unsharded local projection shapes for 5120-wide GDN + GQA models:
+    (5120, 7168, False): (16, 2, False),
+    (5120, 8192, False): (16, 2, False),
+    (3072, 5120, False): (16, 1, False),
+    (8704, 5120, False): (16, 1, False),
+    (5120, 17408, False): (8, 2, True),
+    (5120, 17408, True): (8, 2, True),
 }
 _SM70_FP8_QPN8_EXTRA_SHAPES = {
     "in_proj_qkvz": (5120, 4096),
@@ -124,11 +131,18 @@ def layer_supports_direct_output(layer: torch.nn.Module) -> bool:
 
 def clear_sm70_fp8_workspaces() -> None:
     """Release process-global SM70 FP8 prefill and QPN8 workspaces."""
+    from vllm.model_executor.kernels.linear.qpn.fp8_block import (
+        _block_qpn8_prefill_workspaces,
+    )
+
     sm70_layer_workspaces.workspace_pool(
         "_sm70_fp8_prefill_dense_workspaces", _sm70_fp8_prefill_dense_workspaces
     ).clear()
     sm70_layer_workspaces.workspace_pool(
         "_sm70_fp8_qpn8_pp2_tp4_workspaces", _sm70_fp8_qpn8_pp2_tp4_workspaces
+    ).clear()
+    sm70_layer_workspaces.workspace_pool(
+        "_block_qpn8_prefill_workspaces", _block_qpn8_prefill_workspaces
     ).clear()
     sm70_layer_workspaces.clear_layer_workspaces()
 
@@ -227,7 +241,12 @@ def _is_sm70_fp8_prefill_exact_dense_layer(layer: torch.nn.Module) -> bool:
 
 def _sm70_fp8_qpn8_config(k: int, n: int, gated: bool) -> tuple[int, int, bool]:
     return _SM70_FP8_QPN8_CONFIGS.get(
-        (k, n, gated), (8 if gated or k % 256 else 16, 2, False)
+        (k, n, gated),
+        (
+            8 if (gated or k % 256 or k <= 2048 or n >= 12288) else 16,
+            2,
+            bool(n >= 8704 and k >= 4096),
+        ),
     )
 
 
@@ -335,6 +354,28 @@ def _missing_sm70_fp8_qpn8_ops() -> list[str]:
     ]
 
 
+def _engine_fp8_prefill_ceiling_elements() -> int:
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.distributed.parallel_state import (
+        get_tensor_model_parallel_world_size,
+        model_parallel_is_initialized,
+    )
+
+    cfg = get_current_vllm_config_or_none()
+    model_cfg = getattr(cfg, "model_config", None)
+    text_cfg = getattr(model_cfg, "hf_text_config", None)
+    if text_cfg is None:
+        return 0
+    hidden = int(getattr(text_cfg, "hidden_size", 0) or 0)
+    inter = int(getattr(text_cfg, "intermediate_size", 0) or 0)
+    tp = (
+        get_tensor_model_parallel_world_size() if model_parallel_is_initialized() else 1
+    )
+    if hidden <= 0 or inter <= 0 or tp <= 0:
+        return 0
+    return hidden * ((2 * inter + tp - 1) // tp)
+
+
 def _get_sm70_fp8_prefill_exact_dense_workspace(
     weight: torch.Tensor,
     min_elements: int = 0,
@@ -343,7 +384,10 @@ def _get_sm70_fp8_prefill_exact_dense_workspace(
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
     elements = max(
-        _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS, weight.numel(), min_elements
+        _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS,
+        _engine_fp8_prefill_ceiling_elements(),
+        weight.numel(),
+        min_elements,
     )
     # Never replace a live allocation: prepared layers retain its raw pointer.
     cache_key = (
@@ -430,7 +474,11 @@ def _sm70_fp8_prefill_visible_dense_mm(
     device_index = input.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    elements = max(_SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS, weight.numel())
+    elements = max(
+        _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS,
+        _engine_fp8_prefill_ceiling_elements(),
+        weight.numel(),
+    )
     cache_key = (
         (device_index, torch.float16)
         if elements == _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS
@@ -1337,7 +1385,29 @@ def dispatch_channel_rows(
     if workspace is None:
         raise RuntimeError("SM70 channel-FP8 QPN8 prefill workspace is unavailable")
     rows = x.shape[0]
-    if _QPN8_NATIVE_ROWS_MAX < rows <= _QPN8_ROW_BLOCKS_MAX:
+    k_dim = x.shape[1]
+    packed_n = codes.shape[1]
+    aligned_shape = (
+        k_dim > 0 and split_k > 0 and k_dim % (16 * split_k) == 0 and packed_n > 0
+    )
+    native_m40 = (
+        aligned_shape
+        and accumulator_chains == 2
+        and not prefetch_codes
+        and "fp8_qpn8_m32_native=0" not in (native_policy or ())
+        and (
+            (not gated_silu and split_k in (12, 16) and packed_n % 32 == 0)
+            or (
+                gated_silu
+                and split_k == 8
+                and k_dim >= 4096
+                and packed_n >= 4096
+                and packed_n % 64 == 0
+            )
+        )
+    )
+    single_launch_max = _QPN8_NATIVE_ROWS_MAX if native_m40 else _QPN8_ROW_BLOCK
+    if single_launch_max < rows <= _QPN8_ROW_BLOCKS_MAX:
         # Without the batch TurboMind copy, 41..128 rows would take the dense
         # prefill route (FP16 dequantization plus cuBLAS, about five bytes of
         # traffic per weight). Up to four 32-row QPN8 launches read the FP8

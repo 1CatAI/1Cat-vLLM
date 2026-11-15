@@ -3099,19 +3099,21 @@ __global__ __launch_bounds__(
                                                                     int64_t vb,
                                                                     int64_t vt,
                                                                     int64_t vh,
-                                                                    float
-                                                                        scale) {
-  const int split = blockIdx.x, request = blockIdx.y;
-  lengths += request * 8;
-  blocks += request * max_blocks;
-  q += request * query_len * 6 * 256;
-  partial += static_cast<int64_t>(request) * 80 * 8 * 6 * 256;
-  lse += static_cast<int64_t>(request) * 80 * 8 * 6 * 2;
+                                                                    float scale,
+                                                                    int kv_heads =
+                                                                        1) {
+  const int split = blockIdx.x, panel = blockIdx.y;
+  const int request = panel / kv_heads, kv_head = panel % kv_heads;
+  const int num_requests = gridDim.y / kv_heads;
+  lengths += static_cast<int64_t>(request) * query_len;
+  blocks += static_cast<int64_t>(request) * max_blocks;
+  partial += static_cast<int64_t>(panel) * 80 * 8 * 6 * 256;
+  lse += static_cast<int64_t>(panel) * 80 * 8 * 6 * 2;
   int total = 0;
   for (int r = 0; r < query_len; r++) total = max(total, lengths[r]);
   if (total <= 0) return;
   const int active =
-      SHORT_SPLITS ? fp16_grouped_active_splits(total, query_len, gridDim.y)
+      SHORT_SPLITS ? fp16_grouped_active_splits(total, query_len, num_requests)
                    : grouped_verify_active_splits<8, false>(total);
   if (split >= active) return;
   const int tiles = (total + 31) / 32, base = tiles / active,
@@ -3126,9 +3128,15 @@ __global__ __launch_bounds__(
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
   for (int i = tid; i < 48 * 32; i += 512) {
     const int row = i / 32, col = i % 32;
+    const int q_tok = row / 6, q_head = row % 6;
+    const int64_t q_vec =
+        ((static_cast<int64_t>(request) * query_len + q_tok) * kv_heads +
+         kv_head) *
+            (6 * 32) +
+        q_head * 32 + col;
     reinterpret_cast<uint4*>(sq)[row * 33 + col] =
-        row / 6 < query_len ? reinterpret_cast<const uint4*>(q)[row * 32 + col]
-                            : make_uint4(0, 0, 0, 0);
+        q_tok < query_len ? reinterpret_cast<const uint4*>(q)[q_vec]
+                          : make_uint4(0, 0, 0, 0);
   }
   if (tid < 48) {
     smem.row_max[tid] = kXQANegInf;
@@ -3140,7 +3148,8 @@ __global__ __launch_bounds__(
   for (int tile = first; tile < last; tile += 32) {
     const int valid = min(32, last - tile);
     load_xqa_tc_kv_panel<0, false, 512, flash_v100::KV_CACHE_DTYPE_FP16, false>(
-        kv, k, blocks, valid, 32, 33, tile, 0, page, 0, kb, kt, kh, 0, tid);
+        kv, k, blocks, valid, 32, 33, tile, 0, page, kv_head, kb, kt, kh, 0,
+        tid);
     for (int i = tid + valid * 33; i < 32 * 33; i += 512)
       reinterpret_cast<uint4*>(kv)[i] = make_uint4(0, 0, 0, 0);
     __syncthreads();
@@ -3174,7 +3183,8 @@ __global__ __launch_bounds__(
     }
     __syncthreads();
     load_xqa_tc_kv_panel<0, false, 512, flash_v100::KV_CACHE_DTYPE_FP16, false>(
-        kv, v, blocks, valid, 32, 33, tile, 0, page, 0, vb, vt, vh, 0, tid);
+        kv, v, blocks, valid, 32, 33, tile, 0, page, kv_head, vb, vt, vh, 0,
+        tid);
     __syncthreads();
 #pragma unroll
     for (int rr = 0; rr < 3; rr++) {
@@ -5160,17 +5170,23 @@ __global__ __launch_bounds__(256, ROW_TILES == 1 ? 3 : 2) void grouped_e4m3_2cta
   const int qk_rt = warp / K_WARPS;
   const int qk_kw = warp % K_WARPS;
 
+  uint64_t v_lo0 = 0, v_hi0 = 0, v_lo1 = 0, v_hi1 = 0;
   {
     const int kv_idx = split_start + ld_tok;
     const bool valid_kv = kv_idx < split_end;
     int64_t k_off = 0;
+    int64_t v_off = 0;
     if (valid_kv) {
       const int page = __ldg(&page_ids[kv_idx / page_size]);
-      k_off = page * kb + (kv_idx % page_size) * kt;
+      const int in_page = kv_idx % page_size;
+      k_off = page * kb + in_page * kt;
+      v_off = page * vb + in_page * vt;
     }
     uint64_t lo0, hi0, lo1, hi1;
     e4m3_2cta_load_kv_32B<PAIRED>(lo0, hi0, lo1, hi1, k_cache + k_off, ld_sub,
                                   valid_kv);
+    e4m3_2cta_load_kv_32B<PAIRED>(v_lo0, v_hi0, v_lo1, v_hi1, v_cache + v_off,
+                                  ld_sub, valid_kv);
     e4m3_2cta_unpack_kv_32B(smem.kv, ld_tok, ld_sub, lo0, hi0, lo1, hi1);
   }
   __syncthreads();
@@ -5179,17 +5195,25 @@ __global__ __launch_bounds__(256, ROW_TILES == 1 ? 3 : 2) void grouped_e4m3_2cta
     const int valid_k = min(32, split_end - tile_start);
     const int next_tile = tile_start + 32;
 
-    uint64_t v_lo0, v_hi0, v_lo1, v_hi1;
-    {
-      const int kv_idx = tile_start + ld_tok;
-      const bool valid_kv = ld_tok < valid_k;
-      int64_t v_off = 0;
-      if (valid_kv) {
-        const int page = __ldg(&page_ids[kv_idx / page_size]);
-        v_off = page * vb + (kv_idx % page_size) * vt;
+    constexpr bool kEarlyPrefetchK = (ROW_TILES <= 4);
+    uint64_t nk_lo0 = 0, nk_hi0 = 0, nk_lo1 = 0, nk_hi1 = 0;
+    int64_t next_v_off = 0;
+    bool next_valid_kv = false;
+    if (next_tile < split_end) {
+      const int nkv_idx = next_tile + ld_tok;
+      next_valid_kv = nkv_idx < split_end;
+      int64_t next_k_off = 0;
+      if (next_valid_kv) {
+        const int npage = __ldg(&page_ids[nkv_idx / page_size]);
+        const int next_in_page = nkv_idx % page_size;
+        next_k_off = npage * kb + next_in_page * kt;
+        next_v_off = npage * vb + next_in_page * vt;
       }
-      e4m3_2cta_load_kv_32B<PAIRED>(v_lo0, v_hi0, v_lo1, v_hi1, v_cache + v_off,
-                                    ld_sub, valid_kv);
+      if constexpr (kEarlyPrefetchK) {
+        e4m3_2cta_load_kv_32B<PAIRED>(nk_lo0, nk_hi0, nk_lo1, nk_hi1,
+                                      k_cache + next_k_off, ld_sub,
+                                      next_valid_kv);
+      }
     }
 
     float s_acc[8] = {};
@@ -5220,21 +5244,10 @@ __global__ __launch_bounds__(256, ROW_TILES == 1 ? 3 : 2) void grouped_e4m3_2cta
 
     e4m3_2cta_unpack_kv_32B(smem.kv, ld_tok, ld_sub, v_lo0, v_hi0, v_lo1,
                             v_hi1);
-
-    constexpr bool kEarlyPrefetchK = (ROW_TILES <= 4);
-    uint64_t nk_lo0 = 0, nk_hi0 = 0, nk_lo1 = 0, nk_hi1 = 0;
-    if constexpr (kEarlyPrefetchK) {
-      if (next_tile < split_end) {
-        const int kv_idx = next_tile + ld_tok;
-        const bool valid_kv = kv_idx < split_end;
-        int64_t k_off = 0;
-        if (valid_kv) {
-          const int page = __ldg(&page_ids[kv_idx / page_size]);
-          k_off = page * kb + (kv_idx % page_size) * kt;
-        }
-        e4m3_2cta_load_kv_32B<PAIRED>(nk_lo0, nk_hi0, nk_lo1, nk_hi1,
-                                      k_cache + k_off, ld_sub, valid_kv);
-      }
+    if (next_tile < split_end) {
+      e4m3_2cta_load_kv_32B<PAIRED>(v_lo0, v_hi0, v_lo1, v_hi1,
+                                    v_cache + next_v_off, ld_sub,
+                                    next_valid_kv);
     }
 
     if constexpr (K_WARPS == 1) {
@@ -5615,15 +5628,17 @@ void warm_e4m3_split160_workspace(const at::Tensor& partial,
 }
 
 void resolve_e4m3_split160_workspace(at::Tensor& partial, at::Tensor& lse,
-                                     int64_t panels, int query_len,
-                                     cudaStream_t stream, float*& partial_ptr,
-                                     float*& lse_ptr, int& max_splits) {
-  const int base_splits = query_len == 1 ? 240 : 160;
-  const int target_splits =
-      std::max(20, base_splits / static_cast<int>(std::max<int64_t>(1, panels)));
+                                     int64_t batch_size, int64_t panels,
+                                     int query_len, cudaStream_t stream,
+                                     float*& partial_ptr, float*& lse_ptr,
+                                     int& max_splits) {
+  const int64_t kv_heads = panels / std::max<int64_t>(1, batch_size);
+  const int base_splits =
+      query_len == 1 ? 240 : (query_len <= 4 ? 160 : 80);
+  const int target_splits = std::max(
+      20, base_splits / static_cast<int>(std::max<int64_t>(1, batch_size)));
   const int64_t panel_splits = panels * target_splits;
   if (target_splits * query_len <= 80 * 8) {
-    warm_e4m3_split160_workspace(partial, lse, panel_splits, stream);
     partial_ptr = partial.data_ptr<float>();
     lse_ptr = lse.data_ptr<float>();
     max_splits = target_splits;
@@ -5658,7 +5673,7 @@ void resolve_e4m3_split160_workspace(at::Tensor& partial, at::Tensor& lse,
       capture_status == cudaStreamCaptureStatusNone) {
     try {
       const int64_t alloc_ps =
-          std::max<int64_t>(panel_splits, kMaxWorkspacePanelSplits);
+          std::max<int64_t>(panel_splits, kv_heads * kMaxWorkspacePanelSplits);
       auto ws_partial = at::empty({alloc_ps, 8, 6, 256}, partial.options());
       auto ws_lse = at::empty({alloc_ps, 8, 6, 2}, lse.options());
       partial_ptr = ws_partial.data_ptr<float>();
@@ -5775,8 +5790,6 @@ at::Tensor private_grouped_e4m3_fp32_paged(
   }
   const int query_len = static_cast<int>(q.size(0) / batch_size);
   if (query_len * kGroupedVerifyHeads > 32) {
-    warm_e4m3_split160_workspace(partial, lse, kMaxWorkspacePanelSplits,
-                                 stream);
     // Six to eight rows per request (the DFlash2 q8 verifier) keep the
     // 48-row packed kernel: one 512-thread CTA per split reads each KV tile
     // once for all 48 rows. The 2-CTA kernel below runs these widths with a
@@ -5830,13 +5843,15 @@ at::Tensor private_grouped_e4m3_fp32_paged(
   float* partial_ptr = nullptr;
   float* lse_ptr = nullptr;
   int max_splits = 80;
-  resolve_e4m3_split160_workspace(partial, lse, panels, query_len, stream,
-                                  partial_ptr, lse_ptr, max_splits);
+  resolve_e4m3_split160_workspace(partial, lse, batch_size, panels, query_len,
+                                  stream, partial_ptr, lse_ptr, max_splits);
   const int64_t max_possible_kv = block_table.size(1) * k.size(1);
-  const int panel_split_cap =
-      std::max(20, (row_tiles == 1 ? 240 : 160) / static_cast<int>(panels));
+  const int panel_split_cap = std::max(
+      20, (row_tiles == 1 ? 240 : (query_len <= 4 ? 160 : 80)) /
+              static_cast<int>(std::max<int64_t>(1, batch_size)));
   const int l2_split_cap = std::max(
-      10, static_cast<int>(800 / std::max<int64_t>(1, panels * query_len)));
+      10,
+      static_cast<int>(800 / std::max<int64_t>(1, batch_size * query_len)));
   const int split_cap =
       std::min(max_splits, std::min(panel_split_cap, l2_split_cap));
   const int launch_splits = max_possible_kv <= 256
@@ -5847,10 +5862,11 @@ at::Tensor private_grouped_e4m3_fp32_paged(
   auto launch = [&](auto rt_tag, auto paired_tag) {
     constexpr int RT = decltype(rt_tag)::value;
     constexpr bool P = decltype(paired_tag)::value;
-    constexpr int kSmemBytes = sizeof(E4M3Long2CtaSmem<RT, true>);
+    constexpr bool kCompP = (RT == 1);
+    constexpr int kSmemBytes = sizeof(E4M3Long2CtaSmem<RT, kCompP>);
     TORCH_CHECK(properties->sharedMemPerBlockOptin >= kSmemBytes,
                 "E4M3 attention exceeds device opt-in shared memory");
-    auto kernel = grouped_e4m3_2cta_partial_kernel<RT, P, true>;
+    auto kernel = grouped_e4m3_2cta_partial_kernel<RT, P, kCompP>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
     C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -5900,41 +5916,44 @@ at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
                                            const at::Tensor& row_lengths,
                                            at::Tensor& partial, at::Tensor& lse,
                                            float scale, bool short_splits) {
-  TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
-                  q.is_contiguous() && q.dim() == 3 && q.size(0) >= 2 &&
-                  q.size(1) == 6 && q.size(2) == 256,
-              "FP16 grouped FP32 requires contiguous CUDA FP16 Q [rows,6,256]");
   TORCH_CHECK(
-      k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 && k.size(1) > 0 &&
+      k.dim() == 4 && k.size(2) >= 1 && k.size(3) == 256 && k.size(1) > 0 &&
           k.size(1) % 16 == 0 && k.scalar_type() == at::kHalf &&
           v.scalar_type() == at::kHalf && v.sizes() == k.sizes(),
-      "FP16 grouped FP32 requires supported FP16 paged KV [pages,page,1,256]");
+      "FP16 grouped FP32 requires supported FP16 paged KV [pages,page,Hkv,256]");
+  const int64_t kv_heads = k.size(2);
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
+                  q.is_contiguous() && q.dim() == 3 && q.size(0) >= 2 &&
+                  q.size(1) == 6 * kv_heads && q.size(2) == 256,
+              "FP16 grouped FP32 requires contiguous CUDA FP16 Q [rows,6*Hkv,256]");
   const int64_t batch_size = block_table.dim() == 2 ? block_table.size(0) : 0;
+  const int64_t panels = batch_size * kv_heads;
   TORCH_CHECK(
       block_table.dim() == 2 && batch_size >= 1 && batch_size <= 16 &&
-          block_table.is_contiguous() &&
+          panels <= 65535 && block_table.is_contiguous() &&
           block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
           block_table.size(1) <= (INT_MAX - 4096) / k.size(1) &&
-          q.size(0) % batch_size == 0 &&
-          (batch_size == 1 ? (q.size(0) >= 2 && q.size(0) <= 8)
-                           : q.size(0) == batch_size * 8) &&
+          q.size(0) % batch_size == 0 && q.size(0) / batch_size >= 2 &&
+          q.size(0) / batch_size <= 8 &&
           row_lengths.sizes() == at::IntArrayRef({q.size(0)}) &&
           row_lengths.scalar_type() == at::kInt && row_lengths.is_contiguous(),
-      "FP16 grouped FP32 requires q2..8/B1 or request-major q8/B2..16 "
+      "FP16 grouped FP32 requires request-major q2..8/B1..16 "
       "and per-query int32 lengths");
   TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
                   out.scalar_type() == at::kHalf,
               "FP16 grouped FP32 output must be contiguous FP16 and Q-shaped");
   const bool workspace_shapes =
-      batch_size == 1
-          ? (partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
-             lse.sizes() == at::IntArrayRef({80, 8, 6, 2}))
-          : (partial.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 256}) &&
-             lse.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 2}));
+      panels == 1
+          ? ((partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
+              lse.sizes() == at::IntArrayRef({80, 8, 6, 2})) ||
+             (partial.sizes() == at::IntArrayRef({1, 80, 8, 6, 256}) &&
+              lse.sizes() == at::IntArrayRef({1, 80, 8, 6, 2})))
+          : (partial.sizes() == at::IntArrayRef({panels, 80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({panels, 80, 8, 6, 2}));
   TORCH_CHECK(workspace_shapes && partial.is_contiguous() &&
                   partial.scalar_type() == at::kFloat && lse.is_contiguous() &&
                   lse.scalar_type() == at::kFloat,
-              "FP16 grouped FP32 requires request-major FP32 numerator "
+              "FP16 grouped FP32 requires panel-major FP32 numerator "
               "and max/sum workspaces");
   TORCH_CHECK(std::isfinite(scale),
               "FP16 grouped FP32 requires finite attention scale");
@@ -5971,30 +5990,33 @@ at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            sizeof(GroupedVerifySmem)));
   const int query_len = static_cast<int>(q.size(0) / batch_size);
-  kernel<<<dim3(80, static_cast<unsigned>(batch_size)), kGroupedVerifyThreads,
+  const int kv_heads_i32 = static_cast<int>(kv_heads);
+  kernel<<<dim3(80, static_cast<unsigned>(panels)), kGroupedVerifyThreads,
            sizeof(GroupedVerifySmem), stream>>>(
       reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr(), v.data_ptr(),
       block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
       partial.data_ptr<float>(), lse.data_ptr<float>(), query_len,
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
-      v.stride(0), v.stride(1), v.stride(2), scale);
+      v.stride(0), v.stride(1), v.stride(2), scale, kv_heads_i32);
   if (short_splits) {
     flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true,
                                                        true>
-        <<<dim3(query_len, 6, static_cast<unsigned>(batch_size)),
+        <<<dim3(query_len, static_cast<unsigned>(6 * kv_heads),
+                static_cast<unsigned>(batch_size)),
            kGroupedVerifyHeadDim, 0, stream>>>(
             partial.data_ptr<float>(), lse.data_ptr<float>(),
             row_lengths.data_ptr<int>(),
             reinterpret_cast<__half*>(out.data_ptr()), query_len,
-            row_lengths.data_ptr<int>());
+            row_lengths.data_ptr<int>(), kv_heads_i32);
   } else {
     flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
-        <<<dim3(query_len, 6, static_cast<unsigned>(batch_size)),
+        <<<dim3(query_len, static_cast<unsigned>(6 * kv_heads),
+                static_cast<unsigned>(batch_size)),
            kGroupedVerifyHeadDim, 0, stream>>>(
             partial.data_ptr<float>(), lse.data_ptr<float>(),
             row_lengths.data_ptr<int>(),
             reinterpret_cast<__half*>(out.data_ptr()), query_len,
-            row_lengths.data_ptr<int>());
+            row_lengths.data_ptr<int>(), kv_heads_i32);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
@@ -6040,6 +6062,12 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
       "Tensor block_table, Tensor row_lengths, Tensor(b!) partial, "
       "Tensor(c!) lse, float scale, bool short_splits=True) -> Tensor(a!)");
   ops.def("sm70_grouped_fp16_short_split_revision() -> int",
+          []() -> int64_t { return 1; });
+  ops.def("sm70_grouped_fp16_kv_heads_revision() -> int",
+          []() -> int64_t { return 1; });
+  ops.def("sm70_grouped_fp16_page_revision() -> int",
+          []() -> int64_t { return 1; });
+  ops.def("sm70_grouped_fp16_query_rows_revision() -> int",
           []() -> int64_t { return 1; });
   // The runtime-page specialization is compiled alongside the fixed pages.
   // Python uses this capability to avoid widening admission for stale DSOs.

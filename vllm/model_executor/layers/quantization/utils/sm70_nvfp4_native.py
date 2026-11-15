@@ -6,21 +6,101 @@ import torch
 
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import register_policy_op
-from vllm.model_executor.kernels.linear.qpn.fp8 import (
-    _get_sm70_fp8_prefill_exact_dense_workspace,
-)
 from vllm.model_executor.kernels.linear.qpn.nvfp4_dequant import (
     _e4m3_value,
 )
 from vllm.triton_utils import tl, triton
 
+_dense_workspaces: dict[int, torch.Tensor] = {}
+_retained_dense_workspaces: list[torch.Tensor] = []
 _scale_workspaces: dict[int, torch.Tensor] = {}
 _code_workspaces: dict[tuple[int, int], torch.Tensor] = {}
 
 
 def clear_sm70_nvfp4_native_workspaces() -> None:
+    _dense_workspaces.clear()
+    _retained_dense_workspaces.clear()
     _scale_workspaces.clear()
     _code_workspaces.clear()
+
+
+def _engine_prefill_ceiling_elements() -> int:
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.distributed.parallel_state import (
+        get_tensor_model_parallel_world_size,
+        model_parallel_is_initialized,
+    )
+
+    cfg = get_current_vllm_config_or_none()
+    model_cfg = getattr(cfg, "model_config", None)
+    text_cfg = getattr(model_cfg, "hf_text_config", None)
+    if text_cfg is None:
+        return 0
+    hidden = int(getattr(text_cfg, "hidden_size", 0) or 0)
+    inter = int(getattr(text_cfg, "intermediate_size", 0) or 0)
+    tp = (
+        get_tensor_model_parallel_world_size() if model_parallel_is_initialized() else 1
+    )
+    if hidden <= 0 or inter <= 0 or tp <= 0:
+        return 0
+    return hidden * ((2 * inter + tp - 1) // tp)
+
+
+def _shared_fp8_prefill_workspace(
+    device: int, min_elements: int
+) -> torch.Tensor | None:
+    from vllm.model_executor.kernels.linear.qpn import fp8 as qpn_fp8
+    from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces
+
+    pool = sm70_layer_workspaces.workspace_pool(
+        "_sm70_fp8_prefill_dense_workspaces",
+        qpn_fp8._sm70_fp8_prefill_dense_workspaces,
+    )
+    best: torch.Tensor | None = None
+    for key, candidate in pool.items():
+        if (
+            isinstance(key, tuple)
+            and len(key) >= 2
+            and key[0] == device
+            and key[1] == torch.float16
+            and isinstance(candidate, torch.Tensor)
+            and candidate.is_cuda
+            and candidate.dtype == torch.float16
+            and candidate.numel() >= min_elements
+            and (best is None or candidate.numel() > best.numel())
+        ):
+            best = candidate
+    return best
+
+
+def _get_native_prefill_dense_workspace(
+    codes: torch.Tensor, elements: int
+) -> torch.Tensor | None:
+    device = codes.device.index
+    assert device is not None
+    target_elements = max(elements, _engine_prefill_ceiling_elements())
+    shared = _shared_fp8_prefill_workspace(device, target_elements)
+    if shared is not None:
+        return shared
+    workspace = _dense_workspaces.get(device)
+    if workspace is not None and workspace.numel() >= target_elements:
+        return workspace
+    capturing = torch.cuda.is_current_stream_capturing()
+    if workspace is not None and not capturing:
+        # Release any smaller eager buffer before allocating the wider ceiling
+        # so multi-projection layers never leave an orphaned scratch tensor.
+        del _dense_workspaces[device]
+        workspace = None
+    elif workspace is not None and capturing:
+        _retained_dense_workspaces.append(workspace)
+    try:
+        workspace = torch.empty(
+            target_elements, dtype=torch.float16, device=codes.device
+        )
+    except torch.OutOfMemoryError:
+        return None
+    _dense_workspaces[device] = workspace
+    return workspace
 
 
 def _get_bundled_prefill_code_workspace(
@@ -98,17 +178,6 @@ def _dispatch(
     # Keep M dispatch opaque: compiled token ranges include both decode and
     # prefill. Native QPN2 codes and E4M3 scales are the only resident layout.
     if x.shape[0] <= _native_decode_rows():
-        # Retune only the single-request gated shape; preserve the admitted
-        # two-chain batch reductions for concurrent requests.
-        if (
-            x.shape[0] <= 8
-            and gated_silu
-            and x.shape[1] >= 1024
-            and x.shape[1] % 128 == 0
-            and out.shape[1] >= 1024
-            and out.shape[1] % 32 == 0
-        ):
-            accumulator_chains = 1
         op = (
             sm70_ops.nvfp4_qpn2_gated_sm70_out
             if gated_silu
@@ -128,9 +197,7 @@ def _dispatch(
         return
     k = x.shape[1]
     n = out.shape[1] * (2 if gated_silu else 1)
-    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
-    if workspace is not None and workspace.numel() < k * n:
-        workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes, k * n)
+    workspace = _get_native_prefill_dense_workspace(codes, k * n)
     if workspace is None or workspace.numel() < k * n:
         raise RuntimeError("Native QPN2 prefill workspace is unavailable")
     device = codes.device.index

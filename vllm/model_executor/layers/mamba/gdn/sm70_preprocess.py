@@ -125,8 +125,8 @@ def conv_gate_zero(
     b,
     bias,
     core_out,
-    channel_tile=64,
-    num_warps=2,
+    channel_tile=None,
+    num_warps=None,
     *,
     compute_gating: bool = True,
 ):
@@ -138,6 +138,10 @@ def conv_gate_zero(
     batch = state_indices.numel()
     assert batch > 0 and rows % batch == 0
     tokens = rows // batch
+    if channel_tile is None:
+        channel_tile = 128 if batch * channels >= 16384 else 64
+    if num_warps is None:
+        num_warps = 4
     assert 1 <= tokens <= 8 and channels > 0 and qkv.stride(1) == 1
     assert qkv.dtype == state.dtype == weight.dtype == torch.float16
     assert weight.shape == (channels, 4)

@@ -216,3 +216,86 @@ def test_prepare_weights_fails_when_an_indexed_shard_is_not_selected(
 
     with pytest.raises(RuntimeError, match="would not be loaded"):
         _prepare(tmp_path, load_format="safetensors")
+
+
+def test_prepare_weights_retains_same_shard_quant_companions_without_filtering(
+    tmp_path,
+) -> None:
+    first_shard = tmp_path / "model-00001-of-00002.safetensors"
+    second_shard = tmp_path / "model-00002-of-00002.safetensors"
+    save_file(
+        {
+            "layers.0.mlp.down_proj.weight": torch.tensor([1.0]),
+            "layers.0.mlp.down_proj.weight_scale": torch.tensor([0.25]),
+        },
+        first_shard,
+    )
+    save_file({"lm_head.weight": torch.tensor([2.0])}, second_shard)
+    _write_index(
+        tmp_path,
+        {
+            "layers.0.mlp.down_proj.weight": first_shard.name,
+            "lm_head.weight": second_shard.name,
+        },
+    )
+
+    *_, indexed_weights_by_file = _prepare(tmp_path, load_format="safetensors")
+    assert indexed_weights_by_file is None
+
+    loader = DefaultModelLoader(
+        LoadConfig(load_format="safetensors", use_tqdm_on_load=False)
+    )
+    source = DefaultModelLoader.Source(
+        model_or_path=str(tmp_path), revision=None, fall_back_to_pt=False
+    )
+    weights = dict(loader._get_weights_iterator(source))
+    assert sorted(weights) == [
+        "layers.0.mlp.down_proj.weight",
+        "layers.0.mlp.down_proj.weight_scale",
+        "lm_head.weight",
+    ]
+
+
+def test_reused_shard_keeps_indexed_companions_and_drops_foreign_companions(
+    tmp_path,
+) -> None:
+    main_shard = tmp_path / "model-00001-of-00002.safetensors"
+    reused_shard = tmp_path / "model-00002-of-00002.safetensors"
+    save_file(
+        {
+            "main.weight": torch.tensor([1.0]),
+            "main.weight_scale": torch.tensor([0.5]),
+        },
+        main_shard,
+    )
+    save_file(
+        {
+            "ple.weight": torch.tensor([2.0]),
+            "ple.weight_scale": torch.tensor([0.25]),
+            "main.weight": torch.tensor([99.0]),
+            "main.weight_scale": torch.tensor([99.0]),
+            "stale.weight": torch.tensor([3.0]),
+            "stale.weight_scale": torch.tensor([3.0]),
+        },
+        reused_shard,
+    )
+    _write_index(
+        tmp_path,
+        {"main.weight": main_shard.name, "ple.weight": reused_shard.name},
+    )
+
+    loader = DefaultModelLoader(
+        LoadConfig(load_format="safetensors", use_tqdm_on_load=False)
+    )
+    source = DefaultModelLoader.Source(
+        model_or_path=str(tmp_path), revision=None, fall_back_to_pt=False
+    )
+    weights = dict(loader._get_weights_iterator(source))
+    assert sorted(weights) == [
+        "main.weight",
+        "main.weight_scale",
+        "ple.weight",
+        "ple.weight_scale",
+    ]
+    torch.testing.assert_close(weights["main.weight_scale"], torch.tensor([0.5]))
+    torch.testing.assert_close(weights["ple.weight_scale"], torch.tensor([0.25]))

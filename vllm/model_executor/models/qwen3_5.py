@@ -43,7 +43,6 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
-    _is_dflash2_spec_config,
     _qwen_gdn_run_recurrent_core,
     _resolve_qwen_gdn_kv_cache_args,
     _sm70_compile_graph_slice_dim,
@@ -375,6 +374,27 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         self.use_split_input_projections = _uses_split_gdn_input_projections(
             self.quant_config
         )
+        if (
+            self.use_split_input_projections
+            and self.quant_config is not None
+            and self.quant_config.get_name()
+            in {"compressed-tensors", "fp8", "modelopt_fp4"}
+        ):
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+            cfg = get_current_vllm_config_or_none()
+            qpn8_allowed = cfg is None or cfg.kernel_config.sm70_fp8.qpn8 is not False
+            if qpn8_allowed:
+                for proj in (self.in_proj_qkvz, self.out_proj):
+                    if (
+                        isinstance(
+                            getattr(proj, "quant_method", None),
+                            UnquantizedLinearMethod,
+                        )
+                        and getattr(proj, "bias", None) is None
+                    ):
+                        proj._sm70_gdn_mixed_qpn8 = True
 
     def create_qkvz_proj(
         self,
@@ -592,11 +612,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.layer_idx = extract_layer_index(prefix)
         self.sm70_dflash2_direct_attention_output = bool(
             current_platform.is_device_capability(70)
-            and _is_dflash2_spec_config(vllm_config)
             and vllm_config.parallel_config.tensor_parallel_size in (2, 4)
             and model_config.dtype == torch.float16
-            and model_config.quantization
-            in ("compressed-tensors", "gguf", "fp8", "modelopt_fp4", None)
             and config.hidden_size == 5120
             and config.model_type == "qwen3_5_text"
         )

@@ -403,9 +403,6 @@ class Qwen3NextAttention(nn.Module):
 
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-            _is_dflash2_spec_config,
-        )
 
         self.sm70_qk_rope_prep = bool(
             current_platform.is_cuda()
@@ -415,7 +412,6 @@ class Qwen3NextAttention(nn.Module):
             and model_config is not None
             and model_config.dtype == torch.float16
             and config.model_type == "qwen3_5_text"
-            and _is_dflash2_spec_config(get_current_vllm_config())
             and self.attn_output_gate
             and self.num_kv_heads > 0
             and self.num_heads == 6 * self.num_kv_heads

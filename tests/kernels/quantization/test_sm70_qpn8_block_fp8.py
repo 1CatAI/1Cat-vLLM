@@ -429,3 +429,73 @@ def test_block_qpn8_fused_gated_silu_matches_reference(
         gate, up = gate_up.chunk(2, dim=-1)
         expected = torch.nn.functional.silu(gate) * up
         assert ((y.float() - expected).norm() / expected.norm()).item() < 2e-3
+
+
+def test_sm70_block_native_and_ba_split_revision_ops_bound():
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 is required")
+    assert hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out")
+    assert hasattr(torch.ops._C, "fp8_qpn8_ba_split_geometry_revision")
+    assert torch.ops._C.fp8_qpn8_ba_split_geometry_revision() >= 1
+
+
+@pytest.mark.parametrize("m", [20, 36, 40, 72, 128, 192])
+def test_block_qpn8_row_blocks_and_cudagraph_reuse_prefill_workspace(
+    default_vllm_config, m
+):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 is required")
+    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
+        False
+    )
+    layer, reference = _layer(2048, 1024)
+    layer.prefix = "model.layers.0.mlp.gate_up_proj"
+    layer.output_partition_sizes = [1024, 1024]
+    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(2048, 1024))
+    kernel.process_weights_after_loading(layer)
+    assert not hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight")
+
+    x = torch.randn(m, 1024, device="cuda", dtype=torch.float16) * 0.1
+    y_lin = kernel.apply_weights(layer, x)
+    expected_lin = x.float() @ reference.t()
+    assert ((y_lin.float() - expected_lin).norm() / expected_lin.norm()).item() < 1e-3
+
+    y_gated = kernel.apply_fused_silu_and_mul(layer, x)
+    assert y_gated is not None
+    gate, up = expected_lin.chunk(2, dim=-1)
+    expected_gated = torch.nn.functional.silu(gate) * up
+    assert (
+        (y_gated.float() - expected_gated).norm() / expected_gated.norm()
+    ).item() < 2e-3
+
+    # Verify CUDA graph capture of large-M prefill reuses the pre-allocated
+    # primary dense weight buffer instead of allocating K*N inside graph_pool.
+    if m > 128:
+        from vllm.model_executor.kernels.linear.qpn.fp8_block import (
+            _ensure_block_qpn8_prefill_workspace,
+        )
+
+        preallocated_ptr = _ensure_block_qpn8_prefill_workspace(
+            x.device, 2048 * 1024
+        ).data_ptr()
+        pool = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            assert (
+                _ensure_block_qpn8_prefill_workspace(x.device, 2048 * 1024).data_ptr()
+                == preallocated_ptr
+            )
+            # First call initializes the cuBLAS stream workspace in graph_pool;
+            # second call must allocate only the output tensor (no 4 MiB weight).
+            _ = kernel.apply_weights(layer, x)
+            before_second = torch.cuda.memory_allocated()
+            captured = kernel.apply_weights(layer, x)
+            after_second = torch.cuda.memory_allocated()
+        assert after_second - before_second == captured.nbytes
+        x.normal_(0, 0.1)
+        graph.replay()
+        torch.accelerator.synchronize()
+        ref_replay = x.float() @ reference.t()
+        assert (
+            (captured.float() - ref_replay).norm() / ref_replay.norm()
+        ).item() < 1e-3
