@@ -167,7 +167,14 @@ def device_history_attention(
     gate = gate.view_as(query) if gate is not None else None
     if hot:
         resolved = state.resolve_hot(indices, table, requests, positions, lengths)
+        page_slots = getattr(state, "page_slots", None)
+        tags = getattr(state, "tags", None)
         if getattr(state, "hot_fp8", False):
+            hot_tiles = (
+                3
+                if (query.shape[0] >= 16 and indices.shape[1] >= 1024)
+                else (2 if query.shape[0] >= 32 else 1)
+            )
             torch.ops.vllm_sm70_qsa_device.run_hot_fp8(
                 query,
                 state.history,
@@ -183,7 +190,9 @@ def device_history_attention(
                 state.hot_values,
                 resolved,
                 state.hot_scales,
-                2 if query.shape[0] >= 32 else 1,
+                hot_tiles,
+                page_slots,
+                tags,
             )
         else:
             torch.ops.vllm_sm70_qsa_device.run_hot(
@@ -200,6 +209,9 @@ def device_history_attention(
                 *workspace,
                 state.hot_values,
                 resolved,
+                1,
+                page_slots,
+                tags,
             )
         state.device_history_reason = None
         logger.info_once(

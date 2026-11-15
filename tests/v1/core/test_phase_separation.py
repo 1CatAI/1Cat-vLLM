@@ -305,3 +305,106 @@ def test_explicit_phase_admission_rejects_unsupported_modes(
 ):
     with pytest.raises(ValueError, match="phase_separation requires"):
         _scheduler(monkeypatch, local_model_config, **options)
+
+
+def test_split_mtp_phase_pure_eliminates_mixed_steps_and_falls_back_on_full_kv(
+    monkeypatch, local_model_config
+):
+    monkeypatch.setenv("VLLM_SM70_PHASE_SEPARATION", "0")
+    scheduler = create_scheduler(
+        model=local_model_config,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        max_model_len=2048,
+        num_blocks=16,
+        block_size=16,
+        async_scheduling=True,
+        skip_tokenizer_init=True,
+        split_mtp_phase_pure=True,
+        split_mtp_prefill_cap=32,
+    )
+    assert scheduler._split_mtp_phase_pure is True
+
+    # Start a resident decode request.
+    dec = _decoder(scheduler)
+    assert dec.num_output_tokens == 1
+
+    # Add a 64-token prefill request while decode is resident:
+    # Step 1 must run PURE prefill (capped to 32 tokens, NOT mixed with decode!).
+    prefill = create_requests(1, num_tokens=64, max_tokens=16, req_ids=["prefill"])[0]
+    scheduler.add_request(prefill)
+    step1 = scheduler.schedule()
+    assert step1.num_scheduled_tokens == {"prefill": 32}
+    _finish_step(scheduler, step1)
+
+    # Next 2 steps run PURE decode before continuing the remaining 32-token prefill.
+    step2 = scheduler.schedule()
+    assert step2.num_scheduled_tokens == {"decode": 1}
+    _finish_step(scheduler, step2)
+    step3 = scheduler.schedule()
+    assert step3.num_scheduled_tokens == {"decode": 1}
+    _finish_step(scheduler, step3)
+
+    # Step 4 finishes the remaining 32-token prefill as a PURE prefill step.
+    step4 = scheduler.schedule()
+    assert step4.num_scheduled_tokens == {"prefill": 32}
+    _finish_step(scheduler, step4)
+
+    # Now both requests decode together in a pure decode batch.
+    step5 = scheduler.schedule()
+    assert step5.num_scheduled_tokens == {"decode": 1, "prefill": 1}
+    _finish_step(scheduler, step5)
+
+    # Exhaust remaining free blocks with a waiting giant request that cannot fit:
+    # schedule() must fall back in the SAME step to pure decode, never empty!
+    scheduler._split_mtp_decode_steps_due = 0
+    huge = create_requests(1, num_tokens=240, max_tokens=8, req_ids=["huge"])[0]
+    scheduler.add_request(huge)
+    step6 = scheduler.schedule()
+    assert step6.num_scheduled_tokens == {"decode": 1, "prefill": 1}
+    _finish_step(scheduler, step6)
+
+
+def test_phase_pure_auto_enabled_for_zero_mixed_latency_and_short_warm_turns(
+    monkeypatch, local_model_config
+):
+    monkeypatch.setenv("VLLM_SM70_PHASE_SEPARATION", "0")
+    scheduler = create_scheduler(
+        model=local_model_config,
+        max_num_seqs=4,
+        max_num_batched_tokens=2048,
+        max_model_len=4096,
+        num_blocks=160,
+        block_size=16,
+        async_scheduling=True,
+        skip_tokenizer_init=True,
+        split_mtp_phase_pure=None,
+    )
+    # Simulate EngineArgs / 27B profile default mixed_prefill_step_latency_ms=0.
+    scheduler.scheduler_config.mixed_prefill_step_latency_ms = 0
+    scheduler._split_mtp_phase_pure = True
+
+    dec = _decoder(scheduler)
+    assert dec.num_output_tokens == 1
+
+    # Two warm agent turns (600 tokens each -> 1200 >= 1024 total) that BOTH
+    # complete in a single Phase.PREFILL step must batch together without decode
+    # and resume after 3 decode steps (not 8!), resetting burst_tokens to 0.
+    w1, w2 = create_requests(2, num_tokens=600, max_tokens=16, req_ids=["w1", "w2"])
+    scheduler.add_request(w1)
+    scheduler.add_request(w2)
+    p_step = scheduler.schedule()
+    assert p_step.num_scheduled_tokens == {"w1": 600, "w2": 600}
+    assert scheduler._split_mtp_decode_steps_due == 3
+    _finish_step(scheduler, p_step)
+
+    # Arrival of w3 sees 3 pure decode steps, then immediate pure prefill for w3.
+    w3 = create_requests(1, num_tokens=300, max_tokens=16, req_ids=["w3"])[0]
+    scheduler.add_request(w3)
+    for _ in range(3):
+        d_step = scheduler.schedule()
+        assert d_step.num_scheduled_tokens == {"decode": 1, "w1": 1, "w2": 1}
+        _finish_step(scheduler, d_step)
+    assert scheduler._split_mtp_prefill_burst_tokens == 0
+    p_w3 = scheduler.schedule()
+    assert p_w3.num_scheduled_tokens == {"w3": 300}

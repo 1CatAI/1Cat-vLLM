@@ -1934,3 +1934,77 @@ def test_streaming_call_completed_in_delta_after_skipped_empty_block(
         "get_current_weather"
     ]
     assert json.loads(extracted.tool_calls[0].function.arguments) == expected_arguments
+
+
+def test_streaming_string_parameter_emits_incremental_chunks_and_literal_tags(
+    qwen3_tokenizer,
+):
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                        "mode": {"type": "integer"},
+                    },
+                },
+            },
+        )
+    ]
+    code_body = (
+        "def render_xml(name: str) -> str:\n"
+        '    tag = "</parameter>"\n'
+        '    inline = "<parameter=fake>ok"\n'
+        "    if len(name) < 4:\n"
+        '        return f"{tag}:{inline}:{name}"\n'
+        '    return "\\n".join([name, tag, inline])'
+    )
+    model_output = (
+        "<tool_call>\n"
+        "<function=write_file>\n"
+        "<parameter=path>\n"
+        "src/xml_helper.py\n"
+        "</parameter>\n"
+        "<parameter=content>\n"
+        f"{code_body}\n"
+        "</parameter>\n"
+        "<parameter=mode>\n"
+        "420\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+
+    arg_chunks: list[str] = []
+    for delta_message in stream_delta_message_generator(
+        parser, qwen3_tokenizer, model_output, request
+    ):
+        if delta_message.tool_calls:
+            for tc in delta_message.tool_calls:
+                if tc.function and tc.function.arguments:
+                    arg_chunks.append(tc.function.arguments)
+
+    # Incremental streaming must emit many argument chunks while content streams,
+    # rather than holding the entire code payload until </parameter>.
+    assert len(arg_chunks) >= 10
+    streamed_json = "".join(arg_chunks)
+    parsed_stream = json.loads(streamed_json)
+    assert parsed_stream == {
+        "path": "src/xml_helper.py",
+        "content": code_body,
+        "mode": 420,
+    }
+    assert isinstance(parsed_stream["mode"], int)
+
+    non_stream = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools).extract_tool_calls(
+        model_output, request=request
+    )
+    assert len(non_stream.tool_calls) == 1
+    assert json.loads(non_stream.tool_calls[0].function.arguments) == parsed_stream

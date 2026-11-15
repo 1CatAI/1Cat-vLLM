@@ -1566,6 +1566,9 @@ def _qsa_select_by_request(
     compress_ratio: int,
     out: torch.Tensor,
     query_start_loc_cpu: torch.Tensor,
+    shared_key_scoring: bool = False,
+    max_seq_len: int | None = None,
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None,
 ) -> bool:
     """Select a multi-request batch one long request at a time.
 
@@ -1581,6 +1584,7 @@ def _qsa_select_by_request(
     rows = q.shape[0]
     if (
         page_table.shape[0] < 2
+        or torch.cuda.is_current_stream_capturing()
         or not sparse_policy().value("qsa_indexer_cublas")
         or not current_platform.is_device_capability_family(70)
         or not _qsa_indexer_cublas_shape_supported(q, k_cache, page_table[:1])
@@ -1596,8 +1600,25 @@ def _qsa_select_by_request(
     )
     if all(request is None for _, _, request in segments):
         return False
+    num_reqs = len(query_start_loc) - 1
+    seq_lens_upper: list[int] | None = None
+    if (
+        seq_lens_cpu_upper_bound is not None
+        and not seq_lens_cpu_upper_bound.is_cuda
+        and seq_lens_cpu_upper_bound.numel() >= num_reqs
+    ):
+        seq_lens_upper = [int(v) for v in seq_lens_cpu_upper_bound[:num_reqs].tolist()]
     for start, end, request in segments:
         if request is None:
+            seg_max_seq_len = max_seq_len
+            if seq_lens_upper is not None:
+                req_bounds = [
+                    seq_lens_upper[r]
+                    for r, (rs, re_) in enumerate(pairwise(query_start_loc))
+                    if re_ > rs and rs >= start and re_ <= end
+                ]
+                if req_bounds:
+                    seg_max_seq_len = max(req_bounds)
             qsa_select_paged_tokens(
                 q[start:end],
                 k_cache,
@@ -1608,8 +1629,15 @@ def _qsa_select_by_request(
                 token_topk,
                 compress_ratio,
                 out[start:end],
+                shared_key_scoring=shared_key_scoring,
+                max_seq_len=seg_max_seq_len,
             )
         else:
+            req_max_seq_len = (
+                seq_lens_upper[request]
+                if seq_lens_upper is not None and request < len(seq_lens_upper)
+                else max_seq_len
+            )
             qsa_select_paged_tokens(
                 q[start:end],
                 k_cache,
@@ -1620,6 +1648,8 @@ def _qsa_select_by_request(
                 token_topk,
                 compress_ratio,
                 out[start:end],
+                shared_key_scoring=shared_key_scoring,
+                max_seq_len=req_max_seq_len,
             )
     return True
 
@@ -1638,11 +1668,13 @@ def qsa_select_paged_tokens(
     shared_key_scoring: bool = False,
     max_seq_len: int | None = None,
     tp_group=None,
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization.
 
     ``max_seq_len``: host upper bound of ``sequence_lengths`` (the scheduler's
-    value); it bounds the cuBLAS scoring columns without reading the device.
+    value); it bounds both cuBLAS and eager paged scoring columns without
+    reading the device.
     """
 
     rows = q.shape[0]
@@ -1664,12 +1696,19 @@ def qsa_select_paged_tokens(
         compress_ratio,
         out,
         query_start_loc_cpu,
+        shared_key_scoring=shared_key_scoring,
+        max_seq_len=max_seq_len,
+        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
     ):
         return out
 
     capacity_columns = page_table.shape[1] * k_cache.shape[1]
-    score_columns = capacity_columns
     block_topk = token_topk // compress_ratio
+    bounded_columns = capacity_columns
+    if max_seq_len is not None and not torch.cuda.is_current_stream_capturing():
+        live_bound = max(block_topk, max_seq_len // compress_ratio)
+        bounded_columns = min(capacity_columns, triton.cdiv(live_bound, 4) * 4)
+    score_columns = bounded_columns
     contiguous_keys: torch.Tensor | None = None
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None
@@ -1691,8 +1730,9 @@ def qsa_select_paged_tokens(
             if max_seq_len is not None
             else int(all_visible.max().item())
         )
-        score_columns = min(capacity_columns, max(block_topk, live_blocks))
-        if _qsa_indexer_cublas_work_supported(rows, score_columns):
+        cublas_columns = min(capacity_columns, max(block_topk, live_blocks))
+        if _qsa_indexer_cublas_work_supported(rows, cublas_columns):
+            score_columns = cublas_columns
             logger.info_once(
                 "Using SM70 QSA indexer prefill cuBLAS path "
                 "(single-request FP16, rows=%d, score_tile_mib=%d).",
@@ -1706,7 +1746,7 @@ def qsa_select_paged_tokens(
                 k_cache, page_table, score_columns
             )
         else:
-            score_columns = capacity_columns
+            score_columns = bounded_columns
             all_visible = None
     # Only the model adapter may qualify replicated queries/cache for TP.
     # Keep small work, mixed requests, other topologies and graph capture on
@@ -1776,6 +1816,7 @@ def qsa_select_paged_tokens(
                 query_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
+                num_columns=score_columns,
                 shared_key_scoring=shared_key_scoring,
             )
         blocks = (

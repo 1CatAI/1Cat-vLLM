@@ -2839,7 +2839,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         profile_start = self._gdn_profiler.start()
         projection_override = getattr(self, "output_projection_override", None)
-        if projection_override is not None and output is None:
+        projection_out_override = getattr(self, "output_projection_out_override", None)
+        if output is not None and projection_out_override is not None:
+            projection_out_override(core_attn_out, output)
+            proj_out = output
+        elif projection_override is not None and output is None:
             proj_out = projection_override(core_attn_out)
         elif output is None:
             proj_out, _ = self.out_proj(core_attn_out)
@@ -2900,11 +2904,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and callable(supports_direct)
             and supports_direct(self.out_proj)
         )
+        projection_out_override = getattr(self, "output_projection_out_override", None)
+        direct_hcx = bool(
+            output is not None
+            and projection_out_override is not None
+            and output.ndim == 2
+            and output.shape == (num_tokens, self.hidden_size)
+            and output.dtype == torch.float16
+            and output.is_contiguous()
+        )
         proj_out = self._compute_output_projection(
-            core_attn_out, z, num_tokens, output if direct_write else None
+            core_attn_out,
+            z,
+            num_tokens,
+            output if (direct_write or direct_hcx) else None,
         )
         if output is not None:
-            if not direct_write:
+            if not (direct_write or direct_hcx):
                 output[:num_tokens] = proj_out
             _sm70_gdn_graph_buffer_copy(
                 "proj_output_after_write",

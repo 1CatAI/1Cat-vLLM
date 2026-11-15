@@ -620,6 +620,8 @@ class QSAForwardMetadata(AttentionMetadata):
     query_start_loc_cpu: torch.Tensor | None = None
     # Host upper bound of seq_lens (bounds prefill scoring without a sync).
     max_seq_len: int | None = None
+    # Per-request host upper bounds of seq_lens for multi-request splits.
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -815,6 +817,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             compress_ratio=self.compress_ratio,
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             max_seq_len=_host_max_seq_len(common_attn_metadata),
+            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
         )
 
 

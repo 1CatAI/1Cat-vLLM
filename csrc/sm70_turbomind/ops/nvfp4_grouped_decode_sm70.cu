@@ -68,16 +68,23 @@ __device__ __forceinline__ void decode(unsigned packed, half2 scale,
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
-template <int Inter, int Split, bool Interleaved>
-__global__ void w13_kernel(const half* x, const uint32_t* weights,
-                           const half* scales, const int32_t* rows,
-                           const int32_t* experts, const int32_t* sizes,
-                           const int32_t* total, half* out) {
+template <int Inter, int Split, bool Interleaved, int MinBlocks = 2>
+__global__ __launch_bounds__(64 * Split, MinBlocks) void w13_kernel(
+    const half* __restrict__ x, const uint32_t* __restrict__ weights,
+    const half* __restrict__ scales, const int32_t* __restrict__ rows,
+    const int32_t* __restrict__ experts, const int32_t* __restrict__ sizes,
+    const int32_t* __restrict__ total, half* __restrict__ out) {
   constexpr int kTiles = Inter / 32;
-  // Split within the CTA: no floating-point atomics or global partial tensor.
-  __shared__ float partial[2][Split][kPack][32];
-  __shared__ half projected[2][kPack][32];
+  // Split within the CTA: union partial and projected into 16 KB so Split=8
+  // achieves 3 CTAs/SM (48 expert groups/wave) on SM70 with zero register
+  // spill.
+  union SmemStorage {
+    float partial[2][Split][kPack][32];
+    half projected[2][kPack][32];
+  };
+  __shared__ SmemStorage smem;
   const int total_groups = *total;
+  if (blockIdx.y >= total_groups) return;
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int projection = warp / Split, split = warp % Split;
   const int tile = Interleaved ? blockIdx.x * 2 + projection
@@ -104,45 +111,60 @@ __global__ void w13_kernel(const half* x, const uint32_t* weights,
             __hmul(__ldg(s + (g * (2 * kTiles) + tile) * 32 + col),
                    __float2half_rn(16384.0f));
         const half2 scale = __halves2half2(scalar, scalar);
-        half2 decoded[8];
+        half2 decoded[4];
         decode(__ldcs(w + offset), scale, decoded);
-        decode(__ldcs(w + offset + 32), scale, decoded + 4);
         const unsigned* b = reinterpret_cast<const unsigned*>(decoded);
-        uint4 lo = make_uint4(0, 0, 0, 0), hi = make_uint4(0, 0, 0, 0);
-        if (mma_row < count) {
-          lo = *reinterpret_cast<const uint4*>(input + g * 16);
-          hi = *reinterpret_cast<const uint4*>(input + g * 16 + 8);
-        }
+        uint4 lo = mma_row < count
+                       ? __ldg(reinterpret_cast<const uint4*>(input + g * 16))
+                       : make_uint4(0, 0, 0, 0);
         PACKED_MMA(accum, lo.x, lo.y, b[0], b[1]);
         PACKED_MMA(accum, lo.z, lo.w, b[2], b[3]);
-        PACKED_MMA(accum, hi.x, hi.y, b[4], b[5]);
-        PACKED_MMA(accum, hi.z, hi.w, b[6], b[7]);
+        decode(__ldcs(w + offset + 32), scale, decoded);
+        uint4 hi =
+            mma_row < count
+                ? __ldg(reinterpret_cast<const uint4*>(input + g * 16 + 8))
+                : make_uint4(0, 0, 0, 0);
+        PACKED_MMA(accum, hi.x, hi.y, b[0], b[1]);
+        PACKED_MMA(accum, hi.z, hi.w, b[2], b[3]);
       }
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       const int r = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
       const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-      partial[projection][split][r][quad * 8 + c] = accum[i];
+      smem.partial[projection][split][r][quad * 8 + c] = accum[i];
     }
     __syncthreads();
-    for (int idx = threadIdx.x; idx < 2 * kPack * 32; idx += blockDim.x) {
-      const int p = idx / (kPack * 32), r = idx / 32 % kPack, c = idx % 32;
-      // FP16 materialization is retained before SiLU, then again before the
-      // multiplication. Split>1 changes FP32 association, not quantization.
-      float value = 0;
+    // 2 * kPack * 32 == 512; for Split < 8 loop covers all 512 elements.
+    half reduced_vals[Split < 8 ? (8 / Split) : 1];
 #pragma unroll
-      for (int s = 0; s < Split; ++s) value += partial[p][s][r][c];
-      projected[p][r][c] = __float2half_rn(value);
+    for (int it = 0; it < (Split < 8 ? (8 / Split) : 1); ++it) {
+      const int idx = threadIdx.x + it * (64 * Split);
+      if (idx < 2 * kPack * 32) {
+        const int p = idx / (kPack * 32), r = idx / 32 % kPack, c = idx % 32;
+        float value = 0;
+#pragma unroll
+        for (int sp = 0; sp < Split; ++sp) value += smem.partial[p][sp][r][c];
+        reduced_vals[it] = __float2half_rn(value);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int it = 0; it < (Split < 8 ? (8 / Split) : 1); ++it) {
+      const int idx = threadIdx.x + it * (64 * Split);
+      if (idx < 2 * kPack * 32) {
+        const int p = idx / (kPack * 32), r = idx / 32 % kPack, c = idx % 32;
+        smem.projected[p][r][c] = reduced_vals[it];
+      }
     }
     __syncthreads();
     for (int idx = threadIdx.x; idx < count * 32; idx += blockDim.x) {
       const int r = idx / 32, c = idx % 32;
       const int p = Interleaved ? c / 16 : 0;
       const int pc = Interleaved ? c % 16 * 2 : c;
-      const half gate = projected[p][r][pc];
+      const half gate = smem.projected[p][r][pc];
       const half up =
-          Interleaved ? projected[p][r][pc + 1] : projected[1][r][c];
+          Interleaved ? smem.projected[p][r][pc + 1] : smem.projected[1][r][c];
       const float gf = __half2float(gate);
       const half activated = __float2half_rn(gf / (1.0f + expf(-gf)));
       out[static_cast<size_t>(rows[group_id * kPack + r]) * Inter +
@@ -181,14 +203,36 @@ void run(torch::Tensor out, torch::Tensor x, torch::Tensor w, torch::Tensor s,
       ids.data_ptr<int32_t>(), rows.data_ptr<int32_t>(),
       experts.data_ptr<int32_t>(), sizes.data_ptr<int32_t>(),
       total.data_ptr<int32_t>(), routes);
-  const int grid_y = std::min(routes, 128);
-#define LAUNCH(INTER, S, I)                                                   \
-  w13_kernel<INTER, S, I><<<dim3((INTER) / 32, grid_y), 64 * S, 0, stream>>>( \
-      reinterpret_cast<const half*>(x.data_ptr()),                            \
-      reinterpret_cast<const uint32_t*>(w.data_ptr()),                        \
-      reinterpret_cast<const half*>(s.data_ptr()), rows.data_ptr<int32_t>(),  \
-      experts.data_ptr<int32_t>(), sizes.data_ptr<int32_t>(),                 \
-      total.data_ptr<int32_t>(), reinterpret_cast<half*>(out.data_ptr()))
+  const int grid_y = std::min(routes, routes <= 60 ? 48 : 192);
+  if (split == 4 && inter == 160 && (routes <= 100 || routes >= 180)) {
+    const int persistent_gy = std::min(routes, routes <= 300 ? 48 : 96);
+    if (interleaved) {
+      w13_kernel<160, 4, true, 3><<<dim3(5, persistent_gy), 256, 0, stream>>>(
+          reinterpret_cast<const half*>(x.data_ptr()),
+          reinterpret_cast<const uint32_t*>(w.data_ptr()),
+          reinterpret_cast<const half*>(s.data_ptr()), rows.data_ptr<int32_t>(),
+          experts.data_ptr<int32_t>(), sizes.data_ptr<int32_t>(),
+          total.data_ptr<int32_t>(), reinterpret_cast<half*>(out.data_ptr()));
+    } else {
+      w13_kernel<160, 4, false, 3><<<dim3(5, persistent_gy), 256, 0, stream>>>(
+          reinterpret_cast<const half*>(x.data_ptr()),
+          reinterpret_cast<const uint32_t*>(w.data_ptr()),
+          reinterpret_cast<const half*>(s.data_ptr()), rows.data_ptr<int32_t>(),
+          experts.data_ptr<int32_t>(), sizes.data_ptr<int32_t>(),
+          total.data_ptr<int32_t>(), reinterpret_cast<half*>(out.data_ptr()));
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+#define LAUNCH(INTER, S, I)                                      \
+  w13_kernel<INTER, S, I, 2>                                     \
+      <<<dim3((INTER) / 32, grid_y), 64 * S, 0, stream>>>(       \
+          reinterpret_cast<const half*>(x.data_ptr()),           \
+          reinterpret_cast<const uint32_t*>(w.data_ptr()),       \
+          reinterpret_cast<const half*>(s.data_ptr()),           \
+          rows.data_ptr<int32_t>(), experts.data_ptr<int32_t>(), \
+          sizes.data_ptr<int32_t>(), total.data_ptr<int32_t>(),  \
+          reinterpret_cast<half*>(out.data_ptr()))
 #define LAUNCH_INTER(S, I)   \
   if (inter == 160) {        \
     LAUNCH(160, S, I);       \
@@ -320,8 +364,8 @@ __global__ __launch_bounds__(1024) void w2_batch_reduce_kernel(
         const unsigned* b = reinterpret_cast<const unsigned*>(decoded);
         uint4 lo = make_uint4(0, 0, 0, 0), hi = lo;
         if (r < count) {
-          lo = *reinterpret_cast<const uint4*>(input + g * 16);
-          hi = *reinterpret_cast<const uint4*>(input + g * 16 + 8);
+          lo = __ldg(reinterpret_cast<const uint4*>(input + g * 16));
+          hi = __ldg(reinterpret_cast<const uint4*>(input + g * 16 + 8));
         }
         PACKED_MMA(accum, lo.x, lo.y, b[0], b[1]);
         PACKED_MMA(accum, lo.z, lo.w, b[2], b[3]);

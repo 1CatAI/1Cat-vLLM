@@ -655,10 +655,17 @@ def enable_sm70_hcx(
         )
         from functools import partial
 
-        from .sm70_hcx import partial_moe_output, partial_projection
+        from .sm70_hcx import (
+            partial_moe_output,
+            partial_projection,
+            partial_projection_out,
+        )
 
         attention_module.output_projection_override = partial(
             partial_projection, prefix
+        )
+        attention_module.output_projection_out_override = partial(
+            partial_projection_out, prefix
         )
         # QSA still owns its model-specific projection dispatch.
         attention_module.sm70_hcx_projection_name = prefix

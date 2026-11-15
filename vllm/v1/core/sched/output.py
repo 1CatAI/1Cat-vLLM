@@ -282,6 +282,9 @@ class SchedulerOutput:
     # blocks and before the forward pass: partial prefix-cache entries and
     # their copy-on-write targets.
     kv_block_copies: list[tuple[int, int]] | None = None
+    # Optional KV cache group ID aligned 1:1 with ``kv_block_copies`` so the
+    # worker copies only the owning group's segments and host/hot caches.
+    kv_block_copy_groups: list[int] | None = None
 
     # Exact Mamba ``align`` boundary-state sources offered to a KV connector:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]}.
