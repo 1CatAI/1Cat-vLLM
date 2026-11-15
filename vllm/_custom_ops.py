@@ -3,6 +3,7 @@
 
 import os
 from enum import IntEnum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -2473,6 +2474,58 @@ def dsv3_router_gemm(
     )
     torch.ops._moe_C.dsv3_router_gemm(output, hidden_states, router_weight)
     return output
+
+
+@lru_cache(maxsize=1)
+def _load_native_sm70_router() -> bool:
+    import importlib
+
+    try:
+        importlib.import_module("vllm._sm70_router_C")
+    except ImportError:
+        return False
+    if not hasattr(torch.ops.vllm_sm70_router, "top10_batch"):
+        return False
+
+    @torch.library.register_fake("vllm_sm70_router::top10_batch")
+    def _top10_batch_fake(
+        weights: torch.Tensor,
+        ids: torch.Tensor,
+        source: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> None:
+        return None
+
+    return True
+
+
+def try_native_router_top10(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+) -> bool:
+    num_tokens = gating_output.shape[0]
+    if not (
+        gating_output.is_cuda
+        and gating_output.dtype == torch.float16
+        and gating_output.is_contiguous()
+        and gating_output.shape == (num_tokens, 512)
+        and 1 <= num_tokens <= 64
+        and topk_weights.dtype == torch.float32
+        and topk_ids.dtype == torch.int32
+        and token_expert_indices.dtype == torch.int32
+        and topk_weights.is_contiguous()
+        and topk_ids.is_contiguous()
+        and token_expert_indices.is_contiguous()
+        and current_platform.is_device_capability(70)
+        and _load_native_sm70_router()
+    ):
+        return False
+    torch.ops.vllm_sm70_router.top10_batch(
+        topk_weights, topk_ids, token_expert_indices, gating_output
+    )
+    return True
 
 
 def topk_softmax(

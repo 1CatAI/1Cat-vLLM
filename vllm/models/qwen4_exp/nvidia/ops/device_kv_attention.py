@@ -46,8 +46,9 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
     reason = None
     if not enabled:
         reason = "user_override"
-    elif getattr(state, "is_speculative_draft", False) or (
-        cfg and cfg.is_speculative_draft
+    elif state.device_reference and (
+        getattr(state, "is_speculative_draft", False)
+        or (cfg and cfg.is_speculative_draft)
     ):
         reason = "speculative_draft_unqualified"
     elif not state.device_reference and not cfg_allows_host_native(cfg):
@@ -166,28 +167,40 @@ def device_history_attention(
     gate = gate.view_as(query) if gate is not None else None
     if hot:
         resolved = state.resolve_hot(indices, table, requests, positions, lengths)
-        op = (
-            torch.ops.vllm_sm70_qsa_device.run_hot_fp8
-            if getattr(state, "hot_fp8", False)
-            else torch.ops.vllm_sm70_qsa_device.run_hot
-        )
-        extra = (state.hot_scales,) if getattr(state, "hot_fp8", False) else ()
-        op(
-            query,
-            state.history,
-            state.scales,
-            indices,
-            table,
-            requests,
-            positions,
-            lengths,
-            out,
-            gate,
-            *workspace,
-            state.hot_values,
-            resolved,
-            *extra,
-        )
+        if getattr(state, "hot_fp8", False):
+            torch.ops.vllm_sm70_qsa_device.run_hot_fp8(
+                query,
+                state.history,
+                state.scales,
+                indices,
+                table,
+                requests,
+                positions,
+                lengths,
+                out,
+                gate,
+                *workspace,
+                state.hot_values,
+                resolved,
+                state.hot_scales,
+                2 if query.shape[0] >= 32 else 1,
+            )
+        else:
+            torch.ops.vllm_sm70_qsa_device.run_hot(
+                query,
+                state.history,
+                state.scales,
+                indices,
+                table,
+                requests,
+                positions,
+                lengths,
+                out,
+                gate,
+                *workspace,
+                state.hot_values,
+                resolved,
+            )
         state.device_history_reason = None
         logger.info_once(
             "Using SM70 native QSA attention over host history with a device "

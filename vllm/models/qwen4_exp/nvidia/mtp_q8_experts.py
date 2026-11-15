@@ -23,6 +23,8 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -145,6 +147,12 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
             guarded = pad_weight_tail(weight, GGML_Q8_0)
             if guarded is not weight:
                 replace_parameter(layer, name, guarded)
+        if layer.w13_weight.is_cuda and current_platform.is_device_capability((7, 0)):
+            max_needed = (
+                _SM70_FAST_MAX_TOKENS * (self.hidden // _BLOCK)
+                + _SM70_FAST_MAX_TOKENS * _SM70_FAST_MAX_TOPK * (self.local // _BLOCK)
+            ) * _Q8_1_BYTES
+            _get_sm70_mtp_q8_workspace(layer.w13_weight.device, max_needed)
         stored = layer.w13_weight.numel() + layer.w2_weight.numel()
         fp16 = 2 * self.num_experts * 3 * self.local * self.hidden
         logger.info(
@@ -168,30 +176,141 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
             or layer.apply_router_weight_on_input
         ):
             raise ValueError("Q8_0 MTP experts need TP-only output-weighted SiLU")
-        from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
+        return torch.ops.vllm.qwen4_mtp_q8_0_moe(
+            x, layer.w13_weight, layer.w2_weight, topk_weights, topk_ids
+        )
 
-        def run(rows):
-            return fused_moe_gguf(
-                x[rows],
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights[rows],
-                topk_ids[rows],
-                GGML_Q8_0,
-                GGML_Q8_0,
-                "silu",
-            )
 
-        tokens = x.shape[0]
-        if tokens <= _PREFILL_CHUNK:
-            return run(slice(None))
-        # Prefill: the GGUF MoE path keeps [tokens * top_k, hidden]
-        # temporaries; token chunks bound them (tokens are independent).
-        out = torch.empty_like(x)
-        for start in range(0, tokens, _PREFILL_CHUNK):
-            rows = slice(start, min(tokens, start + _PREFILL_CHUNK))
-            out[rows] = run(rows)
+_ENABLE_SM70_MTP_Q8_FAST = True
+_Q8_1_BYTES = 36
+_SM70_FAST_MAX_TOKENS = 64
+_SM70_FAST_MAX_TOPK = 16
+_SM70_MAX_SMEM = 44 * 1024
+_SM70_MTP_Q8_WORKSPACE: dict[int, torch.Tensor] = {}
+
+
+def _get_sm70_mtp_q8_workspace(device: torch.device, needed_bytes: int) -> torch.Tensor:
+    dev_idx = device.index or 0
+    ws = _SM70_MTP_Q8_WORKSPACE.get(dev_idx)
+    if ws is None or ws.device != device or ws.numel() < needed_bytes:
+        alloc_bytes = max(needed_bytes, 512 * 1024)
+        alloc_bytes = (alloc_bytes + 255) & ~255
+        ws = torch.empty(alloc_bytes, dtype=torch.uint8, device=device)
+        _SM70_MTP_Q8_WORKSPACE[dev_idx] = ws
+    return ws
+
+
+def _can_use_sm70_mtp_q8_fast(
+    x: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    if (
+        not _ENABLE_SM70_MTP_Q8_FAST
+        or not hasattr(torch.ops._C, "sm70_mtp_q8_0_moe_out")
+        or not x.is_cuda
+        or x.dtype != torch.float16
+        or x.ndim != 2
+        or not (1 <= x.shape[0] <= _SM70_FAST_MAX_TOKENS)
+        or x.shape[1] < _BLOCK
+        or x.shape[1] % _BLOCK != 0
+        or not current_platform.is_device_capability((7, 0))
+    ):
+        return False
+    if (
+        w13_weight.ndim != 3
+        or w2_weight.ndim != 3
+        or w13_weight.dtype != torch.uint8
+        or w2_weight.dtype != torch.uint8
+        or not w13_weight.is_contiguous()
+        or not w2_weight.is_contiguous()
+        or w13_weight.shape[1] < 2 * _BLOCK
+        or w13_weight.shape[1] % (2 * _BLOCK) != 0
+        or topk_ids.ndim != 2
+        or not (1 <= topk_ids.shape[1] <= _SM70_FAST_MAX_TOPK)
+        or topk_ids.dtype != torch.int32
+        or topk_weights.dtype != torch.float32
+        or topk_weights.shape != topk_ids.shape
+    ):
+        return False
+    hidden_groups = x.shape[1] // _BLOCK
+    inter_groups = (w13_weight.shape[1] // 2) // _BLOCK
+    return (
+        hidden_groups * _Q8_1_BYTES <= _SM70_MAX_SMEM
+        and topk_ids.shape[1] * inter_groups * _Q8_1_BYTES <= _SM70_MAX_SMEM
+    )
+
+
+def _qwen4_mtp_q8_0_moe(
+    x: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    tokens = x.shape[0]
+    if tokens == 0:
+        return x.new_empty((0, x.shape[1]))
+    if _can_use_sm70_mtp_q8_fast(x, w13_weight, w2_weight, topk_weights, topk_ids):
+        x_c = x.contiguous()
+        tw_c = topk_weights.contiguous()
+        ti_c = topk_ids.contiguous()
+        hidden_groups = x_c.shape[1] // _BLOCK
+        inter_groups = (w13_weight.shape[1] // 2) // _BLOCK
+        needed = (
+            tokens * hidden_groups + tokens * ti_c.shape[1] * inter_groups
+        ) * _Q8_1_BYTES
+        ws = _get_sm70_mtp_q8_workspace(x_c.device, needed)
+        out = torch.empty_like(x_c)
+        torch.ops._C.sm70_mtp_q8_0_moe_out(
+            out, ws, x_c, w13_weight, w2_weight, tw_c, ti_c
+        )
+        logger.info_once("SM70 fused Q8_0 MTP draft MoE kernel enabled.")
         return out
+
+    from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
+
+    def run(rows):
+        return fused_moe_gguf(
+            x[rows],
+            w13_weight,
+            w2_weight,
+            topk_weights[rows],
+            topk_ids[rows],
+            GGML_Q8_0,
+            GGML_Q8_0,
+            "silu",
+        )
+
+    if tokens <= _PREFILL_CHUNK:
+        return run(slice(None))
+    # Prefill: the GGUF MoE path keeps [tokens * top_k, hidden]
+    # temporaries; token chunks bound them (tokens are independent).
+    out = torch.empty_like(x)
+    for start in range(0, tokens, _PREFILL_CHUNK):
+        rows = slice(start, min(tokens, start + _PREFILL_CHUNK))
+        out[rows] = run(rows)
+    return out
+
+
+def _qwen4_mtp_q8_0_moe_fake(
+    x: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    del w13_weight, w2_weight, topk_weights, topk_ids
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="qwen4_mtp_q8_0_moe",
+    op_func=_qwen4_mtp_q8_0_moe,
+    fake_impl=_qwen4_mtp_q8_0_moe_fake,
+)
 
 
 class MTPQ80Config(QuantizationConfig):

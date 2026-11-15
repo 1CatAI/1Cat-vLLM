@@ -3,6 +3,7 @@
 """Compatibility entry point for the organized SM70 native bindings."""
 
 from vllm._sm70.auxiliary import (
+    qwen38_shared_down_gated_sm70_out,
     qwen38_shared_gate_exact_out,
     qwen38_shared_gate_sigmoid_mul_out,
     silu_and_mul_interleaved,
@@ -38,6 +39,7 @@ from vllm._sm70.common import (
     has_nvfp4_qpn_w13_swiglu_batch_dispatch,
     has_nvfp4_qwen38_w2_direct_reduce,
     has_nvfp4_qwen38_w13_fused_swiglu,
+    has_qwen38_shared_down_gated,
     has_qwen38_shared_gate_exact,
     has_qwen38_shared_gate_sigmoid_mul,
 )
@@ -167,6 +169,7 @@ __all__ = [
     "moe_permute_with_scratch",
     "moe_permute_metadata_with_scratch",
     "moe_unpermute",
+    "qwen38_shared_down_gated_sm70_out",
     "qwen38_shared_gate_exact_out",
     "qwen38_shared_gate_sigmoid_mul_out",
     "silu_and_mul_interleaved",
@@ -200,6 +203,7 @@ __all__ = [
     "has_nvfp4_qpn_w13_swiglu_batch_dispatch",
     "has_nvfp4_qwen38_w2_direct_reduce",
     "has_nvfp4_qwen38_w13_fused_swiglu",
+    "has_qwen38_shared_down_gated",
     "has_qwen38_shared_gate_exact",
     "has_qwen38_shared_gate_sigmoid_mul",
     "_register_qwen38_qpn8_out_fakes",

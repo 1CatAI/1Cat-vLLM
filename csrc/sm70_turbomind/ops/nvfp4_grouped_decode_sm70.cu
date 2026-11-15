@@ -77,9 +77,7 @@ __global__ void w13_kernel(const half* x, const uint32_t* weights,
   // Split within the CTA: no floating-point atomics or global partial tensor.
   __shared__ float partial[2][Split][kPack][32];
   __shared__ half projected[2][kPack][32];
-  const int group_id = blockIdx.y;
-  if (group_id >= *total) return;
-  const int count = sizes[group_id], expert = experts[group_id];
+  const int total_groups = *total;
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int projection = warp / Split, split = warp % Split;
   const int tile = Interleaved ? blockIdx.x * 2 + projection
@@ -87,63 +85,70 @@ __global__ void w13_kernel(const half* x, const uint32_t* weights,
   const int mma_row = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int quad = (lane >> 2) & 3;
   const int col = quad * 8 + mma_row;
-  const int route = mma_row < count ? rows[group_id * kPack + mma_row] : 0;
-  float accum[8] = {};
-  if (expert < kExperts) {
-    const uint32_t* w =
-        weights + static_cast<size_t>(expert) * 2560 * (Inter / 4);
-    const half* s = scales + static_cast<size_t>(expert) * 160 * (2 * Inter);
-    const half* input = x + static_cast<size_t>(route / kTopK) * 2560;
+  for (int group_id = blockIdx.y; group_id < total_groups;
+       group_id += gridDim.y) {
+    const int count = sizes[group_id], expert = experts[group_id];
+    const int route = mma_row < count ? rows[group_id * kPack + mma_row] : 0;
+    float accum[8] = {};
+    if (expert < kExperts) {
+      const uint32_t* w =
+          weights + static_cast<size_t>(expert) * 2560 * (Inter / 4);
+      const half* s = scales + static_cast<size_t>(expert) * 160 * (2 * Inter);
+      const half* input = x + static_cast<size_t>(route / kTopK) * 2560;
 #pragma unroll 4
-    for (int g = split * (160 / Split); g < (split + 1) * (160 / Split); ++g) {
-      const size_t offset =
-          (static_cast<size_t>(tile) * 320 + g * 2) * 32 + col;
-      const half scalar =
-          __hmul(__ldg(s + (g * (2 * kTiles) + tile) * 32 + col),
-                 __float2half_rn(16384.0f));
-      const half2 scale = __halves2half2(scalar, scalar);
-      half2 decoded[8];
-      decode(__ldcs(w + offset), scale, decoded);
-      decode(__ldcs(w + offset + 32), scale, decoded + 4);
-      const unsigned* b = reinterpret_cast<const unsigned*>(decoded);
-      uint4 lo = make_uint4(0, 0, 0, 0), hi = make_uint4(0, 0, 0, 0);
-      if (mma_row < count) {
-        lo = *reinterpret_cast<const uint4*>(input + g * 16);
-        hi = *reinterpret_cast<const uint4*>(input + g * 16 + 8);
+      for (int g = split * (160 / Split); g < (split + 1) * (160 / Split);
+           ++g) {
+        const size_t offset =
+            (static_cast<size_t>(tile) * 320 + g * 2) * 32 + col;
+        const half scalar =
+            __hmul(__ldg(s + (g * (2 * kTiles) + tile) * 32 + col),
+                   __float2half_rn(16384.0f));
+        const half2 scale = __halves2half2(scalar, scalar);
+        half2 decoded[8];
+        decode(__ldcs(w + offset), scale, decoded);
+        decode(__ldcs(w + offset + 32), scale, decoded + 4);
+        const unsigned* b = reinterpret_cast<const unsigned*>(decoded);
+        uint4 lo = make_uint4(0, 0, 0, 0), hi = make_uint4(0, 0, 0, 0);
+        if (mma_row < count) {
+          lo = *reinterpret_cast<const uint4*>(input + g * 16);
+          hi = *reinterpret_cast<const uint4*>(input + g * 16 + 8);
+        }
+        PACKED_MMA(accum, lo.x, lo.y, b[0], b[1]);
+        PACKED_MMA(accum, lo.z, lo.w, b[2], b[3]);
+        PACKED_MMA(accum, hi.x, hi.y, b[4], b[5]);
+        PACKED_MMA(accum, hi.z, hi.w, b[6], b[7]);
       }
-      PACKED_MMA(accum, lo.x, lo.y, b[0], b[1]);
-      PACKED_MMA(accum, lo.z, lo.w, b[2], b[3]);
-      PACKED_MMA(accum, hi.x, hi.y, b[4], b[5]);
-      PACKED_MMA(accum, hi.z, hi.w, b[6], b[7]);
     }
-  }
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const int r = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-    const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-    partial[projection][split][r][quad * 8 + c] = accum[i];
-  }
-  __syncthreads();
-  for (int idx = threadIdx.x; idx < 2 * kPack * 32; idx += blockDim.x) {
-    const int p = idx / (kPack * 32), r = idx / 32 % kPack, c = idx % 32;
-    // FP16 materialization is retained before SiLU, then again before the
-    // multiplication. Split>1 changes FP32 association, not quantization.
-    float value = 0;
+    for (int i = 0; i < 8; ++i) {
+      const int r = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      partial[projection][split][r][quad * 8 + c] = accum[i];
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < 2 * kPack * 32; idx += blockDim.x) {
+      const int p = idx / (kPack * 32), r = idx / 32 % kPack, c = idx % 32;
+      // FP16 materialization is retained before SiLU, then again before the
+      // multiplication. Split>1 changes FP32 association, not quantization.
+      float value = 0;
 #pragma unroll
-    for (int s = 0; s < Split; ++s) value += partial[p][s][r][c];
-    projected[p][r][c] = __float2half_rn(value);
-  }
-  __syncthreads();
-  for (int idx = threadIdx.x; idx < count * 32; idx += blockDim.x) {
-    const int r = idx / 32, c = idx % 32;
-    const int p = Interleaved ? c / 16 : 0;
-    const int pc = Interleaved ? c % 16 * 2 : c;
-    const half gate = projected[p][r][pc];
-    const half up = Interleaved ? projected[p][r][pc + 1] : projected[1][r][c];
-    const float gf = __half2float(gate);
-    const half activated = __float2half_rn(gf / (1.0f + expf(-gf)));
-    out[static_cast<size_t>(rows[group_id * kPack + r]) * Inter +
-        blockIdx.x * 32 + c] = __hmul(activated, up);
+      for (int s = 0; s < Split; ++s) value += partial[p][s][r][c];
+      projected[p][r][c] = __float2half_rn(value);
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < count * 32; idx += blockDim.x) {
+      const int r = idx / 32, c = idx % 32;
+      const int p = Interleaved ? c / 16 : 0;
+      const int pc = Interleaved ? c % 16 * 2 : c;
+      const half gate = projected[p][r][pc];
+      const half up =
+          Interleaved ? projected[p][r][pc + 1] : projected[1][r][c];
+      const float gf = __half2float(gate);
+      const half activated = __float2half_rn(gf / (1.0f + expf(-gf)));
+      out[static_cast<size_t>(rows[group_id * kPack + r]) * Inter +
+          blockIdx.x * 32 + c] = __hmul(activated, up);
+    }
+    if (group_id + gridDim.y < total_groups) __syncthreads();
   }
 }
 
@@ -176,8 +181,9 @@ void run(torch::Tensor out, torch::Tensor x, torch::Tensor w, torch::Tensor s,
       ids.data_ptr<int32_t>(), rows.data_ptr<int32_t>(),
       experts.data_ptr<int32_t>(), sizes.data_ptr<int32_t>(),
       total.data_ptr<int32_t>(), routes);
+  const int grid_y = std::min(routes, 128);
 #define LAUNCH(INTER, S, I)                                                   \
-  w13_kernel<INTER, S, I><<<dim3((INTER) / 32, routes), 64 * S, 0, stream>>>( \
+  w13_kernel<INTER, S, I><<<dim3((INTER) / 32, grid_y), 64 * S, 0, stream>>>( \
       reinterpret_cast<const half*>(x.data_ptr()),                            \
       reinterpret_cast<const uint32_t*>(w.data_ptr()),                        \
       reinterpret_cast<const half*>(s.data_ptr()), rows.data_ptr<int32_t>(),  \
@@ -384,28 +390,23 @@ void w2_dispatch(torch::Tensor out, torch::Tensor routed, torch::Tensor x,
           sizes.data_ptr<int32_t>(), total.data_ptr<int32_t>(),
           reinterpret_cast<half*>(out.data_ptr()), tokens);
     };
-    if (tokens <= 16) {
+    auto dispatch_inter = [&](auto max_routes_tag) {
       if (inter == 160) {
-        launch_br(std::integral_constant<int, 160>{},
-                  std::integral_constant<int, 160>{});
+        launch_br(std::integral_constant<int, 160>{}, max_routes_tag);
       } else if (inter == 320) {
-        launch_br(std::integral_constant<int, 320>{},
-                  std::integral_constant<int, 160>{});
+        launch_br(std::integral_constant<int, 320>{}, max_routes_tag);
       } else {
-        launch_br(std::integral_constant<int, 640>{},
-                  std::integral_constant<int, 160>{});
+        launch_br(std::integral_constant<int, 640>{}, max_routes_tag);
       }
+    };
+    if (tokens <= 10) {
+      dispatch_inter(std::integral_constant<int, 100>{});
+    } else if (tokens <= 16) {
+      dispatch_inter(std::integral_constant<int, 160>{});
+    } else if (tokens <= 20) {
+      dispatch_inter(std::integral_constant<int, 200>{});
     } else {
-      if (inter == 160) {
-        launch_br(std::integral_constant<int, 160>{},
-                  std::integral_constant<int, kMaxRoutes>{});
-      } else if (inter == 320) {
-        launch_br(std::integral_constant<int, 320>{},
-                  std::integral_constant<int, kMaxRoutes>{});
-      } else {
-        launch_br(std::integral_constant<int, 640>{},
-                  std::integral_constant<int, kMaxRoutes>{});
-      }
+      dispatch_inter(std::integral_constant<int, kMaxRoutes>{});
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;

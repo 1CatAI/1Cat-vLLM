@@ -62,6 +62,31 @@ if hasattr(torch.ops._C, "qwen38_shared_gate_sigmoid_mul_out"):
         return None
 
 
+def qwen38_shared_down_gated_sm70_out(
+    out: torch.Tensor,
+    hidden_x: torch.Tensor,
+    act_out: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> None:
+    _op("qwen38_shared_down_gated_sm70_out")(
+        out, hidden_x, act_out, down_weight, gate_weight
+    )
+
+
+if hasattr(torch.ops._C, "qwen38_shared_down_gated_sm70_out"):
+
+    @register_fake("_C::qwen38_shared_down_gated_sm70_out")
+    def _qwen38_shared_down_gated_sm70_out_fake(
+        out: torch.Tensor,
+        hidden_x: torch.Tensor,
+        act_out: torch.Tensor,
+        down_weight: torch.Tensor,
+        gate_weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
 def sm70_glm_mhc_pre_norm_out(
     gemm_mul: torch.Tensor,
     gemm_sqrsum: torch.Tensor,
@@ -718,5 +743,107 @@ if hasattr(torch.ops._C, "sm70_f16_gate_mul_out"):
         out: torch.Tensor,
         input: torch.Tensor,
         gate_weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "qwen38_ple_spec_add_sm70_out"):
+
+    @register_fake("_C::qwen38_ple_spec_add_sm70_out")
+    def _qwen38_ple_spec_add_sm70_out_fake(
+        residual_inout: torch.Tensor,
+        state: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        ids: torch.Tensor,
+        starts: torch.Tensor,
+        accepted: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "qwen38_ple_kv_proj_tp4_sm70_out"):
+
+    @register_fake("_C::qwen38_ple_kv_proj_tp4_sm70_out")
+    def _qwen38_ple_kv_proj_tp4_sm70_out_fake(
+        embeddings: torch.Tensor,
+        scale: torch.Tensor,
+        packed_kv: torch.Tensor,
+        cnt: torch.Tensor,
+        dirty_m: torch.Tensor,
+        ll_ptrs: list[int],
+        seq: torch.Tensor,
+        logical_rank: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "qwen38_ple_kv_proj_local_sm70_out"):
+
+    @register_fake("_C::qwen38_ple_kv_proj_local_sm70_out")
+    def _qwen38_ple_kv_proj_local_sm70_out_fake(
+        key_out: torch.Tensor,
+        val_out: torch.Tensor,
+        embeddings: torch.Tensor,
+        scale: torch.Tensor,
+        key_w: torch.Tensor,
+        val_w: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "qwen38_ple_gate_norm_sm70_out"):
+
+    @register_fake("_C::qwen38_ple_gate_norm_sm70_out")
+    def _qwen38_ple_gate_norm_sm70_out_fake(
+        gated_value_out: torch.Tensor,
+        normalized_out: torch.Tensor,
+        hidden_states: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        ll_ple_ptr: int,
+        ple_seq: torch.Tensor,
+        norm_key_w: torch.Tensor,
+        norm_query_w: torch.Tensor,
+        norm_conv_w: torch.Tensor,
+        eps: float,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "sm70_hc_ll_add_all_gather_fc_out"):
+
+    @register_fake("_C::sm70_hc_ll_add_all_gather_fc_out")
+    def _sm70_hc_ll_add_all_gather_fc_out_fake(
+        out: torch.Tensor,
+        el: torch.Tensor,
+        hl: torch.Tensor,
+        cnt: torch.Tensor,
+        dirty_m: torch.Tensor,
+        ll_ptrs: list[int],
+        seq: torch.Tensor,
+        logical_rank: int,
+        phys_order: list[int],
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "sm70_hc_ll_allreduce_combine_norm_out"):
+
+    @register_fake("_C::sm70_hc_ll_allreduce_combine_norm_out")
+    def _sm70_hc_ll_allreduce_combine_norm_out_fake(
+        res_out: torch.Tensor,
+        norm_out: torch.Tensor,
+        p0: torch.Tensor,
+        p1: torch.Tensor,
+        res: torch.Tensor,
+        inj: torch.Tensor,
+        nw: torch.Tensor,
+        eps: float,
+        cnt: torch.Tensor,
+        dirty_m: torch.Tensor,
+        seq: torch.Tensor,
+        ar_ptrs: list[int],
+        logical_rank: int,
     ) -> None:
         return None

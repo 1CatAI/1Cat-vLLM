@@ -37,7 +37,10 @@ from vllm.model_executor.kernels.ple.ngram import (
     SM70_PLE_NGRAM,
     sm70_ple_ngram_ids,
 )
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    ReplicatedLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
@@ -3232,6 +3235,29 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             query_start_loc,
             ngram_context,
         )
+        if not diagnostic:
+            gated_value, normalized = torch.ops.vllm.qwen4_exp_ple_kv_gate_norm(
+                embeddings,
+                hidden_states,
+                self.prefix,
+                hc_sequence_parallel,
+            )
+            if hc_sequence_parallel:
+                from vllm.distributed import get_tp_group
+
+                normalized = get_tp_group().all_gather(normalized, dim=0)[
+                    : input_ids.shape[0]
+                ]
+                conv_output = torch.ops.vllm.qwen4_exp_ple_short_conv_rows(
+                    normalized, self.prefix, get_tp_group().rank_in_group, 4
+                )
+                return gated_value + conv_output
+            torch.ops.vllm.qwen4_exp_ple_short_conv_add_inplace(
+                normalized,
+                gated_value,
+                self.prefix,
+            )
+            return gated_value
         embeddings = snapshot_ple_diagnostic(
             embeddings, self.prefix + ":02_embeddings", diagnostic
         )
@@ -3242,8 +3268,30 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             # Lookup/offload keeps its full-row ABI. Projection, gate and
             # grouped norms are row independent and need only this TP owner.
             embeddings = hc_sequence_shard_rows(embeddings)
-        key, _ = self.key_proj(embeddings)
-        value, _ = self.value_proj(embeddings)
+        if hasattr(self, "ple_shard_kv"):
+            from vllm.distributed import get_tp_group
+
+            group = get_tp_group()
+            communicator = getattr(group.device_communicator, "hc_ll_comm", None)
+            assert communicator is not None
+            order = tuple(communicator.order)
+            local_kv = _unpack_ple_shard_kv(self.ple_shard_kv)
+            if hc_sequence_parallel:
+                gathered_w = group.all_gather(local_kv, dim=0).reshape(4, 3200, 1024)
+                key_w = torch.cat([gathered_w[r, :2560] for r in order], dim=0)
+                val_w = torch.cat([gathered_w[r, 2560:] for r in order], dim=0)
+                key = torch.mm(embeddings, key_w.T)
+                value = torch.mm(embeddings, val_w.T)
+            else:
+                local_out = torch.mm(embeddings, local_kv.T)
+                gathered = group.all_gather(local_out, dim=0).reshape(
+                    4, embeddings.shape[0], 3200
+                )
+                key = torch.cat([gathered[r, :, :2560] for r in order], dim=-1)
+                value = torch.cat([gathered[r, :, 2560:] for r in order], dim=-1)
+        else:
+            key, _ = self.key_proj(embeddings)
+            value, _ = self.value_proj(embeddings)
         key = snapshot_ple_diagnostic(key, self.prefix + ":03_key", diagnostic)
         value = snapshot_ple_diagnostic(value, self.prefix + ":04_value", diagnostic)
         token_count = hidden_states.shape[0]
@@ -3288,6 +3336,407 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             conv_output, self.prefix + ":08_conv_output", diagnostic
         )
         return gated_value.flatten(-2) + conv_output
+
+
+def _unpack_ple_shard_kv(packed_kv: torch.Tensor) -> torch.Tensor:
+    return packed_kv.permute(0, 3, 1, 2, 4).contiguous().reshape(3200, 1024)
+
+
+def prepare_sm70_ple_storage(model: nn.Module, vllm_config: VllmConfig) -> None:
+    """Shard TP4 replicated PLE key/value projections onto the SM70 LL bus."""
+    if (
+        vllm_config.kernel_config.hc_weight_storage != "sharded"
+        or vllm_config.lora_config is not None
+        or vllm_config.kernel_config.sm70_hcx_diagnostics
+        or not hasattr(torch.ops._C, "qwen38_ple_kv_proj_tp4_sm70_out")
+        or not hasattr(torch.ops._C, "qwen38_ple_gate_norm_sm70_out")
+    ):
+        return
+    from vllm.distributed.parallel_state import get_tp_group
+
+    group = get_tp_group()
+    communicator = getattr(group.device_communicator, "hc_ll_comm", None)
+    if (
+        communicator is None
+        or not communicator.status["enabled"]
+        or getattr(communicator, "ple_pointers", None) is None
+    ):
+        return
+    rk = communicator.logical_rank
+    count = 0
+    for module in model.modules():
+        if not isinstance(module, Qwen4ExpPLELayer) or hasattr(module, "ple_shard_kv"):
+            continue
+        kw = getattr(module.key_proj, "weight", None)
+        vw = getattr(module.value_proj, "weight", None)
+        if not (
+            (module.hc_count, module.hidden_size, module.hc_hidden_size)
+            == (4, 2560, 10240)
+            and isinstance(kw, torch.Tensor)
+            and isinstance(vw, torch.Tensor)
+            and kw.is_cuda
+            and vw.is_cuda
+            and kw.dtype == vw.dtype == torch.float16
+            and kw.shape == (10240, 1024)
+            and vw.shape == (2560, 1024)
+            and getattr(module.key_proj, "bias", None) is None
+            and getattr(module.value_proj, "bias", None) is None
+            and isinstance(module.key_proj.quant_method, UnquantizedLinearMethod)
+            and isinstance(module.value_proj.quant_method, UnquantizedLinearMethod)
+        ):
+            continue
+        local_kv = torch.cat(
+            (
+                kw.detach()[rk * 2560 : (rk + 1) * 2560],
+                vw.detach()[rk * 640 : (rk + 1) * 640],
+            ),
+            dim=0,
+        )
+        packed_kv = (
+            local_kv.reshape(100, 32, 64, 2, 8)
+            .permute(0, 2, 3, 1, 4)
+            .contiguous()
+            .to(communicator.device)
+        )
+        module.register_buffer("ple_shard_kv", packed_kv, persistent=False)
+        for layer in (module.key_proj, module.value_proj):
+            layer.register_parameter(
+                "weight",
+                nn.Parameter(layer.weight.new_empty((0,)), requires_grad=False),
+            )
+            if hasattr(layer, "_sm70_dense_state"):
+                del layer._sm70_dense_state
+        count += 1
+    if count:
+        logger.info(
+            "Prepared %d lossless SM70 PLE KV shards; replicated banks released",
+            count,
+        )
+
+
+def _ple_eager_gate_norm(
+    layer: Qwen4ExpPLELayer,
+    hidden_states: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    token_count = hidden_states.shape[0]
+    key_3d = key.reshape(token_count, layer.hc_count, layer.hidden_size)
+    query_3d = hidden_states.reshape(token_count, layer.hc_count, layer.hidden_size)
+    key_norm = layer._apply_norm(layer.norm_key, key_3d)
+    query_norm = layer._apply_norm(layer.norm_query, query_3d)
+    gate = (key_norm * query_norm).sum(dim=-1, keepdim=True) / math.sqrt(
+        layer.hidden_size
+    )
+    gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+    gated_value = gate * value.unsqueeze(-2)
+    normalized = layer._apply_norm(layer.norm_conv, gated_value).flatten(-2)
+    return gated_value.flatten(-2), normalized
+
+
+def _ple_gate_norm_or_eager(
+    layer: Qwen4ExpPLELayer,
+    hidden_states: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sm70_ok: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m = hidden_states.shape[0]
+    if (
+        sm70_ok
+        and 1 <= m <= 32768
+        and key.shape == (m, 10240)
+        and value.shape == (m, 2560)
+        and key.dtype == value.dtype == torch.float16
+        and key.is_contiguous()
+        and value.is_contiguous()
+        and key.data_ptr() % 16 == 0
+        and value.data_ptr() % 16 == 0
+    ):
+        gated_value = hidden_states.new_empty((m, 10240))
+        normalized = hidden_states.new_empty((m, 10240))
+        torch.ops._C.qwen38_ple_gate_norm_sm70_out(
+            gated_value,
+            normalized,
+            hidden_states,
+            key,
+            value,
+            0,
+            hidden_states,
+            layer.norm_key.weight,
+            layer.norm_query.weight,
+            layer.norm_conv.weight,
+            float(layer.norm_key.eps),
+        )
+        return gated_value, normalized
+    return _ple_eager_gate_norm(layer, hidden_states, key, value)
+
+
+def qwen4_exp_ple_kv_gate_norm(
+    embeddings: torch.Tensor,
+    hidden_states: torch.Tensor,
+    layer_name: str,
+    hc_sequence_parallel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    m = hidden_states.shape[0]
+    sm70_ok = bool(
+        not envs.VLLM_BATCH_INVARIANT
+        and current_platform.is_device_capability((7, 0))
+        and hidden_states.is_cuda
+        and hidden_states.dtype == torch.float16
+        and hidden_states.ndim == 2
+        and hidden_states.shape == (m, 10240)
+        and hidden_states.is_contiguous()
+        and hidden_states.data_ptr() % 16 == 0
+        and layer.norm_key.weight.shape == (10240,)
+        and layer.norm_key.weight.dtype == torch.float16
+        and layer.norm_key.weight.is_contiguous()
+        and layer.norm_query.weight.is_contiguous()
+        and layer.norm_conv.weight.is_contiguous()
+        and hasattr(torch.ops._C, "qwen38_ple_gate_norm_sm70_out")
+    )
+    if hasattr(layer, "ple_shard_kv"):
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+        communicator = getattr(group.device_communicator, "hc_ll_comm", None)
+        assert communicator is not None
+        if (
+            not hc_sequence_parallel
+            and sm70_ok
+            and 1 <= m <= 64
+            and not torch.backends.cuda.matmul.allow_fp16_accumulation
+            and embeddings.ndim == 2
+            and embeddings.shape == (m, 1024)
+            and embeddings.is_cuda
+            and embeddings.is_contiguous()
+            and embeddings.dtype in (torch.uint8, torch.float16)
+            and embeddings.data_ptr() % (8 if embeddings.dtype == torch.uint8 else 16)
+            == 0
+            and hasattr(communicator, "apply_ple")
+        ):
+            scale = (
+                layer._get_embedding_weight_scale()
+                if embeddings.dtype == torch.uint8
+                else None
+            )
+            if embeddings.dtype != torch.uint8 or (
+                scale is not None
+                and scale.is_cuda
+                and scale.device == embeddings.device
+                and scale.numel() == 1
+                and scale.dtype in (torch.float16, torch.float32)
+            ):
+                result = communicator.apply_ple(
+                    embeddings,
+                    scale,
+                    layer.ple_shard_kv,
+                    hidden_states,
+                    layer.norm_key.weight,
+                    layer.norm_query.weight,
+                    layer.norm_conv.weight,
+                    float(layer.norm_key.eps),
+                )
+                if result is not None:
+                    logger.info_once(
+                        "SM70 Qwen3.8 sharded TP4 PLE KV+gate+norm fusion enabled."
+                    )
+                    return result
+        emb_fp16 = layer._dequantize_embeddings(embeddings, hidden_states.dtype)
+        order = tuple(communicator.order)
+        local_kv = _unpack_ple_shard_kv(layer.ple_shard_kv)
+        if hc_sequence_parallel:
+            from .sm70_hc_prefill_peer import hc_sequence_shard_rows
+
+            emb_fp16 = hc_sequence_shard_rows(emb_fp16)
+            gathered_w = group.all_gather(local_kv, dim=0).reshape(4, 3200, 1024)
+            del local_kv
+            key_w = torch.cat([gathered_w[r, :2560] for r in order], dim=0)
+            val_w = torch.cat([gathered_w[r, 2560:] for r in order], dim=0)
+            del gathered_w
+            key = torch.mm(emb_fp16, key_w.T)
+            value = torch.mm(emb_fp16, val_w.T)
+            del key_w, val_w
+        else:
+            local_out = torch.mm(emb_fp16, local_kv.T)
+            del local_kv
+            gathered = group.all_gather(local_out, dim=0).reshape(4, m, 3200)
+            del local_out
+            key = torch.cat([gathered[r, :, :2560] for r in order], dim=-1).contiguous()
+            value = torch.cat(
+                [gathered[r, :, 2560:] for r in order], dim=-1
+            ).contiguous()
+            del gathered
+        return _ple_gate_norm_or_eager(layer, hidden_states, key, value, sm70_ok)
+
+    kw = getattr(layer.key_proj, "weight", None)
+    vw = getattr(layer.value_proj, "weight", None)
+    if (
+        not hc_sequence_parallel
+        and sm70_ok
+        and 1 <= m <= 64
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        and hasattr(torch.ops._C, "qwen38_ple_kv_proj_local_sm70_out")
+        and embeddings.ndim == 2
+        and embeddings.shape == (m, 1024)
+        and embeddings.is_cuda
+        and embeddings.is_contiguous()
+        and embeddings.dtype in (torch.uint8, torch.float16)
+        and embeddings.data_ptr() % (8 if embeddings.dtype == torch.uint8 else 16) == 0
+        and isinstance(kw, torch.Tensor)
+        and isinstance(vw, torch.Tensor)
+        and kw.shape == (10240, 1024)
+        and vw.shape == (2560, 1024)
+        and kw.dtype == vw.dtype == torch.float16
+        and kw.is_contiguous()
+        and vw.is_contiguous()
+        and kw.data_ptr() % 16 == 0
+        and vw.data_ptr() % 16 == 0
+        and getattr(layer.key_proj, "bias", None) is None
+        and getattr(layer.value_proj, "bias", None) is None
+        and isinstance(layer.key_proj.quant_method, UnquantizedLinearMethod)
+        and isinstance(layer.value_proj.quant_method, UnquantizedLinearMethod)
+    ):
+        scale = (
+            layer._get_embedding_weight_scale()
+            if embeddings.dtype == torch.uint8
+            else hidden_states
+        )
+        if embeddings.dtype != torch.uint8 or (
+            scale is not None
+            and scale.is_cuda
+            and scale.device == embeddings.device
+            and scale.numel() == 1
+            and scale.dtype in (torch.float16, torch.float32)
+        ):
+            key = hidden_states.new_empty((m, 10240))
+            value = hidden_states.new_empty((m, 2560))
+            assert scale is not None
+            torch.ops._C.qwen38_ple_kv_proj_local_sm70_out(
+                key, value, embeddings, scale, kw, vw
+            )
+            logger.info_once("SM70 Qwen3.8 local PLE KV+gate+norm fusion enabled.")
+            return _ple_gate_norm_or_eager(layer, hidden_states, key, value, sm70_ok)
+
+    emb_fp16 = layer._dequantize_embeddings(embeddings, hidden_states.dtype)
+    if hc_sequence_parallel:
+        from .sm70_hc_prefill_peer import hc_sequence_shard_rows
+
+        emb_fp16 = hc_sequence_shard_rows(emb_fp16)
+    key, _ = layer.key_proj(emb_fp16)
+    value, _ = layer.value_proj(emb_fp16)
+    return _ple_gate_norm_or_eager(layer, hidden_states, key, value, sm70_ok)
+
+
+def qwen4_exp_ple_kv_gate_norm_fake(
+    embeddings: torch.Tensor,
+    hidden_states: torch.Tensor,
+    layer_name: str,
+    hc_sequence_parallel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del embeddings, layer_name, hc_sequence_parallel
+    return torch.empty_like(hidden_states), torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_kv_gate_norm",
+    op_func=qwen4_exp_ple_kv_gate_norm,
+    fake_impl=qwen4_exp_ple_kv_gate_norm_fake,
+)
+
+
+def qwen4_exp_ple_short_conv_add_inplace(
+    inputs: torch.Tensor,
+    residual_inout: torch.Tensor,
+    layer_name: str,
+) -> None:
+    forward_context = get_forward_context()
+    layer = forward_context.no_compile_layers[layer_name]
+    attn_metadata = forward_context.attn_metadata
+    if (
+        isinstance(attn_metadata, dict)
+        and isinstance(
+            meta := attn_metadata.get(layer.prefix), PleShortConvAttentionMetadata
+        )
+        and meta.num_prefills == 0
+        and meta.num_decodes == 0
+        and meta.spec_sequence_masks is not None
+        and meta.num_actual_tokens == inputs.shape[0]
+        and layer_policy().value("ple_spec_conv")
+        and hasattr(torch.ops._C, "qwen38_ple_spec_add_sm70_out")
+        and meta.spec_state_indices_tensor is not None
+        and meta.spec_query_start_loc is not None
+        and meta.num_accepted_tokens is not None
+    ):
+        spec_ids = meta.spec_state_indices_tensor[: meta.num_spec_decodes]
+        conv_state = layer.kv_cache[0]
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
+        state_capacity = layer.conv_state_len + layer.num_spec_tokens
+        if state_capacity > 0 and conv_state.size(-1) >= state_capacity:
+            conv_state = conv_state[..., -state_capacity:]
+        conv_weights = layer.conv1d.weight.squeeze(1)
+        if (
+            1 <= spec_ids.numel() <= 8
+            and meta.spec_query_len == 5
+            and layer.conv_state_len == 9
+            and layer.short_conv_dilation == 3
+            and 1 <= inputs.shape[0] <= 40
+            and inputs.shape[1] == 10240
+            and inputs.is_cuda
+            and inputs.dtype == torch.float16
+            and inputs.is_contiguous()
+            and residual_inout.shape == inputs.shape
+            and residual_inout.dtype == torch.float16
+            and residual_inout.is_contiguous()
+            and conv_weights.shape == (10240, 4)
+            and conv_weights.dtype == torch.float16
+            and conv_weights.is_contiguous()
+            and conv_state.shape[1:] == (10240, 13)
+            and conv_state.dtype in (torch.float16, torch.float32)
+            and all(
+                t.dtype == torch.int32 and t.is_cuda and t.is_contiguous()
+                for t in (
+                    spec_ids,
+                    meta.spec_query_start_loc,
+                    meta.num_accepted_tokens,
+                )
+            )
+            and current_platform.is_device_capability((7, 0))
+        ):
+            torch.ops._C.qwen38_ple_spec_add_sm70_out(
+                residual_inout,
+                conv_state,
+                inputs,
+                conv_weights,
+                spec_ids,
+                meta.spec_query_start_loc,
+                meta.num_accepted_tokens,
+            )
+            logger.info_once(
+                "SM70 MTP4 PLE rollback/conv/SiLU/state/residual-add fusion enabled."
+            )
+            return
+    result = layer._short_conv(inputs)
+    residual_inout[: result.shape[0]].add_(result)
+
+
+def qwen4_exp_ple_short_conv_add_inplace_fake(
+    inputs: torch.Tensor,
+    residual_inout: torch.Tensor,
+    layer_name: str,
+) -> None:
+    del inputs, residual_inout, layer_name
+    return
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_short_conv_add_inplace",
+    op_func=qwen4_exp_ple_short_conv_add_inplace,
+    mutates_args=["residual_inout"],
+    fake_impl=qwen4_exp_ple_short_conv_add_inplace_fake,
+)
 
 
 def qwen4_exp_ple_short_conv(

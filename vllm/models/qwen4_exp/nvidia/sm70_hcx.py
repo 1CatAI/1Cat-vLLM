@@ -53,12 +53,30 @@ def hc_prefill_sequence_parallel_active() -> bool:
     return _PREFILL_SEQUENCE_PARALLEL.get()
 
 
+def get_ll_allreduce_comm():
+    try:
+        from vllm.distributed import get_tp_group
+
+        comm = getattr(get_tp_group().device_communicator, "hc_ll_comm", None)
+    except (AssertionError, AttributeError, RuntimeError):
+        return None
+    return comm if comm is not None and getattr(comm, "can_allreduce", False) else None
+
+
+def can_defer_ll_allreduce(rows: int) -> bool:
+    return (
+        HCX_BATCH_M < rows <= 64
+        and not hc_prefill_sequence_parallel_active()
+        and get_ll_allreduce_comm() is not None
+    )
+
+
 # One exchange region per 8-row group (HCX_BATCH_M rows per launch).
 HCX_GROUPS = 5
 AR_BYTES = HCX_GROUPS * 4 * 80 * 256 * 8
 LORA_BYTES = HCX_GROUPS * 8 * 336 * 8
 HB_BYTES = HCX_GROUPS * 8 * HD * 4
-TOP1_ROWS = 32
+TOP1_ROWS = 64
 TOP1_BYTES = 2 * 2 * TOP1_ROWS * 16
 _LANE_R = [(L & 3) + (4 if L & 16 else 0) for L in range(32)]
 _LANE_Q = [(L >> 2) & 3 for L in range(32)]
@@ -79,7 +97,11 @@ def _output_projection(x: torch.Tensor, name: str) -> torch.Tensor:
     if 0 < x.shape[0] <= HCX_BATCH_M and defer:
         return torch.nn.functional.pad(x, (0, layer.output_size - x.shape[1]))
     projected, _ = layer(x)
-    if x.shape[0] > HCX_BATCH_M and not hc_prefill_sequence_parallel_active():
+    if (
+        x.shape[0] > HCX_BATCH_M
+        and not hc_prefill_sequence_parallel_active()
+        and not can_defer_ll_allreduce(x.shape[0])
+    ):
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         projected = tensor_model_parallel_all_reduce(projected)
@@ -95,7 +117,11 @@ def _moe_output(
     shared: torch.Tensor | None, fused: torch.Tensor, name: str, trunc_size: int
 ) -> torch.Tensor:
     rows = fused.shape[0]
-    if 0 < rows <= HCX_BATCH_M:
+    if (
+        0 < rows <= HCX_BATCH_M
+        or hc_prefill_sequence_parallel_active()
+        or can_defer_ll_allreduce(rows)
+    ):
         # An owned payload makes both contributions explicit to the compiler
         # and graph allocator. Hidden references to producer temporaries are
         # unsafe: the memory planner cannot see those additional consumers.
@@ -103,12 +129,6 @@ def _moe_output(
         second = torch.zeros_like(first) if shared is None else shared[..., :trunc_size]
         return torch.cat((first, second), dim=0)
     runner = _MOE_RUNNERS[name]
-    if hc_prefill_sequence_parallel_active():
-        first = fused[..., :trunc_size]
-        second = torch.zeros_like(first) if shared is None else shared[..., :trunc_size]
-        # Keep both contributions finite until the row owner has received the
-        # FP32 sum. Narrowing each rank's sum before reduction can overflow.
-        return torch.cat((first, second), dim=0)
     reduced = runner._maybe_sm70_moe_sum2_allreduce(shared, fused, trunc_size)
     if reduced is None:
         summed = fused if shared is None else shared + fused

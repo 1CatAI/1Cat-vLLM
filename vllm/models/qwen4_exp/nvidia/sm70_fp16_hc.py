@@ -432,22 +432,12 @@ def _qwen38_sm70_fp16_fused_hc(
         if model_parallel_is_initialized()
         else None
     )
-    if x.ndim == 2 and x.shape[0] > 8:
-        logger.warning_once(
-            "FNXDBG HC M=%d concurrent=%s ll=%s down=%s up=%s contiguous=%s",
-            x.shape[0],
-            concurrent_batch,
-            None if hc_ll is None else hc_ll.status.get("enabled"),
-            None if packed_down is None else tuple(packed_down.shape),
-            None if packed_up is None else tuple(packed_up.shape),
-            x.is_contiguous(),
-        )
     if (
         hc_ll is not None
         and hc_ll.status["enabled"]
         and concurrent_batch
         and x.ndim == 2
-        and 1 <= x.shape[0] <= 20
+        and 1 <= x.shape[0] <= 64
         and x.shape[1] == _HC_HIDDEN
         and x.dtype == torch.float16
         and x.is_contiguous()
@@ -733,6 +723,102 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
     )
 
 
+def maybe_apply_qwen38_sm70_fp16_fused_hc_no_combine(
+    down_layer: nn.Module,
+    up_layer: nn.Module,
+    x: torch.Tensor,
+    enabled: bool,
+) -> torch.Tensor | None:
+    if not enabled or not use_sm70_decode_graph_semantics():
+        return None
+    if not all(
+        isinstance(layer, LinearBase)
+        and type(layer.quant_method)
+        in (UnquantizedLinearMethod, Qwen38SM70FP16LinearMethod)
+        for layer in (down_layer, up_layer)
+    ):
+        return None
+    down_weight = getattr(down_layer, "weight", None)
+    up_weight = getattr(up_layer, "weight", None)
+    if down_weight is None or up_weight is None:
+        return None
+    if down_weight.dtype != torch.float16 or up_weight.dtype != torch.float16:
+        return None
+    if down_weight.shape != (_HC_RANK, _HC_HIDDEN) or up_weight.shape != (
+        _HC_HIDDEN,
+        _HC_RANK,
+    ):
+        return None
+    return torch.ops.vllm.qwen38_sm70_fp16_fused_hc_no_combine(
+        x, down_weight, up_weight
+    )
+
+
+def _qwen38_sm70_fp16_fused_hc_no_combine(
+    x: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        not envs.VLLM_BATCH_INVARIANT
+        and x.ndim == 2
+        and x.shape == (1, _HC_HIDDEN)
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and down_weight.is_cuda
+        and up_weight.is_cuda
+        and down_weight.is_contiguous()
+        and up_weight.is_contiguous()
+    ):
+        lora = x.new_empty((1, _HC_RANK))
+        block = x.new_empty((1, _HC_DIM))
+        _qwen38_hc_down_silu_inject_kernel[(_HC_RANK,)](
+            x,
+            down_weight,
+            lora,
+            lora,
+            K=_HC_HIDDEN,
+            BLOCK_K=256,
+            RANK_VALUE=_HC_RANK,
+            HC_COUNT=_HC_COUNT,
+            num_warps=4,
+        )
+        _qwen38_hc_up_gate_mix_row4_kernel[(triton.cdiv(_HC_DIM, 4),)](
+            lora,
+            up_weight,
+            x,
+            block,
+            K=_HC_RANK,
+            HC_DIMENSION=_HC_DIM,
+            HC_COUNT=_HC_COUNT,
+            BLOCK_N=4,
+            BLOCK_K=512,
+            num_warps=8,
+        )
+        return block
+    down = torch.nn.functional.linear(x, down_weight)
+    lora = torch.ops.vllm.qwen4_exp_hc_silu(down, _HC_COUNT)
+    gate = torch.nn.functional.linear(lora, up_weight)
+    return torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, _HC_COUNT)
+
+
+def _qwen38_sm70_fp16_fused_hc_no_combine_fake(
+    x: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+) -> torch.Tensor:
+    del down_weight, up_weight
+    return x.new_empty((*x.shape[:-1], _HC_DIM))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_fp16_fused_hc_no_combine",
+    op_func=_qwen38_sm70_fp16_fused_hc_no_combine,
+    fake_impl=_qwen38_sm70_fp16_fused_hc_no_combine_fake,
+)
+
+
 def enable_qwen38_sm70_fp16_fused_hc(
     module: nn.Module, dtype: torch.dtype, vllm_config=None
 ) -> None:
@@ -751,6 +837,16 @@ def enable_qwen38_sm70_fp16_fused_hc(
         vllm_config or get_current_vllm_config()
     ).parallel_config.tensor_parallel_size == 4
     for child in module.modules():
+        if (
+            not getattr(child, "use_combine", True)
+            and getattr(child, "lora_rank", None) == _HC_RANK
+            and getattr(child, "hc_count", None) == _HC_COUNT
+            and getattr(child, "hidden_size", None) == _HC_DIM
+            and hasattr(child, "input_mix_weight_down")
+            and hasattr(child, "input_mix_weight_up")
+        ):
+            child._sm70_qwen38_fp16_fused_hc_no_combine = True
+            continue
         if not (
             getattr(child, "use_combine", False)
             and getattr(child, "lora_rank", None) == _HC_RANK
@@ -816,6 +912,7 @@ __all__ = [
     "_qwen38_hc_up_local_gate_kernel",
     "enable_qwen38_sm70_fp16_fused_hc",
     "maybe_apply_qwen38_sm70_fp16_fused_hc",
+    "maybe_apply_qwen38_sm70_fp16_fused_hc_no_combine",
 ]
 
 

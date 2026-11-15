@@ -14,7 +14,7 @@
 #include <c10/cuda/CUDAException.h>
 
 namespace {
-constexpr int kRanks = 4, kRows = 32;
+constexpr int kRanks = 4, kRows = 64;
 
 __device__ __forceinline__ void st4(uint4* p, uint4 v) {
   asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(p),
@@ -43,7 +43,7 @@ struct Top1Args {
   int rank, M;
 };
 
-__global__ __launch_bounds__(32) void top1x_kernel(Top1Args a) {
+__global__ __launch_bounds__(64) void top1x_kernel(Top1Args a) {
   const int row = threadIdx.x;
   const unsigned tag = *reinterpret_cast<volatile unsigned*>(a.seq) + 1u;
   const unsigned par = tag & 1u;
@@ -70,7 +70,7 @@ __global__ __launch_bounds__(32) void top1x_kernel(Top1Args a) {
     }
   }
   if (row < a.M) a.out[row] = static_cast<int64_t>(id);
-  __syncwarp();
+  __syncthreads();
   if (row == 0) *reinterpret_cast<volatile unsigned*>(a.seq) = tag;
 }
 }  // namespace
@@ -93,7 +93,7 @@ void sm70_top1x_out(torch::Tensor out, torch::Tensor pairs,
   a.seq = reinterpret_cast<unsigned*>(seq.data_ptr<int>());
   a.rank = static_cast<int>(rank);
   a.M = static_cast<int>(pairs.size(0));
-  TORCH_CHECK(a.M >= 1 && a.M <= kRows, "top1x supports 1..32 rows");
-  top1x_kernel<<<1, 32, 0, at::cuda::getCurrentCUDAStream()>>>(a);
+  TORCH_CHECK(a.M >= 1 && a.M <= kRows, "top1x supports 1..64 rows");
+  top1x_kernel<<<1, 64, 0, at::cuda::getCurrentCUDAStream()>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

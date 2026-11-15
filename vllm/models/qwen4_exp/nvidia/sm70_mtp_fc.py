@@ -12,6 +12,35 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _fc_add_all_gather(el: torch.Tensor, hl: torch.Tensor) -> torch.Tensor:
+    if el.is_cuda and 1 <= el.shape[0] <= 64 and el.shape[1] == 640:
+        try:
+            group = get_tp_group()
+            comm = getattr(group.device_communicator, "hc_ll_comm", None)
+        except (AssertionError, AttributeError, RuntimeError):
+            comm = None
+        if comm is not None and getattr(comm, "can_add_all_gather_fc", False):
+            out = comm.add_all_gather_fc(
+                el if el.is_contiguous() else el.contiguous(),
+                hl if hl.is_contiguous() else hl.contiguous(),
+            )
+            if out is not None:
+                return out
+    return tensor_model_parallel_all_gather(el.unsqueeze(-2) + hl).flatten(-2)
+
+
+def _fc_add_all_gather_fake(el: torch.Tensor, hl: torch.Tensor) -> torch.Tensor:
+    return el.new_empty((el.shape[0], 10240))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_fc_add_all_gather",
+    op_func=_fc_add_all_gather,
+    fake_impl=_fc_add_all_gather_fake,
+)
 
 
 @torch.compiler.assume_constant_result
@@ -65,6 +94,12 @@ def maybe_combine_fc(model, embedding, hidden):
     hl = model.fc_hidden.quant_method.apply(model.fc_hidden, h)
     # Addition commutes with the feature gather, with exactly the same FP16
     # rounding per element. Norms/projections and TP ownership are unchanged.
+    if (
+        el.is_cuda
+        and el.shape[-1] == 640
+        and tensor_model_parallel_all_gather.__module__.startswith("vllm.")
+    ):
+        return torch.ops.vllm.qwen38_sm70_fc_add_all_gather(el, hl)
     return tensor_model_parallel_all_gather(el.unsqueeze(-2) + hl).flatten(-2)
 
 
