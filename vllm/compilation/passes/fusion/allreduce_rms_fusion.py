@@ -40,6 +40,7 @@ from ..vllm_inductor_pass import (
     VllmPatternMatcherPass,
     VllmPatternReplacement,
 )
+from . import sm70_gemma_fusion as _gemma_fusion
 from .matcher_utils import MatcherQuantFP8
 
 FP8_DTYPE = current_platform.fp8_dtype()
@@ -531,11 +532,17 @@ class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
         dtype: torch.dtype,
         device: str | None,
         residual_dtype: torch.dtype,
+        collective: Any = None,
     ) -> None:
         super().__init__(dtype, device)
         self.epsilon = epsilon
         self.group_name = get_tp_group().unique_name
         self.residual_dtype = residual_dtype
+        self.collective = (
+            torch.ops.vllm.sm70_tp2_all_reduce_gemma_rms_norm
+            if collective is None
+            else collective
+        )
 
     def get_inputs(self) -> list[torch.Tensor]:
         residual = (
@@ -567,7 +574,16 @@ class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
             input: torch.Tensor,
             weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            return torch.ops.vllm.sm70_tp2_all_reduce_gemma_rms_norm(
+            if self.collective is torch.ops.vllm.all_reduce_gemma_rms_norm:
+                return self.collective(
+                    input,
+                    residual,
+                    weight,
+                    self.epsilon,
+                    self.group_name,
+                    False,
+                )
+            return self.collective(
                 input,
                 residual,
                 weight,
@@ -620,7 +636,12 @@ class Sm70PushGemmaRMSNormPattern(BasePattern):
 
         def replacement(input, residual, weight):
             return self.collective(
-                input, residual, weight, self.epsilon, group_name=self.group_name
+                input,
+                residual,
+                weight,
+                self.epsilon,
+                self.group_name,
+                False,
             )
 
         pm.register_replacement(
@@ -654,10 +675,16 @@ class Sm70Tp4LongPrefillFusedNormPattern(BasePattern):
         epsilon: float,
         dtype: torch.dtype,
         device: str | None,
+        collective: Any = None,
     ) -> None:
         super().__init__(dtype, device)
         self.epsilon = epsilon
         self.group_name = get_tp_group().unique_name
+        self.collective = (
+            torch.ops.vllm.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather
+            if collective is None
+            else collective
+        )
 
     def get_inputs(self) -> list[torch.Tensor]:
         return [
@@ -685,7 +712,16 @@ class Sm70Tp4LongPrefillFusedNormPattern(BasePattern):
             input: torch.Tensor,
             weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            return torch.ops.vllm.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+            if self.collective is torch.ops.vllm.all_reduce_gemma_rms_norm:
+                return self.collective(
+                    input,
+                    residual,
+                    weight,
+                    self.epsilon,
+                    self.group_name,
+                    False,
+                )
+            return self.collective(
                 input,
                 residual,
                 weight,
@@ -1110,6 +1146,10 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             else 0
         )
         self.sm70_tp4_total_matches = 0
+        self._closed_residual_model = _gemma_fusion.is_closed_residual_model(
+            config, self.hidden_dim, self.model_dtype
+        )
+        self._unified_gemma_mode = bool(self.sm70_tp4_push_mode or self.sm70_tp2_mode)
         self.sm70_mode = (
             self.sm70_tp2_mode or self.sm70_tp4_long_mode or self.sm70_tp4_push_mode
         )
@@ -1217,14 +1257,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
 
     @enable_fake_mode
     def register_sm70_patterns(self) -> None:
-        if self.sm70_tp4_push_mode or self.sm70_tp2_mode:
-            # Import registers the norm boundary even when the model is traced later.
-            import vllm.model_executor.layers.layernorm  # noqa: F401
-
-            Sm70PushGemmaRMSNormPattern(
-                self.model_dtype, self.device, self.sm70_norm_epsilon, self.tp_size
-            ).register(self.patterns)
-            self.disabled = False
+        if _gemma_fusion.register_unified_gemma_patterns(self):
             return
         if self.sm70_tp4_long_mode:
             Sm70Tp4LongPrefillFusedNormPattern(
@@ -1295,9 +1328,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         if self.disabled:
             logger.warning_once("AllReduce fusion pass is disabled.")
             return False
-        if getattr(self, "sm70_tp4_push_mode", False) or getattr(
-            self, "sm70_tp2_mode", False
-        ):
+        if getattr(self, "_unified_gemma_mode", False):
             # The SM70 replacement checks M=8 at runtime and preserves the
             # original collective/norm for other row counts. It is safe for
             # the mixed prefill/decode range, including the extra capture row.
@@ -1320,6 +1351,19 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             _sm70_tp4_expected_graph_matches(graph) if self.sm70_tp4_long_mode else 0
         )
         self.matched_count = self.patterns.apply(graph)
+        if getattr(self, "_unified_gemma_mode", False):
+            sharded_count = _gemma_fusion.mark_closed_residual_chain(
+                graph,
+                allow_piecewise_output=bool(
+                    getattr(self, "_closed_residual_model", False)
+                ),
+            )
+            if sharded_count > 0:
+                logger.debug(
+                    "TP%d marked %d closed-residual boundaries for RS+Norm+AG.",
+                    self.tp_size,
+                    sharded_count,
+                )
         if self.sm70_tp4_long_mode and self.matched_count != expected_graph_matches:
             if self.rank == 0:
                 logger.error(

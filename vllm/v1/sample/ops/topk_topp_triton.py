@@ -1497,14 +1497,15 @@ def apply_top_k_top_p_triton(
 
     # The pivot kernel can miss split ties in a single grammar-masked row.
     # Keep direct callers on the same reference route as the public sampler.
-    # Graph callers also need a route without a device-to-host fence.
-    if batch_size == 1 or (logits.is_cuda and torch.cuda.is_current_stream_capturing()):
+    if batch_size == 1:
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
         reference_logits = apply_top_k_top_p_pytorch(logits, k, p)
         if mask_value != float("-inf"):
             reference_logits.masked_fill_(torch.isneginf(reference_logits), mask_value)
         return reference_logits
+
+    capturing = bool(logits.is_cuda and torch.cuda.is_current_stream_capturing())
 
     # The Triton kernel supports arbitrary row strides, but it still assumes
     # the vocab dimension is laid out contiguously within each row.
@@ -1523,7 +1524,7 @@ def apply_top_k_top_p_triton(
     else:
         p_ptr = logits  # Dummy pointer (won't be read)
 
-    no_host_sync = bool(
+    no_host_sync = capturing or bool(
         logits.is_cuda
         and runtime is not None
         and getattr(runtime, "no_host_sync", False)
@@ -1543,6 +1544,16 @@ def apply_top_k_top_p_triton(
         )
         if compact is not None:
             return compact
+
+    # Graph callers cannot execute the non-compact Triton fence or allocate
+    # runtime.buffers inside stream capture; fall back before buffer setup.
+    if capturing:
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+        reference_logits = apply_top_k_top_p_pytorch(logits, k, p)
+        if mask_value != float("-inf"):
+            reference_logits.masked_fill_(torch.isneginf(reference_logits), mask_value)
+        return reference_logits
 
     num_sm = num_compute_units(logits.device.index)
     NUM_PROGRAMS = min(num_sm, batch_size)

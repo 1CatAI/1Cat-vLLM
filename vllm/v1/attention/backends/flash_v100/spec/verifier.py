@@ -23,7 +23,11 @@ from vllm.v1.attention.kv_codecs import (
 )
 from vllm.v1.attention.ops.sm70_e4m3_decode import wrap_e4m3_decode_attention
 from vllm.v1.attention.ops.sm70_grouped import (
+    GROUP_ROWS,
+    MAX_CONTEXT,
+    MAX_GROUPS_PER_CALL,
     grouped_e4m3_fp32_allowed,
+    grouped_e4m3_fp32_groups_allowed,
     grouped_fp16_fp32_reason,
 )
 
@@ -377,6 +381,310 @@ class VerificationExecutor:
             is None
         )
 
+    def dispatch_fp16_grouped(
+        self,
+        fp16_grouped,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        out: torch.Tensor,
+        partition_size_hint: int | None,
+    ) -> bool:
+        if getattr(fp16_grouped, "multi_kv_heads", False):
+            if (
+                grouped_fp16_fp32_reason(
+                    self.grouped_admission,
+                    query,
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seq_lens,
+                    attn_metadata,
+                    out=out,
+                    partition_size_hint=partition_size_hint,
+                )
+                is not None
+            ):
+                return False
+            fp16_grouped(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table,
+                seq_lens,
+                out=out,
+                softmax_scale=self.config.scale,
+            )
+        else:
+            kv_heads = per_kv_head_views(query, key_cache, value_cache, out)
+            if (
+                not kv_heads
+                or grouped_fp16_fp32_reason(
+                    self.grouped_admission,
+                    kv_heads[0].query,
+                    kv_heads[0].key,
+                    kv_heads[0].value,
+                    block_table,
+                    seq_lens,
+                    attn_metadata,
+                    out=kv_heads[0].out,
+                    partition_size_hint=partition_size_hint,
+                )
+                is not None
+            ):
+                return False
+            for head in kv_heads:
+                fp16_grouped(
+                    head.query,
+                    head.key,
+                    head.value,
+                    attn_metadata.block_table,
+                    seq_lens,
+                    out=head.out,
+                    softmax_scale=self.config.scale,
+                )
+                if head.out is not out:
+                    out[:, head.query_heads].copy_(head.out)
+        logger.info_once(
+            "FLASH_ATTN_V100 FP16 KV grouped verifier active "
+            "(FP32 probability/PV/numerator/max/sum, page=%d, KV heads=%d).",
+            key_cache.shape[1],
+            key_cache.shape[2],
+            scope="process",
+        )
+        _routing.record_route(
+            _routing.ROUTE_SPECS["prefill_smallq_fp16_grouped_fp32"].name
+        )
+        return True
+
+    def _try_eager_e4m3_grouped(
+        self,
+        grouped_op: Any,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        out: torch.Tensor,
+        max_seq_len_hint: int | None,
+        partition_size_hint: int | None,
+    ) -> bool:
+        from contextlib import suppress
+        from types import SimpleNamespace
+
+        parent_bt = getattr(attn_metadata, "block_table", None)
+        parent_seq = getattr(attn_metadata, "seq_lens", None)
+        if (
+            parent_bt is None
+            or parent_bt.ndim != 2
+            or key_cache.ndim != 4
+            or key_cache.shape[1] <= 0
+            or query.ndim != 3
+        ):
+            return False
+        page = int(key_cache.shape[1])
+        eff_max_seq = int(
+            max_seq_len_hint or getattr(attn_metadata, "max_seq_len", 0) or 0
+        )
+        # 1. Trim over-provisioned block_table columns on eager steps so models
+        #    loaded with max_model_len > 32K still take the Tensor Core grouped
+        #    FP32 route without graph bucket stamps (including >32K eager steps).
+        table_for_group = parent_bt
+        row_bt = block_table
+        eager_bucket: int | None = None
+        if eff_max_seq > 0:
+            cols = min(parent_bt.shape[1], max(1, (eff_max_seq + page - 1) // page))
+            if cols * page > MAX_CONTEXT:
+                eager_bucket = cols * page
+            if cols < parent_bt.shape[1]:
+                meta_any: Any = attn_metadata
+                cached_bt = getattr(meta_any, "_flash_v100_trimmed_bt", None)
+                if cached_bt is None or cached_bt[0] != cols:
+                    trimmed_parent = parent_bt[:, :cols].contiguous()
+                    trimmed_rows = (
+                        block_table[:, :cols].contiguous()
+                        if block_table is not None and block_table.ndim == 2
+                        else block_table
+                    )
+                    cached_bt = (cols, trimmed_parent, trimmed_rows)
+                    with suppress(AttributeError):
+                        meta_any._flash_v100_trimmed_bt = cached_bt
+                _, table_for_group, row_bt = cached_bt
+
+        from contextlib import contextmanager
+
+        from vllm.forward_context import (
+            BatchDescriptor,
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        @contextmanager
+        def _eager_bucket_scope(tokens: int):
+            if eager_bucket is None or not is_forward_context_available():
+                yield
+                return
+            ctx = get_forward_context()
+            prev = ctx.batch_descriptor
+            if prev is not None and prev.attention_context_bucket is not None:
+                yield
+                return
+            ctx.batch_descriptor = (
+                replace(prev, attention_context_bucket=eager_bucket)
+                if prev is not None
+                else BatchDescriptor(
+                    num_tokens=tokens, attention_context_bucket=eager_bucket
+                )
+            )
+            try:
+                yield
+            finally:
+                ctx.batch_descriptor = prev
+
+        if table_for_group is not parent_bt or eager_bucket is not None:
+            meta_proxy = SimpleNamespace(
+                block_table=table_for_group,
+                seq_lens=parent_seq,
+                causal=getattr(attn_metadata, "causal", True),
+                query_start_loc_cpu=getattr(attn_metadata, "query_start_loc_cpu", None),
+            )
+            with _eager_bucket_scope(int(query.shape[0])):
+                if grouped_e4m3_fp32_allowed(
+                    self.grouped_admission,
+                    query,
+                    key_cache,
+                    value_cache,
+                    row_bt,
+                    seq_lens,
+                    meta_proxy,
+                    out=out,
+                    partition_size_hint=partition_size_hint,
+                ):
+                    grouped_op(
+                        query,
+                        key_cache,
+                        value_cache,
+                        table_for_group,
+                        seq_lens,
+                        out=out,
+                        softmax_scale=self.config.scale,
+                        k_scale=float(layer._k_scale_float),
+                        v_scale=float(layer._v_scale_float),
+                    )
+                    _routing.log_fp8_kv_cache_route(
+                        "decode", self.config.kv_cache_dtype, "grouped_fp32"
+                    )
+                    _routing.record_route(
+                        _routing.ROUTE_SPECS["prefill_smallq_e4m3_grouped_fp32"].name
+                    )
+                    return True
+
+        # 2. Pack ragged small-query verification batches (e.g. mixed q=5 and
+        #    q=1 requests during concurrent ramp-up/completion) into 8-row
+        #    groups with zero-length padding rows so they never fall back to
+        #    scalar paged decode.
+        if partition_size_hint is not None:
+            return False
+        groups = int(table_for_group.shape[0])
+        rows = int(query.shape[0])
+        qsl_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+        if (
+            groups < 1
+            or qsl_cpu is None
+            or qsl_cpu.device.type != "cpu"
+            or qsl_cpu.numel() < groups + 1
+            or seq_lens.shape != (rows,)
+        ):
+            return False
+        meta_plan_holder: Any = attn_metadata
+        cached_plan: tuple[torch.Tensor, torch.Tensor] | None
+        if hasattr(meta_plan_holder, "_flash_v100_ragged_smallq_plan"):
+            cached_plan = meta_plan_holder._flash_v100_ragged_smallq_plan
+        else:
+            qsl = qsl_cpu[: groups + 1].tolist()
+            if qsl[0] != 0 or qsl[groups] != rows:
+                cached_plan = None
+            else:
+                q_lens = [qsl[i + 1] - qsl[i] for i in range(groups)]
+                if not q_lens or min(q_lens) < 1 or max(q_lens) > GROUP_ROWS:
+                    cached_plan = None
+                else:
+                    dst: list[int] = []
+                    for i, q_len in enumerate(q_lens):
+                        base = i * GROUP_ROWS
+                        dst.extend(range(base, base + q_len))
+                    dst_idx = torch.tensor(
+                        dst,
+                        dtype=torch.int64,
+                        device="cpu",
+                        pin_memory=query.device.type == "cuda",
+                    ).to(query.device, non_blocking=True)
+                    lengths_pad = torch.zeros(
+                        groups * GROUP_ROWS,
+                        dtype=torch.int32,
+                        device=seq_lens.device,
+                    )
+                    lengths_pad.index_copy_(0, dst_idx, seq_lens)
+                    cached_plan = (dst_idx, lengths_pad)
+            with suppress(AttributeError):
+                meta_plan_holder._flash_v100_ragged_smallq_plan = cached_plan
+        if cached_plan is None:
+            return False
+        dst_idx, lengths_pad = cached_plan
+        total_rows = groups * GROUP_ROWS
+        q_pad = query.new_zeros((total_rows, query.shape[1], query.shape[2]))
+        out_pad = torch.empty_like(q_pad)
+        causal = bool(getattr(attn_metadata, "causal", True))
+        chunks = [
+            (g0, min(g0 + MAX_GROUPS_PER_CALL, groups))
+            for g0 in range(0, groups, MAX_GROUPS_PER_CALL)
+        ]
+        with _eager_bucket_scope(total_rows):
+            for g0, g1 in chunks:
+                r0, r1 = g0 * GROUP_ROWS, g1 * GROUP_ROWS
+                if not grouped_e4m3_fp32_groups_allowed(
+                    self.grouped_admission,
+                    q_pad[r0:r1],
+                    key_cache,
+                    value_cache,
+                    table_for_group[g0:g1],
+                    lengths_pad[r0:r1],
+                    causal=causal,
+                    out=out_pad[r0:r1],
+                ):
+                    return False
+            q_pad.index_copy_(0, dst_idx, query)
+            k_scale = float(layer._k_scale_float)
+            v_scale = float(layer._v_scale_float)
+            for g0, g1 in chunks:
+                r0, r1 = g0 * GROUP_ROWS, g1 * GROUP_ROWS
+                grouped_op(
+                    q_pad[r0:r1],
+                    key_cache,
+                    value_cache,
+                    table_for_group[g0:g1],
+                    lengths_pad[r0:r1],
+                    out=out_pad[r0:r1],
+                    softmax_scale=self.config.scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+        out.copy_(out_pad.index_select(0, dst_idx))
+        _routing.log_fp8_kv_cache_route(
+            "decode", self.config.kv_cache_dtype, "grouped_fp32"
+        )
+        _routing.record_route(
+            _routing.ROUTE_SPECS["prefill_smallq_e4m3_grouped_fp32"].name
+        )
+        return True
+
     def call_smallq_decode_paged(
         self,
         layer: torch.nn.Module,
@@ -393,48 +701,17 @@ class VerificationExecutor:
         partition_size_hint: int | None,
     ) -> None:
         fp16_grouped = self.ops.fp16_grouped
-        kv_heads = (
-            per_kv_head_views(query, key_cache, value_cache, out)
-            if fp16_grouped is not None
-            else ()
-        )
-        if (
-            kv_heads
-            and grouped_fp16_fp32_reason(
-                self.grouped_admission,
-                kv_heads[0].query,
-                kv_heads[0].key,
-                kv_heads[0].value,
-                block_table,
-                seq_lens,
-                attn_metadata,
-                out=kv_heads[0].out,
-                partition_size_hint=partition_size_hint,
-            )
-            is None
+        if fp16_grouped is not None and self.dispatch_fp16_grouped(
+            fp16_grouped,
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            attn_metadata,
+            out=out,
+            partition_size_hint=partition_size_hint,
         ):
-            for head in kv_heads:
-                fp16_grouped(
-                    head.query,
-                    head.key,
-                    head.value,
-                    attn_metadata.block_table,
-                    seq_lens,
-                    out=head.out,
-                    softmax_scale=self.config.scale,
-                )
-                if head.out is not out:
-                    out[:, head.query_heads].copy_(head.out)
-            logger.info_once(
-                "FLASH_ATTN_V100 FP16 KV grouped verifier active "
-                "(FP32 probability/PV/numerator/max/sum, page=%d, KV heads=%d).",
-                key_cache.shape[1],
-                key_cache.shape[2],
-                scope="process",
-            )
-            _routing.record_route(
-                _routing.ROUTE_SPECS["prefill_smallq_fp16_grouped_fp32"].name
-            )
             return
         grouped_op = self.ops.e4m3_grouped
         if grouped_op is not None and grouped_e4m3_fp32_allowed(
@@ -474,6 +751,24 @@ class VerificationExecutor:
             _routing.record_route(
                 _routing.ROUTE_SPECS["prefill_smallq_e4m3_grouped_fp32"].name
             )
+            return
+        if (
+            grouped_op is not None
+            and not _routing.is_cuda_graph_capturing(query)
+            and self._try_eager_e4m3_grouped(
+                grouped_op,
+                layer,
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens,
+                attn_metadata,
+                out=out,
+                max_seq_len_hint=max_seq_len_hint,
+                partition_size_hint=partition_size_hint,
+            )
+        ):
             return
         window_size = self.ops.window_size(causal=True)
         if self.admit_xqa(

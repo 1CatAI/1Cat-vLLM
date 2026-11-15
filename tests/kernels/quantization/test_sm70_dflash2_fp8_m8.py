@@ -89,3 +89,29 @@ def test_head_and_convolution_shapes_are_not_quantized():
         layer._sm70_dflash2_fp8_m8 = True
         assert not prepare_dflash2_fp8_m8(layer)
         assert not hasattr(layer, "_sm70_dflash2_fp8_codes")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "n,k",
+    [(3072, 5120), (5120, 2048), (17408, 5120), (5120, 8704)],
+)
+@torch.inference_mode()
+def test_tp2_dflash2_shapes_prepare_and_match_fp16(n: int, k: int):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 is required")
+    torch.manual_seed(20261115)
+    layer = torch.nn.Linear(k, n, bias=False, device="cuda", dtype=torch.float16)
+    w_fp32 = layer.weight.detach().float()
+    w_scale = (w_fp32.abs().amax(dim=1, keepdim=True) / 448.0).clamp_min(1e-12)
+    w_qref = (w_fp32 / w_scale).to(torch.float8_e4m3fn).float() * w_scale
+    layer._sm70_dflash2_fp8_m8 = True
+    assert prepare_dflash2_fp8_m8(layer)
+    for rows in (8, 16, 24, 32):
+        x = torch.randn(rows, k, device="cuda", dtype=torch.float16) * 0.1
+        out = apply_dflash2_fp8_m8(layer, x, None)
+        assert out is not None and out.shape == (rows, n)
+        ref_q = F.linear(x.float(), w_qref)
+        ref_fp16 = F.linear(x.float(), w_fp32)
+        assert ((out.float() - ref_q).norm() / ref_q.norm()).item() < 2e-3
+        assert ((out.float() - ref_fp16).norm() / ref_fp16.norm()).item() < 3.5e-2

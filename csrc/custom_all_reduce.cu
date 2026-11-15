@@ -613,11 +613,14 @@ void sm70_all_reduce_gemma_rms_norm_impl(
   // The push path consumes the original pointer directly, including in graphs.
   // Legacy pull paths still require IPC registration or a staging copy.
   const bool push_norm =
-      kWorldSize == 4 && fa->fully_connected_ &&
-      fa->sm70_tp4_push_buffers_registered_ &&
-      (inp.size(0) == 8 ||
-       (!benchmark_reference && (fa->sm70_push_norm_mtp_ready(inp.size(0)) ||
-                                 fa->sm70_push_norm_batch_ready(inp.size(0)))));
+      (kWorldSize == 2 && !benchmark_reference &&
+       residual.scalar_type() == at::ScalarType::Float &&
+       fa->sm70_tp2_push_norm_ready(inp.size(0))) ||
+      (kWorldSize == 4 && fa->fully_connected_ &&
+       fa->sm70_tp4_push_buffers_registered_ &&
+       (inp.size(0) == 8 || (!benchmark_reference &&
+                             (fa->sm70_push_norm_mtp_ready(inp.size(0)) ||
+                              fa->sm70_push_norm_batch_ready(inp.size(0))))));
   if (push_norm) {
     reg_buffer = inp.data_ptr();
   } else if (reg_buffer) {
@@ -756,14 +759,14 @@ void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
     torch::Tensor& weight, torch::Tensor& normalized_out,
     torch::Tensor& residual_out, fptr_t _reg_input_buffer,
     fptr_t _reg_output_buffer, int64_t reg_buffer_sz_bytes, double epsilon) {
-  constexpr int64_t kWorldSize = 4;
   constexpr int64_t kHiddenSize = vllm::kSm70GemmaRmsNormHiddenSize;
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
 
-  TORCH_CHECK_EQ(fa->world_size_, kWorldSize);
-  TORCH_CHECK(fa->fully_connected_);
+  const int64_t world_size = fa->world_size_;
+  TORCH_CHECK(world_size == 2 || world_size == 4);
+  TORCH_CHECK(world_size == 2 || fa->fully_connected_);
   TORCH_CHECK_EQ(inp.scalar_type(), at::ScalarType::Half);
   TORCH_CHECK_EQ(residual.scalar_type(), at::ScalarType::Float);
   TORCH_CHECK(weight.scalar_type() == at::ScalarType::Half ||
@@ -772,8 +775,8 @@ void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
   TORCH_CHECK_EQ(residual_out.scalar_type(), at::ScalarType::Float);
   TORCH_CHECK_EQ(inp.dim(), 2);
   TORCH_CHECK_EQ(inp.size(1), kHiddenSize);
-  TORCH_CHECK_EQ(inp.size(0) % kWorldSize, 0);
-  TORCH_CHECK_LE(inp.size(0) / kWorldSize,
+  TORCH_CHECK_EQ(inp.size(0) % world_size, 0);
+  TORCH_CHECK_LE(inp.size(0) / world_size,
                  vllm::kSm70LongPrefillMaxTokensPerRank);
   TORCH_CHECK(residual.sizes() == inp.sizes());
   TORCH_CHECK(normalized_out.sizes() == inp.sizes());
@@ -810,16 +813,30 @@ void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
   auto* residual_out_ptr = reinterpret_cast<float*>(residual_out.data_ptr());
   const int num_tokens = static_cast<int>(inp.size(0));
   const float epsilon_f = static_cast<float>(epsilon);
-  if (weight.scalar_type() == at::ScalarType::Float) {
-    fa->sm70_reduce_scatter_gemma_rms_norm_all_gather<4, float, float>(
-        stream, input_ptr, shared_output_ptr, residual_ptr,
-        reinterpret_cast<const float*>(weight.data_ptr()), residual_out_ptr,
-        num_tokens, kHiddenSize, epsilon_f);
+  if (world_size == 2) {
+    if (weight.scalar_type() == at::ScalarType::Float) {
+      fa->sm70_reduce_scatter_gemma_rms_norm_all_gather<2, float, float>(
+          stream, input_ptr, shared_output_ptr, residual_ptr,
+          reinterpret_cast<const float*>(weight.data_ptr()), residual_out_ptr,
+          num_tokens, kHiddenSize, epsilon_f);
+    } else {
+      fa->sm70_reduce_scatter_gemma_rms_norm_all_gather<2, float, half>(
+          stream, input_ptr, shared_output_ptr, residual_ptr,
+          reinterpret_cast<const half*>(weight.data_ptr()), residual_out_ptr,
+          num_tokens, kHiddenSize, epsilon_f);
+    }
   } else {
-    fa->sm70_reduce_scatter_gemma_rms_norm_all_gather<4, float, half>(
-        stream, input_ptr, shared_output_ptr, residual_ptr,
-        reinterpret_cast<const half*>(weight.data_ptr()), residual_out_ptr,
-        num_tokens, kHiddenSize, epsilon_f);
+    if (weight.scalar_type() == at::ScalarType::Float) {
+      fa->sm70_reduce_scatter_gemma_rms_norm_all_gather<4, float, float>(
+          stream, input_ptr, shared_output_ptr, residual_ptr,
+          reinterpret_cast<const float*>(weight.data_ptr()), residual_out_ptr,
+          num_tokens, kHiddenSize, epsilon_f);
+    } else {
+      fa->sm70_reduce_scatter_gemma_rms_norm_all_gather<4, float, half>(
+          stream, input_ptr, shared_output_ptr, residual_ptr,
+          reinterpret_cast<const half*>(weight.data_ptr()), residual_out_ptr,
+          num_tokens, kHiddenSize, epsilon_f);
+    }
   }
   if (_reg_output_buffer != 0) {
     AT_CUDA_CHECK(cudaMemcpyAsync(normalized_out.data_ptr(), reg_output_buffer,
@@ -1402,6 +1419,10 @@ void dispose(fptr_t _fa) {
 
 int64_t meta_size() { return sizeof(vllm::Signal); }
 
+int64_t sm70_tp2_push_allreduce_buffer_size() {
+  return vllm::kSm70Tp2PushAllreduceBufferBytes;
+}
+
 int64_t sm70_tp4_push_allreduce_buffer_size() {
   return vllm::kSm70Tp4PushAllreduceBufferBytes;
 }
@@ -1418,6 +1439,19 @@ void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
     ipc_ptrs[i] = reinterpret_cast<void*>(fake_ipc_ptrs[i]);
   }
   fa->register_buffer(ipc_ptrs);
+}
+
+void register_sm70_tp2_push_allreduce_buffer(
+    fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK_EQ(fake_ipc_ptrs.size(),
+                 static_cast<size_t>(vllm::kSm70Tp2PushAllreduceWorldSize));
+  TORCH_CHECK_EQ(fake_ipc_ptrs.size(), static_cast<size_t>(fa->world_size_));
+  void* ipc_ptrs[vllm::kSm70Tp2PushAllreduceWorldSize];
+  for (size_t peer = 0; peer < fake_ipc_ptrs.size(); ++peer) {
+    ipc_ptrs[peer] = reinterpret_cast<void*>(fake_ipc_ptrs[peer]);
+  }
+  fa->register_sm70_tp2_push_buffer(ipc_ptrs);
 }
 
 void register_sm70_tp4_push_allreduce_buffer(

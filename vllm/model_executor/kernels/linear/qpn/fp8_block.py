@@ -37,17 +37,56 @@ from vllm.model_executor.kernels.linear.sm70_provider import (
     flatten_linear_input,
     restore_linear_output,
 )
+from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
 )
 from vllm.platforms import current_platform
 
-# Block-scale QPN8 single-tile GEMM bound; M=9..40 uses native two-phase/chunked
-# QPN8 when the optional second TurboMind layout is omitted.
+# Block-scale QPN8 single-tile GEMM bound; M=9..40 uses native two-phase
+# QPN8, and M=41..128 uses 32-row native QPN8 blocks when the optional second
+# TurboMind layout is omitted.
 _QPN8_MAX_M = 8
 _QPN8_BATCH_NATIVE_MAX_M = 40
+_QPN8_ROW_BLOCK = 32
+_QPN8_ROW_BLOCKS_MAX = 128
 _turbomind_headroom_cache: dict[tuple[int, int], bool] = {}
+_block_qpn8_prefill_workspaces: dict[tuple[int, int], torch.Tensor] = {}
 logger = init_logger(__name__)
+
+
+def _ensure_block_qpn8_prefill_workspace(
+    device: torch.device,
+    needed_elements: int,
+) -> torch.Tensor:
+    dev_idx = (
+        device.index
+        if device.index is not None
+        else torch.accelerator.current_device_index()
+    )
+    pool = sm70_layer_workspaces.workspace_pool(
+        "_block_qpn8_prefill_workspaces", _block_qpn8_prefill_workspaces
+    )
+    primary_key = (dev_idx, -1)
+    primary_stream_key = (dev_idx, -2)
+    stream_id = int(torch.cuda.current_stream(device).cuda_stream)
+    if torch.cuda.is_current_stream_capturing():
+        primary = pool.get(primary_key)
+        if primary is not None and primary.numel() >= needed_elements:
+            return primary
+        return torch.empty((needed_elements,), dtype=torch.float16, device=device)
+
+    bound_stream = pool.get(primary_stream_key)
+    if bound_stream is None:
+        pool[primary_stream_key] = stream_id  # type: ignore[assignment]
+        bound_stream = stream_id
+    key = primary_key if stream_id == bound_stream else (dev_idx, stream_id)
+    buf = pool.get(key)
+    if isinstance(buf, torch.Tensor) and buf.numel() >= needed_elements:
+        return buf
+    buf = torch.empty((needed_elements,), dtype=torch.float16, device=device)
+    pool[key] = buf
+    return buf
 
 
 def _qpn8_native_linear_write(
@@ -98,30 +137,57 @@ def _qpn8_native_linear_write(
             False,
         )
         return
-    if x.shape[0] <= _QPN8_BATCH_NATIVE_MAX_M and current_platform.is_device_capability(
-        70
-    ):
+    if x.shape[0] <= _QPN8_ROW_BLOCKS_MAX and current_platform.is_device_capability(70):
+        batch_split_k = 16 if (split_k == 8 and k_dim % 256 == 0) else split_k
         if (
-            split_k in (12, 16)
-            and accumulator_chains == 2
-            and not prefetch_codes
-            and k_dim % (16 * split_k) == 0
+            batch_split_k in (12, 16)
+            and k_dim % (16 * batch_split_k) == 0
             and n_dim % 128 == 0
             and hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out")
         ):
-            torch.ops._C.fp8_qpn8_block_native_sm70_out(
-                out,
-                x,
-                codes,
-                group_scales,
-                split_k,
-                0,
-                False,
-                False,
-            )
+            if x.shape[0] <= _QPN8_BATCH_NATIVE_MAX_M:
+                torch.ops._C.fp8_qpn8_block_native_sm70_out(
+                    out,
+                    x,
+                    codes,
+                    group_scales,
+                    batch_split_k,
+                    0,
+                    False,
+                    False,
+                )
+                return
+            for row in range(0, x.shape[0], _QPN8_ROW_BLOCK):
+                end = min(row + _QPN8_ROW_BLOCK, x.shape[0])
+                chunk_rows = end - row
+                if chunk_rows <= _QPN8_MAX_M:
+                    call_native(
+                        sm70_ops.fp8_qpn8_gemm_sm70_out,
+                        native_policy,
+                        out[row:end],
+                        x[row:end],
+                        codes,
+                        group_scales,
+                        split_k,
+                        accumulator_chains,
+                        True,
+                        prefetch_codes,
+                    )
+                else:
+                    torch.ops._C.fp8_qpn8_block_native_sm70_out(
+                        out[row:end],
+                        x[row:end],
+                        codes,
+                        group_scales,
+                        batch_split_k,
+                        0,
+                        False,
+                        False,
+                    )
             return
         if (
-            split_k in (4, 8, 12, 16, 32)
+            x.shape[0] <= _QPN8_BATCH_NATIVE_MAX_M
+            and split_k in (4, 8, 12, 16, 32)
             and accumulator_chains in (1, 2)
             and (split_k != 12 or (accumulator_chains == 2 and not prefetch_codes))
             and k_dim % (16 * split_k) == 0
@@ -142,7 +208,7 @@ def _qpn8_native_linear_write(
                     prefetch_codes,
                 )
             return
-    dense = torch.empty((k_dim * n_dim,), dtype=torch.float16, device=x.device)
+    dense = _ensure_block_qpn8_prefill_workspace(x.device, k_dim * n_dim)
     call_native(
         sm70_ops.fp8_qpn8_prefill_sm70_out,
         native_policy,
@@ -274,25 +340,72 @@ def _qpn8_native_gated_silu(
         )
         return out
     if (
-        x.shape[0] <= _QPN8_BATCH_NATIVE_MAX_M
-        and split_k == 8
+        x.shape[0] <= _QPN8_ROW_BLOCKS_MAX
+        and fallback_weight is None
         and k_dim % 128 == 0
         and n_dim % 256 == 0
         and current_platform.is_device_capability(70)
         and hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out")
     ):
-        torch.ops._C.fp8_qpn8_block_native_sm70_out(
-            out,
-            x,
-            codes,
-            group_scales,
-            8,
-            0,
-            False,
-            True,
-        )
+        if x.shape[0] <= _QPN8_BATCH_NATIVE_MAX_M:
+            torch.ops._C.fp8_qpn8_block_native_sm70_out(
+                out,
+                x,
+                codes,
+                group_scales,
+                8,
+                0,
+                False,
+                True,
+            )
+            return out
+        for row in range(0, x.shape[0], _QPN8_ROW_BLOCK):
+            end = min(row + _QPN8_ROW_BLOCK, x.shape[0])
+            chunk_rows = end - row
+            if chunk_rows <= _QPN8_MAX_M:
+                call_native(
+                    sm70_ops.fp8_qpn8_gated_pair_sm70_out,
+                    native_policy,
+                    out[row:end],
+                    x[row:end],
+                    codes,
+                    group_scales,
+                    split_k,
+                    accumulator_chains,
+                    True,
+                    prefetch_codes,
+                )
+            else:
+                torch.ops._C.fp8_qpn8_block_native_sm70_out(
+                    out[row:end],
+                    x[row:end],
+                    codes,
+                    group_scales,
+                    8,
+                    0,
+                    False,
+                    True,
+                )
         return out
     if fallback_weight is not None:
+        if (
+            x.shape[0] <= _QPN8_BATCH_NATIVE_MAX_M
+            and k_dim % 128 == 0
+            and n_dim % 256 == 0
+            and current_platform.is_device_capability(70)
+            and hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out")
+        ):
+            torch.ops._C.fp8_qpn8_block_native_sm70_out(
+                out,
+                x,
+                codes,
+                group_scales,
+                8,
+                0,
+                False,
+                True,
+            )
+            return out
         gate_up = x.new_empty((x.shape[0], n_dim))
         call_native(
             sm70_ops.fp8_gemm_sm70_out,
@@ -308,7 +421,7 @@ def _qpn8_native_gated_silu(
         )
         torch.ops._C.silu_and_mul(out, gate_up)
         return out
-    dense = torch.empty((k_dim * n_dim,), dtype=torch.float16, device=x.device)
+    dense = _ensure_block_qpn8_prefill_workspace(x.device, k_dim * n_dim)
     call_native(
         sm70_ops.fp8_qpn8_prefill_sm70_out,
         native_policy,
@@ -529,9 +642,12 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
                 "to hold one layout and use the FP16 prefill instead."
             )
         else:
+            if codes.is_cuda and not torch.cuda.is_current_stream_capturing():
+                _ensure_block_qpn8_prefill_workspace(codes.device, k_dim * n_dim)
             logger.info_once(
-                "Block FP8 QPN8 native GEMM supports M=1..40; larger M uses the "
-                "FP16 prefill, which needs no second copy of the weights."
+                "Block FP8 QPN8 native GEMM supports M=1..128; larger M uses a "
+                "reusable FP16 prefill workspace, which needs no second copy of "
+                "the weights."
             )
         layer._qpn8_out_features = n
         layer._qpn8_cfg = _sm70_fp8_qpn8_config(k_dim, n_dim, False)

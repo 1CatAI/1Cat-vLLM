@@ -189,6 +189,12 @@ _SM70_CHANNEL_FP8_QPN8_CONFIGS = {
     (1536, 5120): (12, 2, False),
     (5120, 8704): (16, 2, False),
     (4352, 5120): (16, 2, False),
+    # TP=2 / unsharded local projection shapes for 5120-wide GDN + GQA models:
+    (5120, 8192): (16, 2, False),
+    (5120, 7168): (16, 2, False),
+    (3072, 5120): (16, 2, False),
+    (8704, 5120): (16, 2, False),
+    (5120, 17408): (16, 2, False),
 }
 _SM70_CHANNEL_FP8_QPN8_GATED_CONFIG = (8, 2, False)
 
@@ -412,14 +418,9 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                     qpn8_codes, qpn8_scales = self.native_ops.fp8_qpn8_prepare_sm70(
                         layer.weight, weight_scale
                     )
-                    policy = capture_sm70_dflash2_config()
-                    native_only = bool(
-                        policy is not None
-                        and policy.qualified
-                        and sm70_tm.use_native_qpn_layouts()
-                        and current_platform.is_device_capability(70)
+                    batch_tm = sm70_tm.should_prepare_channel_qpn8_batch_tm(
+                        linear_policy, platform=current_platform
                     )
-                    batch_tm = sm70_tm.use_batched_gemm_layouts() and not native_only
                     if batch_tm:
                         gated = (
                             getattr(layer, "prefix", "").rsplit(".", 1)[-1]
@@ -460,6 +461,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                     replace_parameter(layer, "weight", qpn8_codes)
                     del layer._parameters["weight_scale"]
                     replace_parameter(layer, "weight_scale_inv", qpn8_scales)
+                    sm70_tm.attach_channel_qpn8_prefill_workspace(layer, workspace)
                     split_k, nacc, prefetch = qpn8_config
                     layer.input_scale = None
                     layer.sm70_fp8_turbomind = True

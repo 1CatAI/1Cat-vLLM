@@ -41,7 +41,40 @@ def use_sm70_decode_graph_semantics(policy=None) -> bool:
     return not policy.dual_compile or is_sm70_decode_graph_compiling()
 
 
+@contextmanager
+def cudagraph_capture_stream_workspace_scope(
+    device: torch.device,
+    get_capture_context,
+) -> Generator[None, None, None]:
+    long_workspaces = None
+    default_stream_id = None
+    capture_stream_id = None
+    if device.type == "cuda":
+        from vllm.v1.attention.ops import sm70_grouped_long
+
+        long_workspaces = sm70_grouped_long._WORKSPACES
+        default_stream_id = torch.cuda.default_stream(device).cuda_stream
+        capture_stream_id = get_capture_context().stream.cuda_stream
+        if default_stream_id != capture_stream_id:
+            for key, bank in list(long_workspaces.items()):
+                if len(key) == 5 and key[3] == device and key[4] == default_stream_id:
+                    long_workspaces.setdefault((*key[:4], capture_stream_id), bank)
+    try:
+        yield
+    finally:
+        if (
+            long_workspaces is not None
+            and default_stream_id is not None
+            and capture_stream_id is not None
+            and default_stream_id != capture_stream_id
+        ):
+            for key, bank in list(long_workspaces.items()):
+                if len(key) == 5 and key[3] == device and key[4] == capture_stream_id:
+                    long_workspaces.setdefault((*key[:4], default_stream_id), bank)
+
+
 __all__ = [
+    "cudagraph_capture_stream_workspace_scope",
     "is_sm70_decode_graph_compiling",
     "sm70_decode_graph_compilation",
     "use_sm70_decode_graph_semantics",

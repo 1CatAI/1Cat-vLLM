@@ -52,6 +52,29 @@ def _is_sm70_mtp_verifier_contract(
     )
 
 
+def _is_sm70_qwen35_collective_contract(
+    model_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """Admit 5120-wide FP16 Qwen3.5/3.8 residual-norm collective fusion across TP."""
+    if model_config is None or parallel_config is None:
+        return False
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    return bool(
+        architectures & {"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"}
+        and getattr(model_config, "dtype", None) == torch.float16
+        and getattr(hf_text_config, "hidden_size", None) == 5120
+        and getattr(hf_text_config, "num_attention_heads", None) == 24
+        and getattr(hf_text_config, "num_key_value_heads", None) == 4
+        and getattr(hf_text_config, "head_dim", None) == 256
+        and getattr(parallel_config, "tensor_parallel_size", 0) in (2, 4)
+        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+    )
+
+
 def _configure_sm70_dflash2_graph_cache(
     model_config: Any,
     speculative_config: Any,
@@ -290,17 +313,52 @@ def apply_runtime_defaults(cfg, defaults, phase: str, *, is_sm70: bool):
     defaults.phase = f"model.{phase}"
     if phase == "verifier":
         args = (cfg.model_config, cfg.speculative_config, cfg.parallel_config)
+        if (
+            is_sm70
+            and cfg.speculative_config is None
+            and cfg.model_config is not None
+            and cfg.model_config.quantization in ("fp8", "compressed-tensors")
+            and cfg.kernel_config.sm70_fp8.qpn8 is None
+            and "VLLM_SM70_FP8_QPN8" not in defaults
+        ):
+            hf_text = getattr(cfg.model_config, "hf_text_config", None)
+            architectures = set(getattr(cfg.model_config, "architectures", ()) or ())
+            if (
+                architectures
+                & {
+                    "Qwen3_5ForCausalLM",
+                    "Qwen3_5ForConditionalGeneration",
+                    "Qwen4ExpForCausalLM",
+                    "Qwen4ExpForConditionalGeneration",
+                }
+                and getattr(cfg.model_config, "dtype", None) == torch.float16
+                and getattr(hf_text, "hidden_size", None) in (2560, 5120)
+                and cfg.parallel_config.pipeline_parallel_size == 1
+                and not cfg.parallel_config.enable_dbo
+            ):
+                cfg.kernel_config.sm70_fp8.qpn8 = True
         return {
             "qualified": is_sm70 and _is_sm70_dflash2_verifier_contract(*args),
             "mtp_qualified": is_sm70 and _is_sm70_mtp_verifier_contract(*args),
         }
     if phase == "collectives":
         args = (cfg.model_config, cfg.speculative_config, cfg.parallel_config)
-        if is_sm70 and _is_sm70_mtp_verifier_contract(*args):
+        if is_sm70 and (
+            _is_sm70_mtp_verifier_contract(*args)
+            or _is_sm70_qwen35_collective_contract(
+                cfg.model_config, cfg.parallel_config
+            )
+        ):
             # The model's opaque FP32-residual norm has the same contract on
             # every admitted shard. The pass checks the active communicator;
             # explicit typed/legacy overrides keep their normal precedence.
             defaults.setdefault("VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION", "1")
+            compile_graph = getattr(
+                cfg.compilation_config.runtime, "compile_graph", None
+            )
+            if compile_graph is not False:
+                defaults.setdefault("VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE", "1")
+        if is_sm70 and _is_sm70_mtp_verifier_contract(*args):
             # Keep M=1..B draft graphs independent of verifier query width so
             # single-request draft steps run at exact M=1 instead of M=q and
             # concurrent draft steps capture up to max_num_seqs.

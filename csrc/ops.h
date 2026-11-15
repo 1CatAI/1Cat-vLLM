@@ -256,6 +256,12 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
                                   int64_t accumulator_chains, bool fast_decoder,
                                   bool prefetch_codes);
 
+void fp8_qpn8_block_native_sm70_out(torch::Tensor out, torch::Tensor input,
+                                    torch::Tensor codes,
+                                    torch::Tensor group_scales, int64_t split_k,
+                                    int64_t k_unroll, bool packed_input,
+                                    bool gated);
+
 void fp8_qpn8_hc_dispatch_sm70_out(
     torch::Tensor block_out, torch::Tensor injection_out,
     torch::Tensor down_staging, torch::Tensor lora_staging,
@@ -911,9 +917,12 @@ void tile_runtime_wait_reduce(fptr_t _fa, torch::Tensor& staging,
                               int64_t reducer_blocks);
 void dispose(fptr_t _fa);
 int64_t meta_size();
+int64_t sm70_tp2_push_allreduce_buffer_size();
 int64_t sm70_tp4_push_allreduce_buffer_size();
 int64_t sm70_tp8_hierarchical_push_allreduce_buffer_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
+void register_sm70_tp2_push_allreduce_buffer(
+    fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 void register_sm70_tp4_push_allreduce_buffer(
     fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 void register_sm70_tp8_hierarchical_push_allreduce_buffer(

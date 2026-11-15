@@ -33,12 +33,21 @@ def _norm_rope_cache(
     NUM_SLOTS: tl.constexpr,
     CACHE_ROWS: tl.constexpr,
     CACHE_TOKENS: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
+    q_width: tl.constexpr = NUM_Q_HEADS * 128
+    kv_width: tl.constexpr = NUM_KV_HEADS * 128
+    v_offset: tl.constexpr = q_width + kv_width
     lanes = tl.arange(0, 16)
     variance = tl.full((16,), 0, tl.float32)
-    base = tl.where(head < 8, head * 128, 1024 + (head - 8) * 128)
+    base = tl.where(
+        head < NUM_Q_HEADS,
+        head * 128,
+        q_width + (head - NUM_Q_HEADS) * 128,
+    )
     for part in tl.static_range(8):
         offset = lanes * 8 + part
         value = tl.load(QKV + row * QKV_STRIDE + base + offset).to(tl.float32)
@@ -46,8 +55,8 @@ def _norm_rope_cache(
     inv = tl.rsqrt(tl.sum(variance, 0) / 128 + EPS)
     d = tl.arange(0, 128)
     mate = (d + 64) % 128
-    weight = tl.load(tl.where(head < 8, QW, KW) + d).to(tl.float32)
-    mate_weight = tl.load(tl.where(head < 8, QW, KW) + mate).to(tl.float32)
+    weight = tl.load(tl.where(head < NUM_Q_HEADS, QW, KW) + d).to(tl.float32)
+    mate_weight = tl.load(tl.where(head < NUM_Q_HEADS, QW, KW) + mate).to(tl.float32)
     value = (
         (tl.load(QKV + row * QKV_STRIDE + base + d).to(tl.float32) * inv * weight)
         .to(tl.float16)
@@ -72,11 +81,11 @@ def _norm_rope_cache(
         tl.float32
     )
     rotated = value * cosine + tl.where(d < 64, -other, other) * sine
-    if head < 8:
-        tl.store(Q + row * 1024 + head * 128 + d, rotated)
+    if head < NUM_Q_HEADS:
+        tl.store(Q + row * q_width + head * 128 + d, rotated)
     else:
-        kv_head = head - 8
-        tl.store(K + row * 256 + kv_head * 128 + d, rotated)
+        kv_head = head - NUM_Q_HEADS
+        tl.store(K + row * kv_width + kv_head * 128 + d, rotated)
         if STORE_CACHE:
             slot = tl.load(SLOTS + row, row < NUM_SLOTS, other=-1)
             page = slot // PAGE
@@ -86,7 +95,7 @@ def _norm_rope_cache(
                 rotated,
                 (slot >= 0) & (slot < CACHE_TOKENS),
             )
-            val = tl.load(QKV + row * QKV_STRIDE + 1280 + kv_head * 128 + d)
+            val = tl.load(QKV + row * QKV_STRIDE + v_offset + kv_head * 128 + d)
             tl.store(
                 CACHE_V + page * CV_BLOCK + token * CV_TOKEN + kv_head * CV_HEAD + d,
                 val,
@@ -107,10 +116,18 @@ def qk_norm_rope_cache(
     k_out=None,
     epsilon=1e-6,
 ):
-    q = q_out if q_out is not None else raw.new_empty((raw.shape[0], 1024))
-    k = k_out if k_out is not None else raw.new_empty((raw.shape[0], 256))
     store_cache = key_cache is not None
-    _norm_rope_cache[(raw.shape[0], 10)](
+    if q_out is not None and k_out is not None:
+        q = q_out
+        k = k_out
+    else:
+        kv_width = key_cache.shape[2] * 128 if store_cache else raw.shape[1] // 6
+        q_width = raw.shape[1] - 2 * kv_width
+        q = q_out if q_out is not None else raw.new_empty((raw.shape[0], q_width))
+        k = k_out if k_out is not None else raw.new_empty((raw.shape[0], kv_width))
+    num_q_heads = q.shape[1] // 128
+    num_kv_heads = k.shape[1] // 128
+    _norm_rope_cache[(raw.shape[0], num_q_heads + num_kv_heads)](
         raw,
         q,
         k,
@@ -130,6 +147,8 @@ def qk_norm_rope_cache(
         slots.numel() if store_cache else 0,
         cos_sin.shape[0],
         key_cache.shape[0] * key_cache.shape[1] if store_cache else 0,
+        NUM_Q_HEADS=num_q_heads,
+        NUM_KV_HEADS=num_kv_heads,
         num_warps=4,
         enable_fp_fusion=False,
     )
@@ -154,6 +173,8 @@ def sm70_dflash2_qk_norm_rope_cache(
     )
 
     _, layer, kv_cache, slots = get_attention_context(_resolve_layer_name(layer_name))
+    num_kv_heads = k_out.shape[1] // 128
+    v_offset = q_out.shape[1] + k_out.shape[1]
     cache_args = {}
     if slots is not None and kv_cache.numel() > 0:
         kc, vc = _split_paged_kv_cache(kv_cache)
@@ -161,7 +182,7 @@ def sm70_dflash2_qk_norm_rope_cache(
             kc.dtype == vc.dtype == torch.float16
             and kc.ndim == vc.ndim == 4
             and kc.shape == vc.shape
-            and kc.shape[2:] == (2, 128)
+            and kc.shape[2:] == (num_kv_heads, 128)
             and kc.stride(3) == vc.stride(3) == 1
             and slots.ndim == 1
             and slots.dtype == torch.int64
@@ -181,8 +202,8 @@ def sm70_dflash2_qk_norm_rope_cache(
     if slots is not None and not cache_args:
         layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
             layer,
-            k_out.view(-1, 2, 128),
-            raw[:, 1280:].view(-1, 2, 128),
+            k_out.view(-1, num_kv_heads, 128),
+            raw[:, v_offset:].view(-1, num_kv_heads, 128),
             kv_cache,
             slots,
         )

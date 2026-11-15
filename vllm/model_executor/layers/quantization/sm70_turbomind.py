@@ -580,6 +580,8 @@ _QPN2_LAUNCH_TABLE: dict[tuple[int, int], tuple[int, int]] = {
     (1536, 5120): (16, 2),
     (4352, 5120): (16, 2),
     (5120, 8704): (8, 2),
+    (5120, 8256): (16, 2),
+    (5120, 4128): (16, 2),
     (5120, 4096): (16, 2),
     (5120, 2048): (32, 2),
     (5120, 62080): (8, 1),
@@ -878,3 +880,40 @@ def apply_prepared_fused_silu_and_mul(
     if state is None:
         return None
     return apply_prepared(state, x, None, getattr(layer, "prefix", ""), gated=True)
+
+
+def should_prepare_channel_qpn8_batch_tm(
+    linear_policy,
+    *,
+    platform=None,
+) -> bool:
+    active_platform = current_platform if platform is None else platform
+    batch_prescaled_explicit = bool(
+        linear_policy.batch_prescaled
+        and linear_policy.sources.get("batch_prescaled") != "default"
+    )
+    native_only = bool(
+        use_native_qpn_layouts(allow_large_batches=True)
+        and active_platform.is_device_capability(70)
+        and not batch_prescaled_explicit
+    )
+    return bool(use_batched_gemm_layouts() and not native_only)
+
+
+def attach_channel_qpn8_prefill_workspace(
+    layer: torch.nn.Module,
+    workspace: torch.Tensor,
+) -> None:
+    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = workspace.data_ptr()
+    if getattr(layer, "prefix", ""):
+        from vllm.model_executor.layers.quantization.utils import (
+            sm70_layer_workspaces,
+        )
+
+        if (
+            sm70_layer_workspaces._engine_workspace_registry() is not None
+            or layer.prefix not in sm70_layer_workspaces._layer_workspaces
+        ):
+            sm70_layer_workspaces.register_layer_workspace(
+                layer, workspace, family="fp8"
+            )

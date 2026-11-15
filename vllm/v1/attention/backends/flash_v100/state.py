@@ -25,5 +25,25 @@ class _LogStateModule(types.ModuleType):
         else:
             super().__setattr__(name, value)
 
+    def __delattr__(self, name):
+        if name in LOG_KEYS:
+            set_log_once_state(LOG_KEYS[name], False)
+        else:
+            super().__delattr__(name)
+
+
+def _make_log_property(log_key: str) -> property:
+    def _get(_self: object) -> bool:
+        return log_once_seen(log_key)
+
+    def _set(_self: object, val: bool) -> None:
+        set_log_once_state(log_key, val)
+
+    return property(_get, _set)
+
+
+for _log_attr, _log_key in LOG_KEYS.items():
+    setattr(_LogStateModule, _log_attr, _make_log_property(_log_key))
+
 
 sys.modules[__name__].__class__ = _LogStateModule

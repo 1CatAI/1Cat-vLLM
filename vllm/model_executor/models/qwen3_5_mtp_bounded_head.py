@@ -27,6 +27,10 @@ from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings, call_native, register_policy_op
 from vllm.config.sm70_native import capture_linear_native_config
 from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.distributed.parallel_state import (
+    get_tp_group,
+    model_parallel_is_initialized,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
@@ -439,8 +443,9 @@ def _proposal(
         valid_vocab = vocab
     assert 32 <= vocab <= 2147483647
     coarse = torch.empty(rows, vocab, device=x.device, dtype=torch.float16)
-    prefetch = rows <= (8 if x.size(1) == 2560 else 16)
+    prefetch = vocab < 65536 and rows <= (8 if x.size(1) == 2560 else 16)
     split_k = 8 if (x.size(1) == 2560 and rows <= 16) else 16
+    nacc = 1 if (vocab >= 65536 and rows <= 16) else 2
     call_native(
         sm70_ops.fp8_qpn8_gemm_sm70_out,
         native_policy,
@@ -449,7 +454,7 @@ def _proposal(
         codes,
         scales,
         split_k,
-        2,
+        nacc,
         True,
         prefetch,
     )
@@ -513,6 +518,29 @@ def _proposal(
     return coarse, norms, upper, ids
 
 
+def _gather_bounded_packet(packet: torch.Tensor) -> torch.Tensor:
+    if model_parallel_is_initialized():
+        tp_group = get_tp_group()
+        world_size = tp_group.world_size
+        if world_size == 1:
+            return packet
+        ca = getattr(tp_group.device_communicator, "ca_comm", None)
+        if (
+            ca is not None
+            and not ca.disabled
+            and packet.is_cuda
+            and (not torch.cuda.is_current_stream_capturing() or ca._IS_CAPTURING)
+        ):
+            rows = packet.size(0)
+            stacked = packet.new_zeros((world_size, rows, 4))
+            stacked[tp_group.rank_in_group, :, :3].copy_(packet)
+            if ca.should_custom_ar(stacked):
+                reduced = ca.custom_all_reduce(stacked)
+                if reduced is not None:
+                    return reduced[:, :, :3].movedim(0, 1).reshape(rows, world_size * 3)
+    return tensor_model_parallel_all_gather(packet, dim=-1)
+
+
 def _bounded_pair(
     x,
     weight,
@@ -545,11 +573,11 @@ def _bounded_pair(
         max(32, triton.next_power_of_2(KEEP)),
         num_warps=2 if KEEP > 32 else 1,
     )
-    gathered = tensor_model_parallel_all_gather(packet, dim=-1)
+    gathered = _gather_bounded_packet(packet)
     flags = torch.empty(rows, device=x.device, dtype=torch.int32)
     global_pairs = torch.empty((rows, 2), device=x.device, dtype=torch.float32)
     _certify[(rows,)](gathered, flags, global_pairs, gathered.size(1) // 3, num_warps=1)
-    dense = torch.empty_like(coarse)
+    dense = coarse
     torch.ops._C.sm70_fp16_masked_head_out(dense, x, weight, flags, True)
     tiles = triton.cdiv(vocab, 1024)
     wide_ids = vocab > 65536
@@ -656,7 +684,7 @@ def _bounded_local_topk(
         num_warps=4,
     )
 
-    dense = torch.empty_like(coarse)
+    dense = coarse
     torch.ops._C.sm70_fp16_masked_head_out(dense, x, weight, flags, True)
     tiles = triton.cdiv(vocab, 1024)
     count = tiles * k_pow2
@@ -796,6 +824,18 @@ class MTPBoundedTargetHead(nn.Module):
         out_shape = (*hidden_states.shape[:-1], k_req)
         return vals.reshape(out_shape), ids.reshape(out_shape)
 
+    def _run_bounded_target_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.native_ops.invoke(
+            torch.ops.vllm.sm70_mtp_bounded_target_head,
+            hidden_states,
+            self.weight,
+            self.codes,
+            self.scales,
+            self.coefficients,
+            self.start,
+            self.native_ops.arguments,
+        )
+
     def maybe_get_sm70_lm_head_top1_pair(self, hidden_states, bias=None):
         if (
             bias is not None
@@ -807,16 +847,7 @@ class MTPBoundedTargetHead(nn.Module):
             or hidden_states.device != self.weight.device
         ):
             return None
-        return self.native_ops.invoke(
-            torch.ops.vllm.sm70_mtp_bounded_target_head,
-            hidden_states,
-            self.weight,
-            self.codes,
-            self.scales,
-            self.coefficients,
-            self.start,
-            self.native_ops.arguments,
-        )
+        return self._run_bounded_target_head(hidden_states)
 
 
 def prepare_mtp_bounded_target_head(

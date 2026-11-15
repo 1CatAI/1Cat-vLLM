@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch.distributed import ProcessGroup
+
+if TYPE_CHECKING:
+    from .custom_all_reduce import CustomAllreduce
 
 import vllm.envs as envs
 from vllm.config.execution_policy import communication_policy
@@ -28,7 +31,7 @@ from .collective_provider import CollectiveTrace
 logger = init_logger(__name__)
 
 _AR_ALLGATHER = envs.VLLM_V41_AR_ALLGATHER == "1"
-_SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
+_LONG_PREFILL_FUSED_NORM_BUFFER_BYTES = 8192 * 5120 * 2
 _PYNCCL_GATHER_DTYPES = {
     torch.int8,
     torch.uint8,
@@ -90,23 +93,52 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_top1_custom_ar = False
             use_sm70_awq_mlp_down_tile_ar = False
             use_sm70_awq_mlp_down_tile_overlap = False
-            use_sm70_tp4_long_prefill_fused_norm = False
+            use_long_prefill_fused_norm = False
+            long_prefill_buffer_bytes = 8192 * 1024
             use_torch_symm_mem = False
             use_flashinfer_allreduce = False
         else:
+            from vllm.config import get_current_vllm_config_or_none
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
+            init_cfg = get_current_vllm_config_or_none()
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
             use_top1_custom_ar = (
                 bool(self._policy.top1_custom_ar) and native_collective_device
             )
             use_sm70_awq_mlp_down_tile_ar = bool(self._policy.awq_tile_ar)
             use_sm70_awq_mlp_down_tile_overlap = bool(self._policy.awq_tile_overlap)
-            use_sm70_tp4_long_prefill_fused_norm = (
-                bool(self._policy.long_prefill_norm)
-                and self.world_size == 4
+            model_cfg = getattr(init_cfg, "model_config", None)
+            spec_cfg = getattr(init_cfg, "speculative_config", None)
+            par_cfg = getattr(init_cfg, "parallel_config", None)
+            auto_long_prefill_norm = bool(
+                native_collective_device
+                and use_custom_allreduce
+                and self.world_size in (2, 4)
+                and self._policy.sources.get("long_prefill_norm", "default")
+                == "default"
+                and model_cfg is not None
+                and getattr(model_cfg, "dtype", None) == torch.float16
+                and model_cfg.get_hidden_size() == 5120
+                and par_cfg is not None
+                and getattr(par_cfg, "pipeline_parallel_size", 1) == 1
+                and (spec_cfg is None or getattr(spec_cfg, "method", None) == "mtp")
+            )
+            use_long_prefill_fused_norm = (
+                (bool(self._policy.long_prefill_norm) or auto_long_prefill_norm)
+                and self.world_size in (2, 4)
                 and native_collective_device
             )
+            if use_long_prefill_fused_norm:
+                if bool(self._policy.long_prefill_norm):
+                    long_prefill_buffer_bytes = _LONG_PREFILL_FUSED_NORM_BUFFER_BYTES
+                else:
+                    # Deterministic 768-row tiling executes arbitrary prefill
+                    # token counts inside the baseline 8-MiB IPC staging window
+                    # without inflating per-GPU collective buffers to 80+80 MiB.
+                    long_prefill_buffer_bytes = 8192 * 1024
+            else:
+                long_prefill_buffer_bytes = 8192 * 1024
             use_torch_symm_mem = bool(self._policy.symm_mem)
             use_flashinfer_allreduce = bool(self._policy.flashinfer)
 
@@ -114,7 +146,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_top1_custom_ar = use_top1_custom_ar
         self.use_sm70_awq_mlp_down_tile_ar = use_sm70_awq_mlp_down_tile_ar
         self.use_sm70_awq_mlp_down_tile_overlap = use_sm70_awq_mlp_down_tile_overlap
-        self.use_sm70_tp4_long_prefill_fused_norm = use_sm70_tp4_long_prefill_fused_norm
+        self.use_sm70_tp4_long_prefill_fused_norm = use_long_prefill_fused_norm
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self._collective_trace = CollectiveTrace(
@@ -177,7 +209,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             or use_top1_custom_ar
             or use_sm70_awq_mlp_down_tile_ar
             or use_sm70_awq_mlp_down_tile_overlap
-            or use_sm70_tp4_long_prefill_fused_norm
+            or use_long_prefill_fused_norm
         ) and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             # `use_top1_custom_ar` deliberately only provisions the IPC/signaling
@@ -191,11 +223,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
                 max_size=(
-                    _SM70_TP4_LONG_PREFILL_BUFFER_BYTES
-                    if use_sm70_tp4_long_prefill_fused_norm
+                    long_prefill_buffer_bytes
+                    if use_long_prefill_fused_norm
                     else 8192 * 1024
                 ),
-                long_prefill_fusion_enabled=use_sm70_tp4_long_prefill_fused_norm,
+                long_prefill_fusion_enabled=use_long_prefill_fused_norm,
                 # Provisioned for the compact collectives although the user
                 # disabled custom all-reduce: do not trust the driver's P2P
                 # report alone. Some hosts report peer access whose direct
@@ -544,6 +576,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         residual: torch.Tensor,
         weight: torch.Tensor,
         epsilon: float,
+        allow_shard_residual: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ca_comm = self.ca_comm
         if (
@@ -561,13 +594,122 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return ca_comm.sm70_tp4_all_reduce_gemma_rms_norm(
                 input_, residual, weight, epsilon
             )
+        if (
+            allow_shard_residual
+            and self.use_custom_allreduce
+            and ca_comm is not None
+            and input_.ndim == 2
+            and input_.shape[0] >= 128
+            and ca_comm.long_prefill_output_ptrs is not None
+        ):
+            if ca_comm.can_sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+                input_, residual, weight
+            ):
+                return ca_comm.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+                    input_, residual, weight, epsilon
+                )
+            tiled = self._try_tiled_long_prefill_gemma_rms_norm(
+                ca_comm, input_, residual, weight, epsilon
+            )
+            if tiled is not None:
+                return tiled
+        return self._fallback_gemma_rms_norm(
+            input_, residual, weight, epsilon, force_fp32_residual=False
+        )
+
+    def _fallback_gemma_rms_norm(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        *,
+        force_fp32_residual: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         from vllm.model_executor.layers.layernorm import (
             _sm70_dflash2_gemma_fused_add_rms_norm,
         )
 
-        return _sm70_dflash2_gemma_fused_add_rms_norm(
-            self.all_reduce(input_), residual, weight, epsilon
+        res = (
+            residual.float()
+            if (force_fp32_residual and residual.dtype != torch.float32)
+            else residual
         )
+        return _sm70_dflash2_gemma_fused_add_rms_norm(
+            self.all_reduce(input_), res, weight, epsilon
+        )
+
+    def _try_tiled_long_prefill_gemma_rms_norm(
+        self,
+        ca_comm: "CustomAllreduce",
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if (
+            ca_comm.disabled
+            or self.world_size not in (2, 4)
+            or (ca_comm._IS_CAPTURING and torch.cuda.is_current_stream_capturing())
+            or not input_.is_cuda
+            or input_.dtype != torch.float16
+            or input_.ndim != 2
+            or input_.shape[1] != 5120
+            or residual.shape != input_.shape
+            or residual.dtype != torch.float32
+            or weight.ndim != 1
+            or weight.numel() != 5120
+            or weight.dtype not in (torch.float16, torch.float32)
+            or not input_.is_contiguous()
+            or not residual.is_contiguous()
+            or not weight.is_contiguous()
+            or not (input_.device == residual.device == weight.device)
+        ):
+            return None
+
+        row_bytes = 5120 * 2
+        max_rows = min(4096 * self.world_size, int(ca_comm.max_size) // row_bytes)
+        chunk_rows = (
+            (max_rows // 256) * 256
+            if max_rows >= 256
+            else (max_rows // self.world_size) * self.world_size
+        )
+        if chunk_rows < self.world_size:
+            return None
+
+        total_rows = int(input_.shape[0])
+        aligned_rows = (total_rows // self.world_size) * self.world_size
+        probe_end = min(aligned_rows, chunk_rows)
+        if probe_end <= 0 or not (
+            ca_comm.can_sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+                input_[:probe_end], residual[:probe_end], weight
+            )
+        ):
+            return None
+
+        normalized_out = torch.empty_like(input_)
+        residual_out = torch.empty_like(residual, dtype=torch.float32)
+        for start in range(0, aligned_rows, chunk_rows):
+            end = min(start + chunk_rows, aligned_rows)
+            ca_comm.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+                input_[start:end],
+                residual[start:end],
+                weight,
+                epsilon,
+                normalized_out=normalized_out[start:end],
+                residual_out=residual_out[start:end],
+            )
+        if aligned_rows < total_rows:
+            norm_tail, res_tail = self.all_reduce_gemma_rms_norm(
+                input_[aligned_rows:],
+                residual[aligned_rows:],
+                weight,
+                epsilon,
+                allow_shard_residual=False,
+            )
+            normalized_out[aligned_rows:].copy_(norm_tail)
+            residual_out[aligned_rows:].copy_(res_tail)
+        return normalized_out, residual_out
 
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,
@@ -585,19 +727,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 input_, residual, weight
             )
         ):
-            reduced = self.all_reduce(input_)
-            residual_out = reduced.float() + residual.float()
-            normalized_fp32 = torch.empty_like(residual_out)
-
-            from vllm import _custom_ops as ops
-
-            ops.rms_norm(
-                normalized_fp32,
-                residual_out,
-                weight.float() + 1.0,
-                epsilon,
+            return self._fallback_gemma_rms_norm(
+                input_, residual, weight, epsilon, force_fp32_residual=True
             )
-            return normalized_fp32.to(input_.dtype), residual_out
         return ca_comm.sm70_tp2_all_reduce_gemma_rms_norm(
             input_, residual, weight, epsilon
         )

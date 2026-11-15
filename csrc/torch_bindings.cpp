@@ -782,6 +782,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "()");
   ops.impl("fp8_qpn8_gemm_ba_split_sm70_out", torch::kCUDA,
            vllm::sm70::with_policy(&fp8_qpn8_gemm_ba_split_sm70_out));
+  ops.def("fp8_qpn8_ba_split_geometry_revision() -> int",
+          []() -> int64_t { return 1; });
 
   ops.def(
       "fp8_qpn8_dispatch_ba_split_sm70_out(Tensor(a!) qkv_out, Tensor(b!) "
@@ -809,6 +811,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "native_policy=None ) -> ()");
   ops.impl("fp8_qpn8_gated_pair_sm70_out", torch::kCUDA,
            vllm::sm70::with_policy(&fp8_qpn8_gated_pair_sm70_out));
+
+  ops.def(
+      "fp8_qpn8_block_native_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor codes, Tensor group_scales, int split_k, int k_unroll, "
+      "bool packed_input, bool gated, str? native_policy=None ) -> ()");
+  ops.impl("fp8_qpn8_block_native_sm70_out", torch::kCUDA,
+           vllm::sm70::with_policy(&fp8_qpn8_block_native_sm70_out));
 
   ops.def(
       "fp8_qpn8_hc_dispatch_sm70_out(Tensor(a!) block_out, Tensor(b!) "
@@ -1785,12 +1794,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
 
   custom_ar.def("dispose", &dispose);
   custom_ar.def("meta_size", &meta_size);
+  custom_ar.def("sm70_tp2_push_allreduce_buffer_size",
+                &sm70_tp2_push_allreduce_buffer_size);
   custom_ar.def("sm70_tp4_push_allreduce_buffer_size",
                 &sm70_tp4_push_allreduce_buffer_size);
   custom_ar.def("sm70_tp8_hierarchical_push_allreduce_buffer_size",
                 &sm70_tp8_hierarchical_push_allreduce_buffer_size);
 
   custom_ar.def("register_buffer", &register_buffer);
+  custom_ar.def("register_sm70_tp2_push_allreduce_buffer",
+                &register_sm70_tp2_push_allreduce_buffer);
   custom_ar.def("register_sm70_tp4_push_allreduce_buffer",
                 &register_sm70_tp4_push_allreduce_buffer);
   custom_ar.def("register_sm70_tp8_hierarchical_push_allreduce_buffer",

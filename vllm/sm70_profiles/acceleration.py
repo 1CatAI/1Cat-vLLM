@@ -487,6 +487,9 @@ def _native_capabilities(page_size: int, policy) -> dict[str, bool]:
 
     return {
         "fp16_grouped": hasattr(torch.ops._vllm_fa2_C, "sm70_grouped_fp16_fwd"),
+        "fp16_kv_heads": hasattr(
+            torch.ops._vllm_fa2_C, "sm70_grouped_fp16_kv_heads_revision"
+        ),
         "fp16_short_splits": hasattr(
             torch.ops._vllm_fa2_C, "sm70_grouped_fp16_short_split_revision"
         ),
@@ -840,8 +843,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     fp16_shape = (
         str(cfg.model_config.dtype) == "torch.float16"
         and tp > 0
-        and full_heads == 6 * tp
-        and kv_heads == tp
+        and kv_heads > 0
+        and kv_heads % tp == 0
+        and full_heads == 6 * kv_heads
         and getattr(text, "head_dim", 0) == 256
     )
     fp16_reason = (
@@ -849,13 +853,15 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         if dtype not in ("auto", "float16", "bfloat16") or not fp16_shape
         else "operator_missing:sm70_grouped_fp16_fwd"
         if not native.get("fp16_grouped", False)
+        else "operator_missing:sm70_grouped_fp16_kv_heads_revision"
+        if kv_heads > tp and not native.get("fp16_kv_heads", True)
         else None
     )
     paths["fp16_grouped_fp32"] = _row(
         fp16_reason,
         kv_cache_dtype=dtype,
-        runtime_guards="FP16 operands; local Q/KV heads=6/1, D=256; page=832; "
-        "causal full context; B1 q2..8 or B2..4 q8; "
+        runtime_guards="FP16 operands; local Q/KV ratio=6:1, D=256; 16-aligned page; "
+        "causal full context; B1..4 q2..8; "
         "served-window capacity requires the FP16 context revision",
         arithmetic="FP32 probability/PV/numerator/max/sum",
         short_context_splits=_row(

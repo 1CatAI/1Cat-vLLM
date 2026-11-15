@@ -395,33 +395,59 @@ class UnquantizedLinearMethod(LinearMethodBase):
             ),
         )
 
+    def supports_direct_output(self, layer: torch.nn.Module) -> bool:
+        return bool(getattr(layer, "_direct_output_ready", False))
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if output is None:
+            return self.apply(layer, x, bias)
+        return self._apply_impl(layer, x, bias, output=output)
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from vllm.model_executor.layers.quantization.sm70_dflash2_fp8 import (
-            apply_dflash2_fp8_m8,
-        )
+        return self._apply_impl(layer, x, bias)
 
-        draft_fp8 = apply_dflash2_fp8_m8(layer, x, bias)
-        if draft_fp8 is not None:
-            return draft_fp8
-        from vllm.model_executor.layers.quantization.sm70_dflash2_fp16 import (
-            apply_dflash2_fp16_m8,
-        )
+    def _apply_impl(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if output is None:
+            from vllm.model_executor.layers.quantization.sm70_dflash2_fp8 import (
+                apply_dflash2_fp8_m8,
+            )
 
-        draft_m8 = apply_dflash2_fp16_m8(layer, x, bias)
-        if draft_m8 is not None:
-            return draft_m8
+            draft_fp8 = apply_dflash2_fp8_m8(layer, x, bias)
+            if draft_fp8 is not None:
+                return draft_fp8
+            from vllm.model_executor.layers.quantization.sm70_dflash2_fp16 import (
+                apply_dflash2_fp16_m8,
+            )
+
+            draft_m8 = apply_dflash2_fp16_m8(layer, x, bias)
+            if draft_m8 is not None:
+                return draft_m8
         from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
             maybe_apply_online_qpn8,
         )
 
-        online_qpn8_out = maybe_apply_online_qpn8(layer, x, bias)
+        online_qpn8_out = maybe_apply_online_qpn8(layer, x, bias, output=output)
         if online_qpn8_out is not None:
             return online_qpn8_out
+        if output is not None:
+            raise ValueError("Direct output requires a prepared direct-output layer")
         sm70_out = _maybe_sm70_dense_forward(layer, x, bias)
         if sm70_out is not None:
             return sm70_out

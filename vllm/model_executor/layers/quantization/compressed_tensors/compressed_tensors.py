@@ -682,7 +682,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     return CompressedTensorsW8A16Fp8(
                         weight_quant=weight_quant,
                         is_static_input_scheme=not input_quant.dynamic,
-                        enable_sm70_qpn8_by_default=self._contains_nvfp4_weights(),
+                        enable_sm70_qpn8_by_default=True,
                     )
 
             # note: input_quant can be None
@@ -691,7 +691,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return CompressedTensorsW8A16Fp8(
                     weight_quant=weight_quant,
                     is_static_input_scheme=is_static_input_scheme,
-                    enable_sm70_qpn8_by_default=self._contains_nvfp4_weights(),
+                    enable_sm70_qpn8_by_default=True,
                 )
 
             if self._is_static_tensor_w8a8(weight_quant, input_quant):

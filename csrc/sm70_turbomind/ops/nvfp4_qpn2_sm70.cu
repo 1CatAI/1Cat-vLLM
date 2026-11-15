@@ -526,7 +526,7 @@ __launch_bounds__(TileColumns* SplitK, (TileColumns == 32 && SplitK == 8) ? 4 : 
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
     const half* __restrict__ input, half* __restrict__ output, int n, int k,
     int m, float global_scale) {
-  constexpr int KUnroll = (K == 4352 || K == 8704) ? 8 : (K == 1536 ? 6 : 4);
+  constexpr int KUnroll = K == 1536 ? 6 : 4;
   nvfp4_qpn2_accumulate_sm70<SplitK, 2, 1, TurboMindLayout, false,
                              BundledScales, KUnroll, true, TileColumns>(
       codes, scales, input, output, n, K > 0 ? K : k, m, global_scale);
@@ -1262,11 +1262,17 @@ void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
         const dim3 narrow_grid = TurboMindLayout ? dim3(row_blocks, n / 16)
                                                  : dim3(n / 16, row_blocks);
         if (k == 5120) {
+          const int ctas_32 = (n / 32) * row_blocks;
           if (n / 32 < sms) {
             nvfp4_qpn2_projection_sm70_kernel<5120, 16, 16, TurboMindLayout,
                                               BundledScales>
                 <<<narrow_grid, 256, 0, stream>>>(codes, scales, input, output,
                                                   n, k, m, global_scale);
+          } else if (row_blocks == 1 && ctas_32 > 2 * sms && ctas_32 <= 224) {
+            nvfp4_qpn2_projection_sm70_kernel<5120, 32, 8, TurboMindLayout,
+                                              BundledScales>
+                <<<grid, 256, 0, stream>>>(codes, scales, input, output, n, k,
+                                           m, global_scale);
           } else {
             nvfp4_qpn2_projection_sm70_kernel<5120, 32, 16, TurboMindLayout,
                                               BundledScales>

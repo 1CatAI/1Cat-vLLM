@@ -1516,6 +1516,39 @@ class KernelConfig:
             self.ir_op_priority,
         )
 
+    def resolve_fp8_verifier_defaults(
+        self,
+        *,
+        model_quantization: str | None,
+        speculative_config: Any,
+        qualification: dict[str, Any],
+        use_native_block_prefill: bool,
+    ) -> None:
+        if speculative_config is not None:
+            policy = speculative_config.sm70_dflash2
+            policy.resolve(**qualification)
+            if (
+                model_quantization in ("fp8", "compressed-tensors")
+                and self.sm70_fp8.qpn8 is None
+                and (
+                    policy.qualified
+                    or qualification.get("mtp_qualified", False)
+                    or "target_fp8_qpn8" in policy.explicit_fields
+                )
+            ):
+                self.sm70_fp8.qpn8 = policy.target_fp8_qpn8
+        if model_quantization in ("fp8", "compressed-tensors"):
+            import torch
+
+            if (
+                use_native_block_prefill
+                and self.sm70_fp8.block_qpn8_volta_turbomind_prefill is None
+                and hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out")
+            ):
+                self.sm70_fp8.block_qpn8_volta_turbomind_prefill = False
+            # Resolve after the per-engine verifier defaults.
+            self.sm70_fp8.resolve()
+
 
 def capture_sm70_fp8_linear_config() -> Sm70Fp8Config:
     """Capture the shared serialized/channel/ModelOpt policy during loading."""

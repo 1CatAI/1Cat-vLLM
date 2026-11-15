@@ -78,8 +78,10 @@ class CollectiveCapabilities:
         )
 
     def gemma_norm(self, inp, residual, weight, *, world_size, long=False):
-        if self.world_size != world_size or (
-            world_size == 4 and not self.fully_connected
+        if (
+            self.world_size != world_size
+            or world_size not in (2, 4)
+            or (world_size == 4 and not self.fully_connected)
         ):
             return False
         if long:
@@ -87,19 +89,23 @@ class CollectiveCapabilities:
                 self.long_norm_registered
                 and inp.ndim == 2
                 and inp.shape[0] % world_size == 0
-                and 1 <= inp.shape[0] // world_size <= 2048
+                and 1 <= inp.shape[0] // world_size <= 4096
                 and inp.numel() * inp.element_size() <= self.allocation_size
             )
         else:
             admitted = self.reduce(inp) and inp.ndim == 2 and 1 <= inp.shape[0] <= 64
+        allowed_residual_dtypes = (
+            (torch.float32,)
+            if (long or world_size != 2)
+            else (torch.float16, torch.float32)
+        )
         return bool(
             admitted
             and inp.is_cuda
             and inp.dtype == torch.float16
             and inp.shape[1] == 5120
             and residual.shape == inp.shape
-            and residual.dtype
-            in ((torch.float16, torch.float32) if world_size == 2 else (torch.float32,))
+            and residual.dtype in allowed_residual_dtypes
             and weight.ndim == 1
             and weight.numel() == 5120
             and weight.dtype in (torch.float16, torch.float32)

@@ -74,6 +74,9 @@ def bits(result):
         ("fp32", 8),
         ("rerank", 1),
         ("rerank", 8),
+        ("rerank", 16),
+        ("rerank", 32),
+        ("rerank", 64),
     ],
 )
 @torch.inference_mode()

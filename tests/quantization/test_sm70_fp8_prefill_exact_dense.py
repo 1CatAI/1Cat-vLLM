@@ -298,6 +298,11 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
         f"{module}._get_sm70_fp8_prefill_exact_dense_workspace",
         lambda weight: workspace,
     )
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.qpn.fp8."
+        "_get_sm70_fp8_prefill_exact_dense_workspace",
+        lambda weight: workspace,
+    )
 
     def fake_prepare(weight, scales):
         prepare_calls.append((tuple(weight.shape), tuple(scales.shape)))

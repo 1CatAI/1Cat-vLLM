@@ -494,22 +494,17 @@ def apply_runtime_policy_defaults(self):
                 else f"decode gathers {host_gib} GiB pinned-host/device shards "
                 "per rank, prefill reads the disk-backed table",
             )
-    if self.speculative_config is not None:
-        policy = self.speculative_config.sm70_dflash2
-        qualification = self.apply_model_runtime_defaults(
-            defaults, "verifier", is_sm70=is_sm70
-        )
-        policy.resolve(**qualification)
-        if (
-            self.model_config is not None
-            and self.model_config.quantization == "fp8"
-            and self.kernel_config.sm70_fp8.qpn8 is None
-            and (policy.qualified or "target_fp8_qpn8" in policy.explicit_fields)
-        ):
-            self.kernel_config.sm70_fp8.qpn8 = policy.target_fp8_qpn8
-    if self.model_config is not None and self.model_config.quantization == "fp8":
-        # Resolve after the per-engine verifier defaults.
-        self.kernel_config.sm70_fp8.resolve()
+    qualification = self.apply_model_runtime_defaults(
+        defaults, "verifier", is_sm70=is_sm70
+    )
+    self.kernel_config.resolve_fp8_verifier_defaults(
+        model_quantization=(
+            self.model_config.quantization if self.model_config is not None else None
+        ),
+        speculative_config=self.speculative_config,
+        qualification=qualification,
+        use_native_block_prefill=is_sm70,
+    )
 
     sm70_flash_0dot3_compile_graph = defaults.value(
         "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH"
