@@ -22,6 +22,7 @@ class SamplingStates:
         self.max_num_reqs = max_num_reqs
         self.vocab_size = vocab_size
         self._topk_runtime = bind_topk_topp_runtime()
+        self._topk_runtime.no_host_sync = True
 
         self.temperature = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
         self.top_k = UvaBackedTensor(max_num_reqs, dtype=torch.int32)

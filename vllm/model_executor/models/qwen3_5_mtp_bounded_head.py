@@ -50,9 +50,9 @@ _MAX_BOUNDED_ROWS = 64
 
 
 @triton.jit
-def _input_norms(X, Norms, Width: tl.constexpr):
+def _input_norms(X, Norms, Width: tl.constexpr, Block: tl.constexpr):
     row = tl.program_id(0)
-    col = tl.arange(0, 8192)
+    col = tl.arange(0, Block)
     x = tl.load(X + row * Width + col, col < Width, 0).to(tl.float32)
     tiny = tl.where(tl.abs(x) < 0.00006103515625, x, 0.0)
     # 1 + 2^-10 covers even a serial 5120-term positive FP32 sum,
@@ -439,6 +439,8 @@ def _proposal(
         valid_vocab = vocab
     assert 32 <= vocab <= 2147483647
     coarse = torch.empty(rows, vocab, device=x.device, dtype=torch.float16)
+    prefetch = rows <= (8 if x.size(1) == 2560 else 16)
+    split_k = 8 if (x.size(1) == 2560 and rows <= 16) else 16
     call_native(
         sm70_ops.fp8_qpn8_gemm_sm70_out,
         native_policy,
@@ -446,13 +448,16 @@ def _proposal(
         x,
         codes,
         scales,
-        16,
+        split_k,
         2,
         True,
-        rows <= 16,
+        prefetch,
     )
     norms = torch.empty(rows, 2, device=x.device, dtype=torch.float32)
-    _input_norms[(rows,)](x, norms, x.size(1), num_warps=8)
+    norm_block = max(1024, triton.next_power_of_2(x.size(1)))
+    _input_norms[(rows,)](
+        x, norms, x.size(1), norm_block, num_warps=4 if norm_block <= 4096 else 8
+    )
     upper = torch.empty_like(coarse) if return_upper else None
     wide_ids = vocab > 65536
     tile_block = 2048 if (keep <= 32 and vocab > 32768) else 1024
@@ -721,6 +726,7 @@ class MTPBoundedTargetHead(nn.Module):
         codes, scales, coefficients = _prepare_proposal(
             head.weight.detach(), self.native_ops
         )
+        head.weight._sm70_shared_qpn8 = (codes, scales)
         self.register_buffer("codes", codes, persistent=False)
         self.register_buffer("scales", scales, persistent=False)
         self.register_buffer("coefficients", coefficients, persistent=False)
@@ -749,15 +755,21 @@ class MTPBoundedTargetHead(nn.Module):
         top_k: int,
         bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        width = int(self.weight.shape[1])
         if (
             bias is not None
             or hidden_states.ndim < 2
-            or hidden_states.shape[-1] != 5120
+            or width not in (2560, 5120)
+            or hidden_states.shape[-1] != width
             or hidden_states.dtype != torch.float16
             or hidden_states.device != self.weight.device
         ):
             return None
-        x_2d = hidden_states.reshape(-1, 5120)
+        if width == 2560:
+            revision = getattr(torch.ops._C, "sm70_fp16_head_vocab_revision", None)
+            if revision is None or int(revision()) < 2:
+                return None
+        x_2d = hidden_states.reshape(-1, width)
         rows = int(x_2d.shape[0])
         vocab = int(self.weight.shape[0])
         num_pad = int(getattr(self.shard_indices, "num_org_vocab_padding", 0))
@@ -788,7 +800,8 @@ class MTPBoundedTargetHead(nn.Module):
         if (
             bias is not None
             or hidden_states.ndim != 2
-            or hidden_states.shape[1] != 5120
+            or hidden_states.shape[1] not in (2560, 5120)
+            or hidden_states.shape[1] != self.weight.shape[1]
             or not 1 <= hidden_states.shape[0] <= _MAX_BOUNDED_ROWS
             or hidden_states.dtype != torch.float16
             or hidden_states.device != self.weight.device
@@ -817,7 +830,7 @@ def prepare_mtp_bounded_target_head(
         or not weight.is_cuda
         or weight.dtype != torch.float16
         or weight.ndim != 2
-        or weight.shape[1] != 5120
+        or weight.shape[1] not in (2560, 5120)
         or not weight.is_contiguous()
         or shard is None
         or not isinstance(
@@ -829,13 +842,16 @@ def prepare_mtp_bounded_target_head(
         or speculative is None
         or speculative.method != "mtp"
         or speculative.draft_sample_method == "probabilistic"
-        or _mtp_head_shard_rows(head) != weight.shape[0]
+        or _mtp_head_shard_rows(head, embedding_dims=(2560, 5120)) != weight.shape[0]
     ):
         return None
     # Old extensions only accept the original shard width. Keep their dense
     # fallback instead of admitting a wider shard to an incompatible binary.
     revision = getattr(torch.ops._C, "sm70_fp16_head_vocab_revision", None)
-    if weight.shape[0] != 62080 and (revision is None or revision() < 1):
+    rev = 0 if revision is None else int(revision())
+    if weight.shape[1] == 2560 and rev < 2:
+        return None
+    if weight.shape[0] != 62080 and rev < 1:
         return None
     state = getattr(head, "_sm70_lm_head_state", None)
     if any(

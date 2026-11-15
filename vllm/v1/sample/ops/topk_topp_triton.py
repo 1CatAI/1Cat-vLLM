@@ -1142,11 +1142,196 @@ def _scatter_compact_rows_kernel(
         tl.store(logits + row * row_stride + index, value)
 
 
+@triton.jit
+def _float_to_ordered_u32(val):
+    bits = tl.cast(val, tl.uint32, bitcast=True)
+    ordered = tl.where((bits >> 31) != 0, ~bits, bits ^ 0x80000000)
+    return tl.where(val != val, 0xFFFFFFFF, ordered)
+
+
+@triton.jit
+def _ordered_u32_to_float(key):
+    bits = tl.where((key & 0x80000000) != 0, key ^ 0x80000000, ~key)
+    return tl.cast(bits, tl.float32, bitcast=True)
+
+
+@triton.jit
+def _resolve_reference_rows_kernel(
+    out_ptr,
+    src_ptr,
+    reference_rows_ptr,
+    k_ptr,
+    p_ptr,
+    out_stride,
+    src_stride,
+    vocab_size,
+    MASK_VALUE: tl.constexpr,
+    TOPK_ENABLED: tl.constexpr,
+    TOPP_ENABLED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if not tl.load(reference_rows_ptr + row):
+        return
+    src_row = src_ptr + row * src_stride
+    out_row = out_ptr + row * out_stride
+
+    has_k = False
+    cutoff_val = -float("inf")
+    if TOPK_ENABLED:
+        k_val = tl.load(k_ptr + row).to(tl.int32)
+        if k_val > 0 and k_val < vocab_size:
+            has_k = True
+            cand = tl.full((), 0, dtype=tl.uint32)
+            for step in range(32):
+                bit = 31 - step
+                probe_key = cand | (tl.full((), 1, dtype=tl.uint32) << bit)
+                count_ge = tl.full((), 0, dtype=tl.int32)
+                for start in range(0, vocab_size, BLOCK):
+                    cols = start + tl.arange(0, BLOCK)
+                    m = cols < vocab_size
+                    v = tl.load(src_row + cols, mask=m, other=-float("inf"))
+                    vk = _float_to_ordered_u32(v)
+                    count_ge += tl.sum(((vk >= probe_key) & m).to(tl.int32), axis=0)
+                cand = tl.where(count_ge >= k_val, probe_key, cand)
+            cutoff_val = _ordered_u32_to_float(cand)
+
+    has_p = False
+    p_val = 1.0
+    if TOPP_ENABLED:
+        p_val = tl.load(p_ptr + row).to(tl.float32)
+        if p_val < 1.0:
+            has_p = True
+
+    if not has_p:
+        for start in range(0, vocab_size, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            m = cols < vocab_size
+            v = tl.load(src_row + cols, mask=m, other=0.0)
+            drop = has_k & (v < cutoff_val)
+            out_v = tl.where(drop | (v == -float("inf")), MASK_VALUE, v)
+            tl.store(out_row + cols, out_v, mask=m)
+        return
+
+    max_pair = tl.full((), 0, dtype=tl.uint64)
+    bad_count = tl.full((), 0, dtype=tl.int32)
+    kept_finite = tl.full((), 0, dtype=tl.int32)
+    for start in range(0, vocab_size, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        m = cols < vocab_size
+        v = tl.load(src_row + cols, mask=m, other=-float("inf"))
+        kept = m & (~(v < cutoff_val) if has_k else m)
+        is_bad = kept & ((v != v) | (v == float("inf")))
+        bad_count += tl.sum(is_bad.to(tl.int32), axis=0)
+        finite_kept = kept & (v > -float("inf")) & ~is_bad
+        kept_finite += tl.sum(finite_kept.to(tl.int32), axis=0)
+        vk = _float_to_ordered_u32(v)
+        pair = (vk.to(tl.uint64) << 32) | cols.to(tl.uint64)
+        tile_max = tl.max(
+            tl.where(kept, pair, tl.zeros([BLOCK], dtype=tl.uint64)), axis=0
+        )
+        max_pair = tl.maximum(max_pair, tile_max)
+
+    if bad_count > 0 or kept_finite == 0:
+        for start in range(0, vocab_size, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            m = cols < vocab_size
+            v = tl.load(src_row + cols, mask=m, other=0.0)
+            drop = has_k & (v < cutoff_val)
+            out_v = tl.where(drop | (v == -float("inf")), MASK_VALUE, v)
+            tl.store(out_row + cols, out_v, mask=m)
+        return
+
+    max_vk = (max_pair >> 32).to(tl.uint32)
+    last_max_idx = (max_pair & 0xFFFFFFFF).to(tl.int32)
+    max_val = _ordered_u32_to_float(max_vk)
+
+    denom = tl.full((), 0.0, dtype=tl.float32)
+    for start in range(0, vocab_size, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        m = cols < vocab_size
+        v = tl.load(src_row + cols, mask=m, other=-float("inf"))
+        kept = m & (~(v < cutoff_val) if has_k else m) & (v > -float("inf"))
+        denom += tl.sum(tl.where(kept, tl.exp(v - max_val), 0.0), axis=0)
+
+    inv_denom = 1.0 / denom
+    bound = 1.0 - p_val
+    split_key = tl.full((), 0, dtype=tl.uint32)
+    sum_lt_split = tl.full((), 0.0, dtype=tl.float32)
+    for step in range(32):
+        bit = 31 - step
+        probe_key = split_key | (tl.full((), 1, dtype=tl.uint32) << bit)
+        prob_lt = tl.full((), 0.0, dtype=tl.float32)
+        for start in range(0, vocab_size, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            m = cols < vocab_size
+            v = tl.load(src_row + cols, mask=m, other=-float("inf"))
+            kept = m & (~(v < cutoff_val) if has_k else m) & (v > -float("inf"))
+            vk = _float_to_ordered_u32(v)
+            prob_lt += tl.sum(
+                tl.where(kept & (vk < probe_key), tl.exp(v - max_val) * inv_denom, 0.0),
+                axis=0,
+            )
+        take = (probe_key <= max_vk) & (prob_lt <= bound)
+        split_key = tl.where(take, probe_key, split_key)
+        sum_lt_split = tl.where(take, prob_lt, sum_lt_split)
+
+    split_val = _ordered_u32_to_float(split_key)
+    tie_prob = tl.where(
+        split_val > -float("inf"), tl.exp(split_val - max_val) * inv_denom, 0.0
+    )
+    running_tie_count = tl.full((), 0, dtype=tl.int32)
+    for start in range(0, vocab_size, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        m = cols < vocab_size
+        v = tl.load(src_row + cols, mask=m, other=-float("inf"))
+        kept = m & (~(v < cutoff_val) if has_k else m) & (v > -float("inf"))
+        vk = _float_to_ordered_u32(v)
+        is_tie = kept & (vk == split_key)
+        tie_ranks = running_tie_count + tl.cumsum(is_tie.to(tl.int32), axis=0)
+        running_tie_count += tl.sum(is_tie.to(tl.int32), axis=0)
+        tie_cum = sum_lt_split + tie_ranks.to(tl.float32) * tie_prob
+        drop_p = (vk < split_key) | (is_tie & (tie_cum <= bound))
+        drop = (~kept | drop_p) & (cols != last_max_idx)
+        out_v = tl.where(drop | (v == -float("inf")), MASK_VALUE, v)
+        tl.store(out_row + cols, out_v, mask=m)
+
+
+def _resolve_reference_rows_gpu(
+    out: torch.Tensor,
+    src: torch.Tensor,
+    reference_rows: torch.Tensor,
+    k_ptr: torch.Tensor,
+    p_ptr: torch.Tensor,
+    mask_value: float,
+    *,
+    topk_enabled: bool,
+    topp_enabled: bool,
+) -> None:
+    _resolve_reference_rows_kernel[(out.shape[0],)](
+        out,
+        src,
+        reference_rows,
+        k_ptr,
+        p_ptr,
+        out.stride(0),
+        src.stride(0),
+        out.shape[1],
+        MASK_VALUE=mask_value,
+        TOPK_ENABLED=topk_enabled,
+        TOPP_ENABLED=topp_enabled,
+        BLOCK=4096,
+        num_warps=8,
+    )
+
+
 def _apply_top_k_top_p_compact(
     logits: torch.Tensor,
     k: torch.Tensor,
     p: torch.Tensor,
     mask_value: float,
+    *,
+    no_host_sync: bool = False,
 ) -> torch.Tensor | None:
     """Filter a bounded shortlist; retain reference handling at boundaries.
 
@@ -1214,6 +1399,21 @@ def _apply_top_k_top_p_compact(
         CAPACITY=capacity,
         num_warps=4,
     )
+
+    if no_host_sync:
+        _resolve_reference_rows_gpu(
+            result,
+            result,
+            reference_rows,
+            k,
+            p,
+            mask_value,
+            topk_enabled=True,
+            topp_enabled=True,
+        )
+        if mask_value != float("-inf"):
+            result.masked_fill_(torch.isneginf(result), mask_value)
+        return result
 
     if reference_rows.any():
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
@@ -1323,6 +1523,11 @@ def apply_top_k_top_p_triton(
     else:
         p_ptr = logits  # Dummy pointer (won't be read)
 
+    no_host_sync = bool(
+        logits.is_cuda
+        and runtime is not None
+        and getattr(runtime, "no_host_sync", False)
+    )
     if (
         not _NO_FENCE
         and topk_enabled
@@ -1333,7 +1538,9 @@ def apply_top_k_top_p_triton(
         and current_platform.is_cuda()
         and current_platform.is_device_capability((7, 0))
     ):
-        compact = _apply_top_k_top_p_compact(logits, k_ptr, p_ptr, mask_value)
+        compact = _apply_top_k_top_p_compact(
+            logits, k_ptr, p_ptr, mask_value, no_host_sync=no_host_sync
+        )
         if compact is not None:
             return compact
 
@@ -1406,6 +1613,19 @@ def apply_top_k_top_p_triton(
 
     if _NO_FENCE and logits.is_cuda:
         return _keep_row_maxima(logits, original_logits)
+    if no_host_sync:
+        _resolve_reference_rows_gpu(
+            logits,
+            original_logits,
+            reference_rows,
+            k_ptr,
+            p_ptr,
+            mask_value,
+            topk_enabled=topk_enabled,
+            topp_enabled=topp_enabled,
+        )
+        return logits
+
     if reference_rows.any():
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 

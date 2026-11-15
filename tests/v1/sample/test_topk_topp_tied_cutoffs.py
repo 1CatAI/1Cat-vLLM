@@ -407,3 +407,54 @@ def test_compact_classifies_rows_without_rejecting_the_batch(monkeypatch):
     # rows 4 and 7 may, when their nucleus boundary falls inside the FP32 margin
     # (row 7 does with torch 2.10 on a V100).
     assert {5, 6} <= dense <= {4, 5, 6, 7}
+
+
+@pytest.mark.parametrize("vocab", [32768, 62080, 248320])
+@pytest.mark.parametrize("mode", ["kp", "p_only", "k_only"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_no_host_sync_compact_and_gpu_fallback_match_reference(vocab, mode):
+    from vllm.config.execution_policy import layer_policy
+    from vllm.v1.sample.ops.topk_topp_runtime import TopKTopPRuntime
+
+    runtime = TopKTopPRuntime(layer_policy(), no_host_sync=True)
+    generator = torch.Generator(device="cuda").manual_seed(29 + vocab)
+    logits = torch.randn((8, vocab), device="cuda", generator=generator) * 2.5
+    # Force tied top-k cutoffs, tied top-p cutoffs, uniform rows, and k > 128.
+    logits[0].fill_(1.0)
+    logits[1].fill_(-20.0)
+    logits[1, :24] = 1.0
+    logits[1, :2] = 2.0
+    logits[2].fill_(-float("inf"))
+    logits[2, -160:] = 3.0
+    if mode == "kp":
+        k = torch.tensor(
+            [vocab, 20, 20, 200, 50, vocab, 1, 127], dtype=torch.int32, device="cuda"
+        )
+        p = torch.tensor([1.0, 0.95, 0.8, 0.9, 1.0, 0.85, 0.6, 0.95], device="cuda")
+    elif mode == "p_only":
+        k = None
+        p = torch.tensor([1.0, 0.95, 0.8, 0.9, 0.7, 0.85, 0.6, 0.95], device="cuda")
+    else:
+        k = torch.tensor(
+            [vocab, 20, 20, 200, 50, vocab, 1, 127], dtype=torch.int32, device="cuda"
+        )
+        p = None
+
+    expected_pytorch = apply_top_k_top_p_pytorch(logits.clone(), k, p)
+    expected_triton = apply_top_k_top_p_triton(logits.clone(), k, p)
+    # Warm up Triton compilation once before enabling strict sync debug mode.
+    _ = apply_top_k_top_p_triton(logits.clone(), k, p, runtime=runtime)
+    torch.accelerator.synchronize()
+    prev_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        actual = apply_top_k_top_p_triton(logits.clone(), k, p, runtime=runtime)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_mode)
+    # No-host-sync must match the default Triton route bit-for-bit across all
+    # rows and match the PyTorch sort reference on deterministic tied cutoffs.
+    assert torch.equal(actual, expected_triton)
+    if mode != "p_only":
+        assert torch.equal(actual, expected_pytorch)
+    else:
+        assert torch.equal(actual[:3], expected_pytorch[:3])

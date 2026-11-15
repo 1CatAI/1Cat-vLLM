@@ -868,6 +868,7 @@ def enable_qwen38_sm70_fp16_gemv(
         if not (
             isinstance(child, LinearBase)
             and type(child.quant_method) is UnquantizedLinearMethod
+            and not getattr(child, "_sm70_mtp_draft_qpn8", False)
         ):
             continue
         weight = getattr(child, "weight", None)

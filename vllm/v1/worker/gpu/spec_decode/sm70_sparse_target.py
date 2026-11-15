@@ -543,6 +543,15 @@ def try_graph_greedy_draft_rejection(
     return graph.replay(hidden, batch)
 
 
+def _sparse_target_reference_check_enabled(speculator: Any) -> bool:
+    ref_check = getattr(
+        speculator.vllm_config.kernel_config,
+        "sm70_sparse_target_reference_check",
+        None,
+    )
+    return True if ref_check is None else bool(ref_check)
+
+
 @torch.inference_mode()
 def maybe_capture_sparse_target_graphs(
     speculator: Any,
@@ -558,11 +567,7 @@ def maybe_capture_sparse_target_graphs(
         or not getattr(
             speculator.vllm_config.kernel_config, "sm70_sparse_target_sampling", False
         )
-        or not getattr(
-            speculator.vllm_config.kernel_config,
-            "sm70_sparse_target_reference_check",
-            True,
-        )
+        or not _sparse_target_reference_check_enabled(speculator)
         or not (
             hasattr(model, "get_compact_target_probe_with_fallback")
             or hasattr(model, "get_topk_tokens_and_logits_with_fallback")
@@ -895,7 +900,7 @@ def maybe_sample_sparse_target(
         sample_hidden_states,
         input_batch,
         grammar_output,
-        reference_check=speculator.vllm_config.kernel_config.sm70_sparse_target_reference_check,
+        reference_check=_sparse_target_reference_check_enabled(speculator),
         allow_graph=allow_graph,
     )
 
@@ -956,9 +961,14 @@ def try_greedy_draft_sparse_rejection(
     probe_k = _TARGET_PROBE_K if retain_ties else batch_top_k + 1
     fallback = None
     if not reference_check:
-        target_ids, target_logits = model.get_topk_tokens_and_logits(
-            sample_hidden_states, probe_k
-        )
+        if retain_ties and hasattr(model, "get_compact_target_probe_with_fallback"):
+            target_ids, target_logits, _ = model.get_compact_target_probe_with_fallback(
+                sample_hidden_states, probe_k
+            )
+        else:
+            target_ids, target_logits = model.get_topk_tokens_and_logits(
+                sample_hidden_states, probe_k
+            )
     elif retain_ties and hasattr(model, "get_compact_target_probe_with_fallback"):
         target_ids, target_logits, fallback = (
             model.get_compact_target_probe_with_fallback(sample_hidden_states, probe_k)

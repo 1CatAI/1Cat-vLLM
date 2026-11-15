@@ -381,6 +381,26 @@ def _use_grouped_mtp5(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
     )
 
 
+def _use_grouped_batch(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
+    """Admit prepared SM70 grouped NVFP4 decode/verify across M=2..40 and TP shards."""
+    return bool(
+        getattr(layer, "sm70_nvfp4_grouped_batch", False)
+        and _nvfp4_policy(layer).qpn_mtp5
+        and x.ndim == 2
+        and 2 <= x.shape[0] <= 40
+        and x.shape[1] == 2560
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (x.shape[0], 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and int(layer.sm70_nvfp4_num_experts) == 512
+        and int(layer.sm70_nvfp4_hidden_size) == 2560
+        and int(layer.sm70_nvfp4_intermediate_size) in (160, 320, 640)
+        and int(layer.sm70_nvfp4_top_k) == 10
+    )
+
+
 @triton.jit
 def _prepare_single_token_slots_kernel(
     input_ptr,
@@ -1136,8 +1156,10 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
         grouped_supported = bool(
-            (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k)
-            == (512, 2560, 160, 10)
+            num_experts == 512
+            and hidden == 2560
+            and intermediate in (160, 320, 640)
+            and layer.sm70_nvfp4_top_k == 10
             and not raw_scale
             and layer.swiglu_limit is None
         )
@@ -1147,13 +1169,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         grouped_mtp5 = bool(
             _nvfp4_policy(layer).grouped_mtp5
             and _nvfp4_policy(layer).qpn_mtp5
-            and int(layer.moe_config.tp_size) == 4
             and grouped_supported
         )
         if (grouped_requested or grouped_mtp5) and (
             not self.native_ops.has_nvfp4_grouped_decode_dispatch()
             or (
                 grouped_mtp5
+                and intermediate == 160
                 and not self.native_ops.has_nvfp4_grouped_batch_reduce_dispatch()
             )
         ):
@@ -1161,19 +1183,22 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "SM70 grouped MoE decode requires a matching native build."
             )
         layer.sm70_nvfp4_grouped_decode = grouped_requested
-        layer.sm70_nvfp4_grouped_mtp5 = grouped_mtp5
+        layer.sm70_nvfp4_grouped_mtp5 = bool(
+            grouped_mtp5 and int(layer.moe_config.tp_size) == 4 and intermediate == 160
+        )
+        layer.sm70_nvfp4_grouped_batch = grouped_mtp5
         if grouped_requested or grouped_mtp5:
             # Layer-owned metadata; W2 reuses sorted_output. No process-global
             # cache or additional activation buffer inside graph capture.
             device = layer.w13_tm_weight.device
             layer._nvfp4_grouped_rows = torch.empty(
-                160, 8, dtype=torch.int32, device=device
+                400, 8, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_experts = torch.empty(
-                160, dtype=torch.int32, device=device
+                400, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_sizes = torch.empty(
-                160, dtype=torch.int32, device=device
+                400, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_total = torch.empty(
                 1, dtype=torch.int32, device=device
@@ -1281,10 +1306,37 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         num_tokens = x.shape[0]
         if num_tokens == 0:
             return x.new_empty((0, hidden))
-        indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
         interleaved_w13 = bool(
             getattr(layer, "sm70_nvfp4_qwen38_fused_swiglu_prefill", False)
         )
+        if _use_grouped_batch(layer, x, topk_ids):
+            intermediate = int(layer.sm70_nvfp4_intermediate_size)
+            use_batch_reduce = (
+                intermediate == 160
+                and self.native_ops.has_nvfp4_grouped_batch_reduce_dispatch()
+            )
+            buffers = NvFp4MoEWorkspace.get_grouped(
+                layer, num_tokens, need_routed=not use_batch_reduce
+            )
+            plan = select_fp4_stage_plan(
+                Stage.ACTIVE_GROUPED,
+                (
+                    Stage.GROUPED_BATCH_REDUCE
+                    if use_batch_reduce
+                    else Stage.ACTIVE_GROUPED
+                ),
+                w13_split_k=(4 if intermediate == 160 or num_tokens <= 8 else 8),
+                interleaved=interleaved_w13,
+            )
+            execute_fp4(layer.sm70_fp4_codec, plan, buffers, x, topk_ids, topk_weights)
+            logger.info_once(
+                "SM70 grouped native-NVFP4 decode selected "
+                "(tokens=%d, W13/W2 share route groups, batch_reduce=%s).",
+                num_tokens,
+                use_batch_reduce,
+            )
+            return buffers["output"]
+        indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
         fused_indexed_w13 = indexed_w13 and interleaved_w13
         split_fused_indexed_w13 = fused_indexed_w13 and bool(
             getattr(layer, "sm70_nvfp4_qwen38_fast_prefill", False)

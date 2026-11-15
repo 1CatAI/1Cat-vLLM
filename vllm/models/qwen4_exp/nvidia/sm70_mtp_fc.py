@@ -19,6 +19,22 @@ def _sm70_device():
     return current_platform.is_device_capability(70)
 
 
+def _fc_shard_ready(layer) -> bool:
+    if (
+        type(layer) is not ColumnParallelLinear
+        or type(layer.quant_method) is not UnquantizedLinearMethod
+        or layer.tp_size not in (2, 4)
+        or not layer.gather_output
+        or layer.return_bias
+        or layer.bias is not None
+    ):
+        return False
+    expected = (2560 // layer.tp_size, 2560)
+    if getattr(layer, "_sm70_mtp_draft_qpn8_ready", False):
+        return getattr(layer, "_sm70_mtp_draft_qpn8_shape", None) == expected
+    return layer.weight.dtype == torch.float16 and layer.weight.shape == expected
+
+
 def _can_combine_fc(model, embedding, hidden):
     if (
         envs.VLLM_BATCH_INVARIANT
@@ -35,15 +51,7 @@ def _can_combine_fc(model, embedding, hidden):
     ):
         return False
     return all(
-        type(layer) is ColumnParallelLinear
-        and type(layer.quant_method) is UnquantizedLinearMethod
-        and layer.tp_size == 4
-        and layer.gather_output
-        and not layer.return_bias
-        and layer.bias is None
-        and layer.weight.shape == (640, 2560)
-        and layer.weight.dtype == torch.float16
-        for layer in (model.fc_embedding, model.fc_hidden)
+        _fc_shard_ready(layer) for layer in (model.fc_embedding, model.fc_hidden)
     )
 
 

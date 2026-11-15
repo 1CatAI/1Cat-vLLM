@@ -104,6 +104,7 @@ def _hc_mtp_prefill_sequence_qualified(vllm_config, config):
     return bool(
         vllm_config.kernel_config.layer_execution.hc_mtp_prefill_sequence_parallel
         and vllm_config.kernel_config.sm70_mtp_q8_0_experts
+        and not vllm_config.kernel_config.sm70_mtp_draft_qpn8
         and not is_offload_process()
         and current_platform.is_device_capability(70)
         and vllm_config.model_config.dtype == torch.float16
@@ -370,15 +371,16 @@ def _make_draft_vllm_config(
         from .mtp_q8_experts import MTPQ80Config
 
         if (
-            draft_quant_config is not None
+            draft_vllm_config.kernel_config.sm70_mtp_lossless_storage
+            or online_fp8
             or draft_vllm_config.model_config.dtype != torch.float16
             or draft_vllm_config.parallel_config.enable_expert_parallel
         ):
             raise ValueError(
-                "Q8_0 MTP experts require an unquantized FP16 draft without EP "
-                "and exclude sm70_mtp_lossless_storage"
+                "Q8_0 MTP experts require an FP16 draft without EP "
+                "and exclude sm70_mtp_lossless_storage and online FP8"
             )
-        draft_quant_config = MTPQ80Config()
+        draft_quant_config = MTPQ80Config(draft_quant_config)
     draft_vllm_config.quant_config = draft_quant_config
     return draft_vllm_config
 
@@ -802,25 +804,31 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 share_target_embed_tokens=self.share_target_io_weights,
             )
 
-        if get_pp_group().is_last_rank:
-            if self.share_target_io_weights:
-                self.lm_head = PPMissingLayer()
-            elif config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
+            if get_pp_group().is_last_rank:
+                if self.share_target_io_weights:
+                    self.lm_head = PPMissingLayer()
+                elif config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        prefix=maybe_prefix(prefix, "lm_head"),
+                    )
             else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    prefix=maybe_prefix(prefix, "lm_head"),
-                )
-        else:
-            self.lm_head = PPMissingLayer()
+                self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+            self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
+        if vllm_config.kernel_config.sm70_mtp_draft_qpn8:
+            from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+                mark_mtp_draft_qpn8,
+            )
+
+            mark_mtp_draft_qpn8(self.model)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
         config_dtype = vllm_config.model_config.dtype
         enable_qwen38_sm70_fp16_gemv(self, config_dtype, vllm_config)
@@ -925,8 +933,20 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             backbone = self._hc_prefill_sequence_model
         # Draft row stages keep the original replicated producer reductions;
         # they must not inherit the target's partial-producer context.
-        from .sm70_hcx import hc_prefill_sequence_parallel_context
+        from .sm70_hcx import (
+            hc_prefill_sequence_parallel_active,
+            hc_prefill_sequence_parallel_context,
+        )
 
+        if not hc_prefill_sequence_parallel_active():
+            return backbone(
+                input_ids,
+                positions,
+                hidden_states,
+                intermediate_tensors,
+                inputs_embeds,
+                spec_step_idx=spec_step_idx,
+            )
         with hc_prefill_sequence_parallel_context(False):
             return backbone(
                 input_ids,

@@ -15,7 +15,7 @@ def _prepare_ngram(
     mapping,
     computed,
     token_ids,
-    num_reqs: tl.constexpr,
+    num_reqs,
     padded_reqs: tl.constexpr,
     context_len: tl.constexpr,
     token_stride: tl.constexpr,

@@ -196,6 +196,41 @@ class NvFp4MoEWorkspace:
             return cls._persistent_buffers(layer, num_tokens)
         return cls._eager_buffers(layer, num_tokens, indexed_w13)
 
+    @classmethod
+    def get_grouped(
+        cls, layer: RoutedExperts, num_tokens: int, *, need_routed: bool = False
+    ) -> dict[str, torch.Tensor]:
+        if 0 < num_tokens <= 18:
+            slots = num_tokens * int(layer.sm70_nvfp4_top_k)
+            return {
+                "output": layer._nvfp4_sm70_output[:num_tokens],
+                "gate_up": layer._nvfp4_sm70_gate_up[:0],
+                "intermediate": layer._nvfp4_sm70_intermediate[:slots],
+                "sorted_output": (
+                    layer._nvfp4_sm70_sorted_output[:slots]
+                    if need_routed
+                    else layer._nvfp4_sm70_sorted_output[:0]
+                ),
+            }
+        device = layer.w13_tm_weight.device
+        slots = num_tokens * int(layer.sm70_nvfp4_top_k)
+        hidden = int(layer.sm70_nvfp4_hidden_size)
+        intermediate = int(layer.sm70_nvfp4_intermediate_size)
+        return {
+            "output": torch.empty(
+                num_tokens, hidden, dtype=torch.float16, device=device
+            ),
+            "gate_up": layer._nvfp4_sm70_gate_up[:0],
+            "intermediate": torch.empty(
+                slots, intermediate, dtype=torch.float16, device=device
+            ),
+            "sorted_output": (
+                torch.empty(slots, hidden, dtype=torch.float16, device=device)
+                if need_routed
+                else layer._nvfp4_sm70_sorted_output[:0]
+            ),
+        }
+
 
 class MxFp4MoEWorkspace:
     @classmethod

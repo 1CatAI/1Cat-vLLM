@@ -865,7 +865,7 @@ class KernelConfig:
     """Compute the GDN a/b and QSA indexer q/k FP16 projections inside the
     small-M GGUF input projection launch (packed dense_mv planes)."""
 
-    sm70_qsa_prep: bool = False
+    sm70_qsa_prep: bool | None = None
     """Fuse QSA q/k GemmaRMSNorm, partial NeoX RoPE and the FP16 K/V cache
     write into one SM70 launch for decode batches."""
 
@@ -893,11 +893,11 @@ class KernelConfig:
     TP4. Preserve subnormals, signed zero and FP32 accumulation; reject weights
     outside the lossless representation instead of requantizing."""
 
-    sm70_mtp_q8_0_experts: bool = False
+    sm70_mtp_q8_0_experts: bool | None = None
     """Store MTP draft experts as GGUF Q8_0 (about half of FP16). Drafts only
     propose tokens, so this can change acceptance but never verified output."""
 
-    sm70_top1x: bool = False
+    sm70_top1x: bool | None = None
     """Exchange TP-local greedy (value, id) pairs in two direct-NVLink hops
     instead of an all-gather."""
 
@@ -928,7 +928,7 @@ class KernelConfig:
     contract. Exact: requests with an ambiguous top-k/top-p cutoff fall back to
     the full-vocabulary sampler."""
 
-    sm70_sparse_target_reference_check: bool = True
+    sm70_sparse_target_reference_check: bool | None = None
     """With sparse target sampling, copy the candidates to the host each round
     and send requests with an ambiguous cutoff (score ties at top-k, a top-p
     boundary within rounding) to the full-vocabulary sampler, for bit-exact
@@ -958,11 +958,11 @@ class KernelConfig:
     """Record bounded decode routing histories for a byte/instruction cost
     ledger. Extra diagnostic kernels invalidate latency measurements."""
 
-    sm70_hcx: bool = False
+    sm70_hcx: bool | None = None
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
     HC down and HC up as one SM70 kernel for verification batches up to 8."""
 
-    sm70_hcx_local_schedule: bool = False
+    sm70_hcx_local_schedule: bool | None = None
     """Experimentally delay HC up-weight prefetch and distribute gate-mix for
     full-mesh TP4 HCX, including fused Q4_K/Q6_K output projection when its
     input normalization is already complete. Keeps the reference arithmetic
@@ -1146,18 +1146,79 @@ class KernelConfig:
 
         return prefer_native_mtp_runner(cfg)
 
+    def _prefer_qwen4_sm70(self, cfg) -> bool:
+        import torch
+
+        from vllm.platforms import current_platform
+
+        model = getattr(cfg, "model_config", None)
+        text = getattr(model, "hf_text_config", None)
+        architectures = set(getattr(model, "architectures", ()) or ())
+        if not (
+            architectures & {"Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"}
+            and getattr(model, "dtype", None) == torch.float16
+            and not getattr(model, "enforce_eager", False)
+            and getattr(text, "hidden_size", None) == 2560
+            and getattr(text, "hc_count", None) == 4
+        ):
+            return False
+        try:
+            cap = current_platform.get_device_capability()
+        except Exception:
+            return False
+        return cap is not None and (cap.major, cap.minor) == (7, 0)
+
     def resolve_speculative_defaults(self, cfg) -> None:
+        import torch
+
         prefer = self.prefer_speculative_runner(cfg)
+        qwen4_sm70 = self._prefer_qwen4_sm70(cfg)
+        if self.sm70_qsa_prep is None:
+            self.sm70_qsa_prep = qwen4_sm70
+        if self.sm70_hcx is None:
+            self.sm70_hcx = bool(
+                qwen4_sm70
+                and not self.sm70_hcx_diagnostics
+                and getattr(cfg, "lora_config", None) is None
+            )
+        if self.sm70_hcx_local_schedule is None:
+            self.sm70_hcx_local_schedule = bool(self.sm70_hcx)
+        if self.sm70_top1x is None:
+            self.sm70_top1x = qwen4_sm70
         if self.sm70_greedy_verify is None:
             self.sm70_greedy_verify = prefer
+        if self.sm70_sparse_target_sampling is None:
+            self.sm70_sparse_target_sampling = prefer
+        if self.sm70_sparse_target_reference_check is None:
+            self.sm70_sparse_target_reference_check = not qwen4_sm70
         if self.sm70_draft_single_graph is None:
             self.sm70_draft_single_graph = prefer
         if self.sm70_mtp_refined_head is None:
             self.sm70_mtp_refined_head = prefer
         if self.sm70_mtp_bounded_target_head is None:
             self.sm70_mtp_bounded_target_head = prefer
-        if self.sm70_sparse_target_sampling is None:
-            self.sm70_sparse_target_sampling = prefer
+        if self.sm70_mtp_q8_0_experts is None:
+            spec = getattr(cfg, "speculative_config", None)
+            draft = getattr(spec, "draft_model_config", None)
+            draft_text = getattr(draft, "hf_text_config", None)
+            parallel = getattr(cfg, "parallel_config", None)
+            tp_size = max(int(getattr(parallel, "tensor_parallel_size", 1) or 1), 1)
+            hidden_size = int(getattr(draft_text, "hidden_size", 0) or 0)
+            moe_inter = int(getattr(draft_text, "moe_intermediate_size", 0) or 0)
+            self.sm70_mtp_q8_0_experts = bool(
+                prefer
+                and qwen4_sm70
+                and draft is not None
+                and getattr(draft, "dtype", None) == torch.float16
+                and getattr(spec, "mtp_expert_quantization", None) is None
+                and not self.sm70_mtp_lossless_storage
+                and not getattr(parallel, "enable_expert_parallel", False)
+                and int(getattr(parallel, "data_parallel_size", 1) or 1) == 1
+                and hidden_size > 0
+                and hidden_size % 32 == 0
+                and moe_inter > 0
+                and (moe_inter // tp_size) % 32 == 0
+            )
         if self.sm70_gdn_spec_replay is None:
             from vllm.model_executor.models.config import sm70_mtp_verifier_qualified
 
@@ -1276,6 +1337,8 @@ class KernelConfig:
             "sm70_marlin",  # Hash only when the provider is prepared.
             "sm70_gdn_verify",  # Compatibility input is represented by gdn policy.
             "sm70_runtime",  # Warmup does not alter compiled model computation.
+            "sm70_sparse_target_sampling",  # Sampler dispatch outside compiled forward.
+            "sm70_sparse_target_reference_check",  # Sampler dispatch outside forward.
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
             "collective_kernel_selections",

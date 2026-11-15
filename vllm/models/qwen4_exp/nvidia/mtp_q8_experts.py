@@ -17,6 +17,9 @@ from vllm.model_executor.layers.fused_moe import (
     MoEActivation,
     RoutedExperts,
 )
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
@@ -192,8 +195,14 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
 
 
 class MTPQ80Config(QuantizationConfig):
+    def __init__(self, fallback: QuantizationConfig | None = None):
+        super().__init__()
+        self.fallback = fallback
+        if fallback is not None:
+            self.packed_modules_mapping = fallback.packed_modules_mapping
+
     def get_name(self):
-        return "q8_0_mtp_experts"
+        return "q8_0_mtp_experts" if self.fallback is None else self.fallback.get_name()
 
     def get_supported_act_dtypes(self):
         return [torch.float16]
@@ -210,9 +219,21 @@ class MTPQ80Config(QuantizationConfig):
     def from_config(cls, config):
         raise NotImplementedError("Construct from the resolved unquantized MTP config")
 
+    def get_cache_scale(self, name):
+        return None if self.fallback is None else self.fallback.get_cache_scale(name)
+
     def get_quant_method(self, layer, prefix):
+        method = (
+            None
+            if self.fallback is None
+            else self.fallback.get_quant_method(layer, prefix)
+        )
         if isinstance(layer, RoutedExperts) and prefix.startswith("mtp.layers."):
+            if method is not None and not isinstance(method, UnquantizedFusedMoEMethod):
+                return method
             return MTPQ80MoEMethod(layer.moe_config)
+        if method is not None:
+            return method
         if isinstance(layer, LinearBase):
             return UnquantizedLinearMethod()
         return None
