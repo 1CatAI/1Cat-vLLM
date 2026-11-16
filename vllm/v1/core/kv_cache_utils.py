@@ -3608,8 +3608,35 @@ def get_kv_cache_configs(
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
+            check_pool_holds_max_model_len(vllm_config, kv_cache_config)
 
     return kv_cache_configs
+
+
+def check_pool_holds_max_model_len(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """Refuse a pool that cannot hold one request of the model's max seq len.
+
+    The memory checks before this point compare each rank's memory with one
+    request's need. The pool then takes the smallest rank's block count and,
+    for layouts with device state blocks, splits it between state and history,
+    so it can end up below one request after the checks passed. The scheduler
+    admits such a request and it never finishes.
+    """
+    max_concurrency = get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    )
+    if max_concurrency >= 1:
+        return
+    max_model_len = vllm_config.model_config.max_model_len
+    raise ValueError(
+        f"The KV cache pool holds {int(max_concurrency * max_model_len):,} "
+        f"tokens, fewer than one request of the model's max seq len "
+        f"({max_model_len:,}) needs (maximum concurrency "
+        f"{max_concurrency:.2f}x). Try increasing `gpu_memory_utilization` or "
+        f"decreasing `max_model_len` when initializing the engine."
+    )
 
 
 class BlockHashListWithBlockSize:
