@@ -314,12 +314,9 @@ def test_group32_refuses_unqualified_variants():
     scales = torch.exp2(s.float() - 127.0)
     with pytest.raises(RuntimeError, match="gated-SiLU"):
         sm70_ops.fp8_sm70_prepare(w, scales, 32, True)
-    tw = b32.prepare_fp8_block32(w, s)
-    x = torch.randn(4, 1024, device="cuda").half()
-    out = torch.empty(4, 256, dtype=torch.float16, device="cuda")
-    with pytest.raises(RuntimeError, match="group_size 128, or 32"):
-        sm70_ops.fp8_gemm_sm70_out(
-            out, x, tw.tm_weight, tw.tm_scales, 32, tw.k_ld, tw.q_ld, True
+    # main's native contract admits group sizes 32, 64 and 128; anything else
+    # is refused before any kernel runs.
+    with pytest.raises(RuntimeError, match="only group_size=32, 64 or 128"):
+        sm70_ops.fp8_sm70_prepare(
+            w, torch.exp2(s.float().repeat_interleave(2, dim=1) - 127.0), 16
         )
-    with pytest.raises(RuntimeError, match="only group_size 128 or 32"):
-        sm70_ops.fp8_sm70_prepare(w, torch.exp2(s.float()[:, ::2] - 127.0), 64)

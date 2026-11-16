@@ -294,7 +294,7 @@ def test_sampler_runner_and_drafter_glue():
     ):
         assert needle in body
     runner = _src("vllm/v1/worker/gpu_model_runner.py")
-    flag = '_COUPLED_DRAFTS = os.getenv("VLLM_V41_COUPLED_DRAFTS", "0") == "1"'
+    flag = '_COUPLED_DRAFTS = envs.VLLM_V41_COUPLED_DRAFTS == "1"'
     assert flag in runner
     assert "self._set_coupled_rows(spec_decode_metadata, logits)" in runner
     rows = "positions = self.positions[metadata.logits_indices.long()] + 1"
