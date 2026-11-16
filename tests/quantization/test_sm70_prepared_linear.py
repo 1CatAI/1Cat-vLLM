@@ -68,7 +68,10 @@ def test_prepared_provider_preserves_dispatch_and_shared_output_contract(
 
         monkeypatch.setattr(nvfp4_dequant, name, qpn2)
     state.native_ops = SimpleNamespace(
-        arguments=(), **{name: lambda out, inp, *args: write(out, inp)}
+        arguments=(),
+        # Like NativeBindings.invoke without a bound runtime owner.
+        invoke=lambda operation, *args: operation(*args),
+        **{name: lambda out, inp, *args: write(out, inp)},
     )
     result = apply_prepared(state, x, bias, "layer")
     expected = (

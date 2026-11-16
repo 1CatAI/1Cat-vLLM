@@ -43,11 +43,6 @@ direct_register_custom_op(
 )
 
 
-@torch.compiler.assume_constant_result
-def _sm70_device():
-    return current_platform.is_device_capability(70)
-
-
 def _fc_shard_ready(layer) -> bool:
     if (
         type(layer) is not ColumnParallelLinear
@@ -76,7 +71,7 @@ def _can_combine_fc(model, embedding, hidden):
         or hidden.dtype != torch.float16
         or not embedding.is_cuda
         or not hidden.is_cuda
-        or not _sm70_device()
+        or not current_platform.is_device_capability(70)
     ):
         return False
     return all(

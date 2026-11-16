@@ -74,10 +74,11 @@ def test_tail_all_four_batches_tp_offsets_and_mixed_formats_are_fp16(
 
     state = SimpleNamespace(
         expert_trace_tokens=0,
-        dp4a_admitted=True,
+        # The tail serves M1..6 only when the integer DP4A path is not admitted.
+        dp4a_admitted=False,
         is_v41=True,
         cache_layer=0,
-        expert_cache=SimpleNamespace(resolve=lambda layer, ids: ids),
+        expert_cache=SimpleNamespace(resolve=lambda layer, ids, weights=None: ids),
         weight_types={"w1": kind, "w3": kind, "w2": down_kind},
         input_padding={"w2": (left, 768)},
         swiglu_limit=10.0,

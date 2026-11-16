@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 import inspect
 from collections.abc import Sequence
 
@@ -59,6 +60,9 @@ def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_bui
             is_same = True
         elif isinstance(a, CpuGpuBuffer):
             is_same = np.allclose(a.np, b.np) and torch.allclose(a.gpu, b.gpu)
+        elif isinstance(a, functools.partial):
+            # Each batch binds its own deferred policy flag; compare the values.
+            is_same = a() == b()
         assert is_same, (
             f"Attribute {attr_name} is different in {obj1} and {obj2}: {a} != {b}"
         )

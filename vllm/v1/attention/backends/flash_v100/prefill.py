@@ -151,59 +151,21 @@ def _run_fp8_prefill_bridge(
     if kv_heads <= 0 or q_heads % kv_heads != 0:
         return None
     if head_groups > 1 and kv_heads % head_groups == 0:
-        # Keep whole KV heads and their contiguous GQA query-head ranges.
-        # Reuse one group's FP16 KV, query and output buffers for every pass.
-        kv_per_group = kv_heads // head_groups
-        q_per_kv = q_heads // kv_heads
-        q_per_group = kv_per_group * q_per_kv
-
-        if plan is not None:
-            scratch = _dense_prefill.get_fp8_prefill_bridge_tail_workspace(
-                query[:, :, :q_per_group],
-                int(query.shape[1]),
-                max_query_len=plan.max_query_tokens,
-                group_scratch=True,
-            )
-        else:
-
-            def allocate_group_scratch() -> tuple[torch.Tensor, ...]:
-                group_query = torch.empty(
-                    (*query.shape[:2], q_per_group, query.shape[3]),
-                    dtype=query.dtype,
-                    device=query.device,
-                )
-                return group_query, torch.empty_like(group_query)
-
-            scratch = _workspace.allocate_growing_workspace(
-                allocate_group_scratch, on_cuda=query.is_cuda
-            )
-        if scratch is None:
-            return None
-        group_query, group_out = scratch
-        for group in range(head_groups):
-            kv_lo = group * kv_per_group
-            kv_hi = kv_lo + kv_per_group
-            q_lo = kv_lo * q_per_kv
-            q_hi = kv_hi * q_per_kv
-            group_query.copy_(query[:, :, q_lo:q_hi])
-            group_result = self._run_fp8_prefill_bridge(
-                query=group_query,
-                key_cache=key_cache[:, :, kv_lo:kv_hi],
-                value_cache=value_cache[:, :, kv_lo:kv_hi],
-                block_table=block_table,
-                seq_lens=seq_lens,
-                seq_len=seq_len,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                causal=causal,
-                window_size=window_size,
-                out=group_out,
-                head_groups=1,
-            )
-            if group_result is None:
-                return None
-            out[:, :, q_lo:q_hi].copy_(group_result[0])
-        return out, True
+        return fp8_bridge_by_head_groups(
+            self,
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            seq_len=seq_len,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            causal=causal,
+            window_size=window_size,
+            out=out,
+            head_groups=head_groups,
+        )
     input_block_size = int(key_cache.shape[1])
     active_input_blocks = min(
         int(block_table.shape[1]),
@@ -215,14 +177,14 @@ def _run_fp8_prefill_bridge(
     input_capacity = active_input_blocks * input_block_size
     required_blocks = _masks.cdiv_int(
         input_capacity,
-        _dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE,
+        _config.FP8_PREFILL_BRIDGE_PAGE_SIZE,
     )
     workspace = _dense_prefill.get_fp8_prefill_bridge_workspace(
         key_cache,
         required_blocks,
         max_blocks=_masks.cdiv_int(
             int(block_table.shape[1]) * input_block_size,
-            _dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE,
+            _config.FP8_PREFILL_BRIDGE_PAGE_SIZE,
         ),
     )
     if workspace is None:
@@ -246,47 +208,9 @@ def _run_fp8_prefill_bridge(
         v_scale,
     )
     q_len = int(query.shape[1])
-    exact_query = query
-    exact_out = out
-    tail_prefix = 0
-    # The exact kernels take 64-row query and 32-row key tiles. Leading zero
-    # queries keep the causal offset of every real query. Below the 79T range
-    # an unaligned sequence is also padded at the end: the trailing zero keys
-    # lie past every real query, so causal masking hides them, and the rows
-    # querying them are dropped.
-    kv_pad = 0
-    if (
-        q_len < _dense_prefill._SM70_79T_Q4096_MIN_QUERY_LEN
-        and seq_len + 31 <= key_out.shape[0] * key_out.shape[1]
-        and key_out.is_contiguous()
-        and value_out.is_contiguous()
-    ):
-        kv_pad = -seq_len % 32
-    if (q_len + kv_pad) % 64 != 0 or kv_pad:
-        padded_q_len = _masks.cdiv_int(q_len + kv_pad, 64) * 64
-        if padded_q_len <= seq_len + kv_pad:
-            tail_workspace = _dense_prefill.get_fp8_prefill_bridge_tail_workspace(
-                query,
-                padded_q_len,
-                max_query_len=(
-                    _masks.cdiv_int(plan.max_query_tokens, 64) * 64
-                    if plan is not None
-                    else None
-                ),
-            )
-            if tail_workspace is not None:
-                exact_query, exact_out = tail_workspace
-                tail_prefix = padded_q_len - q_len - kv_pad
-                exact_query[:, :tail_prefix].zero_()
-                exact_query[:, tail_prefix : tail_prefix + q_len].copy_(query)
-                if kv_pad:
-                    exact_query[:, tail_prefix + q_len :].zero_()
-                    key_out.flatten(0, 1)[seq_len : seq_len + kv_pad].zero_()
-                    value_out.flatten(0, 1)[seq_len : seq_len + kv_pad].zero_()
-            else:
-                kv_pad = 0
-        else:
-            kv_pad = 0
+    exact_query, exact_out, tail_prefix, kv_pad = pad_fp8_bridge_query(
+        query, out, key_out, value_out, seq_len=seq_len, plan=plan
+    )
     padded_seq_len = seq_len + kv_pad
     cu_q, cu_k = _dense_prefill.uniform_cu_seqlens(
         exact_query,
@@ -367,6 +291,140 @@ def _run_fp8_prefill_bridge(
         window_size=window_size,
     )
     return paged_result, False
+
+
+def fp8_bridge_by_head_groups(
+    self: PrefillExecutor,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_len: int,
+    k_scale: float,
+    v_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    out: torch.Tensor,
+    head_groups: int,
+) -> tuple[torch.Tensor, bool] | None:
+    """Run the FP8 bridge one KV-head group at a time.
+
+    Keep whole KV heads and their contiguous GQA query-head ranges. Reuse one
+    group's FP16 KV, query and output buffers for every pass.
+    """
+    plan = getattr(self, "fp8_bridge_workspace_plan", None)
+    kv_heads = int(key_cache.shape[2])
+    kv_per_group = kv_heads // head_groups
+    q_per_kv = int(query.shape[2]) // kv_heads
+    q_per_group = kv_per_group * q_per_kv
+
+    if plan is not None:
+        scratch = _dense_prefill.get_fp8_prefill_bridge_tail_workspace(
+            query[:, :, :q_per_group],
+            int(query.shape[1]),
+            max_query_len=plan.max_query_tokens,
+            group_scratch=True,
+        )
+    else:
+
+        def allocate_group_scratch() -> tuple[torch.Tensor, ...]:
+            group_query = torch.empty(
+                (*query.shape[:2], q_per_group, query.shape[3]),
+                dtype=query.dtype,
+                device=query.device,
+            )
+            return group_query, torch.empty_like(group_query)
+
+        scratch = _workspace.allocate_growing_workspace(
+            allocate_group_scratch, on_cuda=query.is_cuda
+        )
+    if scratch is None:
+        return None
+    group_query, group_out = scratch
+    for group in range(head_groups):
+        kv_lo = group * kv_per_group
+        kv_hi = kv_lo + kv_per_group
+        q_lo = kv_lo * q_per_kv
+        q_hi = kv_hi * q_per_kv
+        group_query.copy_(query[:, :, q_lo:q_hi])
+        group_result = self._run_fp8_prefill_bridge(
+            query=group_query,
+            key_cache=key_cache[:, :, kv_lo:kv_hi],
+            value_cache=value_cache[:, :, kv_lo:kv_hi],
+            block_table=block_table,
+            seq_lens=seq_lens,
+            seq_len=seq_len,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            causal=causal,
+            window_size=window_size,
+            out=group_out,
+            head_groups=1,
+        )
+        if group_result is None:
+            return None
+        out[:, :, q_lo:q_hi].copy_(group_result[0])
+    return out, True
+
+
+def pad_fp8_bridge_query(
+    query: torch.Tensor,
+    out: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    *,
+    seq_len: int,
+    plan,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Pad the bridge query to the exact kernels' tiles.
+
+    Returns the query and output to run, the leading padding rows and the
+    trailing key padding. The exact kernels take 64-row query and 32-row key
+    tiles. Leading zero queries keep the causal offset of every real query.
+    Below the 79T range an unaligned sequence is also padded at the end: the
+    trailing zero keys lie past every real query, so causal masking hides them,
+    and the rows querying them are dropped.
+    """
+    q_len = int(query.shape[1])
+    exact_query = query
+    exact_out = out
+    tail_prefix = 0
+    kv_pad = 0
+    if (
+        q_len < _config.SM70_79T_Q4096_MIN_QUERY_LEN
+        and seq_len + 31 <= key_out.shape[0] * key_out.shape[1]
+        and key_out.is_contiguous()
+        and value_out.is_contiguous()
+    ):
+        kv_pad = -seq_len % 32
+    if (q_len + kv_pad) % 64 != 0 or kv_pad:
+        padded_q_len = _masks.cdiv_int(q_len + kv_pad, 64) * 64
+        if padded_q_len <= seq_len + kv_pad:
+            tail_workspace = _dense_prefill.get_fp8_prefill_bridge_tail_workspace(
+                query,
+                padded_q_len,
+                max_query_len=(
+                    _masks.cdiv_int(plan.max_query_tokens, 64) * 64
+                    if plan is not None
+                    else None
+                ),
+            )
+            if tail_workspace is not None:
+                exact_query, exact_out = tail_workspace
+                tail_prefix = padded_q_len - q_len - kv_pad
+                exact_query[:, :tail_prefix].zero_()
+                exact_query[:, tail_prefix : tail_prefix + q_len].copy_(query)
+                if kv_pad:
+                    exact_query[:, tail_prefix + q_len :].zero_()
+                    key_out.flatten(0, 1)[seq_len : seq_len + kv_pad].zero_()
+                    value_out.flatten(0, 1)[seq_len : seq_len + kv_pad].zero_()
+            else:
+                kv_pad = 0
+        else:
+            kv_pad = 0
+    return exact_query, exact_out, tail_prefix, kv_pad
 
 
 def _should_use_prefill_splitkv(
@@ -462,15 +520,11 @@ def _should_use_prefill_gather_dense(
     graph_capture = _routing.is_cuda_graph_capturing(key_cache)
     q8192_family = (
         not _config.options().value("prefill_d256_gqa_v37")
-        and _dense_prefill._SM70_79T_CORE_QUERY_LEN
-        <= q_len
-        <= _dense_prefill._SM70_79T_MAX_QUERY_LEN
+        and _config.SM70_79T_CORE_QUERY_LEN <= q_len <= _config.SM70_79T_MAX_QUERY_LEN
     )
-    aligned_shape = (
-        q8192_family and seq_len % _dense_prefill._SM70_79T_KV_ALIGNMENT == 0
-    ) or (
-        q_len % _dense_prefill._SM70_79T_EXACT_QUERY_ALIGNMENT == 0
-        and seq_len % _dense_prefill._SM70_SPLITD_KV_ALIGNMENT == 0
+    aligned_shape = (q8192_family and seq_len % _config.SM70_79T_KV_ALIGNMENT == 0) or (
+        q_len % _config.SM70_79T_EXACT_QUERY_ALIGNMENT == 0
+        and seq_len % _config.SM70_SPLITD_KV_ALIGNMENT == 0
     )
     eligible = (
         self.use_flash_v100_prefill_gather_dense
@@ -1102,7 +1156,7 @@ def log_fp8_bridge(config):
             "FLASH_ATTN_V100 %s prefill bridge active (one-pass dequant, shared "
             "FP16 page-%d workspace).",
             config.kv_cache_dtype,
-            _dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE,
+            _config.FP8_PREFILL_BRIDGE_PAGE_SIZE,
             scope="process",
             key="flash_v100._logged_fp8_prefill_bridge",
         )

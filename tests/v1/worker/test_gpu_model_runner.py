@@ -19,6 +19,7 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.diagnostics import bind_diagnostics
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -299,6 +300,7 @@ def test_sample_tokens_receives_pp_sampled_ids_only_on_non_last_rank(
     runner.execute_model_state = None
     runner.kv_connector_output = None
     runner.use_async_scheduling = True
+    runner._runtime_trace = SimpleNamespace(async_cpu=False)
     receive_calls = 0
 
     def receive_prev_sampled_token_ids():
@@ -327,6 +329,7 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
     runner.execute_model_state = None
     runner.kv_connector_output = None
     runner.use_async_scheduling = False
+    runner._runtime_trace = SimpleNamespace(async_cpu=False)
 
     monkeypatch.setattr(
         gpu_model_runner_module,
@@ -857,6 +860,7 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     runner.rejection_sampler = Mock(return_value="sampler_output")
     runner.sampler = Mock()
     runner.speculative_config = None
+    runner._diagnostics = bind_diagnostics()
     runner._draft_prob_req_ids = ["req_c", "req_a", "req_b"]
     runner._draft_prob_token_ids = [[3], [1, 2], []]
     runner._draft_probs = torch.arange(3 * 3 * 4, dtype=torch.float32).reshape(3, 3, 4)
@@ -890,7 +894,7 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     assert torch.equal(passed_draft_probs, expected_draft_probs)
 
 
-def test_dspark_verification_lengths_trim_scheduler_drafts(monkeypatch):
+def test_dspark_verification_lengths_trim_scheduler_drafts():
     runner = object.__new__(GPUModelRunner)
     runner._draft_token_ids = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
     runner._draft_token_req_ids = ["a", "b"]
@@ -898,10 +902,7 @@ def test_dspark_verification_lengths_trim_scheduler_drafts(monkeypatch):
     runner.draft_token_ids_cpu = runner._draft_token_ids.clone()
     runner.dspark_confidence_scheduling = True
     runner._dspark_verification_lengths_cpu = torch.tensor([2, 0], dtype=torch.int32)
-    monkeypatch.setattr(
-        "vllm.v1.worker.gpu_model_runner.sm70_trace_event_sync",
-        lambda *_args, **_kwargs: None,
-    )
+    runner._event_tracer = SimpleNamespace(synchronize=lambda *_args, **_kwargs: None)
 
     token_ids, req_ids = runner._get_draft_token_ids_cpu()
 

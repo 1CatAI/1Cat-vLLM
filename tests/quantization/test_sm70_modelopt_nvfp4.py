@@ -134,7 +134,9 @@ def test_w4a16_keeps_modelopt_global_scale_without_reciprocation_or_heuristic():
         )
 
     with (
-        patch.object(sm70_tm, "should_prepare_turbomind", return_value=False),
+        # Neither exact SM70 nor Turing (which has its own QPN route).
+        patch.object(sm70_tm, "is_exact_sm70_cuda", return_value=False),
+        patch.object(sm70_tm, "is_turing_cuda_platform", return_value=False),
         patch.object(
             sm70_tm,
             "prepare_nvfp4_linear",
@@ -169,7 +171,7 @@ def test_w4a16_turbomind_prepare_only_on_exact_sm70():
         setattr(prepared, sm70_tm.STATE_ATTR, object())
 
     with (
-        patch.object(sm70_tm, "should_prepare_turbomind", return_value=True),
+        patch.object(sm70_tm, "is_exact_sm70_cuda", return_value=True),
         patch.object(sm70_tm, "prepare_nvfp4_linear", side_effect=fake_prepare),
     ):
         method.process_weights_after_loading(layer)
@@ -200,26 +202,28 @@ def test_w4a4_turbomind_prepare_skipped_off_sm70():
     )
     fake_kernel = MagicMock()
 
-    with patch(
-        "vllm.model_executor.layers.quantization.modelopt.init_nvfp4_linear_kernel",
-        return_value=fake_kernel,
-    ):
-        method = ModelOptNvFp4LinearMethod(
-            ModelOptNvFp4Config(
-                quant_method="NVFP4",
-                is_checkpoint_nvfp4_serialized=True,
+    # Neither exact SM70 nor Turing (which has its own QPN route).
+    with patch.object(sm70_tm, "is_turing_cuda_platform", return_value=False):
+        with patch(
+            "vllm.model_executor.layers.quantization.modelopt.init_nvfp4_linear_kernel",
+            return_value=fake_kernel,
+        ):
+            method = ModelOptNvFp4LinearMethod(
+                ModelOptNvFp4Config(
+                    quant_method="NVFP4",
+                    is_checkpoint_nvfp4_serialized=True,
+                )
             )
-        )
 
-    with (
-        patch.object(sm70_tm, "should_prepare_turbomind", return_value=False),
-        patch.object(
-            sm70_tm,
-            "prepare_nvfp4_linear",
-            side_effect=AssertionError("prepare must not run off SM70"),
-        ),
-    ):
-        method.process_weights_after_loading(layer)
+        with (
+            patch.object(sm70_tm, "is_exact_sm70_cuda", return_value=False),
+            patch.object(
+                sm70_tm,
+                "prepare_nvfp4_linear",
+                side_effect=AssertionError("prepare must not run off SM70"),
+            ),
+        ):
+            method.process_weights_after_loading(layer)
 
     fake_kernel.process_weights_after_loading.assert_called_once_with(layer)
     assert not sm70_tm.has_prepared_linear(layer)

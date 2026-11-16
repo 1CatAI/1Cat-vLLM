@@ -124,6 +124,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update_ddtree,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization import (
+    sm70_gdn_ba_verify as gdn_ba_verify,
+)
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
 from vllm.model_executor.layers.quantization.inc import INCConfig
@@ -1233,9 +1236,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._prefill_warmup_keys = runtime_resources_for(vllm_config).setdefault(
             "gdn_prefill_warmup_keys", set()
         )
-        # Runtime forward/capture need not retain the initialization config.
-        # Capture LoRA exclusion while the owning configuration is available.
-        self.enable_sm70_gdn_ba_verify = vllm_config.lora_config is None
+        # Runtime forward/capture need not retain the initialization config:
+        # bind the fused verify projection while it is available.
+        self.sm70_gdn_ba_verify_native = gdn_ba_verify.bind_gdn_ba_verify_policy(
+            vllm_config
+        )
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
@@ -3102,11 +3107,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and use_sm70_decode_graph_semantics(self._execution_graph_policy)
             and not _sm70_gdn_projection_dump_requested(layer_name)
         )
-        from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
-            apply_gdn_ba_verify,
-        )
-
-        fused_verify_projection = apply_gdn_ba_verify(self, hidden_states)
+        fused_verify_projection = gdn_ba_verify.apply_gdn_ba_verify(self, hidden_states)
         if fused_verify_projection is not None:
             mixed_qkv, z, b, a = fused_verify_projection
             z = z.reshape(z.size(0), -1, self.head_v_dim)
@@ -5915,10 +5916,6 @@ def _sm70_gdn_qpn8_ba_weight_contract(
     )
     heads = self.num_v_heads // self.tp_size
     width = (self.key_dim * 2 + self.value_dim * 2) // self.tp_size
-    from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
-        _gdn_ba_shard_supported,
-    )
-
     return bool(
         self.enable_sm70_gdn_qpn8_ba_split
         and ba is not None
@@ -5927,7 +5924,7 @@ def _sm70_gdn_qpn8_ba_weight_contract(
         and isinstance(qkvz_weight, torch.Tensor)
         and qkvz_weight.dtype == torch.uint8
         and input_width in (2560, 5120)
-        and _gdn_ba_shard_supported(width, heads)
+        and gdn_ba_verify._gdn_ba_shard_supported(width, heads)
         and qkvz_weight.shape == (input_width, width)
         and qkvz_weight.is_contiguous()
         and isinstance(qkvz_scales, torch.Tensor)
@@ -6001,10 +5998,6 @@ def qwen_gdn_input_projection_core(
         layer_name,
         hidden_states,
     )
-    from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
-        apply_gdn_ba_verify,
-    )
-
     fused_verify_projection = None
     if (
         hidden_states.ndim == 2
@@ -6016,7 +6009,7 @@ def qwen_gdn_input_projection_core(
         rows = hidden_states.shape[0]
         heads = self.num_v_heads // self.tp_size
         qkv_width = (self.key_dim * 2 + self.value_dim) // self.tp_size
-        fused_verify_projection = apply_gdn_ba_verify(
+        fused_verify_projection = gdn_ba_verify.apply_gdn_ba_verify(
             self,
             hidden_states,
             outputs=(
@@ -6166,10 +6159,6 @@ def qwen_gdn_input_projection(
         layer_name,
         hidden_states,
     )
-    from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
-        apply_gdn_ba_verify,
-    )
-
     if (
         hidden_states.ndim == 2
         and hidden_states.shape[1] == 5120
@@ -6177,7 +6166,7 @@ def qwen_gdn_input_projection(
         and z_out.is_contiguous()
         and not _sm70_gdn_projection_dump_requested(layer_name)
     ):
-        fused_verify_projection = apply_gdn_ba_verify(
+        fused_verify_projection = gdn_ba_verify.apply_gdn_ba_verify(
             self,
             hidden_states,
             outputs=(

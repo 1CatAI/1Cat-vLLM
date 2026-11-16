@@ -706,8 +706,41 @@ class Sm70RingConfig:
 
 
 @config
+class TopologyAllReduceConfig:
+    """Experimental measured single-node CUDA IPC all-reduce selection."""
+
+    enabled: bool = False
+    """Qualify and select routes before first model compilation and capture."""
+
+    precision: Literal["fp16", "fp32"] = "fp16"
+    """Use FP16 sums/transfers by default; opt into FP32 sums and partial
+    transfers for accuracy at higher latency. Input and output stay FP16."""
+
+    cache_dir: str | None = None
+    """Selection cache directory; None uses PyTorch's default extension root."""
+
+
+@config
+class HostReduceConfig:
+    """Two-rank FP16 all-reduce through pinned host memory for GPU pairs without
+    peer access; exact, the same bits as NCCL's two-rank sum."""
+
+    enabled: bool = True
+    """Admit the operator for two-rank groups whose GPUs NCCL cannot connect
+    peer to peer."""
+
+    max_bytes: int = Field(default=262144, gt=0, le=4194304, multiple_of=16)
+    """Largest payload; larger all-reduces stay on NCCL."""
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
+
+    topology_all_reduce: TopologyAllReduceConfig = Field(
+        default_factory=TopologyAllReduceConfig
+    )
+    """Opt-in topology-aware peer reduction with startup measured selection."""
 
     layer_execution: LayerExecutionPolicy = Field(default_factory=LayerExecutionPolicy)
     """Per-engine execution decisions and initialization provenance."""
@@ -831,6 +864,10 @@ class KernelConfig:
     """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
     sm70_router_weight_storage: Literal["dual", "row_major"] = "dual"
     """Read the FP16 checkpoint router directly or retain its packed duplicate."""
+
+    host_reduce: HostReduceConfig = Field(default_factory=HostReduceConfig)
+    """Two-rank host-memory all-reduce policy, resolved from peer access."""
+
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -1332,6 +1369,7 @@ class KernelConfig:
         Any future fields that don't affect compilation should be excluded.
         """
         ignored_factors = {
+            "topology_all_reduce",  # Include enabled math policy below, not cache path.
             "enable_flashinfer_autotune",
             "gdn",  # Hash only initialized computation policy below.
             "sm70_marlin",  # Hash only when the provider is prepared.
@@ -1363,6 +1401,8 @@ class KernelConfig:
             "qsa_host_kv_reason",
             "qsa_host_kv_trim_warmup_cache",  # Startup allocator hygiene only.
             "qsa_host_kv_allocator_headroom_mib",  # Process resource limit only.
+            # Collective transport chosen outside the compiled graph.
+            "host_reduce",
         }
         if not self.qsa_host_kv_prefill_stage_tokens or not (
             self.qsa_host_kv or self.qsa_host_kv_active
@@ -1398,6 +1438,10 @@ class KernelConfig:
         if not self.sm70_mxfp4.values:
             ignored_factors.add("sm70_mxfp4")
         factors = get_hash_factors(self, ignored_factors)
+        if self.topology_all_reduce.enabled:
+            factors["topology_all_reduce"] = dict(
+                enabled=True, precision=self.topology_all_reduce.precision
+            )
         factors["layer_execution"] = self.layer_execution.compute_hash()
         if self.sm70_sparse.active:
             factors["sm70_sparse"] = self.sm70_sparse.compute_hash()

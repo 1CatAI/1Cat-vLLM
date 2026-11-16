@@ -234,7 +234,7 @@
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
   "env": 14,
   "model": 236,
-  "platform": 407
+  "platform": 404
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1
@@ -283,7 +283,7 @@
   "platform": 13
  },
  "vllm/model_executor/layers/quantization/fp8.py": {
-  "platform": 62
+  "platform": 63
  },
  "vllm/model_executor/layers/quantization/modelopt.py": {
   "platform": 87

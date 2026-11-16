@@ -14,6 +14,9 @@ import torch
 from tests.quantization.utils import is_quant_method_supported
 from vllm import _custom_ops as ops
 from vllm.config.model import ModelConfig
+from vllm.model_executor.kernels.linear.qpn.pre_ampere import (
+    TuringQpn8Fp8LinearKernel,
+)
 from vllm.model_executor.layers.attention import attention as attention_module
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
@@ -168,6 +171,9 @@ def test_online_quantization(
     ) as llm:
 
         def check_model(model):
+            attn_backend_name = model.model.decoder.layers[
+                0
+            ].self_attn.attn.attn_backend.get_name()
             fc1 = model.model.decoder.layers[0].fc1
             assert isinstance(fc1.quant_method, Fp8LinearMethod)
             if kv_cache_dtype == "fp8":
@@ -179,11 +185,23 @@ def test_online_quantization(
             if current_platform.is_cuda():
                 if current_platform.supports_fp8() and not force_marlin:
                     # For GPUs with hardware support, we keep weights in fp8
+                    assert not fc1.quant_method.use_marlin
                     assert fc1.weight.dtype == torch.float8_e4m3fn
-                else:
+                elif fc1.quant_method.use_marlin:
                     # For GPUs without hardware support, we pack the fp8 weights
                     # for weight-only quantization using Marlin kernels
                     assert fc1.weight.dtype == torch.int32
+                else:
+                    # Without hardware FP8 the selector may prefer a native
+                    # weight-only kernel over Marlin: Turing lists
+                    # TuringQpn8Fp8LinearKernel ahead of Marlin and
+                    # VLLM_TEST_FORCE_FP8_MARLIN does not change that order.
+                    # It keeps its packed codes in kernel-owned buffers and
+                    # leaves the parameter in the checkpoint's fp8 dtype.
+                    assert isinstance(
+                        fc1.quant_method.fp8_linear, TuringQpn8Fp8LinearKernel
+                    )
+                    assert fc1.weight.dtype == torch.float8_e4m3fn
             elif current_platform.is_rocm():
                 if current_platform.supports_fp8() and not force_marlin:
                     # For GPUs with hardware support, we keep weights in fp8
@@ -200,7 +218,17 @@ def test_online_quantization(
                     "It only runs on CUDA and ROCm platform."
                 )
 
-        llm.apply_model(check_model)
+            return attn_backend_name
+
+        (attn_backend_name,) = llm.apply_model(check_model)
+        if (
+            kv_cache_dtype == "fp8"
+            and attn_backend_name == "TRITON_ATTN"
+            and not current_platform.has_device_capability(89)
+        ):
+            pytest.skip(
+                "Triton attention cannot compile an fp8e4nv KV cache before sm89."
+            )
 
         outputs = llm.generate_greedy(["Hello my name is"], max_tokens=4)
         print(outputs[0][1])
@@ -383,6 +411,10 @@ def test_scaled_fp8_quant(dtype) -> None:
 @pytest.mark.skipif(
     current_platform.is_fp8_fnuz(),
     reason="FP8 e4m3fn weight reloading is not supported on e4m3fnuz platforms",
+)
+@pytest.mark.skipif(
+    current_platform.is_cuda() and not current_platform.supports_fp8(),
+    reason="Without FP8 GEMM the weights take the Marlin repack this test excludes.",
 )
 @pytest.mark.parametrize("method_cls", [Fp8LinearMethod, Fp8MoEMethod])
 # FP8 weight reloading does not support online quantization
@@ -590,10 +622,13 @@ def test_kv_cache_dtype_skip_layers(vllm_runner, monkeypatch):
         kv_cache_dtype_skip_layers=["0", "2"],
         enforce_eager=True,
     ) as llm:
+        # SM70 Flash-V100 resolves the fp8 alias to its E4M3 name.
+        kv_cache_dtype = llm.llm.llm_engine.vllm_config.cache_config.cache_dtype
+        assert kv_cache_dtype in ("fp8", "fp8_e4m3")
 
         def check_layers(model):
             for i, layer in enumerate(model.model.decoder.layers):
-                expected = "auto" if str(i) in ["0", "2"] else "fp8"
+                expected = "auto" if str(i) in ["0", "2"] else kv_cache_dtype
                 assert layer.self_attn.attn.kv_cache_dtype == expected
 
         llm.apply_model(check_layers)

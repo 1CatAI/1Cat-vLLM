@@ -14,8 +14,12 @@ from vllm.model_executor.layers.quantization.utils.int8_utils import (
 )
 from vllm.platforms import current_platform
 
-if current_platform.get_device_capability() < (7, 0):
-    pytest.skip("INT8 Triton requires CUDA 7.0 or higher", allow_module_level=True)
+# The test feeds float8_e4m3fn operands to the Triton kernel.
+if not current_platform.has_device_capability(89):
+    pytest.skip(
+        "Triton limitation: fp8e4nv data type is not supported on CUDA arch < 89",
+        allow_module_level=True,
+    )
 
 vllm_config = VllmConfig()
 

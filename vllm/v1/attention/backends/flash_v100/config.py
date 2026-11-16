@@ -12,6 +12,20 @@ import vllm.envs as envs
 
 FP8_PREFILL_BRIDGE_PAGE_SIZE = 784
 
+# Exact Split-D dense-prefill kernel geometry, shared by the dense route
+# and the prefill selectors that admit it.
+SM70_79T_CORE_QUERY_LEN = 8000
+SM70_79T_MAX_QUERY_LEN = 8192
+# Native Q4096 specialization for 4096-token chunks; 4000..4095 are
+# leading-padded like Q8001..Q8191. Below 8192 keys the exact Split-D kernel is
+# faster, so the first chunks of a prompt keep it.
+SM70_79T_Q4096_QUERY_LEN = 4096
+SM70_79T_Q4096_MIN_QUERY_LEN = 4000
+SM70_79T_Q4096_MIN_KV = 8192
+SM70_79T_EXACT_QUERY_ALIGNMENT = 64
+SM70_79T_KV_ALIGNMENT = 32
+SM70_SPLITD_KV_ALIGNMENT = 32
+
 
 def options():
     from vllm.config.execution_policy import flash_v100_policy

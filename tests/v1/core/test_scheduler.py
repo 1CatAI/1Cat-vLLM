@@ -2707,6 +2707,8 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.enable_return_routed_experts = False
     scheduler.recompute_kv_load_failures = False
     scheduler.use_lookahead_block_hashes = False
+    # DeepSeek-V4.1 PP look-ahead off, as __init__ sets it by default (9fbc11c6f).
+    scheduler.v41_ahead = False
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
     scheduler.mixed_prefill_budget = Mock()

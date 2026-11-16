@@ -676,7 +676,7 @@ def test_fp8_prefill_bridge_growth_releases_previous_workspace(monkeypatch):
 
     cache: dict = {}
     monkeypatch.setattr(flash_v100, "_fp8_prefill_bridge_workspaces", cache)
-    monkeypatch.setattr(flash_v100, "_FP8_PREFILL_BRIDGE_PAGE_SIZE", 4)
+    monkeypatch.setattr(flash_v100, "FP8_PREFILL_BRIDGE_PAGE_SIZE", 4)
     key_cache = torch.empty((8, 4, 1, 2), dtype=torch.uint8)
 
     assert flash_v100._get_fp8_prefill_bridge_workspace(key_cache, 2) is not None

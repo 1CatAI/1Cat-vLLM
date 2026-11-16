@@ -51,6 +51,15 @@ if current_platform.is_rocm():
         allow_module_level=True,
     )
 
+# The SM70 Marlin build (Volta, and Turing in an sm_70-only build) serves fp16
+# activations and outputs with full K, without act_order or atomic-add output,
+# and rejects the rest on purpose. Its repack writes the SM70 kernels' layout.
+SM70_MARLIN = ops.sm70_marlin_available()
+SM70_REPACK_LAYOUT = (
+    "The SM70 repack writes the SM70 kernels' layout, not Marlin's; "
+    "test_marlin_gemm checks it through the GEMM."
+)
+
 ACT_ORDER_OPTS = [False, True]
 K_FULL_OPTS = [False, True]
 USE_ATOMIC_ADD_OPTS = [False, True]
@@ -205,6 +214,7 @@ def test_marlin_int4_fp8_preprocess_awq():
 @pytest.mark.parametrize("act_order", ACT_ORDER_OPTS)
 @pytest.mark.parametrize("is_a_8bit", [True, False])
 @pytest.mark.parametrize("nk_factors", MARLIN_REPACK_NK_FACTORS)
+@pytest.mark.skipif(SM70_MARLIN, reason=SM70_REPACK_LAYOUT)
 def test_gptq_marlin_repack(
     k_chunk, n_chunk, quant_type, act_order, is_a_8bit, nk_factors
 ):
@@ -274,6 +284,7 @@ def test_gptq_marlin_repack(
 @pytest.mark.parametrize("quant_type", query_marlin_supported_quant_types(True))
 @pytest.mark.parametrize("is_a_8bit", [True, False])
 @pytest.mark.parametrize("nk_factors", MARLIN_REPACK_NK_FACTORS)
+@pytest.mark.skipif(SM70_MARLIN, reason=SM70_REPACK_LAYOUT)
 def test_awq_marlin_repack(k_chunk, n_chunk, quant_type, is_a_8bit, nk_factors):
     n_factor, k_factor = nk_factors
 
@@ -355,7 +366,16 @@ def marlin_generate_valid_test_cases():
             return False
         if group_size == size_k:
             return False
-        if not act_order and is_k_full:
+        # Without act_order is_k_full changes nothing, so one value suffices;
+        # the SM70 kernels take full K only.
+        if not act_order and is_k_full != SM70_MARLIN:
+            return False
+        if SM70_MARLIN and (
+            act_order
+            or use_atomic_add
+            or a_type is not scalar_types.float16
+            or c_type is not scalar_types.float16
+        ):
             return False
 
         return a_type.size_bits < 16 or a_type is c_type

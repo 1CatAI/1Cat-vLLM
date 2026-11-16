@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm.config.gdn import GdnConfig
 from vllm.model_executor.layers.fla.ops import (
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
@@ -427,7 +428,10 @@ def test_dflash2_packed_verify_matches_split_contract(
     fused_state = initial_state.clone()
     fused_out = torch.empty(num_tokens, 1, num_v_heads, head_v_dim, dtype=dtype)
     if runtime_bridge:
+        policy = GdnConfig()
+        policy.resolve()
         module = SimpleNamespace(
+            gdn_policy=policy,
             A_log=A_log,
             dt_bias=dt_bias,
             num_k_heads=num_k_heads * 4,

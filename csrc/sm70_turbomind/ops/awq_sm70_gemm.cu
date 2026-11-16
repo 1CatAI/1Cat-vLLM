@@ -2403,8 +2403,10 @@ void fp8_sm70_dequantize_out(torch::Tensor output, torch::Tensor packed_weight,
   TORCH_CHECK(output.is_contiguous() && packed_weight.is_contiguous() &&
                   packed_scales.is_contiguous(),
               "SM70 FP8 prefill dequant expects contiguous tensors.");
-  TORCH_CHECK(group_size == 128,
-              "SM70 FP8 prefill dequant requires group_size=128.");
+  // The kernel indexes groups as k / group_size, so 128 x 128 and 32 x 32
+  // block scales share it.
+  TORCH_CHECK(group_size == 128 || group_size == 32,
+              "SM70 FP8 prefill dequant requires group_size 128 or 32.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
   const int64_t k = output.size(0);
@@ -3699,6 +3701,9 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor qweight,
                                             int64_t group_size,
                                             bool interleave_gated_silu) {
   validate_fp8_inputs(qweight, scales, group_size);
+  TORCH_CHECK(group_size == 128 || !interleave_gated_silu,
+              "fp8_sm70_prepare: the gated-SiLU interleave is only qualified "
+              "for group_size=128.");
 
   qweight = qweight.contiguous();
   scales = scales.contiguous();

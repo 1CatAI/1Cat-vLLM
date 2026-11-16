@@ -80,7 +80,8 @@ def test_compressed_tensors_channel_fp8_prepares_and_dispatches_turbomind(
 
     monkeypatch.setattr(torch.ops._C, "fp8_sm70_prepare", object(), raising=False)
 
-    def fake_prepare(weight, scales, group_size, gated_silu):
+    # process_weights_after_loading binds the native ops with the engine policy.
+    def fake_prepare(weight, scales, group_size, gated_silu, native_policy=()):
         prepare_calls.append(
             (tuple(weight.shape), tuple(scales.shape), group_size, gated_silu)
         )
@@ -129,7 +130,8 @@ def test_compressed_tensors_channel_fp8_prepares_and_dispatches_turbomind(
         )
         out.fill_(2)
 
-    monkeypatch.setattr(f"{module}.sm70_ops.fp8_gemm_sm70_out", fake_gemm)
+    # The bound native ops were captured during process_weights_after_loading.
+    monkeypatch.setattr(scheme.native_ops, "fp8_gemm_sm70_out", fake_gemm)
     output = scheme.apply_weights(
         layer,
         torch.ones((2, 4), dtype=torch.float16),
@@ -211,6 +213,8 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
         f"{module}._get_sm70_fp8_prefill_exact_dense_workspace",
         lambda weight: workspace,
     )
+    # The runtime dispatch resolves the shared workspace again inside the QPN8
+    # kernel module; it must be the one weight preparation reserved.
     monkeypatch.setattr(
         "vllm.model_executor.kernels.linear.qpn.fp8."
         "_get_sm70_fp8_prefill_exact_dense_workspace",
@@ -220,7 +224,8 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
     # VLLM_SM70_BATCH_GEMM_LAYOUTS=1; this test covers the QPN8 prepare only.
     monkeypatch.setattr(f"{module}.sm70_tm.use_batched_gemm_layouts", lambda: False)
 
-    def fake_prepare(weight, scales):
+    # process_weights_after_loading binds the native ops with the engine policy.
+    def fake_prepare(weight, scales, native_policy=()):
         prepare_calls.append((tuple(weight.shape), tuple(scales.shape)))
         return (
             torch.empty((4, 6), dtype=torch.uint8),
@@ -248,7 +253,16 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
     dispatch_calls = []
 
     def fake_dispatch(
-        out, workspace_ptr, x, weight, scales, split_k, nacc, prefetch, gated_silu
+        out,
+        workspace_ptr,
+        x,
+        weight,
+        scales,
+        split_k,
+        nacc,
+        prefetch,
+        gated_silu,
+        native_policy=(),
     ):
         dispatch_calls.append(
             (
@@ -412,12 +426,24 @@ def test_mixed_gdn_unquantized_projections_convert_to_qpn8_and_fuse_ba_tp2():
         ).item()
         assert rel_err < 3.5e-2
 
-        # Verify TP=2 fused qkvz + FP16 ba verification dispatch.
+        # Verify TP=2 fused qkvz + FP16 ba verification dispatch. The layer
+        # binds the engine's FP8 policy at build time (#1508); do the same.
+        from vllm.config import KernelConfig, set_current_vllm_config
+        from vllm.model_executor.layers.quantization import (
+            sm70_gdn_ba_verify as ba_verify,
+        )
+        from vllm.runtime_resources import release_runtime_resources
+
+        verify_cfg = SimpleNamespace(kernel_config=KernelConfig(), lora_config=None)
+        verify_cfg.kernel_config.capture_provider_inputs()
+        with set_current_vllm_config(verify_cfg):  # type: ignore[arg-type]
+            verify_native = ba_verify.bind_gdn_ba_verify_policy(verify_cfg)
+        assert verify_native is not None
         gdn_stub = SimpleNamespace(
             in_proj_qkvz=qkvz,
             in_proj_ba=ba,
             enable_sm70_dflash2_fused_gdn_verify=True,
-            enable_sm70_gdn_ba_verify=True,
+            sm70_gdn_ba_verify_native=verify_native,
             num_v_heads=48,
             tp_size=2,
             head_k_dim=128,
@@ -428,7 +454,9 @@ def test_mixed_gdn_unquantized_projections_convert_to_qpn8_and_fuse_ba_tp2():
             disable_tp_for_ba_proj=False,
         )
         x_in = torch.randn(5, 5120, device="cuda", dtype=torch.float16) * 0.1
-        fused = apply_gdn_ba_verify(gdn_stub, x_in)
+        with verify_native.owner.activate():
+            fused = apply_gdn_ba_verify(gdn_stub, x_in)
+        release_runtime_resources(verify_cfg)  # type: ignore[arg-type]
         assert fused is not None
         qkv_actual, z_actual, b_actual, a_actual = fused
         qkvz_expected = x_in.float() @ qkvz_ref.t()

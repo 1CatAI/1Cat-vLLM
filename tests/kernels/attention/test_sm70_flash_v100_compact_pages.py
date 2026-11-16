@@ -11,6 +11,10 @@ import torch
 @pytest.mark.parametrize("seq_len", [4096, 4111])
 @torch.inference_mode()
 def test_compact_sliding_pages_preserve_output_bits(kv_heads, seq_len):
+    # The paged prefill kernel checks for SM70 itself (TORCH_CHECK in
+    # fused_mha_forward_paged.cu).
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("The Flash-V100 paged prefill kernel runs on SM70 only")
     import flash_attn_v100
 
     torch.manual_seed(690)

@@ -225,13 +225,17 @@ def grouped_fp32_reason(
         or (groups > 1 and rows % groups == 0 and rows // groups in request_query_rows)
     ):
         return "query_rows"
-    if groups > 1 and (
-        hasattr(operator, "request_query_rows") or rows != groups * GROUP_ROWS
+    if (
+        not explicit
+        and groups > 1
+        and (hasattr(operator, "request_query_rows") or rows != groups * GROUP_ROWS)
     ):
         starts = getattr(metadata, "query_start_loc_cpu", None)
         # Runtime-packed batches must retain request boundaries. CUDA graph
         # capture supplies these CPU starts before replay; ragged eager input
         # keeps the existing general fallback until explicitly packed.
+        # Explicit groups carry one table row per group and no request
+        # metadata: their caller has already packed them.
         if (
             starts is None
             or starts.device.type != "cpu"

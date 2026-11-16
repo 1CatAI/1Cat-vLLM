@@ -820,6 +820,24 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_triton_prefill,
         )
 
+    def _unsupported_layer_message(
+        self, layer_info: dict, flash_ops_available: bool
+    ) -> str:
+        return (
+            "FLASH_ATTN_V100 cannot run this layer/config because a required "
+            "Flash op is unavailable or the attention features/KV cache dtype "
+            "are unsupported. Select TRITON_ATTN for a full Triton route, or "
+            "set VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for explicit "
+            "diagnostic fallback. "
+            f"Details: layer={layer_info.get('layer_name')!r}, "
+            f"flash_ops_available={flash_ops_available}, "
+            f"attn_type={self.attn_type!r}, "
+            f"has_alibi={self.alibi_slopes is not None}, "
+            f"logits_soft_cap={self.logits_soft_cap!r}, "
+            f"has_sinks={self.sinks is not None}, "
+            f"kv_cache_dtype={self.kv_cache_dtype!r}."
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -870,20 +888,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not self._supports_flash_v100_path():
             layer_info = self._layer_debug_info(layer)
             feature_fallback = _feature.fallback_kind(layer_info)
-            message = (
-                "FLASH_ATTN_V100 cannot run this layer/config because a required "
-                "Flash op is unavailable or the attention features/KV cache dtype "
-                "are unsupported. Select TRITON_ATTN for a full Triton route, or "
-                "set VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for explicit "
-                "diagnostic fallback. "
-                f"Details: layer={layer_info.get('layer_name')!r}, "
-                f"flash_ops_available={self.use_flash_v100}, "
-                f"attn_type={self.attn_type!r}, "
-                f"has_alibi={self.alibi_slopes is not None}, "
-                f"logits_soft_cap={self.logits_soft_cap!r}, "
-                f"has_sinks={self.sinks is not None}, "
-                f"kv_cache_dtype={self.kv_cache_dtype!r}."
-            )
+            message = self._unsupported_layer_message(layer_info, self.use_flash_v100)
             _feature.unsupported(self._policy(), layer_info, message, feature_fallback)
             return super().forward(
                 layer,

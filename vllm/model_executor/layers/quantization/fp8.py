@@ -107,6 +107,15 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = init_logger(__name__)
 
 
+def _block32():
+    """The 32 x 32 block-FP8 route (platform-owned module, imported lazily)."""
+    from vllm.model_executor.layers.quantization.utils import (
+        sm70_fp8_block32 as block32,
+    )
+
+    return block32
+
+
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -369,6 +378,8 @@ class Fp8LinearMethod(LinearMethodBase):
             and self.block_quant
             and self.weight_block_size == [128, 128]
         )
+        # 32 x 32 block scales (e.g. DeepSeek-V4.1): see utils.*_fp8_block32.
+        self.fp8_block32_candidate = _block32().is_candidate(self)
 
         if self.block_quant:
             assert not self.act_q_static
@@ -474,6 +485,12 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if getattr(layer, "sm70_fp8_turbomind", False):
+            return
+        if getattr(layer, "fp8_block32_route", None) is not None:
+            return
+        if getattr(self, "fp8_block32_candidate", False) and _block32().prepare_layer(
+            self, layer
+        ):
             return
 
         if (
@@ -661,6 +678,10 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if getattr(layer, "sm70_fp8_turbomind", False):
             return self.fp8_linear.apply_weights(layer, x, bias)
+
+        block32_route = getattr(layer, "fp8_block32_route", None)
+        if block32_route is not None:
+            return _block32().apply_layer(layer, x, bias)
 
         if self.use_sm70_dequant_fallback:
             return torch.nn.functional.linear(x, layer.weight, bias)

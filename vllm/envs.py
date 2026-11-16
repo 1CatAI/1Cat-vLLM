@@ -487,11 +487,16 @@ if TYPE_CHECKING:
     VLLM_V41_COL_BLOCK: str = "256"
     VLLM_V41_COL_PROJ: str = "0"
     VLLM_V41_COL_W: str = "4"
+    VLLM_V41_COUPLED_DRAFT_TEMP: str = "0.5"
+    VLLM_V41_COUPLED_TRACE: str = ""
+    VLLM_V41_COUPLED_DRAFTS: str = "0"
     VLLM_V41_COORD_DEBUG: str | None = None
     VLLM_V41_DENSE_TM: str = "1"
     VLLM_V41_DMA_DEBUG: str | None = None
     VLLM_V41_DMA_DEMAND: str | None = None
     VLLM_V41_DMV_CTAS: str = "80"
+    VLLM_V41_DMV_X: str = "0"
+    VLLM_V41_DMV_X_CONFIG: str = ""
     VLLM_V41_DOWN_ROWS: str = "0"
     VLLM_V41_EM: str = "1"
     VLLM_V41_EM5: str = "1"
@@ -500,7 +505,11 @@ if TYPE_CHECKING:
     VLLM_V41_EMPTY_CACHE_TOKENS: str = "2048"
     VLLM_V41_ENGRAM_READERS: str | None = None
     VLLM_V41_EXACT_GEMM: str = "0"
+    VLLM_V41_EXPERT_DIET: str = "0"
+    VLLM_V41_EXPERT_FAST: str = "0"
     VLLM_V41_EXPERT_FAST_HIT: str = "1"
+    VLLM_V41_INDEX_TILED: bool = False
+    VLLM_V41_INDEX_TILED_LIB: str = ""
     VLLM_V41_FP8_GEMV: str = "1"
     VLLM_V41_FREE_SLOTS: str | None = None
     VLLM_V41_FUSED_SPARSE: str = "0"
@@ -589,6 +598,7 @@ if TYPE_CHECKING:
     VLLM_V41_HITLOG_RELAXED: str = "1"
     VLLM_V41_INDEX_DECODE_BLOCKS: str = "8"
     VLLM_V41_INDEX_OVERLAP: str = "0"
+    VLLM_V41_INDEX_REDUCE: str = "0"
     VLLM_V41_INDEX_TILE_MB: str = "64"
     VLLM_V41_INDEX_TOPK: str = "1"
     VLLM_V41_JOB_EVENTS: str | None = None
@@ -596,11 +606,16 @@ if TYPE_CHECKING:
     VLLM_V41_MAX_LEN: str = "16384"
     VLLM_V41_MISS_HIST: str = "0"
     VLLM_V41_PACKED_KV: str | None = None
+    VLLM_V41_PLAN_FUSE: str = "0"
     VLLM_V41_PLAN_STATS: str | None = None
     VLLM_V41_PP_BOUNDARY_SIM: str | None = None
     VLLM_V41_PRED_STATS: str = "0"
     VLLM_V41_PREFETCH: str = "0"
     VLLM_V41_PREFETCH_EVAL: str | None = None
+    VLLM_V41_PREFILL_IQ_GEMM: str = "0"
+    VLLM_V41_PREFILL_IQ_TILES: str = "1,1,1,1,1,1"
+    VLLM_V41_PREFILL_IQ_GRID: str = "160"
+    VLLM_V41_PREFILL_IQ_OBSERVE: str = "0"
     VLLM_V41_PREFILL_DMA: str = "1"
     VLLM_V41_PREFILL_GROUP: str | None = None
     VLLM_V41_PREFILL_TIMING: str = "0"
@@ -1167,6 +1182,7 @@ if TYPE_CHECKING:
     VLLM_USE_SPINLOOP_EXT: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
+    VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
 
     # Native-only compatibility controls are raw optional strings.
     VLLM_CUSTOM_ALLREDUCE_ALGO: str | None = None
@@ -1759,6 +1775,62 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+    ),
+    "VLLM_V41_PREFILL_IQ_GEMM": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_IQ_GEMM", "0"),
+        description=(
+            "DS-V4.1 prefill (more than 6 rows): 1 = the routed-expert IQ1_M,"
+            " IQ2_XXS and IQ2_XS GEMMs run on the v41prefmoe SM70 grouped kernel"
+            " (benchmarks/deepseek_v41/v41prefmoe); 0 = the existing grouped"
+            " prefill GEMM. Decode never enters it."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_IQ_TILES": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_IQ_TILES", "1,1,1,1,1,1"),
+        description=(
+            "DS-V4.1 prefill IQ GEMM: six tile ids 0..5 for IQ1_M gate/up and"
+            " down, IQ2_XXS gate/up and down, IQ2_XS gate/up and down; frozen at"
+            " load. Read only with VLLM_V41_PREFILL_IQ_GEMM=1."
+        ),
+        category="tuning",
+        declared_default="'1,1,1,1,1,1'",
+        effective_default="'1,1,1,1,1,1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_IQ_GRID": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_IQ_GRID", "160"),
+        description=(
+            "DS-V4.1 prefill IQ GEMM launch: 0 = one block per output tile;"
+            " 80 or 160 = a persistent grid of that many blocks."
+        ),
+        category="tuning",
+        declared_default="'160'",
+        effective_default="'160'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_IQ_OBSERVE": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_IQ_OBSERVE", "0"),
+        description=(
+            "DS-V4.1 prefill: 1 = log one descriptor line per grouped expert GEMM"
+            " (shapes and per-expert row counts, no activations) on the existing"
+            " kernel; refused together with VLLM_V41_PREFILL_IQ_GEMM=1."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
     ),
     "VLLM_SM70_E4M3_LONG_ATTENTION": env_var(
         lambda: os.getenv("VLLM_SM70_E4M3_LONG_ATTENTION"),
@@ -7599,6 +7671,46 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
+    "VLLM_V41_COUPLED_DRAFT_TEMP": env_var(
+        lambda: os.getenv("VLLM_V41_COUPLED_DRAFT_TEMP", "0.5"),
+        description=(
+            "Experimental DS-V4.1 exact coupled drafts with keyed verification: "
+            "drafter temperature scale (> 0)."
+        ),
+        category="experimental",
+        declared_default="'0.5'",
+        effective_default="'0.5'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COUPLED_TRACE": env_var(
+        lambda: os.getenv("VLLM_V41_COUPLED_TRACE", ""),
+        description=(
+            "Debug for DS-V4.1 coupled drafts: path prefix of a per-process "
+            "TSV of every keyed verification row (position, winner, runner-up, "
+            "margin, logit bits); host syncs every step. Empty = off."
+        ),
+        category="experimental",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COUPLED_DRAFTS": env_var(
+        lambda: os.getenv("VLLM_V41_COUPLED_DRAFTS", "0"),
+        description=(
+            "Experimental DS-V4.1 exact coupled drafts with keyed verification: "
+            "1 = DSpark drafts share the target's keyed draws."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_V41_COORD_DEBUG": env_var(
         lambda: os.getenv("VLLM_V41_COORD_DEBUG"),
         description=("DS-V4.1 SM70 runtime switch (developer)."),
@@ -7635,6 +7747,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="None",
         effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DMV_X": env_var(
+        lambda: os.getenv("VLLM_V41_DMV_X", "0"),
+        description=(
+            "DS-V4.1 DMV_X: M<=8 Q5_K/Q8_0 dense projections on the v41k"
+            " dmv13_x kernel (same math and reduction order as dmv13 at the"
+            " same warps/split: bit-identical), with the two wo_a O groups in"
+            " one block-diagonal launch and a max-shared carveout. Needs a"
+            " v41k build with dmv13_x; otherwise the dmv13 path stays."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DMV_X_CONFIG": env_var(
+        lambda: os.getenv("VLLM_V41_DMV_X_CONFIG", ""),
+        description=(
+            "DS-V4.1 DMV_X: per-role dmv13_x launch overrides,"
+            " 'role=warps,split,acc;...' with role in qkv, q_b, wo_a, wo_b,"
+            " shared, head, engram, extra; warps 2/4/8, split 1-8, acc 1/2."
+            " Any override changes the FP32 summation order (near-tie gate)."
+        ),
+        category="tuning",
+        declared_default="''",
+        effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -7738,6 +7881,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
+    "VLLM_V41_EXPERT_DIET": env_var(
+        lambda: os.getenv("VLLM_V41_EXPERT_DIET", "0"),
+        description=(
+            "DS-V4.1 EXPERT_FAST kernels, instruction-diet variants (read"
+            " once by v41k.so itself): bit 1 = gate_up_fast runs"
+            " gate_up_diet, bit 2 = down_rows_fast runs down_rows_diet, bit"
+            " 4 = down_rows_diet keeps the activations in shared memory where"
+            " they fit (IQ1_M M <= 4, IQ2 M <= 2). Bitwise identical to the"
+            " fast kernels; only acts with VLLM_V41_EXPERT_FAST=1 and a v41k"
+            " build that has gate_up_diet / down_rows_diet."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EXPERT_FAST": env_var(
+        lambda: os.getenv("VLLM_V41_EXPERT_FAST", "0"),
+        description=(
+            "DS-V4.1 TP4 row-split experts: 1 = gate/up on the v41k"
+            " gate_up_fast kernel and the down projection on down_rows_fast"
+            " (PRMT selector decode, bank-replicated codebooks, one CTA per"
+            " SM). Bit-identical to gate_up7 / gate_up7p and to down_rows at"
+            " row tile rows=4 (the default '4,8'; other tiles raise); needs a"
+            " v41k build with fast_table, gate_up_fast and down_rows_fast,"
+            " otherwise raises at first use."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_V41_EXPERT_FAST_HIT": env_var(
         lambda: os.getenv("VLLM_V41_EXPERT_FAST_HIT", "1"),
         description=("DS-V4.1 SM70 runtime switch (developer)."),
@@ -7747,6 +7926,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
+    ),
+    "VLLM_V41_INDEX_TILED": env_var(
+        lambda: env_with_choices("VLLM_V41_INDEX_TILED", "0", ["0", "1", ""])() == "1",
+        description="Enable the exact SM70 packed V4.1 tiled decode index scorer.",
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DeepSeek V4.1 SM70",),
+        user_visible=True,
+    ),
+    "VLLM_V41_INDEX_TILED_LIB": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_TILED_LIB", ""),
+        description=(
+            "Library for the SM70 packed V4.1 tiled index scorer; empty "
+            "selects the repository build."
+        ),
+        category="experimental",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=("DeepSeek V4.1 SM70",),
+        user_visible=True,
     ),
     "VLLM_V41_FP8_GEMV": env_var(
         lambda: os.getenv("VLLM_V41_FP8_GEMV", "1"),
@@ -8723,6 +8925,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
+    "VLLM_V41_INDEX_REDUCE": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_REDUCE", "0"),
+        description=(
+            "DS-V4.1 indexer INDEX_REDUCE: decode index scores are reduced across"
+            " the TP4 group over the live key prefix only, by a v41k IPC"
+            " kernel (custom all-reduce 1-stage numerics, graph-safe), instead"
+            " of a whole-store NCCL all-reduce. Needs TP4, a fully connected"
+            " custom all-reduce and a v41k build with index_reduce_live."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_V41_INDEX_TILE_MB": env_var(
         lambda: os.getenv("VLLM_V41_INDEX_TILE_MB", "64"),
         description=("DS-V4.1 indexer: FP16 score budget per query tile in MiB."),
@@ -8799,6 +9017,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="None",
         effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PLAN_FUSE": env_var(
+        lambda: os.getenv("VLLM_V41_PLAN_FUSE", "0"),
+        description=(
+            "DS-V4.1 TP4 row-split experts: 1 = build the per-layer expert "
+            "plan inside the q8 activation launch (v41k q8_plan + gate_up7p) "
+            "instead of a separate moe_plan launch; same plan bit for bit."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -18004,6 +18236,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
+    "VLLM_GPU_SYNC_CHECK": env_var(
+        env_with_choices("VLLM_GPU_SYNC_CHECK", None, ["warn", "error"]),
+        description=(
+            "GPU sync debug mode: 'warn' logs unintended GPU<->CPU syncs, "
+            "'error' raises. Unset disables."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     # Comma-separated list of env vars to set from the GPU-NIC mapping.
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
@@ -21557,6 +21802,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_COL_B",
         "VLLM_V41_COL_BLOCK",
         "VLLM_V41_COL_PROJ",
+        "VLLM_V41_COUPLED_DRAFTS",
+        "VLLM_V41_COUPLED_DRAFT_TEMP",
+        "VLLM_V41_COUPLED_TRACE",
         "VLLM_V41_COL_W",
         "VLLM_V41_COORD_DEBUG",
         "VLLM_V41_DENSE_TM",
@@ -21671,6 +21919,10 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_PRED_STATS",
         "VLLM_V41_PREFETCH",
         "VLLM_V41_PREFETCH_EVAL",
+        "VLLM_V41_PREFILL_IQ_GEMM",
+        "VLLM_V41_PREFILL_IQ_TILES",
+        "VLLM_V41_PREFILL_IQ_GRID",
+        "VLLM_V41_PREFILL_IQ_OBSERVE",
         "VLLM_V41_PREFILL_DMA",
         "VLLM_V41_PREFILL_GROUP",
         "VLLM_V41_PREFILL_TIMING",

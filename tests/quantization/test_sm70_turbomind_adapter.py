@@ -91,7 +91,10 @@ def test_mxfp4_unpack_flattens_last_two_block_dims_like_lmdeploy():
 @pytest.mark.parametrize("logical_n", [24, 48])
 def test_nvfp4_prepare_pads_output_to_converter_alignment(monkeypatch, logical_n):
     # The converter is mocked below; no compiled extension is required here.
-    monkeypatch.setattr(torch.ops._C, "nvfp4_sm70_prepare", object(), raising=False)
+    # Never shadow a registered operator: torch enumerates every op packet when
+    # it builds its decomposition table on the first provider import.
+    if not hasattr(torch.ops._C, "nvfp4_sm70_prepare"):
+        monkeypatch.setattr(torch.ops._C, "nvfp4_sm70_prepare", object(), raising=False)
     tm = _load_adapter()
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(
@@ -136,6 +139,14 @@ def test_nvfp4_prepare_pads_output_to_converter_alignment(monkeypatch, logical_n
 def test_nvfp4_apply_crops_converter_padding(monkeypatch):
     tm = _load_adapter()
     layer = torch.nn.Module()
+    from vllm import _sm70_ops as sm70_ops
+
+    def fake_gemm(out, *args, native_policy=()):
+        del args
+        out.copy_(torch.arange(32, dtype=out.dtype).view(1, 32))
+
+    # The state binds its native ops with the engine policy when it is built.
+    monkeypatch.setattr(sm70_ops, "nvfp4_gemm_sm70_out", fake_gemm)
     state = tm.SM70TurboMindLinearState(
         weight=torch.empty((32, 4), dtype=torch.int32),
         scales=torch.empty((2, 32), dtype=torch.float16),
@@ -147,14 +158,6 @@ def test_nvfp4_apply_crops_converter_padding(monkeypatch):
         padded_output_size=32,
     )
     setattr(layer, tm.STATE_ATTR, state)
-
-    from vllm import _sm70_ops as sm70_ops
-
-    def fake_gemm(out, *args):
-        del args
-        out.copy_(torch.arange(32, dtype=out.dtype).view(1, 32))
-
-    monkeypatch.setattr(sm70_ops, "nvfp4_gemm_sm70_out", fake_gemm)
 
     output = tm.apply_prepared_linear(
         layer, torch.ones((1, 32), dtype=torch.float16), bias=None
@@ -209,7 +212,6 @@ def _make_nvfp4_qpn4_state(tm, *, gated_silu: bool):
 def test_nvfp4_gated_layout_is_deinterleaved_for_unfused_apply(monkeypatch):
     tm = _load_adapter()
     layer = torch.nn.Module()
-    setattr(layer, tm.STATE_ATTR, _make_nvfp4_state(tm, gated_silu=True))
 
     from vllm import _sm70_ops as sm70_ops
 
@@ -224,12 +226,15 @@ def test_nvfp4_gated_layout_is_deinterleaved_for_unfused_apply(monkeypatch):
         k_ld,
         q_ld,
         gated_silu=False,
+        native_policy=(),
     ):
         del x, weight, scales, group_size, k_ld, q_ld
         calls.append(gated_silu)
         out.copy_(torch.tensor([[1.0, 10.0, 2.0, 20.0]], dtype=out.dtype))
 
+    # The state binds its native ops with the engine policy when it is built.
     monkeypatch.setattr(sm70_ops, "nvfp4_gemm_sm70_out", fake_gemm)
+    setattr(layer, tm.STATE_ATTR, _make_nvfp4_state(tm, gated_silu=True))
 
     output = tm.apply_prepared_linear(
         layer,
@@ -244,7 +249,6 @@ def test_nvfp4_gated_layout_is_deinterleaved_for_unfused_apply(monkeypatch):
 def test_nvfp4_gated_layout_uses_fused_silu_epilogue(monkeypatch):
     tm = _load_adapter()
     layer = torch.nn.Module()
-    setattr(layer, tm.STATE_ATTR, _make_nvfp4_state(tm, gated_silu=True))
 
     from vllm import _sm70_ops as sm70_ops
 
@@ -259,6 +263,7 @@ def test_nvfp4_gated_layout_uses_fused_silu_epilogue(monkeypatch):
         k_ld,
         q_ld,
         gated_silu=False,
+        native_policy=(),
     ):
         del weight, scales
         calls.append(
@@ -273,7 +278,9 @@ def test_nvfp4_gated_layout_uses_fused_silu_epilogue(monkeypatch):
         )
         out.fill_(3.0)
 
+    # The state binds its native ops with the engine policy when it is built.
     monkeypatch.setattr(sm70_ops, "nvfp4_gemm_sm70_out", fake_gemm)
+    setattr(layer, tm.STATE_ATTR, _make_nvfp4_state(tm, gated_silu=True))
 
     output = tm.apply_prepared_fused_silu_and_mul(
         layer,
