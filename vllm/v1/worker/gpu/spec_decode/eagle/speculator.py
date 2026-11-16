@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import numpy as np
@@ -389,17 +389,13 @@ class EagleSpeculator(TargetSamplingHooks):
                 )
                 inputs_embeds = self.inputs_embeds[:num_tokens]
 
-            # Applied outside the compiled MTP forward: the compiled path must
-            # not call ContextVar.set. Invariants: (1) the var defaults to False,
-            # (2) _hc_prefill_sequence_qualified is set in __init__ (not lazy),
-            # (3) this is the only call site of the compiled MTP forward.
-            hc_ctx = nullcontext()
-            if hasattr(self.model, "_hc_prefill_sequence_qualified"):
-                from vllm.models.qwen4_exp.nvidia.sm70_hcx import (
-                    hc_prefill_sequence_parallel_context,
-                )
-
-                hc_ctx = hc_prefill_sequence_parallel_context(False)
+            # Models whose compiled draft forward must not enter a Python
+            # context (e.g. ContextVar.set under Dynamo) expose the context for
+            # this uncompiled caller instead.
+            draft_ctx = getattr(self.model, "draft_forward_context", None)
+            hc_ctx: AbstractContextManager[Any] = (
+                draft_ctx() if draft_ctx is not None else nullcontext()
+            )
             with hc_ctx:
                 ret_hidden_states = self.model(
                     input_ids=self.input_buffers.input_ids[:num_tokens],
