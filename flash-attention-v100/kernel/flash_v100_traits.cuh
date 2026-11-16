@@ -15,6 +15,8 @@ struct FlashV100Traits {
   static constexpr int BLOCK_N_128 = 176;
   static constexpr int BLOCK_M_256 = 32;
   static constexpr int BLOCK_N_256 = 64;
+  static constexpr int BLOCK_M_512 = 16;
+  static constexpr int BLOCK_N_512 = 32;
   static constexpr int WARPS_PER_BLOCK = 16;
   static constexpr int THREADS_PER_WARP = 32;
 
@@ -22,12 +24,14 @@ struct FlashV100Traits {
                                  : (D == 32)  ? BLOCK_M_32
                                  : (D == 64)  ? BLOCK_M_64
                                  : (D == 128) ? BLOCK_M_128
+                                 : (D == 512) ? BLOCK_M_512
                                               : BLOCK_M_256;
 
   static constexpr int BLOCK_N = (D == 16)    ? BLOCK_N_16
                                  : (D == 32)  ? BLOCK_N_32
                                  : (D == 64)  ? BLOCK_N_64
                                  : (D == 128) ? BLOCK_N_128
+                                 : (D == 512) ? BLOCK_N_512
                                               : BLOCK_N_256;
 
   static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * THREADS_PER_WARP;

@@ -744,28 +744,37 @@ class NvmlCudaPlatform(CudaPlatformBase):
             return cls._torch_device_capability(device_id)
         return cls._nvml_device_capability(device_id)
 
+    _torch_cap_cache: dict = {}
+    _nvml_cap_cache: dict = {}
+
     @classmethod
-    @cache
     def _torch_device_capability(cls, device_id: int) -> DeviceCapability | None:
-        # Same contract as the NVML path: an unusable index answers None.
-        # torch raises AssertionError for an out-of-range ordinal.
+        if device_id in cls._torch_cap_cache:
+            return cls._torch_cap_cache[device_id]
         try:
             major, minor = torch.cuda.get_device_capability(device_id)
         except (RuntimeError, AssertionError):
+            cls._torch_cap_cache[device_id] = None
             return None
-        return DeviceCapability(major=major, minor=minor)
+        cap = DeviceCapability(major=major, minor=minor)
+        cls._torch_cap_cache[device_id] = cap
+        return cap
 
     @classmethod
-    @cache
     @with_nvml_context
     def _nvml_device_capability(cls, device_id: int) -> DeviceCapability | None:
+        if device_id in cls._nvml_cap_cache:
+            return cls._nvml_cap_cache[device_id]
         try:
             physical_device_id = cls.device_id_to_physical_device_id(device_id)
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
             major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
-            return DeviceCapability(major=major, minor=minor)
+            cap = DeviceCapability(major=major, minor=minor)
         except RuntimeError:
+            cls._nvml_cap_cache[device_id] = None
             return None
+        cls._nvml_cap_cache[device_id] = cap
+        return cap
 
     @classmethod
     @with_nvml_context
