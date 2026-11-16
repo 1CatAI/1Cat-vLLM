@@ -72,6 +72,24 @@ def test_memory_profiling():
     lib.cudaFree(handle2)
 
 
+def test_memory_profiling_does_not_credit_negative_non_torch_growth():
+    unit = 1024**2
+    for delta_mib in (-2560, 0, 1280):
+        baseline = MemorySnapshot(device="cpu", auto_measure=False)
+        baseline.non_torch_memory = 3072 * unit
+        with (
+            patch("torch.accelerator.empty_cache"),
+            patch("torch.accelerator.reset_peak_memory_stats"),
+            patch.object(MemorySnapshot, "measure"),
+            memory_profiling(baseline, weights_memory=8192 * unit) as result,
+        ):
+            result.after_profile.non_torch_memory = (3072 + delta_mib) * unit
+            result.after_profile.torch_peak = 2048 * unit
+
+        assert result.non_torch_increase == max(0, delta_mib) * unit
+        assert result.non_kv_cache_memory == (8192 + 2048 + max(0, delta_mib)) * unit
+
+
 def test_memory_snapshot_uses_psutil_on_integrated_gpu():
     """On integrated (UMA) GPUs, free_memory should come from psutil."""
     mock_cuda_free = 40 * 1024**3

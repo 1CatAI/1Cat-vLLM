@@ -330,7 +330,7 @@ def memory_profiling(
     diff_profile = result.after_profile - result.before_profile
     diff_from_create = result.after_profile - result.before_create
     result.torch_peak_increase = diff_profile.torch_peak
-    result.non_torch_increase = diff_from_create.non_torch_memory
+    result.non_torch_increase = max(0, diff_from_create.non_torch_memory)
     result.profile_time = diff_profile.timestamp
 
     non_torch_memory = result.non_torch_increase
