@@ -229,36 +229,77 @@ def _qwen38_fp16_gdn_input_kernel(
     BLOCK_K: tl.constexpr,
 ):
     row = tl.program_id(0)
-    is_qkvz = row < 4096
-    ba_row = row - 4096
     offsets = tl.arange(0, BLOCK_K)
     acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
-    for block_start in tl.static_range(0, K, BLOCK_K):
-        indices = block_start + offsets
-        mask = indices < K
-        x = tl.load(x_ptr + indices, mask=mask, other=0.0)
-        qkvz_weight = tl.load(
-            qkvz_weight_ptr + row * K + indices,
-            mask=is_qkvz & mask,
-            other=0.0,
-        )
-        ba_weight = tl.load(
-            ba_weight_ptr + ba_row * K + indices,
-            mask=(~is_qkvz) & mask,
-            other=0.0,
-        )
-        weight = tl.where(is_qkvz, qkvz_weight, ba_weight)
-        acc += x.to(tl.float32) * weight.to(tl.float32)
+    if row < 4096:
+        for block_start in tl.static_range(0, K, BLOCK_K):
+            indices = block_start + offsets
+            mask = indices < K
+            x = tl.load(x_ptr + indices, mask=mask, other=0.0)
+            w = tl.load(qkvz_weight_ptr + row * K + indices, mask=mask, other=0.0)
+            acc += x.to(tl.float32) * w.to(tl.float32)
+        value = tl.sum(acc, axis=0)
+        if row < 2560:
+            tl.store(qkv_out_ptr + row, value)
+        else:
+            tl.store(z_out_ptr + row - 2560, value)
+    else:
+        ba_row = row - 4096
+        for block_start in tl.static_range(0, K, BLOCK_K):
+            indices = block_start + offsets
+            mask = indices < K
+            x = tl.load(x_ptr + indices, mask=mask, other=0.0)
+            w = tl.load(ba_weight_ptr + ba_row * K + indices, mask=mask, other=0.0)
+            acc += x.to(tl.float32) * w.to(tl.float32)
+        value = tl.sum(acc, axis=0)
+        if ba_row < 12:
+            tl.store(b_out_ptr + ba_row, value)
+        else:
+            tl.store(a_out_ptr + ba_row - 12, value)
 
-    value = tl.sum(acc, axis=0)
-    is_qkv = is_qkvz & (row < 2560)
-    is_z = is_qkvz & (row >= 2560)
-    is_b = (~is_qkvz) & (ba_row < 12)
-    is_a = (~is_qkvz) & (ba_row >= 12)
-    tl.store(qkv_out_ptr + row, value, mask=is_qkv)
-    tl.store(z_out_ptr + row - 2560, value, mask=is_z)
-    tl.store(b_out_ptr + ba_row, value, mask=is_b)
-    tl.store(a_out_ptr + ba_row - 12, value, mask=is_a)
+
+@triton.jit
+def _qwen38_fp16_qsa_input_kernel(
+    x_ptr,
+    qkv_weight_ptr,
+    idx_weight_ptr,
+    qkv_out_ptr,
+    idx_out_ptr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    if row < 3584:
+        for block_start in tl.static_range(0, K, BLOCK_K):
+            indices = block_start + offsets
+            mask = indices < K
+            x = tl.load(x_ptr + indices, mask=mask, other=0.0)
+            w = tl.load(qkv_weight_ptr + row * K + indices, mask=mask, other=0.0)
+            acc += x.to(tl.float32) * w.to(tl.float32)
+        tl.store(qkv_out_ptr + row, tl.sum(acc, axis=0))
+    else:
+        idx_row = row - 3584
+        for block_start in tl.static_range(0, K, BLOCK_K):
+            indices = block_start + offsets
+            mask = indices < K
+            x = tl.load(x_ptr + indices, mask=mask, other=0.0)
+            w = tl.load(idx_weight_ptr + idx_row * K + indices, mask=mask, other=0.0)
+            acc += x.to(tl.float32) * w.to(tl.float32)
+        tl.store(idx_out_ptr + idx_row, tl.sum(acc, axis=0))
+
+
+def _mtp_active() -> bool:
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if is_forward_context_available():
+        policies = get_forward_context().runtime_resources.get("execution_policies", {})
+        if "speculative_config.sampling_policy" in policies:
+            return True
+    cfg = get_current_vllm_config_or_none()
+    spec = getattr(cfg, "speculative_config", None) if cfg is not None else None
+    return bool(spec is not None and getattr(spec, "method", None) == "mtp")
 
 
 def _is_packed_row_major(tensor: torch.Tensor) -> bool:
@@ -364,15 +405,37 @@ def _batch_piecewise(x: torch.Tensor) -> bool:
 def _qwen38_sm70_shared_up(
     x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None
 ) -> torch.Tensor:
-    if packed is not None and _batch_piecewise(x) and x.shape[0] > 40:
+    mtp_shared_ok = bool(
+        _mtp_active()
+        and packed is not None
+        and mtp_batch_enabled("shared_batch")
+        and not envs.VLLM_BATCH_INVARIANT
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        and x.ndim == 2
+        and 2 <= x.shape[0] <= 64
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+    )
+    if (
+        (not mtp_shared_ok)
+        and packed is not None
+        and _batch_piecewise(x)
+        and (x.shape[0] > 40)
+    ):
         return _in_pieces(
             x, 160, lambda piece: _qwen38_sm70_shared_up(piece, weight, packed)
         )
-    if _shared_batch_runtime_ok(x) and packed is not None:
+    if (mtp_shared_ok or _shared_batch_runtime_ok(x)) and packed is not None:
         out = x.new_empty((x.shape[0], 160))
         reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        use_fp16_partials = bool(
+            reduced and (not mtp_shared_ok or _verify_rows(x.shape[0]))
+        )
         dev_idx = x.device.index or 0
-        if reduced:
+        if use_fp16_partials:
             partial = _EMPTY_PARTIAL_FP16.get(dev_idx)
             if partial is None or partial.device != x.device:
                 partial = torch.empty(8, dtype=torch.float16, device=x.device)[:0]
@@ -431,6 +494,69 @@ direct_register_custom_op(
 )
 
 
+def _qwen38_sm70_shared_down_gated(
+    x: torch.Tensor,
+    act_out: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+    batch_allowed: bool = True,
+) -> torch.Tensor:
+    from vllm import _sm70_ops as sm70_ops
+
+    m = x.shape[0]
+    reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    max_m = 8 if _mtp_active() else (1 if reduced else 64)
+    if (
+        sm70_ops.has_qwen38_shared_down_gated()
+        and not envs.VLLM_BATCH_INVARIANT
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        and (m == 1 or (batch_allowed and 2 <= m <= max_m))
+        and x.ndim == 2
+        and act_out.ndim == 2
+        and act_out.shape[0] == m
+        and x.shape[1] == 2560
+        and act_out.shape[1] in (160, 320, 640)
+        and down_weight.shape == (2560, act_out.shape[1])
+        and gate_weight.shape == (1, 2560)
+        and all(
+            t.is_cuda
+            and t.device == x.device
+            and t.dtype == torch.float16
+            and t.is_contiguous()
+            and t.data_ptr() % 16 == 0
+            for t in (x, act_out, down_weight, gate_weight)
+        )
+        and current_platform.is_device_capability(70)
+    ):
+        down_out = x.new_empty((m, 2560))
+        sm70_ops.qwen38_shared_down_gated_sm70_out(
+            down_out, x, act_out, down_weight, gate_weight
+        )
+        logger.info_once("SM70 Qwen3.8 fused shared-expert down+gate path enabled.")
+        return down_out
+    down_out = torch.nn.functional.linear(act_out, down_weight)
+    gate_logits = torch.nn.functional.linear(x, gate_weight)
+    return _qwen38_sm70_shared_gate_mul(gate_logits, down_out)
+
+
+def _qwen38_sm70_shared_down_gated_fake(
+    x: torch.Tensor,
+    act_out: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+    batch_allowed: bool = True,
+) -> torch.Tensor:
+    del act_out, down_weight, gate_weight, batch_allowed
+    return x.new_empty((*x.shape[:-1], 2560))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_shared_down_gated",
+    op_func=_qwen38_sm70_shared_down_gated,
+    fake_impl=_qwen38_sm70_shared_down_gated_fake,
+)
+
+
 def _forward_shared_batch_silu(layer, x):
     if not use_sm70_decode_graph_semantics():
         return None
@@ -440,11 +566,12 @@ def _forward_shared_batch_silu(layer, x):
 
 
 def _router_batch_runtime_ok(x, packed) -> bool:
+    rows_ok = 2 <= x.shape[0] <= 8 if _mtp_active() else _batch_rows_ok(x.shape[0])
     return bool(
         mtp_batch_enabled("router_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
-        and _batch_rows_ok(x.shape[0])
+        and rows_ok
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -540,6 +667,40 @@ direct_register_custom_op(
 )
 
 
+def _qwen38_sm70_fp16_gemv_into(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    role: str = "",
+    dense_batch: bool = False,
+) -> None:
+    if (
+        dense_batch
+        and _can_use_dense_batch(x, weight, role)
+        and out.is_contiguous()
+        and out.data_ptr() % 16 == 0
+    ):
+        torch.ops._C.qwen38_dense_batch_sm70_out(out, x, weight)
+        logger.info_once("SM70 Qwen3.8 exact small-batch dense projections enabled.")
+        return
+    shape = (weight.shape[0], weight.shape[1])
+    plan = _plan_for(role, shape) if role else _SHAPE_PLANS.get(shape)
+    if plan is None or not _runtime_ok(x, weight) or not _is_packed_row_major(out):
+        torch.mm(x.reshape(-1, x.shape[-1]), weight.t(), out=out)
+        return
+    _qwen38_fp16_row_gemv_kernel[(weight.shape[0], x.shape[0])](
+        x,
+        weight,
+        out,
+        K=weight.shape[1],
+        N=weight.shape[0],
+        BLOCK_K=plan.block_k,
+        LOAD_POLICY=plan.load_policy,
+        num_warps=plan.num_warps,
+    )
+    logger.info_once("SM70 Qwen3.8 checkpoint-FP16 M=1 GEMV route enabled.")
+
+
 def _dense_batch_limit(role: str, shape: tuple[int, ...]) -> int:
     # Reject measured regressions: router M8/M16 and output M16. The C1
     # reduction is a different tree and must keep its existing route.
@@ -551,21 +712,31 @@ def _dense_batch_limit(role: str, shape: tuple[int, ...]) -> int:
 
 
 def _can_use_dense_batch(x: torch.Tensor, weight: torch.Tensor, role: str) -> bool:
+    wshape = tuple(weight.shape)
+    mtp_out = bool(
+        _mtp_active()
+        and role.endswith((_GDN_OUT_SUFFIX, _QSA_OUT_SUFFIX))
+        and wshape == (2560, 1536)
+    )
+    limit = 16 if mtp_out else _dense_batch_limit(role, wshape)
     return bool(
         layer_policy().batch_fastpath
         and not envs.VLLM_BATCH_INVARIANT
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         # With reduced-precision reductions allowed, cuBLAS uses FP16 partials
-        # for the small output projections. Retain that baseline schedule;
-        # the native FP32 kernel differs at M2/M4/M5 in the operator oracle.
-        and not (
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
-            and tuple(weight.shape) == (2560, 1536)
-            and x.shape[0] < 8
+        # for the small output projections in non-MTP mode. In MTP, the multi-
+        # group 80-CTA FP32 kernel replaces slow cuBLAS splits across M2..64.
+        and (
+            mtp_out
+            or not (
+                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+                and wshape == (2560, 1536)
+                and x.shape[0] < 8
+            )
         )
         and _is_packed_row_major(x)
         and _is_packed_row_major(weight)
-        and 2 <= x.shape[0] <= _dense_batch_limit(role, tuple(weight.shape))
+        and 2 <= x.shape[0] <= limit
         and x.shape[1] == weight.shape[1]
         and x.is_cuda
         and weight.is_cuda
@@ -587,9 +758,19 @@ def _pack_gdn_input_weight(weight: torch.Tensor) -> torch.Tensor:
     return weight.reshape(-1, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
 
 
+def _pack_qsa_input_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Copy QSA qkv/index_qk FP16 bits into N32/K16 tiles."""
+    if weight.dtype != torch.float16 or weight.shape not in ((3584, 2560), (640, 2560)):
+        raise ValueError("Unsupported packed QSA input weight")
+    return (
+        weight.detach().reshape(-1, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+    )
+
+
 def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
     return bool(
-        (projection_policy().value("input_batch") or layer_policy().batch_fastpath)
+        projection_policy().value("input_batch")
+        and layer_policy().batch_fastpath
         and not envs.VLLM_BATCH_INVARIANT
         # The packed MMA preserves the original FP32 accumulation contract.
         # Let cuBLAS honor an explicit request for FP16 accumulation.
@@ -611,6 +792,34 @@ def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
             and w.is_contiguous()
             and w.data_ptr() % 16 == 0
             for w in (packed_qkvz, packed_ba)
+        )
+        and current_platform.is_device_capability(70)
+    )
+
+
+def _can_use_packed_qsa_input(x, packed_qkv, packed_idx) -> bool:
+    return bool(
+        layer_policy().batch_fastpath
+        and not envs.VLLM_BATCH_INVARIANT
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        and hasattr(torch.ops._C, "qwen38_qsa_input_batch_sm70_out")
+        and x.ndim == 2
+        and 2 <= x.shape[0] <= _GDN_BATCH_ROWS
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and packed_qkv is not None
+        and packed_idx is not None
+        and packed_qkv.shape == (112, 160, 2, 32, 8)
+        and packed_idx.shape == (20, 160, 2, 32, 8)
+        and all(
+            w.device == x.device
+            and w.dtype == x.dtype
+            and w.is_contiguous()
+            and w.data_ptr() % 16 == 0
+            for w in (packed_qkv, packed_idx)
         )
         and current_platform.is_device_capability(70)
     )
@@ -692,6 +901,88 @@ direct_register_custom_op(
 )
 
 
+def _qwen38_sm70_fp16_qsa_input(
+    x: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    idx_weight: torch.Tensor,
+    packed_qkv: torch.Tensor | None = None,
+    packed_idx: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_shape = x.shape[:-1]
+    x2 = x.reshape(-1, x.shape[-1]) if x.ndim != 2 else x
+    if x2.is_contiguous() and _can_use_packed_qsa_input(x2, packed_qkv, packed_idx):
+        qkv = x2.new_empty((x2.shape[0], 3584))
+        idx_qk = x2.new_empty((x2.shape[0], 640))
+        torch.ops._C.qwen38_qsa_input_batch_sm70_out(
+            qkv, idx_qk, x2, packed_qkv, packed_idx
+        )
+        logger.info_once("SM70 Qwen3.8 checkpoint-FP16 batched QSA input enabled.")
+        return qkv.reshape(*batch_shape, 3584), idx_qk.reshape(*batch_shape, 640)
+    if (
+        qkv_weight.shape == (3584, 2560)
+        and idx_weight.shape == (640, 2560)
+        and _runtime_ok(x2, qkv_weight)
+        and _runtime_ok(x2, idx_weight)
+    ):
+        qkv = x2.new_empty((1, 3584))
+        idx_qk = x2.new_empty((1, 640))
+        _qwen38_fp16_qsa_input_kernel[(3584 + 640,)](
+            x2,
+            qkv_weight,
+            idx_weight,
+            qkv,
+            idx_qk,
+            K=2560,
+            BLOCK_K=512,
+            num_warps=2,
+        )
+        logger.info_once("SM70 Qwen3.8 checkpoint-FP16 fused QSA input route enabled.")
+        return qkv.reshape(*batch_shape, 3584), idx_qk.reshape(*batch_shape, 640)
+    return (
+        torch.nn.functional.linear(x, qkv_weight),
+        torch.nn.functional.linear(x, idx_weight),
+    )
+
+
+def _qwen38_sm70_fp16_qsa_input_fake(
+    x: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    idx_weight: torch.Tensor,
+    packed_qkv: torch.Tensor | None = None,
+    packed_idx: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del qkv_weight, idx_weight, packed_qkv, packed_idx
+    batch_shape = x.shape[:-1]
+    return (
+        x.new_empty((*batch_shape, 3584)),
+        x.new_empty((*batch_shape, 640)),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_fp16_qsa_input",
+    op_func=_qwen38_sm70_fp16_qsa_input,
+    fake_impl=_qwen38_sm70_fp16_qsa_input_fake,
+)
+
+
+def _make_qsa_side_projection(qkv_proj: nn.Module, idx_proj: nn.Module):
+    def _side_proj(hidden_states: torch.Tensor):
+        if use_sm70_decode_graph_semantics():
+            return torch.ops.vllm.qwen38_sm70_fp16_qsa_input(
+                hidden_states,
+                qkv_proj.weight,
+                idx_proj.weight,
+                getattr(qkv_proj, "_sm70_qwen38_qsa_packed", None),
+                getattr(idx_proj, "_sm70_qwen38_qsa_packed", None),
+            )
+        qkv_out, _ = qkv_proj(hidden_states)
+        idx_out, _ = idx_proj(hidden_states)
+        return qkv_out, idx_out
+
+    return _side_proj
+
+
 def _mtp_batch_packing_allowed(layer: nn.Module, role: str) -> bool:
     # Match the router/shared runtime precision guards without changing their
     # forward hooks or fallbacks. The worker sets this policy before loading;
@@ -768,6 +1059,18 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
                 layer.register_buffer(
                     "_sm70_mtp_router_packed",
                     _router_batch_storage(weight, storage),
+                    persistent=False,
+                )
+        if getattr(layer, "_sm70_qwen38_prepare_qsa_batch", False):
+            weight = layer.weight
+            if (
+                weight.is_cuda
+                and weight.dtype == torch.float16
+                and hasattr(torch.ops._C, "qwen38_qsa_input_batch_sm70_out")
+            ):
+                layer.register_buffer(
+                    "_sm70_qwen38_qsa_packed",
+                    _pack_qsa_input_weight(weight),
                     persistent=False,
                 )
         if not getattr(layer, "_sm70_qwen38_prepare_gdn_batch", False):
@@ -962,6 +1265,39 @@ def enable_qwen38_sm70_fp16_gemv(
                 ba._sm70_qwen38_prepare_gdn_batch = True
             fused_gdn_inputs += 1
 
+    fused_qsa_inputs = 0
+    if layer_policy().fused_gdn_input:
+        for child in module.modules():
+            qkv = getattr(child, "qkv_proj", None)
+            indexer = getattr(child, "indexer", None)
+            idx_proj = getattr(indexer, "index_qk_proj", None)
+            qkv_weight = getattr(qkv, "weight", None)
+            idx_weight = getattr(idx_proj, "weight", None)
+            if not (
+                isinstance(qkv_weight, torch.Tensor)
+                and qkv_weight.shape == (3584, 2560)
+                and isinstance(idx_weight, torch.Tensor)
+                and idx_weight.shape == (640, 2560)
+                and getattr(qkv, "bias", None) is None
+                and getattr(idx_proj, "bias", None) is None
+                and isinstance(
+                    getattr(qkv, "quant_method", None),
+                    Qwen38SM70FP16LinearMethod,
+                )
+                and isinstance(
+                    getattr(idx_proj, "quant_method", None),
+                    Qwen38SM70FP16LinearMethod,
+                )
+                and getattr(child, "sm70_side_projection", None) is None
+            ):
+                continue
+            assert qkv is not None and idx_proj is not None
+            if batch_allowed:
+                qkv._sm70_qwen38_prepare_qsa_batch = True
+                idx_proj._sm70_qwen38_prepare_qsa_batch = True
+            child.sm70_side_projection = _make_qsa_side_projection(qkv, idx_proj)
+            fused_qsa_inputs += 1
+
     if replaced:
         logger.info_once(
             "Prepared %d Qwen3.8 checkpoint-FP16 SM70 M=1 GEMV projections.",
@@ -980,6 +1316,11 @@ def enable_qwen38_sm70_fp16_gemv(
     elif layer_policy().fused_gdn_input:
         logger.warning_once(
             "Qwen3.8 fused checkpoint-FP16 GDN input opt-in found no targets."
+        )
+    if fused_qsa_inputs:
+        logger.info_once(
+            "Prepared %d Qwen3.8 fused checkpoint-FP16 QSA inputs.",
+            fused_qsa_inputs,
         )
 
 

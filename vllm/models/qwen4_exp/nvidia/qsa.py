@@ -237,6 +237,11 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
         fast_build: bool = False,
     ) -> FlashAttentionMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        metadata._qsa_query_start_loc_cpu = (  # type: ignore[attr-defined]
+            None
+            if common_attn_metadata.is_dummy_batch
+            else common_attn_metadata.query_start_loc_cpu
+        )
         if not self.replicated_draft:
             return metadata
         # Draft K/V owns the full global span on every DCP rank. The mixed
@@ -1154,10 +1159,43 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 plans = {}
                 if metadata is not None:
                     metadata._qsa_stage_plans = plans
-            plan_key = (state.page_size, state.blocks, state.history.dtype)
+            qsl_cpu = getattr(metadata, "_qsa_query_start_loc_cpu", None)
+            query_lens: list[int] | None = None
+            if (
+                qsl_cpu is not None
+                and not getattr(self, "qsa_dcp_sharded", False)
+                and not torch.cuda.is_current_stream_capturing()
+                and not qsl_cpu.is_cuda
+                and qsl_cpu.numel() == table.shape[0] + 1
+            ):
+                qsl_list = [int(v) for v in qsl_cpu.tolist()]
+                if qsl_list[0] == 0 and qsl_list[-1] == query.shape[0]:
+                    query_lens = [
+                        qsl_list[i + 1] - qsl_list[i] for i in range(table.shape[0])
+                    ]
+            host_key = (
+                "_host_inputs",
+                table.data_ptr(),
+                table.shape,
+                lengths.data_ptr(),
+                lengths.shape,
+            )
+            if host_key not in plans:
+                plans[host_key] = state.sync_stage_inputs(table, lengths)
+            host_inputs = plans[host_key]
+            plan_key = (
+                state.page_size,
+                state.blocks,
+                state.history.dtype,
+                query_lens is not None,
+            )
             if plan_key not in plans:
                 plans[plan_key] = state.stage_plan(
-                    table, lengths, self.host_kv_prefill_stage_tokens
+                    table,
+                    lengths,
+                    self.host_kv_prefill_stage_tokens,
+                    query_lens=query_lens,
+                    host_inputs=host_inputs,
                 )
             plan = plans[plan_key]
             # Target layers reuse the configured stage buffers. The previous
@@ -1176,15 +1214,22 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             if plan and pending is not None and pending[0] is plan:
                 torch.cuda.current_stream().wait_event(pending[1])
                 staged_pages = pending[2]
-            # One request: pages holding only this step's tokens are written
-            # into the stage buffer directly (write_staged) instead of being
-            # copied back from the host they were just written to.
+            # Pages holding only this step's tokens are written into the stage
+            # buffer directly (write_staged) instead of being copied back from
+            # the host they were just written to.
             new_kv = getattr(self, "_host_kv_new", None)
             self._host_kv_new: tuple[torch.Tensor, ...] | None = None
             upto = None
-            if plan and new_kv is not None and len(plan[4]) == 1:
-                old_tokens = max(0, plan[4][0] - query.shape[0])
-                upto = -(-old_tokens // state.page_size)
+            if (
+                plan
+                and new_kv is not None
+                and not getattr(self, "qsa_dcp_sharded", False)
+            ):
+                if len(plan) >= 7 and plan[6] is not None:
+                    upto = int(plan[6])
+                elif len(plan[4]) == 1:
+                    old_tokens = max(0, plan[4][0] - query.shape[0])
+                    upto = -(-old_tokens // state.page_size)
             staged = plan and state.stage_history(
                 table,
                 lengths,
@@ -1269,7 +1314,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 window_key = plan_key + ("windows",)
                 if window_key not in plans:
                     plans[window_key] = state.stage_window_plans(
-                        table, lengths, self.host_kv_prefill_stage_tokens
+                        table,
+                        lengths,
+                        self.host_kv_prefill_stage_tokens,
+                        host_inputs=host_inputs,
                     )
                 windows = plans[window_key]
                 if windows:

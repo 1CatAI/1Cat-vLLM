@@ -160,3 +160,74 @@ def test_stage_slot_reuse_waits_for_previous_reader(stage_slots, length, monkeyp
         assert torch.all(history == owner + 1)
         assert torch.all(scales == owner + 0.5)
     assert len(host_kv._STAGES) == stage_slots
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+def test_multi_request_shared_prefix_dedup_prefetch_and_write_staged(dtype):
+    torch.manual_seed(42)
+    dev = torch.device("cuda", 0)
+    page, blocks = 16, 512
+    pool = get_accelerator_view_from_cpu_tensor(
+        torch.zeros((blocks, 2, page, 1, 256), dtype=dtype)
+    )
+    state = HostQSAKV(
+        blocks, page, 256, dev, hot_tokens=2048, rows=8, width=2051, history=pool
+    )
+    # 3 requests sharing 3 prefix blocks [10, 11, 12] (48 tokens):
+    # - req 0: old=54 (3 shared + 6 tokens in block 20), new=20 -> len=74 (blocks 20,21)
+    # - req 1: old=48 (3 shared), new=30 -> len=78 (pure-new blocks 30, 31)
+    # - req 2: old=48 (3 shared), new=0 -> len=48
+    table_cpu = torch.full((3, 8), -1, dtype=torch.int32)
+    table_cpu[0, :5] = torch.tensor([10, 11, 12, 20, 21], dtype=torch.int32)
+    table_cpu[1, :5] = torch.tensor([10, 11, 12, 30, 31], dtype=torch.int32)
+    table_cpu[2, :3] = torch.tensor([10, 11, 12], dtype=torch.int32)
+    table = table_cpu.to(dev)
+    lengths = torch.tensor([74, 78, 48], dtype=torch.int32, device=dev)
+    query_lens = [20, 30, 0]
+
+    # Pre-step writes: shared 48 tokens + req 0's 6 partial tokens in block 20.
+    shared_slots = torch.cat(
+        [torch.arange(b * page, (b + 1) * page, device=dev) for b in (10, 11, 12)]
+    )
+    req0_old_slots = torch.arange(20 * page, 20 * page + 6, device=dev)
+    old_slots = torch.cat([shared_slots, req0_old_slots])
+    k_old = (torch.randn(old_slots.numel(), 1, 256, device=dev) * 0.4).half()
+    state.write(k_old, k_old * 0.5, old_slots)
+
+    plan = state.stage_plan(table, lengths, 131072, query_lens=query_lens)
+    assert plan is not None
+    # Unique blocks: [10, 11, 12] (pure_old=3), [20] (partial -> upto=4), [21, 30, 31]
+    assert plan[1] == 7
+    assert state.prefix_pages(plan, sum(query_lens)) == 3
+    assert plan[6] == 4
+
+    stream = torch.cuda.Stream()
+    done, prefix = state.prefetch_prefix(plan, sum(query_lens), 131072, 1, stream, None)
+    assert prefix == 3
+    torch.cuda.current_stream().wait_event(done)
+
+    # In-step writes for req 0 (positions 54..73) and req 1 (positions 48..77).
+    pos0 = torch.arange(54, 74, device=dev)
+    slots0 = table[0, pos0 // page].long() * page + pos0 % page
+    pos1 = torch.arange(48, 78, device=dev)
+    slots1 = table[1, pos1 // page].long() * page + pos1 % page
+    new_slots = torch.cat([slots0, slots1])
+    k_new = (torch.randn(new_slots.numel(), 1, 256, device=dev) * 0.4).half()
+    v_new = k_new * 0.5
+    state.write(k_new, v_new, new_slots)
+
+    part = state.stage_history(
+        table, lengths, 131072, plan, slot=1, staged_pages=prefix, upto=plan[6]
+    )
+    state.write_staged(k_new, v_new, new_slots, plan, part[0], part[1])
+    full = state.stage_history(table, lengths, 131072, plan, slot=0)
+    torch.accelerator.synchronize()
+
+    stg_tbl = plan[2].cpu()
+    for req, length in enumerate([74, 78, 48]):
+        for tok in range(length):
+            sb = int(stg_tbl[req, tok // page])
+            off = tok % page
+            assert torch.equal(full[0][sb, :, off], part[0][sb, :, off])
+            if dtype == torch.uint8:
+                assert torch.equal(full[1][sb * page + off], part[1][sb * page + off])

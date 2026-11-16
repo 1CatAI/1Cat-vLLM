@@ -1325,7 +1325,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                     if use_batch_reduce
                     else Stage.ACTIVE_GROUPED
                 ),
-                w13_split_k=(4 if intermediate == 160 or num_tokens <= 8 else 8),
+                w13_split_k=(8 if num_tokens <= 6 else 4),
                 interleaved=interleaved_w13,
             )
             execute_fp4(layer.sm70_fp4_codec, plan, buffers, x, topk_ids, topk_weights)

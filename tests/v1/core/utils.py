@@ -82,6 +82,8 @@ def create_scheduler(
     ec_role: str | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
     device_config: DeviceConfig | None = None,
+    split_mtp_phase_pure: bool | None = None,
+    split_mtp_prefill_cap: int = 2048,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -122,6 +124,8 @@ def create_scheduler(
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
+        split_mtp_phase_pure=split_mtp_phase_pure,
+        split_mtp_prefill_cap=split_mtp_prefill_cap,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(

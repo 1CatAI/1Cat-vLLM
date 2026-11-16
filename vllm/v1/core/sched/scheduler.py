@@ -433,6 +433,35 @@ class Scheduler(SchedulerInterface):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
+        _cfg_split_mtp = self.scheduler_config.split_mtp_phase_pure
+        _can_split_phase_pure = (
+            self.phase_separation is None
+            and not self.v41_ahead
+            and not self.v41_micro
+            and self.parallel_config.pipeline_parallel_size == 1
+            and not self.is_encoder_decoder
+            and vllm_config.model_config.runner_type == "generate"
+            and self.scheduler_config.enable_chunked_prefill
+        )
+        self._split_mtp_phase_pure = _can_split_phase_pure and (
+            _cfg_split_mtp is True
+            or (
+                _cfg_split_mtp is None
+                and (
+                    vllm_config.model_config.is_hybrid
+                    or self.scheduler_config.mixed_prefill_step_latency_ms == 0
+                )
+            )
+        )
+        self._split_mtp_decode_steps_due = 0
+        self._split_mtp_prefill_burst_tokens = 0
+        self._split_mtp_skip_kv_step_advance = False
+        self._split_mtp_force_decode_once = False
+        self._split_mtp_concurrent_prefill_cap = min(
+            self.scheduler_config.split_mtp_prefill_cap,
+            self.max_num_scheduled_tokens,
+        )
+
         self.enable_return_routed_experts = (
             vllm_config.model_config.enable_return_routed_experts
         )
@@ -760,6 +789,58 @@ class Scheduler(SchedulerInterface):
             )
             if phase is not None:
                 self.phase_separation.begin_phase(phase, _now)
+        _split_mtp_both_active = False
+        if self._split_mtp_phase_pure and self.phase_separation is None:
+            _force_decode = self._split_mtp_force_decode_once
+            self._split_mtp_force_decode_once = False
+            _schedulable_running = [
+                r
+                for r in self.running
+                if self.current_step >= r.next_decode_eligible_step
+                and not (
+                    r.num_output_placeholders > 0
+                    and r.num_computed_tokens + 2 - r.num_output_placeholders
+                    >= r.num_prompt_tokens + r.max_tokens
+                )
+                and (
+                    r.num_tokens_with_spec
+                    + r.num_output_placeholders
+                    - r.num_computed_tokens
+                    > 0
+                )
+                and self.max_model_len - 1 - r.num_computed_tokens > 0
+            ]
+            _has_decode = any(
+                prefill_remaining[r.request_id] == 0 for r in _schedulable_running
+            )
+            _has_running_prefill = any(
+                prefill_remaining[r.request_id] > 0 for r in _schedulable_running
+            )
+            _has_waiting = (
+                bool(self.waiting or self.skipped_waiting)
+                and len(self.running) < self.max_num_running_reqs
+            )
+            _has_prefill = _has_running_prefill or _has_waiting
+            if _has_decode and _has_prefill:
+                _split_mtp_both_active = True
+                _short_tail_cap = min(256, self._split_mtp_concurrent_prefill_cap // 4)
+                _has_short_tail = any(
+                    bool(r.prefix_cache_boundaries)
+                    and 0 < prefill_remaining[r.request_id] <= _short_tail_cap
+                    for r in _schedulable_running
+                )
+                if _force_decode or (
+                    self._split_mtp_decode_steps_due > 0 and not _has_short_tail
+                ):
+                    phase = Phase.DECODE
+                else:
+                    phase = Phase.PREFILL
+                    token_budget = min(
+                        token_budget, self._split_mtp_concurrent_prefill_cap
+                    )
+            else:
+                self._split_mtp_decode_steps_due = 0
+                self._split_mtp_prefill_burst_tokens = 0
         # A prefill step must complete within one phase, or the wait the guard
         # promises (`max_decode_wait_ms + one prefill step`) does not hold.
         # `prefill_chunk_cap` is derived from measured ms/token, so it narrows
@@ -770,6 +851,7 @@ class Scheduler(SchedulerInterface):
                 token_budget = _chunk_cap
         control_mixed_prefill = (
             self.phase_separation is None
+            and not self._split_mtp_phase_pure
             and self.mixed_prefill_enabled
             and bool(resident_tokens)
             and self.scheduler_config.mixed_prefill_step_latency_ms > 0
@@ -810,7 +892,10 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
-        self.kv_cache_manager.new_step_starts()
+        if self._split_mtp_skip_kv_step_advance:
+            self._split_mtp_skip_kv_step_advance = False
+        else:
+            self.kv_cache_manager.new_step_starts()
 
         # `long_prefill_token_threshold` exists to stop a long prefill from
         # starving other requests of the token budget. When it is the only
@@ -833,7 +918,9 @@ class Scheduler(SchedulerInterface):
 
         # Keep resident phases pure. Waiting/resumed recovery is allowed to
         # follow the existing cache protocol and is classified after admission.
-        _phase_filter = phase is not None and self.phase_separation is not None
+        _phase_filter = phase is not None and (
+            self.phase_separation is not None or self._split_mtp_phase_pure
+        )
 
         # Even share of the budget on sweep steps.
         #
@@ -1610,8 +1697,50 @@ class Scheduler(SchedulerInterface):
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
+        if (
+            _split_mtp_both_active
+            and phase is Phase.PREFILL
+            and not num_scheduled_tokens
+            and not preempted_reqs
+        ):
+            # Waiting/running prefill could not allocate slots right now; run a
+            # pure decode step immediately instead of emitting an empty step.
+            self._split_mtp_decode_steps_due = 8
+            self._split_mtp_skip_kv_step_advance = True
+            self._split_mtp_force_decode_once = True
+            return self.schedule()
+
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        if _split_mtp_both_active and total_num_scheduled_tokens > 0:
+            if phase is Phase.DECODE:
+                self._split_mtp_decode_steps_due = max(
+                    0, self._split_mtp_decode_steps_due - 1
+                )
+                if self._split_mtp_decode_steps_due == 0:
+                    self._split_mtp_prefill_burst_tokens = 0
+            elif phase is Phase.PREFILL:
+                self._split_mtp_prefill_burst_tokens += total_num_scheduled_tokens
+                _short_tail_cap = min(256, self._split_mtp_concurrent_prefill_cap // 4)
+                _next_has_short_tail = any(
+                    (req_obj := self.requests.get(rid)) is not None
+                    and bool(req_obj.prefix_cache_boundaries)
+                    and 0 < prefill_remaining.get(rid, 0) - n <= _short_tail_cap
+                    for rid, n in num_scheduled_tokens.items()
+                )
+                _has_unfinished_prefill = any(
+                    prefill_remaining.get(rid, 0) - n > 0
+                    for rid, n in num_scheduled_tokens.items()
+                )
+                if _next_has_short_tail:
+                    self._split_mtp_decode_steps_due = 0
+                elif self._split_mtp_prefill_burst_tokens >= 1024:
+                    self._split_mtp_decode_steps_due = (
+                        8 if _has_unfinished_prefill else 3
+                    )
+                    self._split_mtp_prefill_burst_tokens = 0
+                else:
+                    self._split_mtp_decode_steps_due = 2
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0
@@ -1678,6 +1807,9 @@ class Scheduler(SchedulerInterface):
         # A Mamba ``align`` table is not append-only. Drain exact committed
         # boundary-state block IDs before the connector builds store jobs.
         boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
+        kv_block_copies, kv_block_copy_groups = (
+            self.kv_cache_manager.take_block_copies_with_groups()
+        )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1716,7 +1848,8 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
-            kv_block_copies=self.kv_cache_manager.take_block_copies() or None,
+            kv_block_copies=kv_block_copies or None,
+            kv_block_copy_groups=kv_block_copy_groups if kv_block_copies else None,
             boundary_state_offloads=(
                 boundary_state_offloads if self.connector is not None else None
             ),

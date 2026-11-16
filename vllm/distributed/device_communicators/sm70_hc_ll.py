@@ -169,7 +169,9 @@ class Sm70HcLLCommunicator:
                 40 * 64 * 96, device=self.device, dtype=torch.float32
             )
             self.down_counter = torch.zeros(16, device=self.device, dtype=torch.int32)
-            self.up_counter = torch.zeros(1, device=self.device, dtype=torch.int32)
+            self.down_counter[4:6] = 64
+            self.up_counter = torch.zeros(3, device=self.device, dtype=torch.int32)
+            self.up_counter[1:3] = 64
             self.down_seq = torch.zeros(1, device=self.device, dtype=torch.int32)
             self.up_seq = torch.zeros(1, device=self.device, dtype=torch.int32)
             self.ple_counter = torch.zeros(1, device=self.device, dtype=torch.int32)

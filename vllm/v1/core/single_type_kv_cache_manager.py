@@ -731,12 +731,11 @@ class CircularBufferManager(FullAttentionManager):
     ) -> int:
         del (
             num_tokens,
-            new_computed_blocks,
             total_computed_tokens,
             num_tokens_main_model,
             apply_admission_cap,
         )
-        return 0 if self.req_to_blocks.get(request_id) else 1
+        return 0 if (self.req_to_blocks.get(request_id) or new_computed_blocks) else 1
 
     def allocate_new_computed_blocks(
         self,
@@ -745,7 +744,11 @@ class CircularBufferManager(FullAttentionManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
-        del new_computed_blocks, num_local_computed_tokens, num_external_computed_tokens
+        del num_local_computed_tokens, num_external_computed_tokens
+        if new_computed_blocks:
+            self.block_pool.touch(new_computed_blocks)
+            self.req_to_blocks[request_id].extend(new_computed_blocks)
+            return
         self._claim_ring_block(request_id)
 
     def allocate_new_blocks(

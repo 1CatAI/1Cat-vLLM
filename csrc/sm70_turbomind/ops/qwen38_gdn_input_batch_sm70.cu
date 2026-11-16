@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// Checkpoint-FP16 Qwen3.8 TP4 GDN input. No quantization or K-tree change.
+// Checkpoint-FP16 Qwen3.8 TP4 GDN/QSA/MoE batch projections for SM70.
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -19,47 +19,163 @@ namespace {
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
+// 66 2-warp CTAs (132 warps) fit in a single wave on 80 V100 SMs with zero
+// shared memory: global warps 0..127 compute the 128 N32 QKVZ tiles while
+// warps 128..130 compute the three N8 b/a tiles using four K640 quad-splits
+// and an ordered left-to-right warp-shuffle reduction.
 template <bool Packed, int Groups>
-__global__ __launch_bounds__(128, 4) void gdn_input_batch_kernel(
-    const half* x, const half* qw, const half* bw, half* qkv, half* z,
-    half* b_out, half* a_out, int m) {
-  __shared__ float partial[4][Groups * 8][32];
-  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-  const bool is_ba = blockIdx.x == 128;
-  const int tile = blockIdx.x;
-  // The small b/a projection retains its four contiguous 640-element K
-  // partitions. QKVZ spreads 128 N32 tiles across all 80 SMs and retains
-  // the original single ordered K reduction while reusing weights across M.
-  if (!is_ba && warp != 0) return;
+__global__ __launch_bounds__(64, 8) void gdn_input_batch_kernel(
+    const half* __restrict__ x, const half* __restrict__ qw,
+    const half* __restrict__ bw, half* __restrict__ qkv, half* __restrict__ z,
+    half* __restrict__ b_out, half* __restrict__ a_out, int m) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int global_warp = blockIdx.x * 2 + warp;
+  if (global_warp >= 131) return;
+  const int row_offset = blockIdx.y * 32;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int quad = (lane >> 2) & 3;
-  const int col = quad * 8 + r;
-  const half* w = is_ba
-                      ? bw
-                      : (Packed ? (qw + static_cast<size_t>(tile) * 2560 * 32)
-                                : (qw + static_cast<size_t>(tile) * 32 * 2560));
-  const int start = is_ba ? warp * 40 : 0;
-  const int end = is_ba ? (warp + 1) * 40 : 160;
   float acc[Groups][8] = {};
+
+  if (global_warp < 128) {
+    const int tile = global_warp;
+    const int col = quad * 8 + r;
+    const half* w = qw + static_cast<size_t>(tile) * 2560 * 32;
 #pragma unroll 16
-  for (int g = start; g < end; ++g) {
-    uint4 lo = make_uint4(0, 0, 0, 0), hi = lo;
-    if constexpr (Packed) {
-      lo = *reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8);
-      hi = *reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8);
-    } else if (!is_ba || col < 24) {
-      // Same fragments and K order, but read the original checkpoint layout.
-      lo = *reinterpret_cast<const uint4*>(w + col * 2560 + g * 16);
-      hi = *reinterpret_cast<const uint4*>(w + col * 2560 + g * 16 + 8);
+    for (int g = 0; g < 160; ++g) {
+      uint4 lo, hi;
+      if constexpr (Packed) {
+        lo = __ldcs(reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8));
+        hi =
+            __ldcs(reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8));
+      } else {
+        lo = __ldcs(reinterpret_cast<const uint4*>(w + col * 2560 + g * 16));
+        hi =
+            __ldcs(reinterpret_cast<const uint4*>(w + col * 2560 + g * 16 + 8));
+      }
+#pragma unroll
+      for (int p = 0; p < Groups; ++p) {
+        const int row = row_offset + p * 8 + r;
+        uint4 a = make_uint4(0, 0, 0, 0), b = a;
+        if (row < m) {
+          const half* input = x + static_cast<size_t>(row) * 2560 + g * 16;
+          a = __ldg(reinterpret_cast<const uint4*>(input));
+          b = __ldg(reinterpret_cast<const uint4*>(input + 8));
+        }
+        GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+        GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+        GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+        GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
+      }
     }
 #pragma unroll
     for (int p = 0; p < Groups; ++p) {
-      const int row = p * 8 + r;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int rr =
+            row_offset + p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+        const int cc =
+            quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+        if (rr < m) {
+          const int outcol = tile * 32 + cc;
+          const half value = __float2half_rn(acc[p][i]);
+          if (outcol < 2560)
+            qkv[static_cast<size_t>(rr) * 2560 + outcol] = value;
+          else
+            z[static_cast<size_t>(rr) * 1536 + outcol - 2560] = value;
+        }
+      }
+    }
+  } else {
+    const int ba_tile = global_warp - 128;
+    const int split = quad;
+    const int col = ba_tile * 8 + r;
+#pragma unroll 10
+    for (int g = split * 40; g < (split + 1) * 40; ++g) {
+      uint4 lo, hi;
+      if constexpr (Packed) {
+        lo = *reinterpret_cast<const uint4*>(bw + (g * 64 + col) * 8);
+        hi = *reinterpret_cast<const uint4*>(bw + (g * 64 + 32 + col) * 8);
+      } else {
+        lo = *reinterpret_cast<const uint4*>(bw + col * 2560 + g * 16);
+        hi = *reinterpret_cast<const uint4*>(bw + col * 2560 + g * 16 + 8);
+      }
+#pragma unroll
+      for (int p = 0; p < Groups; ++p) {
+        const int row = row_offset + p * 8 + r;
+        uint4 a = make_uint4(0, 0, 0, 0), b = a;
+        if (row < m) {
+          const half* input = x + static_cast<size_t>(row) * 2560 + g * 16;
+          a = __ldg(reinterpret_cast<const uint4*>(input));
+          b = __ldg(reinterpret_cast<const uint4*>(input + 8));
+        }
+        GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+        GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+        GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+        GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
+      }
+    }
+    const int base = lane & ~12;
+#pragma unroll
+    for (int p = 0; p < Groups; ++p) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int rr =
+            row_offset + p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+        const int cc = ba_tile * 8 +
+                       ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+        float value = __shfl_sync(0xffffffff, acc[p][i], base);
+#pragma unroll
+        for (int s = 1; s < 4; ++s) {
+          value = __fadd_rn(
+              value, __shfl_sync(0xffffffff, acc[p][i], base | (s << 2)));
+        }
+        if (split == 0 && rr < m) {
+          if (cc < 12)
+            b_out[rr * 12 + cc] = __float2half_rn(value);
+          else
+            a_out[rr * 12 + cc - 12] = __float2half_rn(value);
+        }
+      }
+    }
+  }
+}
+
+// Fused QSA qkv_proj [3584, 2560] (112 N32 tiles) + index_qk_proj [640, 2560]
+// (20 N32 tiles) = 132 warps = 66 2-warp CTAs in one wave on 80 V100 SMs.
+template <bool Packed, int Groups>
+__global__ __launch_bounds__(64, 8) void qsa_input_batch_kernel(
+    const half* __restrict__ x, const half* __restrict__ qw,
+    const half* __restrict__ iw, half* __restrict__ qkv,
+    half* __restrict__ idx_qk, int m) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int global_warp = blockIdx.x * 2 + warp;
+  const bool is_idx = global_warp >= 112;
+  const int tile = is_idx ? (global_warp - 112) : global_warp;
+  const int row_offset = blockIdx.y * 32;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int quad = (lane >> 2) & 3;
+  const int col = quad * 8 + r;
+  const half* w = (is_idx ? iw : qw) + static_cast<size_t>(tile) * 2560 * 32;
+  float acc[Groups][8] = {};
+
+#pragma unroll 16
+  for (int g = 0; g < 160; ++g) {
+    uint4 lo, hi;
+    if constexpr (Packed) {
+      lo = __ldcs(reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8));
+      hi = __ldcs(reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8));
+    } else {
+      lo = __ldcs(reinterpret_cast<const uint4*>(w + col * 2560 + g * 16));
+      hi = __ldcs(reinterpret_cast<const uint4*>(w + col * 2560 + g * 16 + 8));
+    }
+#pragma unroll
+    for (int p = 0; p < Groups; ++p) {
+      const int row = row_offset + p * 8 + r;
       uint4 a = make_uint4(0, 0, 0, 0), b = a;
       if (row < m) {
         const half* input = x + static_cast<size_t>(row) * 2560 + g * 16;
-        a = *reinterpret_cast<const uint4*>(input);
-        b = *reinterpret_cast<const uint4*>(input + 8);
+        a = __ldg(reinterpret_cast<const uint4*>(input));
+        b = __ldg(reinterpret_cast<const uint4*>(input + 8));
       }
       GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
       GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
@@ -67,39 +183,20 @@ __global__ __launch_bounds__(128, 4) void gdn_input_batch_kernel(
       GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
     }
   }
+
+  half* dst = is_idx ? idx_qk : qkv;
+  const int out_stride = is_idx ? 640 : 3584;
 #pragma unroll
   for (int p = 0; p < Groups; ++p) {
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      const int rr = p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+      const int rr =
+          row_offset + p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
       const int cc =
           quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
-      if (is_ba) {
-        partial[warp][rr][cc] = acc[p][i];
-      } else if (rr < m) {
-        const int outcol = tile * 32 + cc;
-        const half value = __float2half_rn(acc[p][i]);
-        if (outcol < 2560)
-          qkv[rr * 2560 + outcol] = value;
-        else
-          z[rr * 1536 + outcol - 2560] = value;
-      }
-    }
-  }
-  if (is_ba) {
-    __syncthreads();
-    for (int i = threadIdx.x; i < Groups * 8 * 24; i += 128) {
-      const int rr = i / 24, cc = i % 24;
-      // cuBLASLt FP32 workspace reduction: preserve left-to-right order.
-      // Balanced alternatives produce measurable FP16 bit differences.
-      const float value =
-          ((partial[0][rr][cc] + partial[1][rr][cc]) + partial[2][rr][cc]) +
-          partial[3][rr][cc];
       if (rr < m) {
-        if (cc < 12)
-          b_out[rr * 12 + cc] = __float2half_rn(value);
-        else
-          a_out[rr * 12 + cc - 12] = __float2half_rn(value);
+        dst[static_cast<size_t>(rr) * out_stride + tile * 32 + cc] =
+            __float2half_rn(acc[p][i]);
       }
     }
   }
@@ -108,8 +205,6 @@ __global__ __launch_bounds__(128, 4) void gdn_input_batch_kernel(
 // Both high-precision small-batch cuBLAS projections use four contiguous
 // FP32 K partitions (router: K640, output: K384). Each independent m8n8k4
 // quad pair owns one partition, with an ordered warp-shuffle reduction.
-// N8 tiles distribute work over more SMs without adding weight copies or
-// changing the dot-product tree. This direct entry remains screening-only.
 template <int K>
 __global__ __launch_bounds__(32, 8) void dense_batch_kernel(const half* x,
                                                             const half* weight,
@@ -153,18 +248,74 @@ __global__ __launch_bounds__(32, 8) void dense_batch_kernel(const half* x,
     }
   }
 }
-template <bool RowMajor>
-__global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
-                                                                  const half* w,
-                                                                  half* out,
-                                                                  int m) {
+
+// Multi-group 80-CTA output projection ([m, 1536] x [2560, 1536]^T -> [m,
+// 2560]): 4 warps/CTA cover 32 output columns (80 * 32 = 2560), streaming the
+// 7.86 MB weight matrix once across all M groups while preserving the exact
+// 4-partition K384 FP32 reduction tree.
+template <int Groups>
+__global__ __launch_bounds__(128, 4) void dense_batch_out_kernel(
+    const half* __restrict__ x, const half* __restrict__ weight,
+    half* __restrict__ output, int m) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int split = (lane >> 2) & 3;
+  const int col_tile = blockIdx.x * 4 + warp;
+  const int col = col_tile * 8 + r;
+  const int row_offset = blockIdx.y * 32;
+  float acc[Groups][8] = {};
+#pragma unroll 6
+  for (int g = split * 24; g < (split + 1) * 24; ++g) {
+    const half* w = weight + static_cast<size_t>(col) * 1536 + g * 16;
+    const uint4 lo = __ldcs(reinterpret_cast<const uint4*>(w));
+    const uint4 hi = __ldcs(reinterpret_cast<const uint4*>(w + 8));
+#pragma unroll
+    for (int p = 0; p < Groups; ++p) {
+      const int row = row_offset + p * 8 + r;
+      uint4 a = make_uint4(0, 0, 0, 0), b = a;
+      if (row < m) {
+        const half* input = x + static_cast<size_t>(row) * 1536 + g * 16;
+        a = __ldg(reinterpret_cast<const uint4*>(input));
+        b = __ldg(reinterpret_cast<const uint4*>(input + 8));
+      }
+      GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+      GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+      GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+      GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
+    }
+  }
+  const int base = lane & ~12;
+#pragma unroll
+  for (int p = 0; p < Groups; ++p) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int rr =
+          row_offset + p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+      const int cc =
+          col_tile * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+      float value = __shfl_sync(0xffffffff, acc[p][i], base);
+#pragma unroll
+      for (int s = 1; s < 4; ++s) {
+        value = __fadd_rn(value,
+                          __shfl_sync(0xffffffff, acc[p][i], base | (s << 2)));
+      }
+      if (split == 0 && rr < m) {
+        output[static_cast<size_t>(rr) * 2560 + cc] = __float2half_rn(value);
+      }
+    }
+  }
+}
+
+template <bool RowMajor, int Groups>
+__global__ __launch_bounds__(32, 8) void router_split_quad_kernel(
+    const half* __restrict__ x, const half* __restrict__ w,
+    half* __restrict__ out, int m) {
   const int lane = threadIdx.x;
   const int col_tile = blockIdx.x;
-  const int row_base = blockIdx.y * 8;
+  const int row_offset = blockIdx.y * 32;
   const int split = (lane >> 2) & 3;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
-  const int row = row_base + r;
-  float acc[8] = {};
+  float acc[Groups][8] = {};
 #pragma unroll 10
   for (int g = 0; g < 40; ++g) {
     const half* weights;
@@ -172,31 +323,41 @@ __global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
       weights = w + (col_tile * 8 + r) * 2560 + split * 640 + g * 16;
     else
       weights = w + (col_tile * 40 * 64 + g * 64 + split * 8 + r) * 8;
-    const uint4 lo = *reinterpret_cast<const uint4*>(weights);
-    const uint4 hi =
-        *reinterpret_cast<const uint4*>(weights + (RowMajor ? 8 : 32 * 8));
-    uint4 a = {}, b = {};
-    if (row < m) {
-      const half* input = x + row * 2560 + split * 640 + g * 16;
-      a = *reinterpret_cast<const uint4*>(input);
-      b = *reinterpret_cast<const uint4*>(input + 8);
+    const uint4 lo = __ldcs(reinterpret_cast<const uint4*>(weights));
+    const uint4 hi = __ldcs(
+        reinterpret_cast<const uint4*>(weights + (RowMajor ? 8 : 32 * 8)));
+#pragma unroll
+    for (int p = 0; p < Groups; ++p) {
+      const int row = row_offset + p * 8 + r;
+      uint4 a = {}, b = {};
+      if (row < m) {
+        const half* input =
+            x + static_cast<size_t>(row) * 2560 + split * 640 + g * 16;
+        a = __ldg(reinterpret_cast<const uint4*>(input));
+        b = __ldg(reinterpret_cast<const uint4*>(input + 8));
+      }
+      GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+      GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+      GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+      GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
     }
-    GDN_MMA(acc, a.x, a.y, lo.x, lo.y);
-    GDN_MMA(acc, a.z, a.w, lo.z, lo.w);
-    GDN_MMA(acc, b.x, b.y, hi.x, hi.y);
-    GDN_MMA(acc, b.z, b.w, hi.z, hi.w);
   }
+  const int base = lane & ~12;
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const int rr = row_base + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
-    const int cc =
-        col_tile * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
-    float value = __shfl_sync(0xffffffff, acc[i], lane & ~12);
+  for (int p = 0; p < Groups; ++p) {
 #pragma unroll
-    for (int s = 1; s < 4; ++s)
-      value = __fadd_rn(
-          value, __shfl_sync(0xffffffff, acc[i], (lane & ~12) | (s << 2)));
-    if (split == 0 && rr < m) out[rr * 512 + cc] = __float2half_rn(value);
+    for (int i = 0; i < 8; ++i) {
+      const int rr =
+          row_offset + p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+      const int cc =
+          col_tile * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+      float value = __shfl_sync(0xffffffff, acc[p][i], base);
+#pragma unroll
+      for (int s = 1; s < 4; ++s)
+        value = __fadd_rn(value,
+                          __shfl_sync(0xffffffff, acc[p][i], base | (s << 2)));
+      if (split == 0 && rr < m) out[rr * 512 + cc] = __float2half_rn(value);
+    }
   }
 }
 
@@ -355,7 +516,7 @@ __global__ __launch_bounds__(128, 4) void shared_down_gated_m1_kernel(
   if (sub == 0) out[col] = __hmul(__float2half_rn(acc), shared_gate);
 }
 
-template <int K_DOWN>
+template <int K_DOWN, int Groups = 1>
 __global__ __launch_bounds__(64, 8) void shared_down_gated_batch_kernel(
     const half* __restrict__ hidden_x, const half* __restrict__ act_out,
     const half* __restrict__ down_w, const half* __restrict__ gate_w,
@@ -363,44 +524,43 @@ __global__ __launch_bounds__(64, 8) void shared_down_gated_batch_kernel(
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31;
   const int col_base = blockIdx.x * 32;
-  const int row_base = blockIdx.y * 8;
-  const int gm = min(8, m - row_base);
+  const int row_base = blockIdx.y * (Groups * 8);
+  const int gm = max(0, min(Groups * 8, m - row_base));
 
-  __shared__ half gate_s[8];
-  __shared__ __align__(16) half act_s[8][K_DOWN + 8];
-  __shared__ float red[8][32];
+  __shared__ half gate_s[Groups * 8];
+  __shared__ __align__(16) half act_s[Groups * 8][K_DOWN + 8];
+  __shared__ float red[Groups][8][32];
 
   uint4 gw[10];
 #pragma unroll
   for (int s = 0; s < 10; ++s)
-    gw[s] = *reinterpret_cast<const uint4*>(gate_w + (s * 32 + lane) * 8);
+    gw[s] = __ldg(reinterpret_cast<const uint4*>(gate_w + (s * 32 + lane) * 8));
 
-  for (int rr = warp * 4; rr < warp * 4 + 4; ++rr) {
-    if (rr < gm) {
-      const half* xrow = hidden_x + static_cast<size_t>(row_base + rr) * 2560;
-      float gsum = 0.0f;
+  for (int rr = warp; rr < gm; rr += 2) {
+    const half* xrow = hidden_x + static_cast<size_t>(row_base + rr) * 2560;
+    float gsum = 0.0f;
 #pragma unroll
-      for (int s = 0; s < 10; ++s) {
-        const uint4 xv =
-            *reinterpret_cast<const uint4*>(xrow + (s * 32 + lane) * 8);
-        const half* xh = reinterpret_cast<const half*>(&xv);
-        const half* wh = reinterpret_cast<const half*>(&gw[s]);
+    for (int s = 0; s < 10; ++s) {
+      const uint4 xv =
+          __ldg(reinterpret_cast<const uint4*>(xrow + (s * 32 + lane) * 8));
+      const half* xh = reinterpret_cast<const half*>(&xv);
+      const half* wh = reinterpret_cast<const half*>(&gw[s]);
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
-          gsum = __fmaf_rn(__half2float(xh[j]), __half2float(wh[j]), gsum);
-      }
-      gsum = warp_sum_down(gsum);
-      if (lane == 0) {
-        const float rounded = __half2float(__float2half_rn(gsum));
-        gate_s[rr] = __float2half_rn(1.0f / (1.0f + __expf(-rounded)));
-      }
+      for (int j = 0; j < 8; ++j)
+        gsum = __fmaf_rn(__half2float(xh[j]), __half2float(wh[j]), gsum);
+    }
+    gsum = warp_sum_down(gsum);
+    if (lane == 0) {
+      const float rounded = __half2float(__float2half_rn(gsum));
+      gate_s[rr] = __float2half_rn(1.0f / (1.0f + __expf(-rounded)));
     }
   }
 
   for (int idx = tid * 8; idx < gm * K_DOWN; idx += 64 * 8) {
     const int rr = idx / K_DOWN, kk = idx % K_DOWN;
-    *reinterpret_cast<uint4*>(&act_s[rr][kk]) = *reinterpret_cast<const uint4*>(
-        act_out + static_cast<size_t>(row_base + rr) * K_DOWN + kk);
+    *reinterpret_cast<uint4*>(&act_s[rr][kk]) =
+        __ldg(reinterpret_cast<const uint4*>(
+            act_out + static_cast<size_t>(row_base + rr) * K_DOWN + kk));
   }
   __syncthreads();
 
@@ -409,37 +569,47 @@ __global__ __launch_bounds__(64, 8) void shared_down_gated_batch_kernel(
   const int quad = (lane >> 2) & 3;
   const int col = col_base + quad * 8 + r;
   const half* wrow = down_w + static_cast<size_t>(col) * K_DOWN;
-  float acc[8] = {};
+  float acc[Groups][8] = {};
 #pragma unroll
   for (int s = 0; s < kHalfSteps; ++s) {
     const int g = warp * kHalfSteps + s;
-    const uint4 lo = *reinterpret_cast<const uint4*>(wrow + g * 16);
-    const uint4 hi = *reinterpret_cast<const uint4*>(wrow + g * 16 + 8);
-    uint4 a = make_uint4(0, 0, 0, 0), b = a;
-    if (r < gm) {
-      a = *reinterpret_cast<const uint4*>(&act_s[r][g * 16]);
-      b = *reinterpret_cast<const uint4*>(&act_s[r][g * 16 + 8]);
+    const uint4 lo = __ldcs(reinterpret_cast<const uint4*>(wrow + g * 16));
+    const uint4 hi = __ldcs(reinterpret_cast<const uint4*>(wrow + g * 16 + 8));
+#pragma unroll
+    for (int p = 0; p < Groups; ++p) {
+      uint4 a = make_uint4(0, 0, 0, 0), b = a;
+      if (p * 8 + r < gm) {
+        a = *reinterpret_cast<const uint4*>(&act_s[p * 8 + r][g * 16]);
+        b = *reinterpret_cast<const uint4*>(&act_s[p * 8 + r][g * 16 + 8]);
+      }
+      GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+      GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+      GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+      GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
     }
-    GDN_MMA(acc, a.x, a.y, lo.x, lo.y);
-    GDN_MMA(acc, a.z, a.w, lo.z, lo.w);
-    GDN_MMA(acc, b.x, b.y, hi.x, hi.y);
-    GDN_MMA(acc, b.z, b.w, hi.z, hi.w);
   }
   if (warp == 1) {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) red[i][lane] = acc[i];
+    for (int p = 0; p < Groups; ++p) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) red[p][i][lane] = acc[p][i];
+    }
   }
   __syncthreads();
   if (warp == 0) {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const int rr = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-      const int cc =
-          quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
-      if (rr < gm) {
-        const half dv = __float2half_rn(__fadd_rn(acc[i], red[i][lane]));
-        out[static_cast<size_t>(row_base + rr) * 2560 + col_base + cc] =
-            __hmul(dv, gate_s[rr]);
+    for (int p = 0; p < Groups; ++p) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int rr = p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+        const int cc =
+            quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+        if (rr < gm) {
+          const half dv =
+              __float2half_rn(__fadd_rn(acc[p][i], red[p][i][lane]));
+          out[static_cast<size_t>(row_base + rr) * 2560 + col_base + cc] =
+              __hmul(dv, gate_s[rr]);
+        }
       }
     }
   }
@@ -448,8 +618,8 @@ __global__ __launch_bounds__(64, 8) void shared_down_gated_batch_kernel(
 #undef GDN_MMA
 
 void dense_batch(torch::Tensor output, torch::Tensor x, torch::Tensor weight) {
-  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) >= 2 && x.size(0) <= 16,
-              "Qwen3.8 dense batch requires CUDA M2..16");
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) >= 2 && x.size(0) <= 64,
+              "Qwen3.8 dense batch requires CUDA M2..64");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
@@ -471,13 +641,30 @@ void dense_batch(torch::Tensor output, torch::Tensor x, torch::Tensor weight) {
   const auto* input = reinterpret_cast<const half*>(x.data_ptr());
   const auto* w = reinterpret_cast<const half*>(weight.data_ptr());
   auto* out = reinterpret_cast<half*>(output.data_ptr());
-  const dim3 grid(n / 8, (m + 7) / 8);
-  if (router)
-    dense_batch_kernel<2560><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
-        input, w, out, m, n);
-  else
-    dense_batch_kernel<1536><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
-        input, w, out, m, n);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  if (router) {
+    TORCH_CHECK(m <= 16, "Qwen3.8 dense batch router requires CUDA M2..16");
+    dense_batch_kernel<2560>
+        <<<dim3(n / 8, (m + 7) / 8), 32, 0, stream>>>(input, w, out, m, n);
+  } else {
+    auto launch_out = [&](auto groups_tag, int row_blocks) {
+      constexpr int G = decltype(groups_tag)::value;
+      dense_batch_out_kernel<G>
+          <<<dim3(80, row_blocks), 128, 0, stream>>>(input, w, out, m);
+    };
+    if (m <= 8)
+      launch_out(std::integral_constant<int, 1>{}, 1);
+    else if (m <= 16)
+      launch_out(std::integral_constant<int, 2>{}, 1);
+    else if (m <= 24)
+      launch_out(std::integral_constant<int, 3>{}, 1);
+    else if (m <= 32)
+      launch_out(std::integral_constant<int, 4>{}, 1);
+    else if (m <= 40)
+      launch_out(std::integral_constant<int, 5>{}, 1);
+    else
+      launch_out(std::integral_constant<int, 4>{}, 2);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -485,8 +672,8 @@ void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
                      torch::Tensor a, torch::Tensor x, torch::Tensor qw,
                      torch::Tensor bw) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 2560 &&
-                  x.size(0) >= 2 && x.size(0) <= 16,
-              "Qwen3.8 batched GDN requires CUDA [2..16, 2560] input");
+                  x.size(0) >= 2 && x.size(0) <= 64,
+              "Qwen3.8 batched GDN requires CUDA [2..64, 2560] input");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
@@ -510,10 +697,10 @@ void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
                   a.sizes() == at::IntArrayRef({m, 12}),
               "Invalid Qwen3.8 GDN output geometry");
   const auto stream = at::cuda::getCurrentCUDAStream();
-  auto launch = [&](auto packed_tag, auto groups_tag) {
+  auto launch = [&](auto packed_tag, auto groups_tag, int row_blocks) {
     constexpr bool P = decltype(packed_tag)::value;
     constexpr int G = decltype(groups_tag)::value;
-    gdn_input_batch_kernel<P, G><<<dim3(129, 1), 128, 0, stream>>>(
+    gdn_input_batch_kernel<P, G><<<dim3(66, row_blocks), 64, 0, stream>>>(
         reinterpret_cast<const half*>(x.data_ptr()),
         reinterpret_cast<const half*>(qw.data_ptr()),
         reinterpret_cast<const half*>(bw.data_ptr()),
@@ -522,24 +709,88 @@ void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
         reinterpret_cast<half*>(b.data_ptr()),
         reinterpret_cast<half*>(a.data_ptr()), m);
   };
-  if (packed) {
+  auto dispatch_m = [&](auto packed_tag) {
     if (m <= 8)
-      launch(std::true_type{}, std::integral_constant<int, 1>{});
+      launch(packed_tag, std::integral_constant<int, 1>{}, 1);
+    else if (m <= 16)
+      launch(packed_tag, std::integral_constant<int, 2>{}, 1);
+    else if (m <= 24)
+      launch(packed_tag, std::integral_constant<int, 3>{}, 1);
+    else if (m <= 32)
+      launch(packed_tag, std::integral_constant<int, 4>{}, 1);
+    else if (m <= 40)
+      launch(packed_tag, std::integral_constant<int, 5>{}, 1);
     else
-      launch(std::true_type{}, std::integral_constant<int, 2>{});
-  } else {
-    if (m <= 8)
-      launch(std::false_type{}, std::integral_constant<int, 1>{});
-    else
-      launch(std::false_type{}, std::integral_constant<int, 2>{});
+      launch(packed_tag, std::integral_constant<int, 4>{}, 2);
+  };
+  if (packed)
+    dispatch_m(std::true_type{});
+  else
+    dispatch_m(std::false_type{});
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void qsa_input_batch(torch::Tensor qkv, torch::Tensor idx_qk, torch::Tensor x,
+                     torch::Tensor qw, torch::Tensor iw) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 2560 &&
+                  x.size(0) >= 2 && x.size(0) <= 64,
+              "Qwen3.8 batched QSA requires CUDA [2..64, 2560] input");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "Qwen3.8 batched QSA is SM70 only");
+  for (const auto& t : {qkv, idx_qk, x, qw, iw}) {
+    TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.is_contiguous() &&
+                    t.scalar_type() == at::kHalf,
+                "Qwen3.8 batched QSA requires same-device contiguous FP16");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                "Qwen3.8 batched QSA requires 16-byte aligned storage");
   }
+  const bool packed = qw.sizes() == at::IntArrayRef({112, 160, 2, 32, 8}) &&
+                      iw.sizes() == at::IntArrayRef({20, 160, 2, 32, 8});
+  const bool row_major = qw.sizes() == at::IntArrayRef({3584, 2560}) &&
+                         iw.sizes() == at::IntArrayRef({640, 2560});
+  TORCH_CHECK(packed || row_major, "Invalid Qwen3.8 QSA weight geometry");
+  const int m = x.size(0);
+  TORCH_CHECK(qkv.sizes() == at::IntArrayRef({m, 3584}) &&
+                  idx_qk.sizes() == at::IntArrayRef({m, 640}),
+              "Invalid Qwen3.8 QSA output geometry");
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  auto launch = [&](auto packed_tag, auto groups_tag, int row_blocks) {
+    constexpr bool P = decltype(packed_tag)::value;
+    constexpr int G = decltype(groups_tag)::value;
+    qsa_input_batch_kernel<P, G><<<dim3(66, row_blocks), 64, 0, stream>>>(
+        reinterpret_cast<const half*>(x.data_ptr()),
+        reinterpret_cast<const half*>(qw.data_ptr()),
+        reinterpret_cast<const half*>(iw.data_ptr()),
+        reinterpret_cast<half*>(qkv.data_ptr()),
+        reinterpret_cast<half*>(idx_qk.data_ptr()), m);
+  };
+  auto dispatch_m = [&](auto packed_tag) {
+    if (m <= 8)
+      launch(packed_tag, std::integral_constant<int, 1>{}, 1);
+    else if (m <= 16)
+      launch(packed_tag, std::integral_constant<int, 2>{}, 1);
+    else if (m <= 24)
+      launch(packed_tag, std::integral_constant<int, 3>{}, 1);
+    else if (m <= 32)
+      launch(packed_tag, std::integral_constant<int, 4>{}, 1);
+    else if (m <= 40)
+      launch(packed_tag, std::integral_constant<int, 5>{}, 1);
+    else
+      launch(packed_tag, std::integral_constant<int, 4>{}, 2);
+  };
+  if (packed)
+    dispatch_m(std::true_type{});
+  else
+    dispatch_m(std::false_type{});
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) >= 2 &&
-                  x.size(0) <= 40 && x.size(1) == 2560,
-              "SM70 batch router requires M2..40, K2560");
+                  x.size(0) <= 64 && x.size(1) == 2560,
+              "SM70 batch router requires M2..64, K2560");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
@@ -554,29 +805,41 @@ void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
           output.sizes() == at::IntArrayRef({x.size(0), 512}),
       "Invalid batch router geometry");
   const int m = x.size(0);
-  const dim3 grid(64, (m + 7) / 8);
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (row_major) {
-    router_split_quad_kernel<true><<<grid, 32, 0, stream>>>(
-        reinterpret_cast<const half*>(x.data_ptr()),
-        reinterpret_cast<const half*>(packed.data_ptr()),
-        reinterpret_cast<half*>(output.data_ptr()), m);
-  } else {
-    router_split_quad_kernel<false><<<grid, 32, 0, stream>>>(
-        reinterpret_cast<const half*>(x.data_ptr()),
-        reinterpret_cast<const half*>(packed.data_ptr()),
-        reinterpret_cast<half*>(output.data_ptr()), m);
-  }
+  const auto* xp = reinterpret_cast<const half*>(x.data_ptr());
+  const auto* wp = reinterpret_cast<const half*>(packed.data_ptr());
+  auto* op = reinterpret_cast<half*>(output.data_ptr());
+  auto launch = [&](auto rm_tag, auto groups_tag, int row_blocks) {
+    constexpr bool RM = decltype(rm_tag)::value;
+    constexpr int G = decltype(groups_tag)::value;
+    router_split_quad_kernel<RM, G>
+        <<<dim3(64, row_blocks), 32, 0, stream>>>(xp, wp, op, m);
+  };
+  auto dispatch_m = [&](auto rm_tag) {
+    if (m <= 8)
+      launch(rm_tag, std::integral_constant<int, 1>{}, 1);
+    else if (m <= 16)
+      launch(rm_tag, std::integral_constant<int, 2>{}, 1);
+    else if (m <= 24)
+      launch(rm_tag, std::integral_constant<int, 3>{}, 1);
+    else if (m <= 32)
+      launch(rm_tag, std::integral_constant<int, 4>{}, 1);
+    else if (m <= 40)
+      launch(rm_tag, std::integral_constant<int, 5>{}, 1);
+    else
+      launch(rm_tag, std::integral_constant<int, 4>{}, 2);
+  };
+  if (row_major)
+    dispatch_m(std::true_type{});
+  else
+    dispatch_m(std::false_type{});
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void shared_up_batch(torch::Tensor output, torch::Tensor partial,
                      torch::Tensor x, torch::Tensor packed) {
-  const bool fp32_partials = partial.scalar_type() == at::kFloat;
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 2560 &&
-                  (fp32_partials ? (x.size(0) >= 2 && x.size(0) <= 40)
-                                 : (x.size(0) % 5 == 0 && x.size(0) >= 5 &&
-                                    x.size(0) <= 40)),
+                  x.size(0) >= 2 && x.size(0) <= 64,
               "Shared expert batch projection requires K2560 and valid M");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
@@ -623,8 +886,8 @@ void shared_up_batch_fp32(torch::Tensor output, torch::Tensor partial,
 void shared_gate_mul(torch::Tensor output, torch::Tensor logits,
                      torch::Tensor source) {
   TORCH_CHECK(source.is_cuda() && source.dim() == 2 && source.size(0) >= 2 &&
-                  source.size(0) <= 40 && source.size(1) == 2560,
-              "Shared gate epilogue requires M2..40, N2560");
+                  source.size(0) <= 64 && source.size(1) == 2560,
+              "Shared gate epilogue requires M2..64, N2560");
   const c10::cuda::CUDAGuard guard(source.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
@@ -674,22 +937,45 @@ void shared_down_gated(torch::Tensor out, torch::Tensor hidden_x,
   const auto* dw = reinterpret_cast<const half*>(down_w.data_ptr());
   const auto* gw = reinterpret_cast<const half*>(gate_w.data_ptr());
   auto* op = reinterpret_cast<half*>(out.data_ptr());
-  auto launch = [&](auto k_tag) {
-    constexpr int KD = decltype(k_tag)::value;
+  if (k_down == 160) {
     if (m == 1) {
-      shared_down_gated_m1_kernel<KD>
+      shared_down_gated_m1_kernel<160>
           <<<80, 128, 0, stream>>>(hx, ao, dw, gw, op);
+    } else if (m <= 8) {
+      shared_down_gated_batch_kernel<160, 1>
+          <<<dim3(80, 1), 64, 0, stream>>>(hx, ao, dw, gw, op, m);
+    } else if (m <= 16) {
+      shared_down_gated_batch_kernel<160, 2>
+          <<<dim3(80, 1), 64, 0, stream>>>(hx, ao, dw, gw, op, m);
+    } else if (m <= 24) {
+      shared_down_gated_batch_kernel<160, 3>
+          <<<dim3(80, 1), 64, 0, stream>>>(hx, ao, dw, gw, op, m);
+    } else if (m <= 32) {
+      shared_down_gated_batch_kernel<160, 4>
+          <<<dim3(80, 1), 64, 0, stream>>>(hx, ao, dw, gw, op, m);
+    } else if (m <= 40) {
+      shared_down_gated_batch_kernel<160, 5>
+          <<<dim3(80, 1), 64, 0, stream>>>(hx, ao, dw, gw, op, m);
     } else {
-      shared_down_gated_batch_kernel<KD>
-          <<<dim3(80, (m + 7) / 8), 64, 0, stream>>>(hx, ao, dw, gw, op, m);
+      shared_down_gated_batch_kernel<160, 4>
+          <<<dim3(80, 2), 64, 0, stream>>>(hx, ao, dw, gw, op, m);
     }
-  };
-  if (k_down == 160)
-    launch(std::integral_constant<int, 160>{});
-  else if (k_down == 320)
-    launch(std::integral_constant<int, 320>{});
-  else
-    launch(std::integral_constant<int, 640>{});
+  } else {
+    auto launch = [&](auto k_tag) {
+      constexpr int KD = decltype(k_tag)::value;
+      if (m == 1) {
+        shared_down_gated_m1_kernel<KD>
+            <<<80, 128, 0, stream>>>(hx, ao, dw, gw, op);
+      } else {
+        shared_down_gated_batch_kernel<KD, 1>
+            <<<dim3(80, (m + 7) / 8), 64, 0, stream>>>(hx, ao, dw, gw, op, m);
+      }
+    };
+    if (k_down == 320)
+      launch(std::integral_constant<int, 320>{});
+    else
+      launch(std::integral_constant<int, 640>{});
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -718,6 +1004,9 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
   m.def(
       "qwen38_gdn_input_batch_sm70_out(Tensor(a!) qkv, Tensor(b!) z, "
       "Tensor(c!) b, Tensor(d!) a, Tensor x, Tensor qw, Tensor bw) -> ()");
+  m.def(
+      "qwen38_qsa_input_batch_sm70_out(Tensor(a!) qkv, Tensor(b!) idx_qk, "
+      "Tensor x, Tensor qw, Tensor iw) -> ()");
 }
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("qwen38_shared_up_batch_sm70_out", &shared_up_batch);
@@ -727,4 +1016,5 @@ TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("qwen38_router_batch_sm70_out", &router_batch);
   m.impl("qwen38_dense_batch_sm70_out", &dense_batch);
   m.impl("qwen38_gdn_input_batch_sm70_out", &gdn_input_batch);
+  m.impl("qwen38_qsa_input_batch_sm70_out", &qsa_input_batch);
 }

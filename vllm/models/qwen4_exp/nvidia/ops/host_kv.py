@@ -737,7 +737,7 @@ class HostQSAKV:
         (`history`/`scales` from stage_history): the same encoding as
         `write`, at each token's staged page, instead of copying the pages
         back from the host."""
-        _, k, _, pages, _ = plan
+        _, k, _, pages, _ = plan[:5]
         if not slots.numel() or not k:
             return
         page = self.page_size
@@ -776,25 +776,63 @@ class HostQSAKV:
             num_warps=4,
         )
 
-    def stage_plan(self, block_table, lengths, capacity_tokens):
+    def sync_stage_inputs(self, block_table, lengths):
+        """Copy `(block_table, lengths)` to CPU with at most one stream sync."""
+        table_cpu = block_table.to("cpu", non_blocking=True)
+        lengths_cpu = lengths.to("cpu", non_blocking=True)
+        if block_table.is_cuda:
+            torch.cuda.current_stream(block_table.device).synchronize()
+        elif lengths.is_cuda:
+            torch.cuda.current_stream(lengths.device).synchronize()
+        return table_cpu.numpy(), [int(n) for n in lengths_cpu.tolist()]
+
+    def stage_plan(
+        self,
+        block_table,
+        lengths,
+        capacity_tokens,
+        query_lens: list[int] | None = None,
+        host_inputs=None,
+    ):
         """Host plan for stage_history: (runs, pages, device table) or None.
 
         Depends only on the step's block table and lengths, so one plan
         (one host sync) serves every layer of a step with this geometry.
         """
         capacity = self._stage_capacity(capacity_tokens)
-        staged, sources, lengths_host = self._stage_layout(block_table, lengths)
+        staged, sources, lengths_host, prefix_k, upto_k = self._stage_layout(
+            block_table,
+            lengths,
+            query_lens=query_lens,
+            host_inputs=host_inputs,
+        )
         if sources.size > capacity or not sources.size:
             return None
-        return self._make_stage_plan(staged, sources, lengths_host)
+        return self._make_stage_plan(
+            staged,
+            sources,
+            lengths_host,
+            prefix_k=prefix_k,
+            upto_k=upto_k,
+        )
 
-    def stage_window_plans(self, block_table, lengths, capacity_tokens):
+    def stage_window_plans(
+        self,
+        block_table,
+        lengths,
+        capacity_tokens,
+        host_inputs=None,
+    ):
         """stage_plan for a history larger than the stage buffer: one plan
         per buffer-sized window of the staged pages, or [] when the history
         fits (or is empty). A window's table maps only its own pages (-1
         elsewhere), so a row reader masks every other window's keys."""
         capacity = self._stage_capacity(capacity_tokens)
-        staged, sources, lengths_host = self._stage_layout(block_table, lengths)
+        staged, sources, lengths_host, _, _ = self._stage_layout(
+            block_table,
+            lengths,
+            host_inputs=host_inputs,
+        )
         if sources.size <= capacity or not capacity:
             return []
         plans = []
@@ -808,32 +846,107 @@ class HostQSAKV:
             )
         return plans
 
-    def _stage_layout(self, block_table, lengths):
-        """(staged table, source pages, lengths): every request's valid pages
-        in order, numbered consecutively across requests."""
+    def _stage_layout(
+        self,
+        block_table,
+        lengths,
+        query_lens: list[int] | None = None,
+        host_inputs=None,
+    ):
+        """(staged table, source pages, lengths, prefix_k, upto_k): deduplicated
+        physical pages across requests, ordered as pure pre-step pages
+        `[0, prefix_k)`, partial boundary pages `[prefix_k, upto_k)`, and pure
+        in-step pages `[upto_k, k)` when `query_lens` is provided."""
         page = self.page_size
-        table = block_table.to("cpu", non_blocking=False).numpy()
-        lengths_host = [int(n) for n in lengths.tolist()]
+        table, lengths_host = (
+            host_inputs
+            if host_inputs is not None
+            else self.sync_stage_inputs(block_table, lengths)
+        )
         sizes = [(n + page - 1) // page for n in lengths_host]
-        # Vectorized per request: valid pages keep their order and get
-        # consecutive staged indices.
         staged = np.full(table.shape, -1, dtype=np.int32)
-        sources = []
-        k = 0
+
+        if query_lens is not None and len(query_lens) == len(lengths_host):
+            seen_mask = np.zeros(self.blocks, dtype=np.bool_)
+            has_old = np.zeros(self.blocks, dtype=np.bool_)
+            has_new = np.zeros(self.blocks, dtype=np.bool_)
+            seen_order: list[int] = []
+            req_valid: list[tuple[int, np.ndarray, np.ndarray]] = []
+            for request, count in enumerate(sizes):
+                if count <= 0:
+                    continue
+                row = table[request, :count]
+                valid = np.flatnonzero((row >= 0) & (row < self.blocks))
+                if not valid.size:
+                    continue
+                blks = row[valid]
+                req_valid.append((request, valid, blks))
+                len_r = lengths_host[request]
+                new_r = max(0, int(query_lens[request]))
+                old_r = max(0, len_r - new_r)
+                page_starts = valid * page
+                page_ends = np.minimum((valid + 1) * page, len_r)
+                old_mask = page_starts < old_r
+                new_mask = page_ends > old_r
+                if np.any(old_mask):
+                    has_old[blks[old_mask]] = True
+                if np.any(new_mask):
+                    has_new[blks[new_mask]] = True
+                for b in blks.tolist():
+                    if not seen_mask[b]:
+                        seen_mask[b] = True
+                        seen_order.append(b)
+            if not seen_order:
+                return staged, np.zeros(0, dtype=np.int32), lengths_host, 0, 0
+            seen_arr = np.asarray(seen_order, dtype=np.int32)
+            ho = has_old[seen_arr]
+            hn = has_new[seen_arr]
+            pure_old = seen_arr[ho & ~hn]
+            partial = seen_arr[ho & hn]
+            pure_new = seen_arr[~ho & hn]
+            prefix_k = int(pure_old.size)
+            upto_k = prefix_k + int(partial.size)
+            sources = np.concatenate((pure_old, partial, pure_new)).astype(
+                np.int32, copy=False
+            )
+            pos_of = np.full(self.blocks, -1, dtype=np.int32)
+            pos_of[sources] = np.arange(sources.size, dtype=np.int32)
+            for request, valid, blks in req_valid:
+                staged[request, valid] = pos_of[blks]
+            return staged, sources, lengths_host, prefix_k, upto_k
+
+        # Deduplicate physical pages across requests in encounter order while
+        # keeping exact page ordering for single-request unique tables.
+        pos_of = np.full(self.blocks, -1, dtype=np.int32)
+        unique_sources: list[int] = []
         for request, count in enumerate(sizes):
+            if count <= 0:
+                continue
             row = table[request, :count]
             valid = np.flatnonzero((row >= 0) & (row < self.blocks))
-            staged[request, valid] = np.arange(k, k + valid.size, dtype=np.int32)
-            sources.append(row[valid])
-            k += valid.size
+            if not valid.size:
+                continue
+            blks = row[valid]
+            for b in blks.tolist():
+                if pos_of[b] < 0:
+                    pos_of[b] = len(unique_sources)
+                    unique_sources.append(b)
+            staged[request, valid] = pos_of[blks]
         sources = (
-            np.concatenate(sources).astype(np.int32)
-            if sources
+            np.asarray(unique_sources, dtype=np.int32)
+            if unique_sources
             else np.zeros(0, dtype=np.int32)
         )
-        return staged, sources, lengths_host
+        return staged, sources, lengths_host, None, None
 
-    def _make_stage_plan(self, staged, sources, lengths_host):
+    def _make_stage_plan(
+        self,
+        staged,
+        sources,
+        lengths_host,
+        prefix_k: int | None = None,
+        upto_k: int | None = None,
+    ):
         k = int(sources.size)
         # Runs of consecutive source blocks (first block, first staged, count)
         # for the host-tensor copy path.
@@ -850,6 +963,8 @@ class HostQSAKV:
             staged.to(device, non_blocking=True),
             pages.to(device, non_blocking=True),
             lengths_host,
+            prefix_k,
+            upto_k,
         )
 
     def _stage_capacity(self, capacity_tokens):
@@ -879,7 +994,7 @@ class HostQSAKV:
 
     def _stage_range(self, plan, history, scales, first, last):
         """Copy staged pages [first, last) of `plan` into the stage views."""
-        runs, _, _, pages, _ = plan
+        runs, _, _, pages, _ = plan[:5]
         if last <= first:
             return
         page = self.page_size
@@ -932,8 +1047,9 @@ class HostQSAKV:
                 )
 
     def prefix_pages(self, plan, new_tokens):
-        """Staged pages holding only tokens written before this step (one
-        request), or 0 when the plan covers several requests."""
+        """Staged pages holding only tokens written before this step."""
+        if len(plan) >= 6 and plan[5] is not None:
+            return int(plan[5])
         lengths = plan[4]
         if len(lengths) != 1:
             return 0
@@ -982,7 +1098,7 @@ class HostQSAKV:
             plan = self.stage_plan(block_table, lengths, capacity_tokens)
         if plan is None:
             return None
-        _, k, staged_table, _, _ = plan
+        _, k, staged_table, _, _ = plan[:5]
         page = self.page_size
         history, scales = self._stage_views(capacity_tokens, slot)
         self._stage_range(

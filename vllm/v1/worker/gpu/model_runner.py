@@ -1547,7 +1547,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
             if scheduler_output.kv_block_copies:
-                self._kv_block_zeroer.copy_block_ids(scheduler_output.kv_block_copies)
+                self._kv_block_zeroer.copy_block_ids(
+                    scheduler_output.kv_block_copies,
+                    scheduler_output.kv_block_copy_groups,
+                )
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)

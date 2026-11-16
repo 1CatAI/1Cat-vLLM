@@ -113,6 +113,47 @@ def _output_projection_fake(x: torch.Tensor, name: str) -> torch.Tensor:
     return x.new_empty((x.shape[0], layer.output_size))
 
 
+def _output_projection_out(out: torch.Tensor, x: torch.Tensor, name: str) -> None:
+    layer, defer = _OUTPUT_PROJECTIONS[name]
+    rows = x.shape[0]
+    if 0 < rows <= HCX_BATCH_M and defer:
+        out[:, : x.shape[1]].copy_(x)
+        if x.shape[1] < layer.output_size:
+            out[:, x.shape[1] :].zero_()
+        return
+    needs_allreduce = (
+        rows > HCX_BATCH_M
+        and not hc_prefill_sequence_parallel_active()
+        and not can_defer_ll_allreduce(rows)
+    )
+    from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+
+    from .sm70_fp16_gemv import Qwen38SM70FP16LinearMethod, _qwen38_sm70_fp16_gemv_into
+
+    if (
+        not needs_allreduce
+        and x.ndim == 2
+        and getattr(layer, "bias", None) is None
+        and not getattr(layer, "reduce_results", False)
+        and isinstance(getattr(layer, "quant_method", None), Qwen38SM70FP16LinearMethod)
+        and use_sm70_decode_graph_semantics()
+    ):
+        _qwen38_sm70_fp16_gemv_into(
+            out,
+            x,
+            layer.weight,
+            getattr(layer, "prefix", ""),
+            getattr(layer, "_sm70_qwen38_dense_batch", False),
+        )
+        return
+    projected = _output_projection(x, name)
+    out.copy_(projected)
+
+
+def _output_projection_out_fake(out: torch.Tensor, x: torch.Tensor, name: str) -> None:
+    del out, x, name
+
+
 def _moe_output(
     shared: torch.Tensor | None, fused: torch.Tensor, name: str, trunc_size: int
 ) -> torch.Tensor:
@@ -148,6 +189,12 @@ direct_register_custom_op(
     "qwen38_sm70_hcx_output_projection",
     _output_projection,
     fake_impl=_output_projection_fake,
+)
+direct_register_custom_op(
+    "qwen38_sm70_hcx_output_projection_out",
+    _output_projection_out,
+    mutates_args=["out"],
+    fake_impl=_output_projection_out_fake,
 )
 direct_register_custom_op(
     "qwen38_sm70_hcx_moe_output",
@@ -480,6 +527,10 @@ def partial_moe_output(name, shared, routed, hidden_dim):
 
 def partial_projection(name, hidden):
     return torch.ops.vllm.qwen38_sm70_hcx_output_projection(hidden, name)
+
+
+def partial_projection_out(name, hidden, out):
+    torch.ops.vllm.qwen38_sm70_hcx_output_projection_out(out, hidden, name)
 
 
 def maybe_top1_exchange(local_pair):

@@ -374,6 +374,7 @@ class QSAIndexer(nn.Module):
             shared_key_scoring=self.shared_key_scoring,
             max_seq_len=compressed_metadata.max_seq_len,
             tp_group=self.prefill_tp_group,
+            seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
         )
 
 

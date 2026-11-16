@@ -988,3 +988,27 @@ def test_cloud_storage_tokenizer_skips_get_model_path(monkeypatch):
     args = EngineArgs(model="s3://bucket/model", tokenizer="s3://bucket/tokenizer")
     assert args.model == "s3://bucket/model"
     assert args.tokenizer == "s3://bucket/tokenizer"
+
+
+def test_engine_args_defaults_to_non_mixed_phase_pure_scheduling():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    parsed = parser.parse_args([])
+    assert parsed.mixed_prefill_step_latency_ms == 0.0
+    assert parsed.split_mtp_phase_pure is None
+    assert parser.parse_args(["--split-mtp-phase-pure"]).split_mtp_phase_pure is True
+    assert (
+        parser.parse_args(["--no-split-mtp-phase-pure"]).split_mtp_phase_pure is False
+    )
+
+
+def test_sm70_hybrid_prefix_cache_applies_even_when_mtp_defaults_disabled(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        env={"VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS": "1"},
+    )
+    assert args.speculative_config is None
+    assert args.enable_prefix_caching is True
+    assert args.mamba_cache_mode == "align"
+    assert args.block_size == 2048
+    assert args.mamba_block_size == 2048
+    assert args.partial_prefix_cache is True

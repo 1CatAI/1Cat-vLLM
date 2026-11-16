@@ -186,6 +186,14 @@ class SchedulerConfig:
     phase_log_interval: int | None = Field(default=None, ge=0)
     """Phase statistics interval; zero disables the diagnostic."""
 
+    split_mtp_phase_pure: bool | None = None
+    """Separate resident decode and prefill into pure non-mixed steps on PP1
+    chunked generation. EngineArgs enables this by default when
+    mixed_prefill_step_latency_ms is 0; set False to allow mixed steps."""
+    split_mtp_prefill_cap: int = Field(default=2048, ge=1)
+    """Maximum prefill tokens scheduled in one step while resident decoders are
+    active under pure phase separation."""
+
     pp_keep_batch: bool | None = None
     """Opt-in V1 persistent-batch retention across empty pipeline steps."""
 

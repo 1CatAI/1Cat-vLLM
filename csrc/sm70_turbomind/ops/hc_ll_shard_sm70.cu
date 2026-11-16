@@ -92,23 +92,28 @@ __device__ __forceinline__ uint32_t tag_of(unsigned seq) {
 template <int S, int WARPS, bool OPTIMIZED = false>
 __global__ void __launch_bounds__(32 * WARPS)
     down3(const half* __restrict__ x, const half* __restrict__ wd,
-          float* __restrict__ part, unsigned* __restrict__ cnt, Peer pr,
-          int total_m) {
+          float* __restrict__ part, unsigned* __restrict__ cnt,
+          unsigned* __restrict__ dirty_m, Peer pr, int total_m) {
   constexpr int KC = KD / S, KW = KC / WARPS, G = KW / 16, NP = 96;
   static_assert(KD % S == 0 && KC % WARPS == 0 && KW % 16 == 0, "");
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int tile = blockIdx.x, s = blockIdx.y;
   const int groups_m = (total_m + 7) / 8;
-  const unsigned page_off = ((ld_vol(pr.seq) + 1) & 1u) * kPageRows * LW;
+  const unsigned page = (ld_vol(pr.seq) + 1u) & 1u;
+  const unsigned page_off = page * kPageRows * LW;
   for (int i = 0; i < 4; ++i)
     if (pr.ll[i]) pr.ll[i] += page_off;
-  // Inactive rows must not retain matching tags from an earlier modulo
-  // cycle. Only this generation's page is touched: a faster peer may
-  // already be writing the next page. All ranks have the same total_m.
+  // Inactive rows must not retain matching tags from an earlier larger batch.
+  // Only clean [total_m, prev_m) when batch size shrinks on this page.
   if (s == 0) {
-    for (int i = tile * blockDim.x + threadIdx.x; i < (kMaxRows - total_m) * LW;
-         i += 3 * blockDim.x) {
-      pr.ll[pr.rank][total_m * LW + i] = 0;
+    const int prev_m =
+        dirty_m ? static_cast<int>(ld_vol(dirty_m + page)) : kMaxRows;
+    if (total_m < prev_m) {
+      const int clean_words = (prev_m - total_m) * LW;
+      for (int i = tile * blockDim.x + threadIdx.x; i < clean_words;
+           i += 3 * blockDim.x) {
+        pr.ll[pr.rank][total_m * LW + i] = 0;
+      }
     }
   }
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
@@ -148,8 +153,8 @@ __global__ void __launch_bounds__(32 * WARPS)
       const int k = kbase + g * 16;
       uint4 a = make_uint4(0, 0, 0, 0), b = a;
       if (r < gm) {
-        a = *reinterpret_cast<const uint4*>(xg + r * KD + k);
-        b = *reinterpret_cast<const uint4*>(xg + r * KD + k + 8);
+        a = __ldg(reinterpret_cast<const uint4*>(xg + r * KD + k));
+        b = __ldg(reinterpret_cast<const uint4*>(xg + r * KD + k + 8));
       }
       mma(acc, a.x, a.y, wlo[g].x, wlo[g].y);
       mma(acc, a.z, a.w, wlo[g].z, wlo[g].w);
@@ -227,6 +232,7 @@ __global__ void __launch_bounds__(32 * WARPS)
     cnt[tile] = 0;
     if (atomicAdd(cnt + 3, 1u) == 2u) {
       cnt[3] = 0;
+      if (dirty_m) st_vol(dirty_m + page, static_cast<unsigned>(total_m));
       st_vol(pr.seq, ld_vol(pr.seq) + 1);
     }
   }
@@ -238,7 +244,8 @@ __global__ void __launch_bounds__(32 * WARPS)
 template <int WARPS, bool OPTIMIZED = false>
 __global__ void __launch_bounds__(32 * WARPS)
     up3(const uint32_t* __restrict__ ll_lora, const half* __restrict__ wu,
-        const half* __restrict__ x, unsigned* __restrict__ cnt, Peer pr,
+        const half* __restrict__ x, unsigned* __restrict__ cnt,
+        unsigned* __restrict__ dirty_m, Peer pr,
         const unsigned* __restrict__ down_seq, half* __restrict__ out,
         half* __restrict__ lora_out, half* __restrict__ inj_out, int total_m) {
   constexpr int GW = 20 / WARPS, SW = 640;
@@ -247,18 +254,27 @@ __global__ void __launch_bounds__(32 * WARPS)
   const int groups_m = (total_m + 7) / 8;
   const unsigned dseq = ld_vol(down_seq);
   const unsigned useq_next = ld_vol(pr.seq) + 1;
+  const unsigned page = useq_next & 1u;
   ll_lora += (dseq & 1u) * kPageRows * LW;
   for (int i = 0; i < 4; ++i)
-    if (pr.ll[i]) pr.ll[i] += (useq_next & 1u) * kPageRows * HD;
+    if (pr.ll[i]) pr.ll[i] += page * kPageRows * HD;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int branch = (lane >> 2) & 3;
   const int col = branch * 8 + r;
   const int rk = pr.rank, p1 = rk ^ 1, p2 = rk ^ 2, p3 = rk ^ 3;
   const bool full_mesh = (pr.ll[p3] != nullptr);
-  for (int i = threadIdx.x; i < (kMaxRows - total_m) * 32; i += blockDim.x) {
-    const int row = total_m + i / 32, c = i % 32, src = c / 8;
-    // The local slice is written directly to out and is never polled.
-    if (src != rk) pr.ll[rk][row * HD + src * SW + tile * 8 + c % 8] = 0;
+  const int prev_m =
+      dirty_m ? static_cast<int>(ld_vol(dirty_m + page)) : kMaxRows;
+  if (total_m < prev_m) {
+    const int clean_rows = prev_m - total_m;
+    for (int idx = threadIdx.x; idx < clean_rows * 6; idx += blockDim.x) {
+      const int peer_sel = idx % 3;
+      const int src = (peer_sel == 0) ? p1 : ((peer_sel == 1) ? p2 : p3);
+      const int rh = idx / 3;
+      const int row = total_m + (rh >> 1), h4 = (rh & 1) * 4;
+      *reinterpret_cast<uint4*>(pr.ll[rk] + row * HD + src * SW + tile * 8 +
+                                h4) = make_uint4(0, 0, 0, 0);
+    }
   }
   const half* w = wu + static_cast<size_t>(tile) * 320 * 32;
   // Issue this CTA's weight loads once; they stay in registers across groups.
@@ -285,6 +301,16 @@ __global__ void __launch_bounds__(32 * WARPS)
   for (int grp = 0; grp < groups_m; ++grp) {
     const int first_row = grp * 8;
     const int gm = min(8, total_m - first_row);
+    half xv[8];
+    if (warp == 0) {
+      const half* xg = x + first_row * KD + branch * HD + rk * SW + tile * 8;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        const int hh = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+        xv[i] = row < gm ? __ldg(xg + row * KD + hh) : __float2half_rn(0.f);
+      }
+    }
     if (grp > 0) __syncthreads();
     for (int idx = threadIdx.x; idx < gm * 80; idx += blockDim.x) {
       const int row = idx / 80, c4 = (idx % 80) * 4;
@@ -328,16 +354,12 @@ __global__ void __launch_bounds__(32 * WARPS)
       }
     }
     if (warp == 0) {
-      const half* xg = x + first_row * KD;
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
         const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
         const int hh = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-        const int hl = tile * 8 + hh;
         const float sg = sigm(__half2float(__float2half_rn(acc[i])));
-        float v = 0.f;
-        if (row < gm)
-          v = __half2float(xg[row * KD + branch * HD + rk * SW + hl]);
+        const float v = __half2float(xv[i]);
         float mixed = 0.f;
 #pragma unroll
         for (int b = 0; b < 4; ++b) {
@@ -377,8 +399,9 @@ __global__ void __launch_bounds__(32 * WARPS)
                                  __ushort_as_half(v.y & 0xffff));
       half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffff),
                                  __ushort_as_half(v.w & 0xffff));
-      *reinterpret_cast<half2*>(out + o) = h01;
-      *reinterpret_cast<half2*>(out + o + 2) = h23;
+      *reinterpret_cast<uint2*>(out + o) =
+          make_uint2(*reinterpret_cast<uint32_t*>(&h01),
+                     *reinterpret_cast<uint32_t*>(&h23));
     }
   } else {
     // Forward r^1's tile to r^2, then collect r^1, r^2, r^3 tiles into `out`.
@@ -391,8 +414,9 @@ __global__ void __launch_bounds__(32 * WARPS)
                                  __ushort_as_half(v.y & 0xffff));
       half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffff),
                                  __ushort_as_half(v.w & 0xffff));
-      *reinterpret_cast<half2*>(out + o) = h01;
-      *reinterpret_cast<half2*>(out + o + 2) = h23;
+      *reinterpret_cast<uint2*>(out + o) =
+          make_uint2(*reinterpret_cast<uint32_t*>(&h01),
+                     *reinterpret_cast<uint32_t*>(&h23));
     }
     for (int t = threadIdx.x; t < 4 * total_m; t += blockDim.x) {
       const int src = (t & 2) ? p3 : p2;
@@ -403,8 +427,9 @@ __global__ void __launch_bounds__(32 * WARPS)
                                  __ushort_as_half(v.y & 0xffff));
       half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffff),
                                  __ushort_as_half(v.w & 0xffff));
-      *reinterpret_cast<half2*>(out + o) = h01;
-      *reinterpret_cast<half2*>(out + o + 2) = h23;
+      *reinterpret_cast<uint2*>(out + o) =
+          make_uint2(*reinterpret_cast<uint32_t*>(&h01),
+                     *reinterpret_cast<uint32_t*>(&h23));
     }
   }
   __syncthreads();
@@ -412,6 +437,7 @@ __global__ void __launch_bounds__(32 * WARPS)
     __threadfence();
     if (atomicAdd(cnt, 1u) == gridDim.x - 1) {
       *cnt = 0;
+      if (dirty_m) st_vol(dirty_m + page, static_cast<unsigned>(total_m));
       st_vol(pr.seq, ld_vol(pr.seq) + 1);
     }
   }
@@ -809,11 +835,12 @@ void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
   auto st = at::cuda::getCurrentCUDAStream().stream();
   Peer p = make_peer(ll, seq, rank);
   auto c = reinterpret_cast<unsigned*>(cnt.data_ptr<int>());
+  unsigned* dm = (cnt.numel() >= 6) ? (c + 4) : nullptr;
 #define D(S, W, O)                                                             \
   down3<S, W, O><<<dim3(3, S), 32 * W, 0, st>>>(                               \
       reinterpret_cast<const half*>(x.data_ptr()),                             \
       reinterpret_cast<const half*>(wd.data_ptr()), part.data_ptr<float>(), c, \
-      p, M)
+      dm, p, M)
   switch (variant) {
     case 0:
       D(20, 4, false);
@@ -879,7 +906,7 @@ void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
   local(lora_out, at::kHalf);
   local(inj_out, at::kHalf);
   TORCH_CHECK(ll_lora && wu.sizes() == at::IntArrayRef({80, 20, 2, 4, 8, 8}) &&
-                  cnt.numel() == 1 && down_seq.numel() == 1 &&
+                  cnt.numel() >= 1 && down_seq.numel() == 1 &&
                   out.sizes() == at::IntArrayRef({M, 2560}) &&
                   (lora_out.numel() == 0 ||
                    lora_out.sizes() == at::IntArrayRef({M, 320})) &&
@@ -888,13 +915,14 @@ void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
   auto st = at::cuda::getCurrentCUDAStream().stream();
   Peer p = make_peer(ll, seq, rank);
   auto c = reinterpret_cast<unsigned*>(cnt.data_ptr<int>());
+  unsigned* dm = (cnt.numel() >= 3) ? (c + 1) : nullptr;
   half* lora_ptr =
       lora_out.numel() ? reinterpret_cast<half*>(lora_out.data_ptr()) : nullptr;
 #define U(W, O)                                                    \
   up3<W, O><<<80, 32 * W, 0, st>>>(                                \
       reinterpret_cast<const uint32_t*>(ll_lora),                  \
       reinterpret_cast<const half*>(wu.data_ptr()),                \
-      reinterpret_cast<const half*>(x.data_ptr()), c, p,           \
+      reinterpret_cast<const half*>(x.data_ptr()), c, dm, p,       \
       reinterpret_cast<const unsigned*>(down_seq.data_ptr<int>()), \
       reinterpret_cast<half*>(out.data_ptr()), lora_ptr,           \
       reinterpret_cast<half*>(inj_out.data_ptr()), M)

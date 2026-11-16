@@ -565,8 +565,10 @@ class EngineArgs:
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
-    mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
+    mixed_prefill_step_latency_ms: float = 0.0
     mixed_prefill_min_tokens: int = SchedulerConfig.mixed_prefill_min_tokens
+    split_mtp_phase_pure: bool | None = SchedulerConfig.split_mtp_phase_pure
+    split_mtp_prefill_cap: int = SchedulerConfig.split_mtp_prefill_cap
     short_prompt_chunk_tokens: int = SchedulerConfig.short_prompt_chunk_tokens
     short_prompt_threshold: int = SchedulerConfig.short_prompt_threshold
     long_prefill_token_threshold_adaptive: bool = (
@@ -1464,11 +1466,19 @@ class EngineArgs:
         # multi-step scheduling has been removed; corresponding arguments
         scheduler_group.add_argument(
             "--mixed-prefill-step-latency-ms",
-            **scheduler_kwargs["mixed_prefill_step_latency_ms"],
+            **{**scheduler_kwargs["mixed_prefill_step_latency_ms"], "default": 0.0},
         )
         scheduler_group.add_argument(
             "--mixed-prefill-min-tokens",
             **scheduler_kwargs["mixed_prefill_min_tokens"],
+        )
+        scheduler_group.add_argument(
+            "--split-mtp-phase-pure",
+            **scheduler_kwargs["split_mtp_phase_pure"],
+        )
+        scheduler_group.add_argument(
+            "--split-mtp-prefill-cap",
+            **scheduler_kwargs["split_mtp_prefill_cap"],
         )
         scheduler_group.add_argument(
             "--short-prompt-chunk-tokens",
@@ -1838,15 +1848,6 @@ class EngineArgs:
         model_config: ModelConfig,
     ) -> None:
         """Apply the 1Cat SM70 speculative serving defaults."""
-        mtp_defaults_disabled = (
-            envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
-            or envs.VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS
-        )
-        explicit_dflash = isinstance(self.speculative_config, dict) and (
-            self.speculative_config.get("method") == "dflash"
-        )
-        if mtp_defaults_disabled and not explicit_dflash:
-            return
         if not current_platform.is_cuda_alike():
             return
         try:
@@ -1882,6 +1883,21 @@ class EngineArgs:
             and self.mamba_cache_mode == "align"
         ):
             profile_updates.extend(self._apply_hybrid_prefix_cache_geometry())
+
+        mtp_defaults_disabled = (
+            envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
+            or envs.VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS
+        )
+        explicit_dflash = isinstance(self.speculative_config, dict) and (
+            self.speculative_config.get("method") == "dflash"
+        )
+        if mtp_defaults_disabled and not explicit_dflash:
+            if profile_updates:
+                logger.info_once(
+                    "Applied hybrid prefix-cache serving defaults: %s.",
+                    ", ".join(profile_updates),
+                )
+            return
 
         if self.speculative_config is None:
             enable_auto_mtp = (
@@ -2064,6 +2080,13 @@ class EngineArgs:
         self._check_feature_supported()
         self._maybe_apply_sm70_mtp_defaults(usage_context, model_config)
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
+        _layer_types = getattr(model_config.hf_text_config, "layer_types", None) or []
+        if (
+            self.enable_prefix_caching
+            and self.mamba_cache_mode == "align"
+            and any(lt == "linear_attention" for lt in _layer_types)
+        ):
+            self._apply_hybrid_prefix_cache_geometry()
         self._set_default_reasoning_config_args()
         sliding_window: int | None = None
         if not is_interleaved(model_config.hf_text_config):
@@ -2370,6 +2393,17 @@ class EngineArgs:
         assert model_config.max_model_len is not None, (
             "max_model_len must be set by this point"
         )
+        split_mtp_phase_pure = self.split_mtp_phase_pure
+        if split_mtp_phase_pure is None:
+            if self.mixed_prefill_step_latency_ms > 0:
+                split_mtp_phase_pure = False
+            elif (
+                self.enable_chunked_prefill
+                and model_config.runner_type == "generate"
+                and not model_config.is_encoder_decoder
+                and self.pipeline_parallel_size == 1
+            ):
+                split_mtp_phase_pure = True
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -2386,6 +2420,8 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
             mixed_prefill_min_tokens=self.mixed_prefill_min_tokens,
+            split_mtp_phase_pure=split_mtp_phase_pure,
+            split_mtp_prefill_cap=self.split_mtp_prefill_cap,
             short_prompt_chunk_tokens=self.short_prompt_chunk_tokens,
             short_prompt_threshold=self.short_prompt_threshold,
             long_prefill_token_threshold_adaptive=(
