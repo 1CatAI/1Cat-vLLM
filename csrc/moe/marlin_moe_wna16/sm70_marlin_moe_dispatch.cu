@@ -28,40 +28,11 @@
 #include <cuda_fp16.h>
 
 #include "quantization/marlin/marlin.cuh"
+#include "quantization/marlin/sm70_marlin_metadata.cuh"
 #include "core/registration.h"
 #include "core/scalar_type.hpp"
 
 namespace {
-
-__device__ __forceinline__ int sm70_inverse_zp_interleave(int idx,
-                                                          int num_bits) {
-  if (num_bits == 4) {
-    constexpr int inv[8] = {0, 4, 1, 5, 2, 6, 3, 7};
-    return inv[idx];
-  }
-  constexpr int inv[4] = {0, 2, 1, 3};
-  return inv[idx];
-}
-
-__device__ __forceinline__ int sm70_inverse_scale_perm(int idx, int perm_len) {
-  if (perm_len == 64) {
-    return (idx % 8) * 8 + idx / 8;
-  }
-  constexpr int inv[32] = {0,  1,  8,  9,  16, 17, 24, 25, 2,  3,  10,
-                           11, 18, 19, 26, 27, 4,  5,  12, 13, 20, 21,
-                           28, 29, 6,  7,  14, 15, 22, 23, 30, 31};
-  return inv[idx];
-}
-
-__global__ void sm70_unpermute_half_metadata_kernel(
-    const half* __restrict__ src, half* __restrict__ dst, int64_t total,
-    int perm_len) {
-  const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total) return;
-  const int64_t block = idx / perm_len;
-  const int pos = static_cast<int>(idx % perm_len);
-  dst[idx] = src[block * perm_len + sm70_inverse_scale_perm(pos, perm_len)];
-}
 
 __global__ void sm70_unpack_moe_zp_to_half_kernel(
     const int32_t* __restrict__ packed_zp, const half* __restrict__ scales,
@@ -98,21 +69,7 @@ torch::Tensor sm70_moe_scales_as_logical(torch::Tensor const& b_scales,
               "SM70 Marlin MoE adapter expects fp16 scales.");
   const bool uses_group_perm =
       group_size < size_k && group_size != -1 && !is_a_8bit;
-  const int perm_len = uses_group_perm ? 64 : 32;
-  TORCH_CHECK(b_scales.numel() % perm_len == 0,
-              "SM70 Marlin MoE scale metadata size is not divisible by ",
-              perm_len);
-
-  auto out = torch::empty_like(b_scales);
-  const int64_t total = out.numel();
-  constexpr int threads = 256;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  sm70_unpermute_half_metadata_kernel<<<blocks, threads, 0,
-                                        at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const half*>(b_scales.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(out.data_ptr<at::Half>()), total, perm_len);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
+  return sm70_unpermute_half(b_scales, uses_group_perm ? 64 : 32);
 }
 
 torch::Tensor sm70_moe_zp_as_half(torch::Tensor const& b_zeros,
@@ -151,6 +108,56 @@ torch::Tensor sm70_moe_zp_as_half(torch::Tensor const& b_zeros,
       b_scales.size(1), size_n, b_zeros.size(2), num_bits, is_a_8bit);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+// One block per routed row. A row is valid under the same rules the SM70
+// MoE store epilogue writes it: inside the padded token count, a local
+// expert (expert_ids >= 0) and a sorted id below size_m * top_k.
+__global__ void sm70_moe_add_bias_kernel(
+    half* __restrict__ c, const half* __restrict__ bias,
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ num_tokens_past_padded,
+    const float* __restrict__ topk_weights, int moe_block_size,
+    int64_t expanded_token_count, int64_t size_n, bool mul_topk_weights) {
+  const int64_t route_row = blockIdx.x;
+  if (route_row >= num_tokens_past_padded[0]) return;
+  const int32_t expert = expert_ids[route_row / moe_block_size];
+  if (expert < 0) return;
+  const int32_t sorted_id = sorted_token_ids[route_row];
+  if (sorted_id < 0 || sorted_id >= expanded_token_count) return;
+  const float weight = mul_topk_weights ? topk_weights[sorted_id] : 1.0f;
+  half* row = c + int64_t(sorted_id) * size_n;
+  const half* expert_bias = bias + int64_t(expert) * size_n;
+  for (int64_t col = threadIdx.x; col < size_n; col += blockDim.x) {
+    // One rounding to fp32, then to fp16; with weight 1 a plain fp16 add.
+    row[col] = __float2half_rn(__fmaf_rn(__half2float(expert_bias[col]), weight,
+                                         __half2float(row[col])));
+  }
+}
+
+// Upstream Marlin MoE adds the expert bias before the top-k weight scales
+// the row, out = (A W + bias[e]) * w. The SM70 kernels have no bias epilogue
+// and scale their output already, so bias[e] * w goes onto the finished rows.
+void sm70_moe_add_bias(torch::Tensor& c, torch::Tensor const& bias,
+                       torch::Tensor const& sorted_token_ids,
+                       torch::Tensor const& expert_ids,
+                       torch::Tensor const& num_tokens_past_padded,
+                       torch::Tensor const& topk_weights,
+                       int64_t moe_block_size, int64_t expanded_token_count,
+                       int64_t size_n, bool mul_topk_weights) {
+  const int64_t route_rows = sorted_token_ids.numel();
+  if (route_rows == 0) return;
+  constexpr int threads = 256;
+  sm70_moe_add_bias_kernel<<<static_cast<unsigned int>(route_rows), threads, 0,
+                             at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<half*>(c.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(bias.data_ptr<at::Half>()),
+      sorted_token_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),
+      num_tokens_past_padded.data_ptr<int32_t>(),
+      topk_weights.data_ptr<float>(), static_cast<int>(moe_block_size),
+      expanded_token_count, size_n, mul_topk_weights);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace
@@ -546,94 +553,110 @@ torch::Tensor moe_wna16_marlin_gemm(
 
   TORCH_CHECK(!has_act_order,
               "act_order is not supported for the SM70 Marlin MoE path.");
-  TORCH_CHECK(!has_bias, "SM70 Marlin MoE does not support bias.");
+  TORCH_CHECK(!has_bias || b_bias.scalar_type() == c.scalar_type(),
+              "SM70 Marlin MoE expects the bias in the output dtype.");
+  TORCH_CHECK(!has_bias || b_bias.size(0) == num_experts,
+              "b_bias.size(0) = ", b_bias.size(0),
+              " is not num_experts = ", num_experts);
   TORCH_CHECK(!use_atomic_add,
               "SM70 Marlin MoE does not support atomic-add "
               "output.");
   TORCH_CHECK(is_k_full, "SM70 Marlin MoE requires full-K inputs.");
 
-  if (b_type == vllm::kU4) {
-    TORCH_CHECK(has_zp && zp_is_float,
-                "SM70 Marlin MoE uint4 path requires fp16 zero points.");
-    return MARLIN_NAMESPACE_NAME::sm70_marlin_u4_gemm(
-        a, c, b_q_weight, b_scales_kernel, b_zeros, sorted_token_ids,
-        expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size);
-  }
-
-  if (b_type == vllm::kU8) {
-    TORCH_CHECK(has_zp && zp_is_float,
-                "SM70 Marlin MoE uint8 path requires fp16 zero points.");
-    return MARLIN_NAMESPACE_NAME::sm70_marlin_u8_gemm(
-        a, c, b_q_weight, b_scales_kernel, b_zeros, sorted_token_ids,
-        expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size);
-  }
-
-  if (b_type == vllm::kU4B8) {
-    TORCH_CHECK(!has_zp && !is_zp_float,
-                "SM70 Marlin MoE uint4b8 does not support zero-point "
-                "metadata.");
-    return MARLIN_NAMESPACE_NAME::sm70_marlin_u4b8_gemm(
-        a, c, b_q_weight, b_scales_kernel, sorted_token_ids, expert_ids,
-        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size);
-  }
-
-  if (b_type == vllm::kU8B128) {
-    TORCH_CHECK(!has_zp && !is_zp_float,
-                "SM70 Marlin MoE uint8b128 does not support zero-point "
-                "metadata.");
-    return MARLIN_NAMESPACE_NAME::sm70_marlin_u8b128_gemm(
-        a, c, b_q_weight, b_scales_kernel, sorted_token_ids, expert_ids,
-        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size);
-  }
-
-  if (b_type == vllm::kFE4M3fn) {
-    TORCH_CHECK(group_size == -1 || group_size == 128,
-                "SM70 Marlin MoE FP8 supports only group_size -1 or "
-                "128. Got ",
-                group_size);
-    TORCH_CHECK(!has_zp && !is_zp_float,
-                "SM70 Marlin MoE fp8 does not support zero-point metadata.");
-    return MARLIN_NAMESPACE_NAME::sm70_marlin_fp8_gemm(
-        a, c, b_q_weight, b_scales_kernel, sorted_token_ids, expert_ids,
-        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size);
-  }
-
-  if (b_type == vllm::kFE2M1f) {
-    TORCH_CHECK(!has_zp && !is_zp_float,
-                "SM70 Marlin MoE fp4 does not support zero-point metadata.");
-    if (s_type == vllm::kFE4M3fn) {
-      TORCH_CHECK(
-          global_scale.numel() == num_experts,
-          "the global_scale parameter must be passed for nvfp4 format.");
-      TORCH_CHECK(group_size == 16,
-                  "SM70 Marlin MoE NVFP4 supports only group_size 16. "
-                  "Got ",
-                  group_size);
-      return MARLIN_NAMESPACE_NAME::sm70_marlin_nvfp4_gemm(
-          a, c, b_q_weight, b_scales_kernel, global_scale, sorted_token_ids,
+  // The kernels have no bias epilogue: add the bias to the finished rows.
+  auto gemm = [&]() -> torch::Tensor {
+    if (b_type == vllm::kU4) {
+      TORCH_CHECK(has_zp && zp_is_float,
+                  "SM70 Marlin MoE uint4 path requires fp16 zero points.");
+      return MARLIN_NAMESPACE_NAME::sm70_marlin_u4_gemm(
+          a, c, b_q_weight, b_scales_kernel, b_zeros, sorted_token_ids,
           expert_ids, num_tokens_past_padded, topk_weights, moe_block_size,
           top_k, mul_topk_weights, size_m, size_n, size_k, group_size);
     }
 
-    TORCH_CHECK(s_type == vllm::kFE8M0fnu,
-                "SM70 Marlin MoE MXFP4 expects float8_e8m0fnu scales.");
-    TORCH_CHECK(group_size == 32,
-                "SM70 Marlin MoE MXFP4 supports only group_size 32. "
-                "Got ",
-                group_size);
-    return MARLIN_NAMESPACE_NAME::sm70_marlin_mxfp4_gemm(
-        a, c, b_q_weight, b_scales_kernel, sorted_token_ids, expert_ids,
-        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size);
-  }
+    if (b_type == vllm::kU8) {
+      TORCH_CHECK(has_zp && zp_is_float,
+                  "SM70 Marlin MoE uint8 path requires fp16 zero points.");
+      return MARLIN_NAMESPACE_NAME::sm70_marlin_u8_gemm(
+          a, c, b_q_weight, b_scales_kernel, b_zeros, sorted_token_ids,
+          expert_ids, num_tokens_past_padded, topk_weights, moe_block_size,
+          top_k, mul_topk_weights, size_m, size_n, size_k, group_size);
+    }
 
-  TORCH_CHECK(false, "Unsupported SM70 Marlin MoE weight type.");
-  return c;
+    if (b_type == vllm::kU4B8) {
+      TORCH_CHECK(!has_zp && !is_zp_float,
+                  "SM70 Marlin MoE uint4b8 does not support zero-point "
+                  "metadata.");
+      return MARLIN_NAMESPACE_NAME::sm70_marlin_u4b8_gemm(
+          a, c, b_q_weight, b_scales_kernel, sorted_token_ids, expert_ids,
+          num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+          mul_topk_weights, size_m, size_n, size_k, group_size);
+    }
+
+    if (b_type == vllm::kU8B128) {
+      TORCH_CHECK(!has_zp && !is_zp_float,
+                  "SM70 Marlin MoE uint8b128 does not support zero-point "
+                  "metadata.");
+      return MARLIN_NAMESPACE_NAME::sm70_marlin_u8b128_gemm(
+          a, c, b_q_weight, b_scales_kernel, sorted_token_ids, expert_ids,
+          num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+          mul_topk_weights, size_m, size_n, size_k, group_size);
+    }
+
+    if (b_type == vllm::kFE4M3fn) {
+      TORCH_CHECK(group_size == -1 || group_size == 128,
+                  "SM70 Marlin MoE FP8 supports only group_size -1 or "
+                  "128. Got ",
+                  group_size);
+      TORCH_CHECK(!has_zp && !is_zp_float,
+                  "SM70 Marlin MoE fp8 does not support zero-point metadata.");
+      return MARLIN_NAMESPACE_NAME::sm70_marlin_fp8_gemm(
+          a, c, b_q_weight, b_scales_kernel, sorted_token_ids, expert_ids,
+          num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+          mul_topk_weights, size_m, size_n, size_k, group_size);
+    }
+
+    if (b_type == vllm::kFE2M1f) {
+      TORCH_CHECK(!has_zp && !is_zp_float,
+                  "SM70 Marlin MoE fp4 does not support zero-point metadata.");
+      if (s_type == vllm::kFE4M3fn) {
+        TORCH_CHECK(
+            global_scale.numel() == num_experts,
+            "the global_scale parameter must be passed for nvfp4 format.");
+        TORCH_CHECK(group_size == 16,
+                    "SM70 Marlin MoE NVFP4 supports only group_size 16. "
+                    "Got ",
+                    group_size);
+        return MARLIN_NAMESPACE_NAME::sm70_marlin_nvfp4_gemm(
+            a, c, b_q_weight, b_scales_kernel, global_scale, sorted_token_ids,
+            expert_ids, num_tokens_past_padded, topk_weights, moe_block_size,
+            top_k, mul_topk_weights, size_m, size_n, size_k, group_size);
+      }
+
+      TORCH_CHECK(s_type == vllm::kFE8M0fnu,
+                  "SM70 Marlin MoE MXFP4 expects float8_e8m0fnu scales.");
+      TORCH_CHECK(group_size == 32,
+                  "SM70 Marlin MoE MXFP4 supports only group_size 32. "
+                  "Got ",
+                  group_size);
+      return MARLIN_NAMESPACE_NAME::sm70_marlin_mxfp4_gemm(
+          a, c, b_q_weight, b_scales_kernel, sorted_token_ids, expert_ids,
+          num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+          mul_topk_weights, size_m, size_n, size_k, group_size);
+    }
+
+    TORCH_CHECK(false, "Unsupported SM70 Marlin MoE weight type.");
+    return c;
+  };
+  torch::Tensor out = gemm();
+  if (has_bias) {
+    // Callers pass each expert's bias in Marlin's single-scale order
+    // (marlin_permute_bias).
+    sm70_moe_add_bias(out, sm70_unpermute_half(b_bias, 32), sorted_token_ids,
+                      expert_ids, num_tokens_past_padded, topk_weights,
+                      moe_block_size, size_m * top_k, size_n, mul_topk_weights);
+  }
+  return out;
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
