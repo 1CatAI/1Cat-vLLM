@@ -939,6 +939,7 @@ def select_packed_positions(
     *,
     top_k=512,
     bank=None,
+    scorer=None,
 ):
     """select_compressed_positions over packed, position-addressed index keys.
 
@@ -951,8 +952,11 @@ def select_packed_positions(
     tokens, heads = q.shape[0], q.shape[1]
     if tokens * heads <= 64:
         # Decode: bounded fused scores over the live keys only (graph-safe).
+        # The tiled scorer (#1372) writes dense rows; keep it off the bank's
+        # strided slot so the two opt-in paths never stack.
         live = (
             bank is not None
+            and scorer is None
             and tokens <= bank.partial.shape[0]
             and keys.shape[0] <= bank.width
             and _cuda_index_scores()
@@ -964,7 +968,17 @@ def select_packed_positions(
             scores = torch.empty(
                 tokens, keys.shape[0], dtype=torch.float16, device=q.device
             )
-        if _cuda_index_scores():
+        if scorer is not None:
+            scorer.scores(
+                scores,
+                q.reshape(-1, 128).contiguous(),
+                weights.reshape(-1).contiguous(),
+                keys,
+                positions.long(),
+                heads,
+                ratio,
+            )
+        elif _cuda_index_scores():
             # Volta: Triton dots fall back to FMA; the CUDA kernel is bounded too.
             torch.ops.v41k.index_scores_decode(
                 scores,
