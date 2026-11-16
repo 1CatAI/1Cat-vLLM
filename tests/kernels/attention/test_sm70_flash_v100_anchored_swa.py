@@ -41,6 +41,13 @@ def _require_flash_ops() -> tuple[FlashOp, FlashOp]:
     return flash_ops
 
 
+def _skip_unless_volta_prefill() -> None:
+    # The paged prefill kernel checks for SM70 itself (TORCH_CHECK in
+    # fused_mha_forward_paged.cu); the decode kernel also runs on Turing.
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("The Flash-V100 paged prefill kernel runs on SM70 only")
+
+
 def _anchored_mask(
     q_positions: torch.Tensor,
     kv_len: int,
@@ -218,6 +225,7 @@ def test_prefill_paged_anchored_matches_reference(
     the decode region) and the full-sequence shape (q_len == kv_len, where
     prompt-region queries must stay purely causal).
     """
+    _skip_unless_volta_prefill()
     device = "cuda"
     dtype = torch.float16
     block_size = 16
@@ -251,6 +259,7 @@ def test_prefill_paged_anchored_matches_reference(
 
 
 def test_prefill_paged_uses_per_request_anchor_lengths():
+    _skip_unless_volta_prefill()
     device = "cuda"
     dtype = torch.float16
     head_dim, num_heads, num_kv_heads = 128, 8, 4
