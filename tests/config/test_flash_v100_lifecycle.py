@@ -216,11 +216,12 @@ def test_fp8_bridge_workspace_stays_within_addressable_context():
 
     from vllm.config import set_current_vllm_config
     from vllm.runtime_resources import release_runtime_resources
+    from vllm.v1.attention.backends.flash_v100 import config as flash_v100_config
     from vllm.v1.attention.backends.flash_v100 import dense_prefill
 
     engine = SimpleNamespace()
     input_page_size = 1616
-    output_page_size = dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE
+    output_page_size = flash_v100_config.FP8_PREFILL_BRIDGE_PAGE_SIZE
     max_model_len = 262144
     table_width = math.ceil(max_model_len / input_page_size)
     max_blocks = math.ceil(table_width * input_page_size / output_page_size)

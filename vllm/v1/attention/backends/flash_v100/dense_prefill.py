@@ -29,18 +29,6 @@ _sm70_fa2_cu_seqlens_cache: dict[
 ] = {}
 
 
-_FP8_PREFILL_BRIDGE_PAGE_SIZE = _config.FP8_PREFILL_BRIDGE_PAGE_SIZE
-_SM70_79T_CORE_QUERY_LEN = 8000
-_SM70_79T_MAX_QUERY_LEN = 8192
-# Native Q4096 specialization for 4096-token chunks; 4000..4095 are
-# leading-padded like Q8001..Q8191. Below 8192 keys the exact Split-D kernel is
-# faster, so the first chunks of a prompt keep it.
-_SM70_79T_Q4096_QUERY_LEN = 4096
-_SM70_79T_Q4096_MIN_QUERY_LEN = 4000
-_SM70_79T_Q4096_MIN_KV = 8192
-_SM70_79T_EXACT_QUERY_ALIGNMENT = 64
-_SM70_79T_KV_ALIGNMENT = 32
-_SM70_SPLITD_KV_ALIGNMENT = 32
 _fp8_prefill_bridge_workspaces: dict[
     tuple[int, int, int, int],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -223,9 +211,9 @@ def _prefill_dense_splitkv_splits(
     """Split count for a prefix chunk; 1 keeps the unsplit kernel."""
     if (
         not _config.options().value("prefill_dense_splitkv3")
-        or max_seqlen_q >= _SM70_79T_Q4096_MIN_QUERY_LEN
-        or max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT
-        or max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT
+        or max_seqlen_q >= _config.SM70_79T_Q4096_MIN_QUERY_LEN
+        or max_seqlen_q % _config.SM70_79T_EXACT_QUERY_ALIGNMENT
+        or max_seqlen_k % _config.SM70_SPLITD_KV_ALIGNMENT
         or query.shape[0] != 1
         or _ops.get_sm70_splitd_d256_splitkv_op() is None
     ):
@@ -244,7 +232,7 @@ def _prefill_dense_splitkv_splits(
     if num_sms is None:
         num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count
         _sm70_num_sms[device_index] = num_sms
-    tiles = max_seqlen_q // _SM70_79T_EXACT_QUERY_ALIGNMENT * int(query.shape[2])
+    tiles = max_seqlen_q // _config.SM70_79T_EXACT_QUERY_ALIGNMENT * int(query.shape[2])
     # Waves of CTAs that each cover 1/n of the prefix, plus the per-split
     # partial write and merge (fitted on V100 at 8K-110K keys).
     best, best_cost = 1, float("inf")
@@ -305,8 +293,10 @@ def _should_use_prefill_dense_splitkv3(
 def _sm70_79t_q4096_eligible(max_seqlen_q: int, max_seqlen_k: int) -> bool:
     """Whether a chunk takes the native Q4096 architecture specialization."""
     return (
-        _SM70_79T_Q4096_MIN_QUERY_LEN <= max_seqlen_q <= _SM70_79T_Q4096_QUERY_LEN
-        and max_seqlen_k >= _SM70_79T_Q4096_MIN_KV
+        _config.SM70_79T_Q4096_MIN_QUERY_LEN
+        <= max_seqlen_q
+        <= _config.SM70_79T_Q4096_QUERY_LEN
+        and max_seqlen_k >= _config.SM70_79T_Q4096_MIN_KV
         and not _config.options().value("prefill_d256_gqa_v37")
         and _ops.get_sm70_d256_gqa_architecture_q4096_op() is not None
     )
@@ -333,11 +323,13 @@ def _should_use_prefill_d256_gqa_architecture(
     else:
         shape_allowed = (
             (
-                _SM70_79T_CORE_QUERY_LEN <= max_seqlen_q <= _SM70_79T_MAX_QUERY_LEN
+                _config.SM70_79T_CORE_QUERY_LEN
+                <= max_seqlen_q
+                <= _config.SM70_79T_MAX_QUERY_LEN
                 or _sm70_79t_q4096_eligible(max_seqlen_q, max_seqlen_k)
             )
             and max_seqlen_q <= max_seqlen_k <= 262144
-            and max_seqlen_k % _SM70_79T_KV_ALIGNMENT == 0
+            and max_seqlen_k % _config.SM70_79T_KV_ALIGNMENT == 0
         )
     return (
         _config.options().value("prefill_d256_gqa_arch_128k_experimental")
@@ -382,25 +374,27 @@ def profile_sm70_prefill_workspace(query: torch.Tensor, num_kv_heads: int) -> No
         or query.ndim != 3
         or query.shape[2] != 256
         or query.shape[1] != 6 * num_kv_heads
-        or query.shape[0] < _SM70_79T_Q4096_MIN_QUERY_LEN
-        or _SM70_79T_Q4096_QUERY_LEN < query.shape[0] < _SM70_79T_CORE_QUERY_LEN
+        or query.shape[0] < _config.SM70_79T_Q4096_MIN_QUERY_LEN
+        or _config.SM70_79T_Q4096_QUERY_LEN
+        < query.shape[0]
+        < _config.SM70_79T_CORE_QUERY_LEN
         or not current_platform.is_device_capability(70)
         or torch.cuda.is_current_stream_capturing()
     ):
         return
-    if query.shape[0] <= _SM70_79T_Q4096_QUERY_LEN:
-        q_len = _SM70_79T_Q4096_QUERY_LEN
-    elif query.shape[0] == _SM70_79T_CORE_QUERY_LEN:
-        q_len = _SM70_79T_CORE_QUERY_LEN
+    if query.shape[0] <= _config.SM70_79T_Q4096_QUERY_LEN:
+        q_len = _config.SM70_79T_Q4096_QUERY_LEN
+    elif query.shape[0] == _config.SM70_79T_CORE_QUERY_LEN:
+        q_len = _config.SM70_79T_CORE_QUERY_LEN
     else:
-        q_len = _SM70_79T_MAX_QUERY_LEN
+        q_len = _config.SM70_79T_MAX_QUERY_LEN
     cache_key = (query.device, q_len)
     profiled = workspace_cache("prefill_profiled", _sm70_prefill_profiled_workspaces)
     if cache_key in profiled:
         return
-    if q_len == _SM70_79T_Q4096_QUERY_LEN:
+    if q_len == _config.SM70_79T_Q4096_QUERY_LEN:
         op = _ops.get_sm70_d256_gqa_architecture_q4096_op()
-    elif q_len == _SM70_79T_CORE_QUERY_LEN:
+    elif q_len == _config.SM70_79T_CORE_QUERY_LEN:
         op = _ops.get_sm70_d256_gqa_architecture_op()
     else:
         op = _ops.get_sm70_d256_gqa_architecture_q8192_op()
@@ -460,8 +454,8 @@ def _run_sm70_d256_gqa_79t_dispatch(
     work to the Q8000 core.
     """
     query_len = int(query.shape[1])
-    fringe_len = query_len - _SM70_79T_CORE_QUERY_LEN
-    if fringe_len < 0 or query_len > _SM70_79T_MAX_QUERY_LEN:
+    fringe_len = query_len - _config.SM70_79T_CORE_QUERY_LEN
+    if fringe_len < 0 or query_len > _config.SM70_79T_MAX_QUERY_LEN:
         raise ValueError(f"unsupported SM70 79T query length {query_len}")
     if fringe_len == 0:
         return _run_sm70_gqa_groups(
@@ -486,10 +480,10 @@ def _run_sm70_d256_gqa_79t_dispatch(
         True,
     )
 
-    fringe_kv_len = int(key.shape[1]) - _SM70_79T_CORE_QUERY_LEN
+    fringe_kv_len = int(key.shape[1]) - _config.SM70_79T_CORE_QUERY_LEN
     padded_fringe_len = (
-        _masks.cdiv_int(fringe_len, _SM70_79T_EXACT_QUERY_ALIGNMENT)
-        * _SM70_79T_EXACT_QUERY_ALIGNMENT
+        _masks.cdiv_int(fringe_len, _config.SM70_79T_EXACT_QUERY_ALIGNMENT)
+        * _config.SM70_79T_EXACT_QUERY_ALIGNMENT
     )
     if padded_fringe_len == fringe_len:
         fringe_query = query[:, :fringe_len]
@@ -520,7 +514,7 @@ def _run_sm70_d256_gqa_79t_dispatch(
 
 def _get_sm70_79t_q8192_padding_workspace(
     query: torch.Tensor,
-    padded_len: int = _SM70_79T_MAX_QUERY_LEN,
+    padded_len: int = _config.SM70_79T_MAX_QUERY_LEN,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     cache = workspace_cache(
         "sm70_79t_q8192_padding_workspaces", _sm70_79t_q8192_padding_workspaces
@@ -566,9 +560,13 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
 ) -> torch.Tensor:
     """Run Q8001..Q8192 through the native Q8192 specialization."""
     query_len = int(query.shape[1])
-    if not _SM70_79T_CORE_QUERY_LEN < query_len <= _SM70_79T_MAX_QUERY_LEN:
+    if (
+        not _config.SM70_79T_CORE_QUERY_LEN
+        < query_len
+        <= _config.SM70_79T_MAX_QUERY_LEN
+    ):
         raise ValueError(f"unsupported SM70 Q8192 dispatch length {query_len}")
-    if query_len == _SM70_79T_MAX_QUERY_LEN:
+    if query_len == _config.SM70_79T_MAX_QUERY_LEN:
         return _run_sm70_gqa_groups(
             architecture_q8192_op,
             query,
@@ -580,12 +578,12 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
         )
 
     padded_query, padded_out = _get_sm70_79t_q8192_padding_workspace(query)
-    leading_padding = _SM70_79T_MAX_QUERY_LEN - query_len
+    leading_padding = _config.SM70_79T_MAX_QUERY_LEN - query_len
     # A scheduler can split the first chunk below 8192 while other requests
     # decode. If KV is also shorter, pad only future keys and shift the real
     # query slice back by the same amount. For original query i, the last
     # visible key remains KV - Q + i; padded keys are always masked out.
-    kv_padding = max(0, _SM70_79T_MAX_QUERY_LEN - int(key.shape[1]))
+    kv_padding = max(0, _config.SM70_79T_MAX_QUERY_LEN - int(key.shape[1]))
     if kv_padding:
         key = torch.nn.functional.pad(key, (0, 0, 0, 0, 0, kv_padding))
         value = torch.nn.functional.pad(value, (0, 0, 0, 0, 0, kv_padding))
@@ -620,16 +618,20 @@ def _run_sm70_d256_gqa_79t_q4096_dispatch(
     causal alignment of every real row; KV is at least 8192 keys here.
     """
     query_len = int(query.shape[1])
-    if not _SM70_79T_Q4096_MIN_QUERY_LEN <= query_len <= _SM70_79T_Q4096_QUERY_LEN:
+    if (
+        not _config.SM70_79T_Q4096_MIN_QUERY_LEN
+        <= query_len
+        <= _config.SM70_79T_Q4096_QUERY_LEN
+    ):
         raise ValueError(f"unsupported SM70 Q4096 dispatch length {query_len}")
-    if query_len == _SM70_79T_Q4096_QUERY_LEN:
+    if query_len == _config.SM70_79T_Q4096_QUERY_LEN:
         return _run_sm70_gqa_groups(
             architecture_q4096_op, query, key, value, out, softmax_scale, True
         )
     padded_query, padded_out = _get_sm70_79t_q8192_padding_workspace(
-        query, _SM70_79T_Q4096_QUERY_LEN
+        query, _config.SM70_79T_Q4096_QUERY_LEN
     )
-    leading_padding = _SM70_79T_Q4096_QUERY_LEN - query_len
+    leading_padding = _config.SM70_79T_Q4096_QUERY_LEN - query_len
     padded_query[:, :leading_padding].zero_()
     padded_query[:, leading_padding:].copy_(query)
     _run_sm70_gqa_groups(
@@ -645,7 +647,7 @@ def _run_sm70_d256_gqa_79t_q4096_dispatch(
     return out
 
 
-def try_sm70_fa2_d256_prefill(
+def fa2_d256_prefill_admitted(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -657,13 +659,14 @@ def try_sm70_fa2_d256_prefill(
     softmax_scale: float,
     causal: bool,
     window_size: tuple[int, int],
-    out: torch.Tensor | None = None,
-    seqused_k: torch.Tensor | None = None,
-    block_table: torch.Tensor | None = None,
-) -> torch.Tensor | None:
+    out: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+) -> bool:
+    """Whether the exact SM70 D256 prefill kernels admit these inputs."""
     int32_max = torch.iinfo(torch.int32).max
     if not _config.options().value("fa2_d256_prefill"):
-        return None
+        return False
     if (
         query.device.type != "cuda"
         or query.dtype != torch.float16
@@ -686,16 +689,16 @@ def try_sm70_fa2_d256_prefill(
         or cu_seqlens_q.dtype != torch.int32
         or not cu_seqlens_q.is_contiguous()
     ):
-        return None
+        return False
     paged_kv = block_table is not None
     if max_seqlen_q < 1024:
         if paged_kv:
-            return None
+            return False
         if not _config.options().value("prefill_d256_gqa_v37"):
             # Short chunks over a long prefix take split-KV, or keep the
             # existing fallback.
             if _prefill_dense_splitkv_splits(query, max_seqlen_q, max_seqlen_k) < 2:
-                return None
+                return False
         elif not _should_use_prefill_d256_gqa_architecture(
             query,
             key,
@@ -705,7 +708,7 @@ def try_sm70_fa2_d256_prefill(
             softmax_scale=softmax_scale,
             architecture_op=_ops.get_sm70_d256_gqa_architecture_op(),
         ):
-            return None
+            return False
     if block_table is not None:
         if (
             seqused_k is None
@@ -720,7 +723,7 @@ def try_sm70_fa2_d256_prefill(
             or seqused_k.dtype != torch.int32
             or not seqused_k.is_contiguous()
         ):
-            return None
+            return False
     elif (
         cu_seqlens_k is None
         or seqused_k is not None
@@ -728,16 +731,50 @@ def try_sm70_fa2_d256_prefill(
         or cu_seqlens_k.dtype != torch.int32
         or not cu_seqlens_k.is_contiguous()
     ):
-        return None
+        return False
     device_index = query.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
     device_capability = current_platform.get_device_capability(device_index)
-    if device_capability is None or (
+    return device_capability is not None and (
         device_capability.major,
         device_capability.minor,
-    ) != (7, 0):
+    ) == (7, 0)
+
+
+def try_sm70_fa2_d256_prefill(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor | None,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    out: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    if not fa2_d256_prefill_admitted(
+        query,
+        key,
+        value,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        out=out,
+        seqused_k=seqused_k,
+        block_table=block_table,
+    ):
         return None
+    paged_kv = block_table is not None
 
     splitd_ops, splitd_eligible = _splitd_admission(
         query, paged_kv, max_seqlen_q, max_seqlen_k
@@ -839,8 +876,8 @@ def try_sm70_fa2_d256_prefill(
                         )
                 if (
                     splitd_result is None
-                    and max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
-                    and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
+                    and max_seqlen_q % _config.SM70_79T_EXACT_QUERY_ALIGNMENT == 0
+                    and max_seqlen_k % _config.SM70_SPLITD_KV_ALIGNMENT == 0
                 ):
                     splitd_result = dense_op(
                         query, key, value, splitd_out, softmax_scale, True
@@ -893,7 +930,7 @@ def profile_sm70_long_prefix_workspaces(
             # automatic plan. Preserve their full-context profiling reservation.
             blocks = _masks.cdiv_int(
                 _masks.cdiv_int(max_model_len, kv_block_size) * kv_block_size,
-                _FP8_PREFILL_BRIDGE_PAGE_SIZE,
+                _config.FP8_PREFILL_BRIDGE_PAGE_SIZE,
             )
             layout = torch.empty(
                 (0, kv_block_size, num_kv_heads, 256),
@@ -957,11 +994,16 @@ def profile_fp8_prefill_bridge_workspace(
     groups = plan.head_groups
     group_query = query.unsqueeze(0)[:, :, : query.shape[1] // groups]
     key = torch.empty(
-        (0, _FP8_PREFILL_BRIDGE_PAGE_SIZE, num_kv_heads // groups, query.shape[2]),
+        (
+            0,
+            _config.FP8_PREFILL_BRIDGE_PAGE_SIZE,
+            num_kv_heads // groups,
+            query.shape[2],
+        ),
         dtype=torch.uint8,
         device=query.device,
     )
-    blocks = plan.max_kv_tokens // _FP8_PREFILL_BRIDGE_PAGE_SIZE
+    blocks = plan.max_kv_tokens // _config.FP8_PREFILL_BRIDGE_PAGE_SIZE
     if get_fp8_prefill_bridge_workspace(key, blocks, max_blocks=blocks) is None:
         return
     padded_query_len = (plan.max_query_tokens + 63) // 64 * 64
@@ -1024,7 +1066,7 @@ def get_fp8_prefill_bridge_workspace(
         capacity = min(capacity, max(required_blocks, int(max_blocks)))
     shape = (
         capacity,
-        _FP8_PREFILL_BRIDGE_PAGE_SIZE,
+        _config.FP8_PREFILL_BRIDGE_PAGE_SIZE,
         key_cache.shape[2],
         key_cache.shape[3],
     )
@@ -1433,7 +1475,7 @@ def _try_dense_architecture(
         _ops.get_sm70_d256_gqa_architecture_q8192_op()
         if architecture_op is not None
         and not _config.options().value("prefill_d256_gqa_v37")
-        and max_seqlen_q > _SM70_79T_CORE_QUERY_LEN
+        and max_seqlen_q > _config.SM70_79T_CORE_QUERY_LEN
         else None
     )
     architecture_q4096_op = (
@@ -1482,8 +1524,8 @@ def _try_dense_architecture(
                     architecture_q8192_op=architecture_q8192_op,
                 )
             elif (
-                max_seqlen_q == _SM70_79T_CORE_QUERY_LEN
-                or max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
+                max_seqlen_q == _config.SM70_79T_CORE_QUERY_LEN
+                or max_seqlen_k % _config.SM70_SPLITD_KV_ALIGNMENT == 0
             ):
                 splitd_result = _run_sm70_d256_gqa_79t_dispatch(
                     query,
@@ -1540,20 +1582,20 @@ def _try_dense_architecture(
                             "prefill_dense_d256_gqa_79t_fp32_q4096"
                         ].name
                     )
-                    if max_seqlen_q < _SM70_79T_Q4096_QUERY_LEN:
+                    if max_seqlen_q < _config.SM70_79T_Q4096_QUERY_LEN:
                         _routing.record_route(
                             _routing.ROUTE_SPECS[
                                 "prefill_dense_d256_gqa_79t_fp32_q4096_pad"
                             ].name
                         )
-                elif max_seqlen_q > _SM70_79T_CORE_QUERY_LEN:
+                elif max_seqlen_q > _config.SM70_79T_CORE_QUERY_LEN:
                     if architecture_q8192_op is not None:
                         _routing.record_route(
                             _routing.ROUTE_SPECS[
                                 "prefill_dense_d256_gqa_79t_fp32_q8192"
                             ].name
                         )
-                        if max_seqlen_q < _SM70_79T_MAX_QUERY_LEN:
+                        if max_seqlen_q < _config.SM70_79T_MAX_QUERY_LEN:
                             _routing.record_route(
                                 _routing.ROUTE_SPECS[
                                     "prefill_dense_d256_gqa_79t_fp32_q8192_pad"
@@ -1573,16 +1615,19 @@ def _splitd_admission(query, paged_kv, max_seqlen_q, max_seqlen_k):
     q8000_core_dispatch_eligible = not paged_kv and (
         (
             not _config.options().value("prefill_d256_gqa_v37")
-            and _SM70_79T_CORE_QUERY_LEN <= max_seqlen_q <= _SM70_79T_MAX_QUERY_LEN
+            and _config.SM70_79T_CORE_QUERY_LEN
+            <= max_seqlen_q
+            <= _config.SM70_79T_MAX_QUERY_LEN
         )
         or _sm70_79t_q4096_eligible(max_seqlen_q, max_seqlen_k)
     )
     architecture_kv_eligible = (
-        q8000_core_dispatch_eligible and max_seqlen_k % _SM70_79T_KV_ALIGNMENT == 0
+        q8000_core_dispatch_eligible
+        and max_seqlen_k % _config.SM70_79T_KV_ALIGNMENT == 0
     )
     exact_splitd_shape_eligible = (
-        max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
-        and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
+        max_seqlen_q % _config.SM70_79T_EXACT_QUERY_ALIGNMENT == 0
+        and max_seqlen_k % _config.SM70_SPLITD_KV_ALIGNMENT == 0
     )
     splitd_eligible = (
         splitd_ops is not None
