@@ -1283,6 +1283,9 @@ class PerfMetricsProm:
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[object]],
     ):
+        self.enabled = vllm_config.observability_config.enable_mfu_metrics
+        if not self.enabled:
+            return
         counter_flops = self._counter_cls(
             name="vllm:estimated_flops_per_gpu_total",
             documentation=(
@@ -1320,6 +1323,8 @@ class PerfMetricsProm:
         )
 
     def observe(self, perf_stats: PerfStats, engine_idx: int = 0):
+        if not self.enabled:
+            return
         if not (
             perf_stats.num_flops_per_gpu
             or perf_stats.num_read_bytes_per_gpu
