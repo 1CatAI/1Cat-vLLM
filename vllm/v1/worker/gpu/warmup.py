@@ -217,6 +217,14 @@ def _warmup_cycle(
 
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = finished
+    if getattr(kv_cache_config, "needs_kv_cache_zeroing", False):
+        touched_end = min(next_block_id, kv_cache_config.num_blocks)
+        state_end = min(state_blocks, 1 + next_state_id) if next_state_id > 0 else 1
+        dirty_ids = list(range(1, state_end)) + list(
+            range(max(1, state_blocks), touched_end)
+        )
+        if dirty_ids:
+            cleanup_output.new_block_ids_to_zero = dirty_ids
     worker_execute_model(cleanup_output)
 
 

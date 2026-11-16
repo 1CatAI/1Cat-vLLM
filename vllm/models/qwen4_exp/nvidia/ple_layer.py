@@ -2730,12 +2730,19 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             existing_state = conv_state.index_select(0, state_indices)
             existing_base_state = existing_state[..., :state_len]
             update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
+            mask_3d = update_mask.view(num_prefills, 1, 1)
             safe_next_state = torch.where(
-                update_mask.view(num_prefills, 1, 1),
+                mask_3d,
                 next_state.to(conv_state.dtype),
                 existing_base_state,
             )
             existing_state[..., :state_len] = safe_next_state
+            if existing_state.size(-1) > state_len:
+                existing_state[..., state_len:] = torch.where(
+                    mask_3d,
+                    torch.zeros_like(existing_state[..., state_len:]),
+                    existing_state[..., state_len:],
+                )
             conv_state.index_copy_(0, state_indices, existing_state)
         return _ple_output_rows(output, output_start, output_rows)
 
@@ -2830,12 +2837,19 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if have_state:
             existing_base_state = existing_state[..., :state_len]
             update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
+            mask_3d = update_mask.view(num_prefills, 1, 1)
             safe_next_state = torch.where(
-                update_mask.view(num_prefills, 1, 1),
+                mask_3d,
                 next_state.to(conv_state.dtype),
                 existing_base_state,
             )
             existing_state[..., :state_len] = safe_next_state
+            if existing_state.size(-1) > state_len:
+                existing_state[..., state_len:] = torch.where(
+                    mask_3d,
+                    torch.zeros_like(existing_state[..., state_len:]),
+                    existing_state[..., state_len:],
+                )
             conv_state.index_copy_(0, state_indices, existing_state)
         return output
 

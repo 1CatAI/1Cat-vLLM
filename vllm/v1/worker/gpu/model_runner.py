@@ -1540,6 +1540,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            if scheduler_output.decode_ckpt_mounts:
+                for req_id, even_ids, odd_ids in scheduler_output.decode_ckpt_mounts:
+                    req_idx = self.req_states.req_id_to_index.get(req_id)
+                    if req_idx is not None:
+                        self.model_state.mount_decode_ckpt_blocks(
+                            req_idx, even_ids, odd_ids
+                        )
+            self.model_state.flush_decode_ckpt_blocks()
             self.block_tables.apply_staged_writes()
             # Finish offload stores whose source blocks this step reuses before
             # zeroing them below; see ActiveKVConnector.handle_preemptions.

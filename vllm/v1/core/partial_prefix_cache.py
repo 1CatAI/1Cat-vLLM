@@ -76,6 +76,8 @@ class PartialEntry:
     copy_last: list[bool]
     # Scheduler step whose worker pass fills ``blocks``; usable after it.
     ready_step: int
+    # Referenced full-block parents kept resident while this entry is cached.
+    pinned_blocks: list[KVCacheBlock] = field(default_factory=list)
 
     @property
     def num_blocks(self) -> int:
@@ -113,7 +115,9 @@ class PartialPrefixCache:
             if not siblings:
                 del self.by_parent[key[0]]
         self.num_blocks -= entry.num_blocks
-        self.block_pool.free_blocks([b for blocks in entry.blocks for b in blocks])
+        self.block_pool.free_blocks(
+            [b for blocks in entry.blocks for b in blocks] + entry.pinned_blocks
+        )
 
     def remove(self, key: PartialKey) -> bool:
         """Drop one entry and free its blocks; False if it is already gone."""

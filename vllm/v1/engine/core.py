@@ -682,6 +682,8 @@ class EngineCore:
                 and scheduler_output.total_num_scheduled_tokens == 0
                 and not scheduler_output.finished_req_ids
                 and not scheduler_output.scheduled_new_reqs
+                and not scheduler_output.kv_block_copies
+                and not scheduler_output.decode_ckpt_mounts
             ):
                 # VLLM_V41_PP_MICRO: every schedulable request is in flight.
                 # An empty step would still run on every stage (and drop the

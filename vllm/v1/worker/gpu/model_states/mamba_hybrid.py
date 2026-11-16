@@ -207,6 +207,21 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
+            self._decode_ckpt_slots_gpu = torch.full(
+                (8, self.max_num_reqs, 2), -1, dtype=torch.int32, device=self.device
+            )
+            self._decode_ckpt_cpu = torch.full(
+                (8, self.max_num_reqs, 2), -1, dtype=torch.int32
+            )
+            use_pin = is_pin_memory_available() and self.device.type == "cuda"
+            self._decode_ckpt_stage_ring = [
+                torch.empty(
+                    (8, self.max_num_reqs, 2), dtype=torch.int32, pin_memory=use_pin
+                )
+                for _ in range(4)
+            ]
+            self._decode_ckpt_ring_idx = 0
+            self._decode_ckpt_dirty = False
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -220,6 +235,39 @@ class MambaHybridModelState(DefaultModelState):
             # resolved MambaSpec block size. -2 is distinct from -1 (fresh
             # request with no computed state).
             self._mamba_state_idx_gpu[req_index].fill_(-2)
+            self._decode_ckpt_cpu[:, req_index, :] = -1
+            self._decode_ckpt_dirty = True
+
+    def remove_request(self, req_index: int) -> None:
+        super().remove_request(req_index)
+        if self._align_mode:
+            self._decode_ckpt_cpu[:, req_index, :] = -1
+            self._decode_ckpt_dirty = True
+
+    def mount_decode_ckpt_blocks(
+        self,
+        req_index: int,
+        even_ids: list[int],
+        odd_ids: list[int],
+    ) -> None:
+        if not self._align_mode:
+            return
+        n = min(len(even_ids), len(odd_ids), self._decode_ckpt_slots_gpu.shape[0])
+        if n <= 0:
+            return
+        cpu_np = self._decode_ckpt_cpu.numpy()
+        cpu_np[:n, req_index, 0] = even_ids[:n]
+        cpu_np[:n, req_index, 1] = odd_ids[:n]
+        self._decode_ckpt_dirty = True
+
+    def flush_decode_ckpt_blocks(self) -> None:
+        if not self._align_mode or not self._decode_ckpt_dirty:
+            return
+        stage = self._decode_ckpt_stage_ring[self._decode_ckpt_ring_idx & 3]
+        self._decode_ckpt_ring_idx += 1
+        stage.copy_(self._decode_ckpt_cpu)
+        self._decode_ckpt_slots_gpu.copy_(stage, non_blocking=True)
+        self._decode_ckpt_dirty = False
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -317,6 +365,7 @@ class MambaHybridModelState(DefaultModelState):
                 ctx.block_table_ptrs,
                 ctx.block_table_stride_req,
                 mamba_spec.block_size,
+                decode_ckpt_slots=self._decode_ckpt_slots_gpu,
             )
         run_mamba_align_precopy(
             ctx,
@@ -585,6 +634,12 @@ class MambaHybridModelState(DefaultModelState):
                 self._mamba_state_idx_gpu,
                 num_computed_tokens,
                 idx_mapping,
+                decode_ckpt_slots=self._decode_ckpt_slots_gpu,
+                spec_verified=(
+                    self._spec_replay.verified
+                    if self._spec_replay is not None
+                    else None
+                ),
             )
 
 

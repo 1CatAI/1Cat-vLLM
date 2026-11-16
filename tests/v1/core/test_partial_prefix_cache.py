@@ -4,7 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.entrypoints.openai.chat_completion.serving import _PrefixCacheBoundaries
+from vllm.entrypoints.openai.chat_completion.serving import (
+    _AssistantReasoningCache,
+    _PrefixCacheBoundaries,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -474,3 +477,474 @@ def test_partial_prefix_hit_reclaims_older_lru_entry_under_tight_pool():
     assert hit_tokens == 64
     assert len(cm.partial_cache.entries) == 1
     cm.block_pool.free_blocks(held)
+
+
+def test_assistant_reasoning_cache_restores_omitted_reasoning_across_turns():
+    cache = _AssistantReasoningCache(max_entries=16)
+    prior_msgs = [
+        {"role": "system", "content": "you are an agent"},
+        {"role": "user", "content": "inspect src/wal.py"},
+    ]
+    # 1. Tool-calling turn recorded with compact JSON arguments, queried with
+    # re-formatted JSON arguments and omitted reasoning_content.
+    cache.record(
+        prior_msgs,
+        "",
+        [("read_file", '{"path":"src/wal.py","start":1}')],
+        "Need to inspect WAL header invariants first.",
+    )
+    restored = cache.lookup(
+        prior_msgs,
+        "",
+        [
+            {
+                "id": "call_new_id",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{ "start": 1, "path": "src/wal.py" }',
+                },
+            }
+        ],
+    )
+    assert restored == "Need to inspect WAL header invariants first."
+
+    # 2. Empty-content length-truncated thinking turn matches via context digest
+    # without colliding across different conversation contexts.
+    other_prior = [
+        {"role": "system", "content": "you are an agent"},
+        {"role": "user", "content": "unrelated task"},
+    ]
+    cache.record(prior_msgs, "", [], "Partial truncated reasoning trace")
+    assert cache.lookup(prior_msgs, "", []) == "Partial truncated reasoning trace"
+    assert cache.lookup(other_prior, "", []) is None
+
+
+def test_decode_ckpt_promotes_64_aligned_output_and_coalesces_warm_tail():
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        CircularBufferSpec,
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import RequestStatus
+
+    full = FullAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    ring = CircularBufferSpec(
+        block_size=8, num_kv_heads=1, head_size=4, head_size_v=0, dtype=torch.float16
+    )
+    mamba = MambaSpec(
+        block_size=256,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        64,
+        [],
+        [
+            KVCacheGroupSpec(["qsa"], full),
+            KVCacheGroupSpec(["ring"], ring),
+            KVCacheGroupSpec(["gdn"], mamba),
+        ],
+    )
+    cm = KVCacheManager(
+        config,
+        2048,
+        256,
+        partial_prefix_cache=True,
+        enable_decode_ckpt=True,
+    )
+    assert cm.partial_cache is not None
+    assert cm._enable_decode_ckpt is True
+    free_initial = cm.block_pool.get_num_free_blocks()
+
+    def _hasher(req):
+        return [
+            BlockHash(bytes(x % 256 for x in req.all_token_ids[i : i + 256]))
+            for i in range(0, len(req.all_token_ids) // 256 * 256, 256)
+        ]
+
+    # Turn 1: prompt=90 tokens, generates 60 decode tokens -> total=150 -> B64=128.
+    t1 = Request(
+        request_id="t1",
+        prompt_token_ids=list(range(10, 100)),
+        sampling_params=SamplingParams(max_tokens=128),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+    cm.new_step_starts()
+    assert cm.allocate_slots(t1, 90) is not None
+    assert cm.take_decode_ckpt_mounts() == []
+    t1.num_computed_tokens = 90
+    t1.append_output_token_ids([500])
+
+    # First decode step mounts ping-pong Mamba checkpoint blocks.
+    cm.new_step_starts()
+    assert cm.allocate_slots(t1, 1) is not None
+    mounts = cm.take_decode_ckpt_mounts()
+    assert len(mounts) == 1
+    req_id, even_ids, odd_ids = mounts[0]
+    assert req_id == "t1" and len(even_ids) == 1 and len(odd_ids) == 1
+    even_mamba_id = even_ids[0]  # 128 // 64 == 2 -> parity 0 (even)
+
+    # Simulate decoding past 128 up to 150 tokens and finishing cleanly.
+    t1.append_output_token_ids(list(range(501, 560)))
+    t1.num_computed_tokens = 149
+    t1.status = RequestStatus.FINISHED_STOPPED
+    cm.free(t1)
+
+    # Immediate next step (c=1 sequential multi-turn agent): Turn 2 arrives and
+    # MUST hit 128 (including 38 decode-generated tokens!) in the SAME step with
+    # zero (A->B, B->C) copy chains, and coalesce its near-end gen-prompt tail!
+    cm.new_step_starts()
+    t2_tokens = list(t1.all_token_ids[:149]) + list(range(700, 740))
+    t2 = Request(
+        request_id="t2",
+        prompt_token_ids=t2_tokens,
+        sampling_params=SamplingParams(
+            max_tokens=128,
+            extra_args={"prefix_cache_boundaries": [len(t2_tokens) - 10]},
+        ),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+    comp_blocks, hit = cm.get_computed_blocks(t2)
+    assert hit == 128
+    # Warm continuation skips the 10-token generation-prompt split -> 1 prefill step!
+    assert cm.partial_prefix_stops(t2, hit, len(t2_tokens)) == ()
+    assert cm.allocate_slots(t2, len(t2_tokens) - hit, hit, comp_blocks) is not None
+    copies, _ = cm.take_block_copies_with_groups()
+    dsts = {dst for _, dst in copies}
+    srcs = {src for src, _ in copies}
+    assert srcs.isdisjoint(dsts), (
+        f"Unexpected chained block copy in same step: {copies}"
+    )
+    entry = next(iter(cm.partial_cache.entries.values()))
+    assert entry.length == 128
+    assert entry.blocks[2][0].block_id == even_mamba_id
+
+    # Also verify client abort (FINISHED_ABORTED) promotes odd parity B64=192,
+    # while preemption (RUNNING) does NOT promote and leaks zero blocks.
+    t2.num_computed_tokens = len(t2_tokens)
+    t2.append_output_token_ids([800])
+    cm.new_step_starts()
+    assert cm.allocate_slots(t2, 1) is not None
+    _, _, odd_ids_2 = cm.take_decode_ckpt_mounts()[0]
+    t2.append_output_token_ids(list(range(801, 830)))
+    t2.num_computed_tokens = 205
+    t2.status = RequestStatus.FINISHED_ABORTED
+    cm.free(t2)
+    cm.new_step_starts()
+    cm.take_block_copies_with_groups()
+    lengths = sorted(e.length for e in cm.partial_cache.entries.values())
+    assert lengths == [128, 192]
+    entry_192 = [e for e in cm.partial_cache.entries.values() if e.length == 192][0]
+    assert entry_192.blocks[2][0].block_id == odd_ids_2[0]
+
+    for _ in range(4):
+        cm.new_step_starts()
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_partial_prefix_pins_full_parent_blocks_and_deduplicates_swarm_leaders():
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import RequestStatus
+
+    full = FullAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    mamba = MambaSpec(
+        block_size=256,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        32,
+        [],
+        [
+            KVCacheGroupSpec(["qsa"], full),
+            KVCacheGroupSpec(["gdn"], mamba),
+        ],
+    )
+    cm = KVCacheManager(
+        config,
+        2048,
+        256,
+        partial_prefix_cache=True,
+        enable_decode_ckpt=True,
+    )
+    free_initial = cm.block_pool.get_num_free_blocks()
+
+    def _hasher(req):
+        return [
+            BlockHash(
+                bytes(((x * 31 + i) % 256) for x in req.all_token_ids[i : i + 256])
+            )
+            for i in range(0, len(req.all_token_ids) // 256 * 256, 256)
+        ]
+
+    # Swarm burst: leader is prefilling [0..600) with shared system boundary at 384.
+    leader_tokens = list(range(100, 700))
+    follower_tokens = list(range(100, 484)) + list(range(900, 1020))
+    leader = Request(
+        request_id="leader",
+        prompt_token_ids=leader_tokens,
+        sampling_params=SamplingParams(
+            max_tokens=32,
+            extra_args={"prefix_cache_boundaries": [384]},
+        ),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+    follower = Request(
+        request_id="follower",
+        prompt_token_ids=follower_tokens,
+        sampling_params=SamplingParams(
+            max_tokens=32,
+            extra_args={"prefix_cache_boundaries": [384]},
+        ),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+
+    cm.new_step_starts()
+    comp_l, hit_l = cm.get_computed_blocks(leader)
+    assert hit_l == 0
+    stops = cm.partial_prefix_stops(leader, 0, len(leader_tokens))
+    assert stops == (384,)
+    assert cm.allocate_slots(leader, 384, 0, comp_l) is not None
+    # Follower shares both full block [0..256) and partial boundary 384 -> waits!
+    assert cm.should_wait_for_inflight_snapshot(follower, [(leader, 0, 384)]) is True
+
+    # Finish leader's 384-token boundary step -> snapshot is usable immediately
+    # in the next step AND pins its FullAttention parent block [0..256)!
+    leader.num_computed_tokens = 384
+    cm.new_step_starts()
+    assert cm.allocate_slots(leader, len(leader_tokens) - 384) is not None
+    cm.take_block_copies_with_groups()
+    leader.num_computed_tokens = len(leader_tokens)
+    leader.status = RequestStatus.FINISHED_STOPPED
+    cm.free(leader)
+
+    entry_384 = next(iter(cm.partial_cache.entries.values()))
+    assert entry_384.length == 384
+    assert len(entry_384.pinned_blocks) == 1
+    assert entry_384.pinned_blocks[0].ref_cnt >= 1
+
+    # Allocate and free unrelated traffic to churn free_block_queue, then verify
+    # follower STILL hits 384 (not degraded or invalidated due to parent eviction)!
+    for k in range(6):
+        noise = Request(
+            request_id=f"noise-{k}",
+            prompt_token_ids=[5000 + k * 500 + j for j in range(300)],
+            sampling_params=SamplingParams(max_tokens=8),
+            pooling_params=None,
+            block_hasher=_hasher,
+        )
+        cm.new_step_starts()
+        assert cm.allocate_slots(noise, 300) is not None
+        noise.num_computed_tokens = 300
+        noise.status = RequestStatus.FINISHED_STOPPED
+        cm.free(noise)
+
+    cm.new_step_starts()
+    _, hit_f = cm.get_computed_blocks(follower)
+    assert hit_f == 384
+
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_short_conv_blocks_zeroed_on_alloc_and_decode_ckpt_mount():
+    import torch
+
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import RequestStatus
+
+    for short_conv_type in (MambaAttentionBackendEnum.SHORT_CONV, "short_conv"):
+        full = FullAttentionSpec(
+            block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+        )
+        gdn = MambaSpec(
+            block_size=256,
+            shapes=((4,), (4, 4)),
+            dtypes=(torch.float16, torch.float32),
+            mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+            mamba_cache_mode="align",
+        )
+        ple = MambaSpec(
+            block_size=256,
+            shapes=((13, 16),),
+            dtypes=(torch.float16,),
+            mamba_type=short_conv_type,
+            mamba_cache_mode="align",
+        )
+        config = KVCacheConfig(
+            32,
+            [],
+            [
+                KVCacheGroupSpec(["qsa"], full),
+                KVCacheGroupSpec(["gdn"], gdn),
+                KVCacheGroupSpec(["ple"], ple),
+            ],
+        )
+        cm = KVCacheManager(
+            config,
+            2048,
+            256,
+            partial_prefix_cache=True,
+            enable_decode_ckpt=True,
+        )
+        free_initial = cm.block_pool.get_num_free_blocks()
+
+        req = Request(
+            request_id="sc-zero-1",
+            prompt_token_ids=list(range(80)),
+            sampling_params=SamplingParams(max_tokens=32),
+            pooling_params=None,
+            block_hasher=lambda _r: [],
+        )
+        cm.new_step_starts()
+        allocated = cm.allocate_slots(req, 80)
+        assert allocated is not None
+        zero_ids_prefill = set(cm.take_new_block_ids())
+        assert allocated.blocks[0][0].block_id in zero_ids_prefill
+        assert allocated.blocks[2][0].block_id in zero_ids_prefill
+        assert allocated.blocks[1][0].block_id not in zero_ids_prefill
+
+        req.num_computed_tokens = 80
+        req.append_output_token_ids([501])
+        cm.new_step_starts()
+        assert cm.allocate_slots(req, 1) is not None
+        mounts = cm.take_decode_ckpt_mounts()
+        assert len(mounts) == 1
+        _, even_ids, odd_ids = mounts[0]
+        zero_ids_decode = set(cm.take_new_block_ids())
+        # Group 2 (ple short_conv) is index 1 in _mamba_group_ids=(1, 2).
+        assert even_ids[1] in zero_ids_decode
+        assert odd_ids[1] in zero_ids_decode
+        assert even_ids[0] not in zero_ids_decode
+
+        req.status = RequestStatus.FINISHED_STOPPED
+        cm.free(req)
+        cm.reset_prefix_cache()
+        assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_decode_ckpt_duplicate_snapshot_defers_chosen_release():
+    import torch
+
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import RequestStatus
+
+    full = FullAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    gdn = MambaSpec(
+        block_size=256,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        32,
+        [],
+        [
+            KVCacheGroupSpec(["qsa"], full),
+            KVCacheGroupSpec(["gdn"], gdn),
+        ],
+    )
+    cm = KVCacheManager(
+        config,
+        2048,
+        256,
+        partial_prefix_cache=True,
+        enable_decode_ckpt=True,
+    )
+    free_initial = cm.block_pool.get_num_free_blocks()
+
+    prompt = list(range(90))
+    out_tail = list(range(900, 950))
+    r1 = Request(
+        request_id="dup-1",
+        prompt_token_ids=list(prompt),
+        sampling_params=SamplingParams(max_tokens=64),
+        pooling_params=None,
+        block_hasher=lambda _r: [],
+    )
+    r2 = Request(
+        request_id="dup-2",
+        prompt_token_ids=list(prompt),
+        sampling_params=SamplingParams(max_tokens=64),
+        pooling_params=None,
+        block_hasher=lambda _r: [],
+    )
+    cm.new_step_starts()
+    assert cm.allocate_slots(r1, 90) is not None
+    assert cm.allocate_slots(r2, 90) is not None
+    r1.num_computed_tokens = 90
+    r2.num_computed_tokens = 90
+    r1.append_output_token_ids([899])
+    r2.append_output_token_ids([899])
+
+    cm.new_step_starts()
+    assert cm.allocate_slots(r1, 1) is not None
+    assert cm.allocate_slots(r2, 1) is not None
+    mounts = dict((rid, (ev, od)) for rid, ev, od in cm.take_decode_ckpt_mounts())
+    r2_even_blk_id = mounts["dup-2"][0][0]
+
+    r1.append_output_token_ids(out_tail)
+    r2.append_output_token_ids(out_tail)
+    r1.num_computed_tokens = 140
+    r2.num_computed_tokens = 140
+    r1.status = RequestStatus.FINISHED_STOPPED
+    r2.status = RequestStatus.FINISHED_STOPPED
+    cm.free(r1)
+    cm.free(r2)
+
+    # Next step materializes dup-1 at boundary=128 and skips dup-2 via cache.contains;
+    # dup-2's chosen_mamba block must stay held in _deferred_release for 3 steps.
+    cm.new_step_starts()
+    r2_even_blk = cm.block_pool.blocks[r2_even_blk_id]
+    assert r2_even_blk.ref_cnt >= 1
+    cm.new_step_starts()
+    assert r2_even_blk.ref_cnt >= 1
+    cm.new_step_starts()
+    assert r2_even_blk.ref_cnt >= 1
+    cm.new_step_starts()
+    assert r2_even_blk.ref_cnt == 0
+
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial

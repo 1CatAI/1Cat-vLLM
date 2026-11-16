@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
@@ -282,6 +283,10 @@ class SingleTypeKVCacheManager(ABC):
                 FullAttentionSpec,
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
+            ) or (
+                isinstance(self.kv_cache_spec, MambaSpec)
+                and self.kv_cache_spec.mamba_type
+                in (MambaAttentionBackendEnum.SHORT_CONV, "short_conv")
             ):
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
@@ -316,6 +321,10 @@ class SingleTypeKVCacheManager(ABC):
                 FullAttentionSpec,
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
+            ) or (
+                isinstance(self.kv_cache_spec, MambaSpec)
+                and self.kv_cache_spec.mamba_type
+                in (MambaAttentionBackendEnum.SHORT_CONV, "short_conv")
             ):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
@@ -1540,6 +1549,11 @@ class MambaManager(SingleTypeKVCacheManager):
                     num_new_blocks, self.kv_cache_group_id
                 )
                 req_blocks.extend(new_blocks)
+                if self.kv_cache_spec.mamba_type in (
+                    MambaAttentionBackendEnum.SHORT_CONV,
+                    "short_conv",
+                ):
+                    self.new_block_ids.extend(b.block_id for b in new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
 
