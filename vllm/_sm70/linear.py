@@ -1202,26 +1202,6 @@ if hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out"):
         return None
 
 
-if hasattr(torch.ops._C, "fp8_qpn8_dispatch_ba_masked_sm70_out"):
-
-    @register_fake("_C::fp8_qpn8_dispatch_ba_masked_sm70_out")
-    def _fp8_qpn8_dispatch_ba_masked_sm70_out_fake(
-        qkv_out: torch.Tensor,
-        z_out: torch.Tensor,
-        b_out: torch.Tensor,
-        a_out: torch.Tensor,
-        qkvz_staging: torch.Tensor,
-        ba_staging: torch.Tensor,
-        dense_weight_ptr: int,
-        input: torch.Tensor,
-        codes: torch.Tensor,
-        group_scales: torch.Tensor,
-        ba_weight: torch.Tensor,
-        native_policy: tuple[str, ...] = (),
-    ) -> None:
-        return None
-
-
 def _register_qwen38_qpn8_out_fakes() -> None:
     """Teach Dynamo about out-variant operators from the task sidecar."""
 
