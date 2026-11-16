@@ -501,3 +501,47 @@ def test_block_qpn8_row_blocks_and_cudagraph_reuse_prefill_workspace(
         assert (
             (captured.float() - ref_replay).norm() / ref_replay.norm()
         ).item() < 1e-3
+
+
+@pytest.mark.parametrize(
+    ("capture_sizes", "kv_bytes"), [([8], None), ([8, 1024], None), ([8], 1 << 30)]
+)
+def test_prefill_workspace_is_held_only_for_captured_prefill(
+    default_vllm_config, capture_sizes, kv_bytes
+):
+    # The shared FP16 prefill workspace keeps captured layers from each holding
+    # a K*N buffer in the graph pool. An engine whose graphs stop at 8 rows runs
+    # every prefill eagerly; a workspace held for its whole life would come out
+    # of the KV cache (GLM-5.3 on PP5: 128 MiB per stage, 39 322 tokens less).
+    # A fixed KV byte budget plans no activation peak, so it keeps the workspace.
+    from vllm.model_executor.kernels.linear.qpn.fp8 import clear_sm70_fp8_workspaces
+    from vllm.model_executor.kernels.linear.qpn.fp8_block import (
+        _block_qpn8_prefill_workspaces,
+    )
+    from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces
+
+    default_vllm_config.kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill = (
+        False
+    )
+    default_vllm_config.compilation_config.cudagraph_capture_sizes = capture_sizes
+    default_vllm_config.cache_config.kv_cache_memory_bytes = kv_bytes
+    clear_sm70_fp8_workspaces()
+    pool = sm70_layer_workspaces.workspace_pool(
+        "_block_qpn8_prefill_workspaces", _block_qpn8_prefill_workspaces
+    )
+    primary = (torch.cuda.current_device(), -1)
+    layer, reference = _layer(2048, 1024)
+    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(2048, 1024))
+    kernel.process_weights_after_loading(layer)
+    resident = max(capture_sizes) > 8 or kv_bytes is not None
+    if resident:
+        assert pool[primary].numel() >= 2048 * 1024
+    else:
+        assert primary not in pool
+    # 1024 rows take the FP16 prefill on SM70 and SM75 alike.
+    x = torch.randn(1024, 1024, device="cuda", dtype=torch.float16) * 0.1
+    y = kernel.apply_weights(layer, x)
+    expected = x.float() @ reference.t()
+    assert ((y.float() - expected).norm() / expected.norm()).item() < 1e-3
+    assert (primary in pool) == resident
+    clear_sm70_fp8_workspaces()
