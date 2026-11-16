@@ -3,8 +3,10 @@
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, overload
 
@@ -24,6 +26,7 @@ from vllm.inputs import (
     TokensPrompt,
     build_enc_dec_input,
     embeds_input,
+    split_enc_dec_input,
     tokens_input,
 )
 from vllm.logger import init_logger
@@ -80,6 +83,9 @@ class BaseRenderer(ABC, Generic[_T]):
         self.api_process_rank = config.parallel_config._api_process_rank
 
         self.tokenizer = tokenizer
+        self._rendered_mm_hashes: ContextVar[list[str] | None] = ContextVar(
+            "rendered_mm_hashes", default=None
+        )
 
         # Shared thread pool executor for blocking tokenizer and
         # multimodal preprocessing operations.  The multimodal processor
@@ -100,6 +106,9 @@ class BaseRenderer(ABC, Generic[_T]):
         self._mm_cache_stats: MultiModalCacheStats | None = None
         self._clear_mm_cache_async = make_async(
             self.clear_mm_cache, executor=self._executor
+        )
+        self._invalidate_mm_cache_items_async = make_async(
+            self.invalidate_mm_cache_items, executor=self._mm_executor
         )
         self._process_multimodal_async = make_async(
             self._process_multimodal, executor=self._mm_executor
@@ -189,6 +198,18 @@ class BaseRenderer(ABC, Generic[_T]):
         if self._mm_cache_stats is not None:
             self._mm_cache_stats.reset = True
 
+    def invalidate_mm_cache_items(self, mm_hashes: Sequence[str]) -> None:
+        """Drop sender-cache entries whose engine-side copy may be missing
+        (a request that sent them without data failed, see
+        `MultiModalCacheMissError`), so the next request that uses them sends
+        their data again."""
+        mm_processor_cache = self.mm_processor_cache
+        if mm_processor_cache is None:
+            return
+
+        for mm_hash in mm_hashes:
+            mm_processor_cache.invalidate(mm_hash)
+
     @staticmethod
     def _clear_processor_cache(
         processor: "BaseMultiModalProcessor | None",
@@ -273,6 +294,35 @@ class BaseRenderer(ABC, Generic[_T]):
         """Serialize clear_mm_cache through the shared executor to avoid
         races with concurrent process_inputs on the mm_processor_cache."""
         await self._clear_mm_cache_async()
+
+    def invalidate_mm_cache_items_async(
+        self, mm_hashes: Sequence[str]
+    ) -> Awaitable[None]:
+        """Run invalidate_mm_cache_items on the multimodal executor, like
+        clear_mm_cache_async. The work is submitted when this is called, so it
+        runs before any rendering submitted later; awaiting is optional."""
+        return self._invalidate_mm_cache_items_async(mm_hashes)
+
+    @contextmanager
+    def track_mm_cache_items(self):
+        """Track rendered items until the serving layer accepts the request."""
+        hashes: list[str] = []
+        token = self._rendered_mm_hashes.set(hashes)
+        try:
+            yield hashes
+        finally:
+            self._rendered_mm_hashes.reset(token)
+
+    @staticmethod
+    def get_mm_hashes(engine_input: EngineInput) -> list[str]:
+        encoder, decoder = split_enc_dec_input(engine_input)
+        return [
+            mm_hash
+            for inputs in (encoder, decoder)
+            if inputs is not None and inputs["type"] == "multimodal"
+            for hashes in inputs["mm_hashes"].values()
+            for mm_hash in hashes
+        ]
 
     def shutdown(self) -> None:
         mm_processor_cache = self.mm_processor_cache
@@ -884,6 +934,9 @@ class BaseRenderer(ABC, Generic[_T]):
 
         engine_input["arrival_time"] = arrival_time
 
+        if (hashes := self._rendered_mm_hashes.get()) is not None:
+            hashes.extend(self.get_mm_hashes(engine_input))
+
         return engine_input
 
     async def process_for_engine_async(
@@ -905,6 +958,9 @@ class BaseRenderer(ABC, Generic[_T]):
             )
 
         engine_input["arrival_time"] = arrival_time
+
+        if (hashes := self._rendered_mm_hashes.get()) is not None:
+            hashes.extend(self.get_mm_hashes(engine_input))
 
         return engine_input
 
