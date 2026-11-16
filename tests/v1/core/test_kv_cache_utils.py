@@ -1539,6 +1539,41 @@ def test_get_max_concurrency_for_kv_cache_config():
     assert max_concurrency_hybrid_model == 3
 
 
+@pytest.mark.parametrize("num_blocks", [1023, 1024])
+def test_pool_below_one_max_model_len_request_is_refused(num_blocks):
+    # A pool that cannot hold one request of max_model_len admits such a
+    # request that never finishes (GLM-5.3 DFlash2 at 0.94x and 0.97x).
+    max_model_len = 16384
+    model_config = ModelConfig(
+        "Qwen/Qwen1.5-7B",
+        runner="generate",
+        dtype="float16",
+        max_model_len=max_model_len,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        scheduler_config=SchedulerConfig(
+            max_num_batched_tokens=1024,
+            enable_chunked_prefill=True,
+            max_model_len=max_model_len,
+            is_encoder_decoder=model_config.is_encoder_decoder,
+        ),
+    )
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=32, head_size=128, dtype=torch.float16
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer_0"], spec)],
+    )
+    if num_blocks * 16 < max_model_len:
+        with pytest.raises(ValueError, match="fewer than one request"):
+            kv_cache_utils.check_pool_holds_max_model_len(vllm_config, kv_cache_config)
+    else:
+        kv_cache_utils.check_pool_holds_max_model_len(vllm_config, kv_cache_config)
+
+
 def test_allocate_with_lookahead():
     """Verify that lookahead tokens correctly affect block allocation"""
     block_size = 4
