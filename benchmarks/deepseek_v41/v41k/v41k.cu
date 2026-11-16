@@ -1799,13 +1799,13 @@ __global__ void __launch_bounds__(128 * WPD)
   }
 }
 
-// ---- INDEX_REDUCE: live-prefix TP4 reduce of decode index scores ---------------
-// Each rank's bank: kRedFlags bytes of per-CTA flags (CTA b, rank r at word
-// b * 4 + r), then that rank's FP16 partial scores [8][n_pad] (written by
-// index_scores_decode into its own bank). CTA b publishes a per-CTA epoch to
-// every peer (release, system scope) and waits for theirs (acquire), so no
-// CTA depends on another CTA of its own grid. It then adds columns [0, end)
-// of the four partials in rank order 0..3 in FP32 and rounds once (custom
+// ---- INDEX_REDUCE: live-prefix TP4 reduce of decode index scores
+// --------------- Each rank's bank: kRedFlags bytes of per-CTA flags (CTA b,
+// rank r at word b * 4 + r), then that rank's FP16 partial scores [8][n_pad]
+// (written by index_scores_decode into its own bank). CTA b publishes a per-CTA
+// epoch to every peer (release, system scope) and waits for theirs (acquire),
+// so no CTA depends on another CTA of its own grid. It then adds columns [0,
+// end) of the four partials in rank order 0..3 in FP32 and rounds once (custom
 // all-reduce 1-stage numerics; identical on all ranks), end =
 // (positions[T-1] + 1) / ratio as in index_scores_decode, clamped to width.
 // The all-reduces that separate two decode index calls bound rank skew, so
@@ -2740,9 +2740,12 @@ torch::Tensor v41k_fast_table(int64_t type, torch::Device device) {
   auto stream = at::cuda::getCurrentCUDAStream();
   auto* p = reinterpret_cast<uint32_t*>(out.data_ptr());
   const int blocks = (words + 255) / 256;
-  if (type == 16) v41k_fast::build_fast_table<16><<<blocks, 256, 0, stream>>>(p);
-  if (type == 17) v41k_fast::build_fast_table<17><<<blocks, 256, 0, stream>>>(p);
-  if (type == 29) v41k_fast::build_fast_table<29><<<blocks, 256, 0, stream>>>(p);
+  if (type == 16)
+    v41k_fast::build_fast_table<16><<<blocks, 256, 0, stream>>>(p);
+  if (type == 17)
+    v41k_fast::build_fast_table<17><<<blocks, 256, 0, stream>>>(p);
+  if (type == 29)
+    v41k_fast::build_fast_table<29><<<blocks, 256, 0, stream>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -2779,8 +2782,8 @@ static void v41k_down_rows_fast_launch(half* out, const uint8_t* gathered,
   }
   v41k_fast::down_rows_fast<T, M>
       <<<rows_local / v41k_fast::kDnRows, 32 * v41k_fast::kDnWarps, 0,
-         stream>>>(out, gathered, down, row_stride, rows_local, row_base,
-                   fbook, classes, plan);
+         stream>>>(out, gathered, down, row_stride, rows_local, row_base, fbook,
+                   classes, plan);
 }
 
 // Diet down (v41k_diet.cuh): dynamic shared memory DnDiet<T, M, SA>::kSmem,
@@ -2812,8 +2815,8 @@ static void v41k_down_rows_diet_launch(half* out, const uint8_t* gathered,
   }
   v41k_diet::down_rows_diet<T, M, SA>
       <<<rows_local / v41k_fast::kDnRows, 32 * v41k_fast::kDnWarps, smem,
-         stream>>>(out, gathered, down, row_stride, rows_local, row_base,
-                   fbook, classes, plan);
+         stream>>>(out, gathered, down, row_stride, rows_local, row_base, fbook,
+                   classes, plan);
 }
 
 template <int T>
@@ -2826,10 +2829,9 @@ static void v41k_down_rows_diet_m(int tokens, bool sa, half* out,
   do {                                                                       \
     if constexpr (v41k_diet::dn_sa_fits<T, M>())                             \
       if (sa) {                                                              \
-        v41k_down_rows_diet_launch<T, M, true>(out, gathered, down,          \
-                                               row_stride, rows_local,       \
-                                               row_base, fbook, classes,     \
-                                               plan, stream);                \
+        v41k_down_rows_diet_launch<T, M, true>(                              \
+            out, gathered, down, row_stride, rows_local, row_base, fbook,    \
+            classes, plan, stream);                                          \
         break;                                                               \
       }                                                                      \
     v41k_down_rows_diet_launch<T, M, false>(out, gathered, down, row_stride, \
@@ -2837,12 +2839,24 @@ static void v41k_down_rows_diet_m(int tokens, bool sa, half* out,
                                             classes, plan, stream);          \
   } while (0)
   switch (tokens) {
-    case 1: V41K_DND(1); break;
-    case 2: V41K_DND(2); break;
-    case 3: V41K_DND(3); break;
-    case 4: V41K_DND(4); break;
-    case 5: V41K_DND(5); break;
-    default: V41K_DND(6); break;
+    case 1:
+      V41K_DND(1);
+      break;
+    case 2:
+      V41K_DND(2);
+      break;
+    case 3:
+      V41K_DND(3);
+      break;
+    case 4:
+      V41K_DND(4);
+      break;
+    case 5:
+      V41K_DND(5);
+      break;
+    default:
+      V41K_DND(6);
+      break;
   }
 #undef V41K_DND
 }
@@ -2853,17 +2867,29 @@ static void v41k_down_rows_fast_m(int tokens, half* out,
                                   int row_stride, int rows_local, int row_base,
                                   const uint32_t* fbook, int classes,
                                   const int* plan, cudaStream_t stream) {
-#define V41K_DNF(M)                                                         \
-  v41k_down_rows_fast_launch<T, M>(out, gathered, down, row_stride,         \
-                                   rows_local, row_base, fbook, classes,    \
-                                   plan, stream)
+#define V41K_DNF(M)                                                            \
+  v41k_down_rows_fast_launch<T, M>(out, gathered, down, row_stride,            \
+                                   rows_local, row_base, fbook, classes, plan, \
+                                   stream)
   switch (tokens) {
-    case 1: V41K_DNF(1); break;
-    case 2: V41K_DNF(2); break;
-    case 3: V41K_DNF(3); break;
-    case 4: V41K_DNF(4); break;
-    case 5: V41K_DNF(5); break;
-    default: V41K_DNF(6); break;
+    case 1:
+      V41K_DNF(1);
+      break;
+    case 2:
+      V41K_DNF(2);
+      break;
+    case 3:
+      V41K_DNF(3);
+      break;
+    case 4:
+      V41K_DNF(4);
+      break;
+    case 5:
+      V41K_DNF(5);
+      break;
+    default:
+      V41K_DNF(6);
+      break;
   }
 #undef V41K_DNF
 }
@@ -2878,8 +2904,7 @@ static void v41k_down_rows_impl(torch::Tensor out, torch::Tensor gathered,
                                 int64_t rank_stride, int64_t routes,
                                 torch::Tensor down, int64_t dtype,
                                 int64_t row_base, torch::Tensor fbook,
-                                int64_t classes, torch::Tensor plan,
-                                int diet) {
+                                int64_t classes, torch::Tensor plan, int diet) {
   const at::cuda::OptionalCUDAGuard guard(out.device());
   TORCH_CHECK(dtype == 16 || dtype == 17 || dtype == 29,
               "down_rows_fast: dtype must be 16, 17 or 29");
@@ -2905,11 +2930,12 @@ static void v41k_down_rows_impl(torch::Tensor out, torch::Tensor gathered,
                   gathered.is_contiguous() &&
                   gathered.numel() >= 4 * rank_stride,
               "down_rows_fast: gathered must hold 4 rank slots");
-  TORCH_CHECK(fbook.scalar_type() == torch::kInt32 &&
-                  fbook.numel() == (dtype == 16   ? v41k_fast::FastBook<16>::kWords
-                                    : dtype == 17 ? v41k_fast::FastBook<17>::kWords
-                                                  : v41k_fast::FastBook<29>::kWords),
-              "down_rows_fast: fbook must be fast_table(dtype)");
+  TORCH_CHECK(
+      fbook.scalar_type() == torch::kInt32 &&
+          fbook.numel() == (dtype == 16   ? v41k_fast::FastBook<16>::kWords
+                            : dtype == 17 ? v41k_fast::FastBook<17>::kWords
+                                          : v41k_fast::FastBook<29>::kWords),
+      "down_rows_fast: fbook must be fast_table(dtype)");
   TORCH_CHECK(plan.scalar_type() == torch::kInt32 && plan.numel() >= 289 &&
                   plan.is_contiguous(),
               "down_rows_fast: plan");
@@ -2938,14 +2964,14 @@ static void v41k_down_rows_impl(torch::Tensor out, torch::Tensor gathered,
       v41k_down_rows_diet_m<29>(tokens, sa, o, g, w, rs, rows_local,
                                 int(row_base), b, int(classes), pl, stream);
   } else if (dtype == 16)
-    v41k_down_rows_fast_m<16>(tokens, o, g, w, rs, rows_local, int(row_base),
-                              b, int(classes), pl, stream);
+    v41k_down_rows_fast_m<16>(tokens, o, g, w, rs, rows_local, int(row_base), b,
+                              int(classes), pl, stream);
   else if (dtype == 17)
-    v41k_down_rows_fast_m<17>(tokens, o, g, w, rs, rows_local, int(row_base),
-                              b, int(classes), pl, stream);
+    v41k_down_rows_fast_m<17>(tokens, o, g, w, rs, rows_local, int(row_base), b,
+                              int(classes), pl, stream);
   else
-    v41k_down_rows_fast_m<29>(tokens, o, g, w, rs, rows_local, int(row_base),
-                              b, int(classes), pl, stream);
+    v41k_down_rows_fast_m<29>(tokens, o, g, w, rs, rows_local, int(row_base), b,
+                              int(classes), pl, stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2957,8 +2983,8 @@ void v41k_down_rows_fast(torch::Tensor out, torch::Tensor gathered,
                          torch::Tensor fbook, int64_t classes,
                          torch::Tensor plan) {
   const int f = v41k_expert_diet();
-  v41k_down_rows_impl(out, gathered, rank_stride, routes, down, dtype,
-                      row_base, fbook, classes, plan, (f & 2) ? f : 0);
+  v41k_down_rows_impl(out, gathered, rank_stride, routes, down, dtype, row_base,
+                      fbook, classes, plan, (f & 2) ? f : 0);
 }
 
 // down_rows_diet explicitly (check scripts): sa = 1 copies the activations
@@ -2968,8 +2994,8 @@ void v41k_down_rows_diet(torch::Tensor out, torch::Tensor gathered,
                          torch::Tensor down, int64_t dtype, int64_t row_base,
                          torch::Tensor fbook, int64_t classes,
                          torch::Tensor plan, int64_t sa) {
-  v41k_down_rows_impl(out, gathered, rank_stride, routes, down, dtype,
-                      row_base, fbook, classes, plan, sa ? 5 : 1);
+  v41k_down_rows_impl(out, gathered, rank_stride, routes, down, dtype, row_base,
+                      fbook, classes, plan, sa ? 5 : 1);
 }
 
 template <int T>
@@ -3065,14 +3091,14 @@ static void v41k_gate_up_impl(torch::Tensor xq, torch::Tensor xd,
                   hq.numel() >= int64_t(routes) * 576 &&
                   hd.scalar_type() == torch::kFloat && hd.is_contiguous() &&
                   hd.numel() >= int64_t(routes) * 18 &&
-                  prob.scalar_type() == torch::kFloat &&
-                  prob.numel() >= routes,
+                  prob.scalar_type() == torch::kFloat && prob.numel() >= routes,
               "gate_up_fast: hq / hd / prob sizes");
-  TORCH_CHECK(fbook.scalar_type() == torch::kInt32 &&
-                  fbook.numel() == (gtype == 16   ? v41k_fast::FastBook<16>::kWords
-                                    : gtype == 17 ? v41k_fast::FastBook<17>::kWords
-                                                  : v41k_fast::FastBook<29>::kWords),
-              "gate_up_fast: fbook must be fast_table(gtype)");
+  TORCH_CHECK(
+      fbook.scalar_type() == torch::kInt32 &&
+          fbook.numel() == (gtype == 16   ? v41k_fast::FastBook<16>::kWords
+                            : gtype == 17 ? v41k_fast::FastBook<17>::kWords
+                                          : v41k_fast::FastBook<29>::kWords),
+      "gate_up_fast: fbook must be fast_table(gtype)");
   auto stream = at::cuda::getCurrentCUDAStream();
   auto i8 = [](torch::Tensor& t) {
     return reinterpret_cast<int8_t*>(t.data_ptr());
@@ -3086,27 +3112,26 @@ static void v41k_gate_up_impl(torch::Tensor xq, torch::Tensor xd,
   if (diet) {
     TORCH_CHECK(gate.numel() < (int64_t(1) << 31),
                 "gate_up_diet: gate / up must be < 2 GB (32-bit row offsets)");
-#define V41K_GUD(T)                                                           \
-  v41k_gate_up_diet_launch<T>(grid, int(tokens), i8(hq), hd.data_ptr<float>(), \
-                              i8(xq), xd.data_ptr<float>(),                   \
-                              prob.data_ptr<float>(), gate.data_ptr<uint8_t>(), \
-                              up.data_ptr<uint8_t>(), int(gate.size(2)), b, pl, \
-                              stream)
+#define V41K_GATE_UP_DISPATCH(T)                                              \
+  v41k_gate_up_diet_launch<T>(                                                \
+      grid, int(tokens), i8(hq), hd.data_ptr<float>(), i8(xq),                \
+      xd.data_ptr<float>(), prob.data_ptr<float>(), gate.data_ptr<uint8_t>(), \
+      up.data_ptr<uint8_t>(), int(gate.size(2)), b, pl, stream)
     if (gtype == 16)
-      V41K_GUD(16);
+      V41K_GATE_UP_DISPATCH(16);
     else if (gtype == 17)
-      V41K_GUD(17);
+      V41K_GATE_UP_DISPATCH(17);
     else
-      V41K_GUD(29);
-#undef V41K_GUD
+      V41K_GATE_UP_DISPATCH(29);
+#undef V41K_GATE_UP_DISPATCH
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
-#define V41K_GUF(T)                                                          \
-  v41k_gate_up_fast_launch<T>(grid, i8(hq), hd.data_ptr<float>(), i8(xq),    \
-                              xd.data_ptr<float>(), prob.data_ptr<float>(),  \
-                              gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(), \
-                              int(gate.size(2)), b, pl, stream)
+#define V41K_GUF(T)                                                     \
+  v41k_gate_up_fast_launch<T>(                                          \
+      grid, i8(hq), hd.data_ptr<float>(), i8(xq), xd.data_ptr<float>(), \
+      prob.data_ptr<float>(), gate.data_ptr<uint8_t>(),                 \
+      up.data_ptr<uint8_t>(), int(gate.size(2)), b, pl, stream)
   if (gtype == 16)
     V41K_GUF(16);
   else if (gtype == 17)
@@ -3121,9 +3146,9 @@ static void v41k_gate_up_impl(torch::Tensor xq, torch::Tensor xd,
 // v41k_gate_up_impl); VLLM_V41_EXPERT_DIET bit 1 runs gate_up_diet instead.
 void v41k_gate_up_fast(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
                        torch::Tensor hd, torch::Tensor ids32,
-                       torch::Tensor prob, torch::Tensor gate,
-                       torch::Tensor up, int64_t gtype, torch::Tensor fbook,
-                       torch::Tensor plan, bool build_plan) {
+                       torch::Tensor prob, torch::Tensor gate, torch::Tensor up,
+                       int64_t gtype, torch::Tensor fbook, torch::Tensor plan,
+                       bool build_plan) {
   v41k_gate_up_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, fbook, plan,
                     build_plan, v41k_expert_diet() & 1);
 }
@@ -3131,9 +3156,9 @@ void v41k_gate_up_fast(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
 // gate_up_diet explicitly (check scripts): same arguments as gate_up_fast.
 void v41k_gate_up_diet(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
                        torch::Tensor hd, torch::Tensor ids32,
-                       torch::Tensor prob, torch::Tensor gate,
-                       torch::Tensor up, int64_t gtype, torch::Tensor fbook,
-                       torch::Tensor plan, bool build_plan) {
+                       torch::Tensor prob, torch::Tensor gate, torch::Tensor up,
+                       int64_t gtype, torch::Tensor fbook, torch::Tensor plan,
+                       bool build_plan) {
   v41k_gate_up_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, fbook, plan,
                     build_plan, 1);
 }

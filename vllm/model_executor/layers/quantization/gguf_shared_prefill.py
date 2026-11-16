@@ -877,7 +877,7 @@ class SharedOriginalPrefill:
             (f, min(self.tile_experts, spec.experts - f))
             for f in range(0, spec.experts, self.tile_experts)
         ]
-        iq = None
+        iq: Any = None
         if _PREFILL_IQ_OBSERVE and x.shape[0] > 6:
             from .gguf_prefill_iq_observe import ObservedBaseline
 

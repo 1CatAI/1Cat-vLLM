@@ -10,13 +10,15 @@
 //   1. key decode: every (nibble byte, scale byte) pair against the OCP MX
 //      E2M1 table {0, .5, 1, 1.5, 2, 3, 4, 6} (sign bit 8) and the IEEE meaning
 //      of the scale byte as an FP32 exponent field (0 -> 0, 255 -> inf);
-//   2. scores: ref_scores(), a line-by-line transliteration of the public reference
+//   2. scores: ref_scores(), a line-by-line transliteration of the public
+//   reference
 //      kernel's loops (v41k.cu index_scores_decode: decode into float ks, one
 //      fmaf chain per (row, key), relu/weight/head-sum epilogue), with its own
 //      decode from item 1.
 // Build and run (no GPU, no kernel launch):
-//   nvcc -std=c++17 -O2 -DV41IDX_HOST_TEST v41idx_host_test.cu -o host_test && ./host_test
-//   nvcc ... -DV41IDX_MUTANT_ORDER ... && ./host_test --expect-mismatch   (mutant must be caught)
+//   nvcc -std=c++17 -O2 -DV41IDX_HOST_TEST v41idx_host_test.cu -o host_test &&
+//   ./host_test nvcc ... -DV41IDX_MUTANT_ORDER ... && ./host_test
+//   --expect-mismatch   (mutant must be caught)
 
 #include <cstdio>
 #include <cstdlib>
@@ -61,16 +63,19 @@ static float spec_e2m1(int code) {
   return (code & 8) ? -m : m;  // code 8 -> -0.0f
 }
 static float spec_scale(int e) {
-  if (e == 0) return 0.f;          // exponent field 0, mantissa 0
-  if (e == 255) return INFINITY;   // exponent field all ones, mantissa 0
+  if (e == 0) return 0.f;         // exponent field 0, mantissa 0
+  if (e == 255) return INFINITY;  // exponent field all ones, mantissa 0
   return std::ldexp(1.f, e - 127);
 }
 
-// --- transliteration of the public reference kernel (v41k.cu, G4b decode indexer) --
-static void ref_scores(const std::vector<__half>& q, const std::vector<__half>& w,
+// --- transliteration of the public reference kernel (v41k.cu, G4b decode
+// indexer) --
+static void ref_scores(const std::vector<__half>& q,
+                       const std::vector<__half>& w,
                        const std::vector<uint8_t>& keys, int64_t cap,
-                       const std::vector<int64_t>& positions, std::vector<__half>& out,
-                       int tokens, int heads, int64_t n_out, int ratio) {
+                       const std::vector<int64_t>& positions,
+                       std::vector<__half>& out, int tokens, int heads,
+                       int64_t n_out, int ratio) {
   const int64_t end = (positions[tokens - 1] + 1) / ratio;
   const int RB = 32;
   const int64_t blocks = (cap + RB - 1) / RB;
@@ -109,10 +114,12 @@ static void ref_scores(const std::vector<__half>& q, const std::vector<__half>& 
 
 // --- the kernel bodies, run with the kernel's schedule ---------------------
 template <int H>
-static void tiled_host(const std::vector<__half>& q, const std::vector<__half>& w,
+static void tiled_host(const std::vector<__half>& q,
+                       const std::vector<__half>& w,
                        const std::vector<uint8_t>& keys, int64_t cap,
-                       const std::vector<int64_t>& positions, std::vector<__half>& out,
-                       int tokens, int64_t n_out, int ratio, int grid_cap) {
+                       const std::vector<int64_t>& positions,
+                       std::vector<__half>& out, int tokens, int64_t n_out,
+                       int ratio, int grid_cap) {
   const int64_t end = v41idx::live_end(positions[tokens - 1], ratio, cap);
   const int rows = tokens * H;
   const int nt = ((tokens * v41idx::KL + 31) / 32) * 32;
@@ -144,7 +151,8 @@ static long decode_test() {
   long bad = 0;
   std::vector<uint8_t> row(68 * KB, 0);
   std::vector<__half> ks(KB * v41idx::KS);
-  // row k: nibble byte (k + 64 * rep) in every one of its 64 bytes, scale byte e
+  // row k: nibble byte (k + 64 * rep) in every one of its 64 bytes, scale byte
+  // e
   for (int e = 0; e < 256; ++e) {
     for (int rep = 0; rep < 4; ++rep) {
       for (int k = 0; k < KB; ++k) {
@@ -155,8 +163,10 @@ static long decode_test() {
         v41idx::stage_keys(tid, 96, row.data(), 0, KB, ks.data());
       for (int k = 0; k < KB; ++k) {
         const int byte = k + 64 * rep;
-        const __half elo = __float2half_rn(spec_e2m1(byte & 15) * spec_scale(e));
-        const __half ehi = __float2half_rn(spec_e2m1((byte >> 4) & 15) * spec_scale(e));
+        const __half elo =
+            __float2half_rn(spec_e2m1(byte & 15) * spec_scale(e));
+        const __half ehi =
+            __float2half_rn(spec_e2m1((byte >> 4) & 15) * spec_scale(e));
         for (int b = 0; b < 64; ++b) {
           if (hbits(ks[k * v41idx::KS + 2 * b]) != hbits(elo)) ++bad;
           if (hbits(ks[k * v41idx::KS + 2 * b + 1]) != hbits(ehi)) ++bad;
@@ -167,18 +177,24 @@ static long decode_test() {
   // mixed scales per 32-element group (byte b uses scale 64 + b / 16)
   for (int k = 0; k < KB; ++k)
     for (int i = 0; i < 68; ++i) row[k * 68 + i] = uint8_t(rnd());
-  for (int tid = 0; tid < 96; ++tid) v41idx::stage_keys(tid, 96, row.data(), 0, KB, ks.data());
+  for (int tid = 0; tid < 96; ++tid)
+    v41idx::stage_keys(tid, 96, row.data(), 0, KB, ks.data());
   for (int k = 0; k < KB; ++k)
     for (int b = 0; b < 64; ++b) {
       const int byte = row[k * 68 + b], e = row[k * 68 + 64 + b / 16];
-      if (hbits(ks[k * v41idx::KS + 2 * b]) != hbits(__float2half_rn(spec_e2m1(byte & 15) * spec_scale(e)))) ++bad;
-      if (hbits(ks[k * v41idx::KS + 2 * b + 1]) != hbits(__float2half_rn(spec_e2m1(byte >> 4) * spec_scale(e)))) ++bad;
+      if (hbits(ks[k * v41idx::KS + 2 * b]) !=
+          hbits(__float2half_rn(spec_e2m1(byte & 15) * spec_scale(e))))
+        ++bad;
+      if (hbits(ks[k * v41idx::KS + 2 * b + 1]) !=
+          hbits(__float2half_rn(spec_e2m1(byte >> 4) * spec_scale(e))))
+        ++bad;
     }
   return bad;
 }
 
-// A stale live position must not consume the guarded allocation beyond capacity.
-// The reference grid has exactly two 32-key blocks for this aligned capacity.
+// A stale live position must not consume the guarded allocation beyond
+// capacity. The reference grid has exactly two 32-key blocks for this aligned
+// capacity.
 static int capacity_test() {
   constexpr int cap = 64, allocated = 128, heads = 8;
   std::vector<__half> q(heads * 128, __float2half_rn(1.f));
@@ -202,12 +218,18 @@ static int capacity_test() {
 }
 
 int main(int argc, char** argv) {
-  if (argc > 1 && std::string(argv[1]) == "--capacity-only") return capacity_test();
+  if (argc > 1 && std::string(argv[1]) == "--capacity-only")
+    return capacity_test();
   if (capacity_test() != 0) return 1;
-  const bool expect_mismatch = argc > 1 && std::string(argv[1]) == "--expect-mismatch";
-  long cases = 0, mismatch_cases = 0, mismatched = 0, compared = 0, nonfinite = 0, written = 0, written_finite = 0;
+  const bool expect_mismatch =
+      argc > 1 && std::string(argv[1]) == "--expect-mismatch";
+  long cases = 0, mismatch_cases = 0, mismatched = 0, compared = 0,
+       nonfinite = 0, written = 0, written_finite = 0;
   long decode_bad = decode_test();
-  std::printf("DECODE exhaustive 256 bytes x 256 scale bytes + mixed groups: %ld mismatches\n", decode_bad);
+  std::printf(
+      "DECODE exhaustive 256 bytes x 256 scale bytes + mixed groups: %ld "
+      "mismatches\n",
+      decode_bad);
   const int caps[] = {1, 63, 64, 65, 300};
   const int grids[] = {1, 3, 160};
   for (int heads : {8, 4}) {
@@ -215,37 +237,49 @@ int main(int argc, char** argv) {
       for (int cap : caps) {
         for (int ratio : {1, 4}) {
           for (int mode = 0; mode < 2; ++mode) {
-            const int64_t full = int64_t(cap) * ratio;  // positions[T-1] + 1 -> end = cap
-            const int64_t ends_pos[] = {0, 1, int64_t(ratio), full / 2, full - 1, full};
+            const int64_t full =
+                int64_t(cap) * ratio;  // positions[T-1] + 1 -> end = cap
+            const int64_t ends_pos[] = {0,        1,        int64_t(ratio),
+                                        full / 2, full - 1, full};
             for (int64_t p1 : ends_pos) {
               for (int grid : grids) {
                 const int rows = tokens * heads;
                 std::vector<__half> q(rows * 128), w(rows);
                 for (auto& v : q) {
                   float f = gauss();
-                  if (mode == 1) {  // extremes: large, overflowing dots, some inf / nan
+                  if (mode ==
+                      1) {  // extremes: large, overflowing dots, some inf / nan
                     const float r = uni();
                     f = r < 0.02f ? (r < 0.01f ? INFINITY : NAN) : f * 30000.f;
                   }
                   v = __float2half_rn(f);
                 }
-                for (auto& v : w) v = __float2half_rn(mode == 1 ? gauss() * 300.f : gauss() * 0.1f);
+                for (auto& v : w)
+                  v = __float2half_rn(mode == 1 ? gauss() * 300.f
+                                                : gauss() * 0.1f);
                 std::vector<uint8_t> keys(size_t(cap) * 68);
                 for (int64_t n = 0; n < cap; ++n) {
-                  for (int b = 0; b < 64; ++b) keys[n * 68 + b] = uint8_t(rnd());
+                  for (int b = 0; b < 64; ++b)
+                    keys[n * 68 + b] = uint8_t(rnd());
                   for (int g = 0; g < 4; ++g)
-                    keys[n * 68 + 64 + g] = mode == 1 ? uint8_t(rnd()) : uint8_t(118 + rnd() % 14);
+                    keys[n * 68 + 64 + g] =
+                        mode == 1 ? uint8_t(rnd()) : uint8_t(118 + rnd() % 14);
                 }
                 std::vector<int64_t> positions(tokens);
-                for (int t = 0; t < tokens; ++t) positions[t] = p1 - 1 - (tokens - 1 - t);
+                for (int t = 0; t < tokens; ++t)
+                  positions[t] = p1 - 1 - (tokens - 1 - t);
                 const int64_t n_out = cap + 7;
                 std::vector<__half> a(tokens * n_out), b(tokens * n_out);
-                for (size_t i = 0; i < a.size(); ++i) a[i] = b[i] = hfrom(uint16_t(0x7E00 | (i & 0x1FF)));
-                ref_scores(q, w, keys, cap, positions, a, tokens, heads, n_out, ratio);
+                for (size_t i = 0; i < a.size(); ++i)
+                  a[i] = b[i] = hfrom(uint16_t(0x7E00 | (i & 0x1FF)));
+                ref_scores(q, w, keys, cap, positions, a, tokens, heads, n_out,
+                           ratio);
                 if (heads == 8)
-                  tiled_host<8>(q, w, keys, cap, positions, b, tokens, n_out, ratio, grid);
+                  tiled_host<8>(q, w, keys, cap, positions, b, tokens, n_out,
+                                ratio, grid);
                 else
-                  tiled_host<4>(q, w, keys, cap, positions, b, tokens, n_out, ratio, grid);
+                  tiled_host<4>(q, w, keys, cap, positions, b, tokens, n_out,
+                                ratio, grid);
                 long m = 0;
                 for (size_t i = 0; i < a.size(); ++i) {
                   if (hbits(a[i]) != hbits(b[i])) ++m;
@@ -261,8 +295,11 @@ int main(int argc, char** argv) {
                 if (m) {
                   ++mismatch_cases;
                   if (!expect_mismatch && mismatch_cases <= 5)
-                    std::printf("MISMATCH heads %d tokens %d cap %d ratio %d mode %d p1 %lld grid %d: %ld\n",
-                                heads, tokens, cap, ratio, mode, (long long)p1, grid, m);
+                    std::printf(
+                        "MISMATCH heads %d tokens %d cap %d ratio %d mode %d "
+                        "p1 %lld grid %d: %ld\n",
+                        heads, tokens, cap, ratio, mode, (long long)p1, grid,
+                        m);
                 }
               }
             }
@@ -271,8 +308,12 @@ int main(int argc, char** argv) {
       }
     }
   }
-  std::printf("SCORES %ld cases, %ld values compared (%ld non-finite incl. poison; %ld written by the reference, %ld of them finite), %ld mismatched values in %ld cases\n",
-              cases, compared, nonfinite, written, written_finite, mismatched, mismatch_cases);
+  std::printf(
+      "SCORES %ld cases, %ld values compared (%ld non-finite incl. poison; %ld "
+      "written by the reference, %ld of them finite), %ld mismatched values in "
+      "%ld cases\n",
+      cases, compared, nonfinite, written, written_finite, mismatched,
+      mismatch_cases);
   if (!expect_mismatch && (written < 100000 || written_finite < 50000)) {
     std::printf("FAILED: too few written values for a meaningful comparison\n");
     return 1;

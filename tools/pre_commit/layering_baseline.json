@@ -283,7 +283,7 @@
   "platform": 13
  },
  "vllm/model_executor/layers/quantization/fp8.py": {
-  "platform": 62
+  "platform": 63
  },
  "vllm/model_executor/layers/quantization/modelopt.py": {
   "platform": 87

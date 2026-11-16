@@ -25,11 +25,11 @@ modules need a CUDA build to import). CPU checks, with fake v41k ops:
 """
 
 import ast
-import re
 import sys
 import types
 from pathlib import Path
 
+import regex as re
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -66,7 +66,7 @@ def _functions(path, names, namespace):
     tree = ast.parse(path.read_text())
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names), [n.name for n in nodes]
-    exec(compile(ast.Module(nodes, []), str(path), "exec"), namespace)
+    exec(compile(ast.Module(nodes, []), str(path), "exec"), namespace)  # type: ignore[arg-type]
     return namespace
 
 
@@ -86,7 +86,7 @@ def fake_scores(out, q, w, keys, positions, heads, ratio):
     tokens = out.shape[0]
     end = int(positions[tokens - 1] + 1) // ratio
     dots = torch.einsum(
-        "thd,nd->thn", q.view(tokens, heads, 128).float(), keys[:end].float()
+        "tgd,nd->tgn", q.view(tokens, heads, 128).float(), keys[:end].float()
     )
     s = dots.half().float().clamp_min(0)
     s = (s * w.view(tokens, heads, 1).float()).half().float()
@@ -126,7 +126,7 @@ class FakeV41k:
         for p in (p0, p1, p2, p3):
             part = self.registry[p].partial[:tokens, :end].float()
             acc = part if acc is None else acc + part
-        out[:, :end] = acc.half()
+        out[:, :end] = acc.half()  # type: ignore[union-attr]
         epochs.add_(1)
 
 
@@ -153,10 +153,10 @@ class Bank:
 def _ops(cuda=True):
     v41k = FakeV41k()
     topk = types.ModuleType("vllm.models.deepseek_v41.index_topk")
-    topk.index_topk = lambda out, s, p, v, ratio, k: reference_topk(
+    topk.index_topk = lambda out, s, p, v, ratio, k: reference_topk(  # type: ignore[attr-defined]
         out, s, p, v, ratio, k
     )
-    topk.index_topk_parallel = topk.index_topk
+    topk.index_topk_parallel = topk.index_topk  # type: ignore[attr-defined]
     _fake_module(topk)
     namespace = dict(torch=TorchProxy(v41k), _cuda_index_scores=lambda: cuda)
     _functions(OPS, ("_index_reduce_live", "select_packed_positions"), namespace)
@@ -317,7 +317,7 @@ def test_live_scores_equal_custom_ar_sum():
 
 def test_too_many_tokens_fall_back():
     case = _case(3, 1001, 3, 500, 1)
-    on, calls, v41k, _ = _knob_on(*case, decode_rows=2)
+    on, calls, v41k, _ = _knob_on(*case, decode_rows=2)  # type: ignore[misc]
     assert v41k.reduce_calls == []
     assert calls == [(3, 1001)] * RANKS
     expected, _ = _reference(*case)
@@ -351,7 +351,7 @@ def _ready(knob, world=4, ca=True, disabled=False, connected=True, op=True):
     warnings = []
     logger = types.SimpleNamespace(warning=lambda *a: warnings.append(a))
     moe = types.ModuleType("vllm.model_executor.layers.quantization.gguf_v41_moe")
-    moe._expert_major_ready = lambda: True
+    moe._expert_major_ready = lambda: True  # type: ignore[attr-defined]
     _fake_module(moe)
     v41k = types.SimpleNamespace(**({"index_reduce_live": object()} if op else {}))
     namespace = dict(
@@ -366,7 +366,7 @@ def _ready(knob, world=4, ca=True, disabled=False, connected=True, op=True):
         else None
     )
     group = types.SimpleNamespace(world_size=world, device_communicator=comm)
-    return namespace["_index_bank_ready"](group), warnings
+    return namespace["_index_bank_ready"](group), warnings  # type: ignore[operator]
 
 
 def test_bank_gate():
@@ -416,7 +416,7 @@ def test_kernel_walk_covers_live_columns():
         n_pad = (rows + 7) // 8 * 8
         written = _kernel_walk(tokens, end, n_pad)
         for t in range(tokens):
-            cols = set()
+            cols = set()  # type: ignore[var-annotated]
             for at in written:
                 if at // (n_pad // 8) == t:
                     cols.update(

@@ -1155,7 +1155,7 @@ _V41_LATE_GATHER = envs.VLLM_V41_LATE_GATHER == "1"
 # graph per shape (GPUModelRunner._v41_propose_graphed).
 _V41_PROPOSE_GRAPH = envs.VLLM_V41_PROPOSE_GRAPH == "1"
 _V41_GREEDY_VERIFY = envs.VLLM_V41_NATIVE == "1" and envs.VLLM_V41_GREEDY_VERIFY == "1"
-_COUPLED_DRAFTS = os.getenv("VLLM_V41_COUPLED_DRAFTS", "0") == "1"
+_COUPLED_DRAFTS = envs.VLLM_V41_COUPLED_DRAFTS == "1"
 
 
 class GPUModelRunner(

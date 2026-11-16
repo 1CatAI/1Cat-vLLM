@@ -183,7 +183,7 @@ def matrix(st, dev, quick, sanitize, seed=517):
                                     run_case(
                                         st, H, T, keys, q, w, pos, ratio, bank, tag
                                     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
 
 def graph_replay(st, dev):
@@ -195,7 +195,7 @@ def graph_replay(st, dev):
     pos = positions_for(T, 1, 4, 0).to(dev)
     out = poison(T, cap + 40, dev)
     torch.ops.v41idx.index_scores_tiled(out, q, w, keys, pos, H, 4)  # warm (eager)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         torch.ops.v41idx.index_scores_tiled(out, q, w, keys, pos, H, 4)
@@ -206,7 +206,7 @@ def graph_replay(st, dev):
             g.replay()
             ref = poison(T, cap + 40, dev)
             torch.ops.v41k.index_scores_decode(ref, q, w, keys, pos, H, 4)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             st.cases += 1
             if not torch.equal(out.view(torch.int16), ref.view(torch.int16)):
                 st.bad.append(f"graph replay end{end}+{off}: tiled!=v41k")
@@ -228,14 +228,14 @@ keys = c.make_keys(cap, "real", gen, dev)
 q, w = c.make_qw(T * H, "normal", gen, dev)
 pos = c.positions_for(T, 30000, 4, 1).to(dev)
 out = c.poison(T, cap, dev)
-torch.cuda.synchronize()
+torch.accelerator.synchronize()
 g = torch.cuda.CUDAGraph()
 with torch.cuda.graph(g):
     torch.ops.v41idx.index_scores_tiled(out, q, w, keys, pos, H, 4)
 g.replay()
 ref = c.poison(T, cap, dev)
 torch.ops.v41k.index_scores_decode(ref, q, w, keys, pos, H, 4)
-torch.cuda.synchronize()
+torch.accelerator.synchronize()
 print("FIRSTCAP", "OK" if torch.equal(out.view(torch.int16), ref.view(torch.int16)) else "MISMATCH")
 """
 
@@ -280,7 +280,7 @@ def timing(dev, lines):
                     else torch.ops.v41idx.index_scores_tiled
                 )
                 op(out, q, w, keys, pos, H, 4)
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
                     for _ in range(20):
@@ -295,7 +295,7 @@ def timing(dev, lines):
                 for _ in range(50):
                     g.replay()
                 e.record()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 res[name] = s.elapsed_time(e) * 1000.0 / (50 * 20)
             line = (
                 f"TIME H{H} T{T} cap{cap} keys{end}: v41k {res['v41k']:.1f} us "

@@ -434,7 +434,6 @@ class V41Compressor(nn.Module):
 class V41Indexer(nn.Module):
     def __init__(self, c, quant_config, source, ratio, prefix):
         super().__init__()
-        from vllm.config import get_current_vllm_config
 
         from .index_tiled import IndexTiledScorer
 

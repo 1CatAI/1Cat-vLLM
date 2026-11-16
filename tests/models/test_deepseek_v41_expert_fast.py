@@ -78,7 +78,7 @@ def _module(fast, ops, peer, plan_fuse=False):
         calls.append(("q8_aligned", (xq, xd, x)))
         return gate_up7
 
-    nccl = types.SimpleNamespace(all_gather=lambda dst, src: calls.append(("ag",)))
+    nccl = types.SimpleNamespace(all_gather=lambda dst, src: calls.append(("ag",)))  # type: ignore[arg-type]
     torch = types.SimpleNamespace(
         ops=types.SimpleNamespace(
             v41k=types.SimpleNamespace(**{n: op(n) for n in ops})
@@ -106,7 +106,7 @@ def _module(fast, ops, peer, plan_fuse=False):
         "_book": lambda kind, device: FakeTensor(f"book{kind}"),
         "ROWS_FLAGS": 99,
     }
-    exec(compile(ast.Module(fns, []), str(MOE), "exec"), ns)
+    exec(compile(ast.Module(fns, []), str(MOE), "exec"), ns)  # type: ignore[arg-type]
     return ns["_v41_experts_rows"], calls, logs
 
 

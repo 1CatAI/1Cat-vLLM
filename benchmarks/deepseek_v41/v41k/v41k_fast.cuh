@@ -139,9 +139,8 @@ V41KF_HD uint32_t lds_byte_off(const uint32_t* book, uint32_t off) {
 // Lane byte offsets into the replicated tables: lg = 4 (lane % 32) for the
 // IQ2_XXS grid (R = 32), ls = 4 (lane % 16) for the R = 16 tables.
 // IQ2_XXS: w0 = 4 grid bytes, w1 = 4 x 7 sign bits + 4-bit scale.
-V41KF_HD void dec16(uint32_t w0, uint32_t w1, const uint32_t* book,
-                    uint32_t lg, uint32_t ls, uint32_t (&w)[8], int& m0,
-                    int& m1) {
+V41KF_HD void dec16(uint32_t w0, uint32_t w1, const uint32_t* book, uint32_t lg,
+                    uint32_t ls, uint32_t (&w)[8], int& m0, int& m1) {
   using FB = FastBook<16>;
 #pragma unroll
   for (int o = 0; o < 4; ++o) {
@@ -156,9 +155,8 @@ V41KF_HD void dec16(uint32_t w0, uint32_t w1, const uint32_t* book,
 }
 
 // IQ2_XS: four 16-bit codes (9-bit grid index, 7 sign bits); sc = scale byte.
-V41KF_HD void dec17(uint32_t w0, uint32_t w1, uint32_t sc,
-                    const uint32_t* book, uint32_t ls, uint32_t (&w)[8],
-                    int& m0, int& m1) {
+V41KF_HD void dec17(uint32_t w0, uint32_t w1, uint32_t sc, const uint32_t* book,
+                    uint32_t ls, uint32_t (&w)[8], int& m0, int& m1) {
   using FB = FastBook<17>;
 #pragma unroll
   for (int o = 0; o < 4; ++o) {
@@ -213,8 +211,9 @@ V41KF_HD float fast_dot(const uint32_t (&w)[8], const int (&q)[8], float d,
 #pragma unroll
   for (int i = 4; i < 8; ++i) s1 = dp4a(w[i], q[i], s1);
 #if defined(__CUDA_ARCH__)
-  return __fmaf_rn(__fmul_rn(__fmul_rn(d, xd), __int2float_rn(s0 * m0 + s1 * m1)),
-                   0.125f, acc);
+  return __fmaf_rn(
+      __fmul_rn(__fmul_rn(d, xd), __int2float_rn(s0 * m0 + s1 * m1)), 0.125f,
+      acc);
 #else
   const volatile float a = d * xd;
   const volatile float b = a * float(s0 * m0 + s1 * m1);
@@ -236,8 +235,8 @@ __global__ void build_fast_table(uint32_t* __restrict__ out) {
 // Global table -> replicated shared table.
 template <int Type>
 __device__ __forceinline__ void fill_book(uint32_t* book,
-                                          const uint32_t* __restrict__ g,
-                                          int t, int nt) {
+                                          const uint32_t* __restrict__ g, int t,
+                                          int nt) {
   using FB = FastBook<Type>;
   for (int i = t; i < FB::kSmemWords; i += nt) {
     int src = i;
@@ -258,53 +257,53 @@ __device__ __forceinline__ uint32_t ldg16(const uint8_t* p) {
 // but makes them the first victims, so they do not push the activations out
 // of L1. Non-volatile asm: ptxas schedules these like __ldg.
 __device__ __forceinline__ uint32_t ldw32(const void* p) {
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   uint32_t v;
   asm("ld.global.nc.L1::evict_first.u32 %0, [%1];" : "=r"(v) : "l"(p));
   return v;
-#else
+  #else
   return *static_cast<const uint32_t*>(p);
-#endif
+  #endif
 }
 __device__ __forceinline__ uint32_t ldw16(const void* p) {
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   unsigned short v;
   asm("ld.global.nc.L1::evict_first.u16 %0, [%1];" : "=h"(v) : "l"(p));
   return v;
-#else
+  #else
   return *static_cast<const unsigned short*>(p);
-#endif
+  #endif
 }
 __device__ __forceinline__ uint32_t ldw8(const void* p) {
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   unsigned short v;
   asm("ld.global.nc.L1::evict_first.u8 %0, [%1];" : "=h"(v) : "l"(p));
   return v;
-#else
+  #else
   return *static_cast<const uint8_t*>(p);
-#endif
+  #endif
 }
 __device__ __forceinline__ uint2 ldw64(const void* p) {
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   uint2 v;
   asm("ld.global.nc.L1::evict_first.v2.u32 {%0, %1}, [%2];"
       : "=r"(v.x), "=r"(v.y)
       : "l"(p));
   return v;
-#else
+  #else
   return *static_cast<const uint2*>(p);
-#endif
+  #endif
 }
 
 // Prefetch the line holding p into L1 (CCTL.E.PF1 on sm_70): no register,
 // no wait. Activations are prefetched one unit ahead so their loads hit L1
 // instead of exposing L2 / DRAM latency at every K block.
 __device__ __forceinline__ void prefetch_l1(const void* p) {
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   asm volatile("prefetch.global.L1 [%0];" ::"l"(p));
-#else
+  #else
   (void)p;
-#endif
+  #endif
 }
 
 // Raw fields of the 9 K blocks of one (row, sub) of a 2304-wide down row,
@@ -315,9 +314,9 @@ __device__ __forceinline__ void prefetch_l1(const void* p) {
 // the row offset at every block.
 template <class T>
 __device__ __forceinline__ void pin_ptr(T*& p) {
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   asm volatile("" : "+l"(p));
-#endif
+  #endif
 }
 template <int Type>
 struct DnRaw;
@@ -386,10 +385,9 @@ struct DnRaw<17> {
     dh[j] = ldw16(p.row + 74 * j);
     sc[j] = ldw8(p.scp + 74 * j);
   }
-  __device__ __forceinline__ void decode(int j, const uint32_t* book,
-                                         uint32_t, uint32_t ls, int,
-                                         uint32_t (&w)[8], float& d, int& m0,
-                                         int& m1) const {
+  __device__ __forceinline__ void decode(int j, const uint32_t* book, uint32_t,
+                                         uint32_t ls, int, uint32_t (&w)[8],
+                                         float& d, int& m0, int& m1) const {
     const uint32_t sh = ((a + 2 * j) & 3) * 8;
     const uint32_t w0 = __funnelshift_r(x[j][0], x[j][1], sh);
     const uint32_t w1 = __funnelshift_r(x[j][1], x[j][2], sh);
@@ -512,7 +510,7 @@ __global__ void __launch_bounds__(32 * kDnWarps, 1)
   using Ptr = typename DnRaw<Type>::Ptr;
   if (u < units) {
     const int q0 = u >> 2, c0 = __ldg(plan + 37 + q0);
-#pragma unroll
+  #pragma unroll
     for (int c = 0; c < 6; ++c) {
       if (c >= c0) break;
       dn_prefetch_route<RS, QB>(gathered, __ldg(plan + 73 + 6 * q0 + c), lane);
@@ -522,15 +520,15 @@ __global__ void __launch_bounds__(32 * kDnWarps, 1)
                             row_stride,
                  sub);
     raw.set(p0);
-#pragma unroll
+  #pragma unroll
     for (int j = 0; j < 9; ++j) raw.load(j, p0);
   }
   // Lane byte offsets into the replicated tables, kept in registers (opaque
   // to the compiler, which would otherwise re-mask the lane per lookup).
   uint32_t lg = uint32_t(lane) * 4, ls = uint32_t(lane & 15) * 4;
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   asm volatile("" : "+r"(lg), "+r"(ls));
-#endif
+  #endif
   fill_book<Type>(book, fbook, t, 32 * kDnWarps);
   __syncthreads();
   const int nu = s_nu;
@@ -551,7 +549,7 @@ __global__ void __launch_bounds__(32 * kDnWarps, 1)
     const bool more = nxt < units;
     if (more) {
       const int qn = nxt >> 2, cn = s_cnt[qn];
-#pragma unroll
+  #pragma unroll
       for (int c = 0; c < 6; ++c) {
         if (c >= cn) break;
         dn_prefetch_route<RS, QB>(gathered, s_route[qn][c], lane);
@@ -565,12 +563,12 @@ __global__ void __launch_bounds__(32 * kDnWarps, 1)
     np.pin();
     const int q = u >> 2, slab = u & 3, cnt = s_cnt[q];
     int rt[6];
-#pragma unroll
+  #pragma unroll
     for (int c = 0; c < 6; ++c) rt[c] = s_route[q][c];
     const uint8_t* const pq0 = gq + rt[0] * (LG * 32);
     const float* const pd0 = gd + rt[0] * LG;
     float p[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-#pragma unroll
+  #pragma unroll
     for (int j = 0; j < 9; ++j) {
       uint32_t w[8];
       float d;
@@ -586,7 +584,7 @@ __global__ void __launch_bounds__(32 * kDnWarps, 1)
         load_act(pq0 + qo, pd0 + dof, qv, xd);
         p[0] = fast_dot(w, qv, d, xd, m0, m1, p[0]);
       }
-#pragma unroll
+  #pragma unroll
       for (int c = 1; c < 6; ++c) {
         if (c >= cnt) break;
         int qv[8];
@@ -595,7 +593,7 @@ __global__ void __launch_bounds__(32 * kDnWarps, 1)
         p[c] = fast_dot(w, qv, d, xd, m0, m1, p[c]);
       }
     }
-#pragma unroll
+  #pragma unroll
     for (int c = 0; c < 6; ++c) {
       if (c >= cnt) break;
       p[c] += __shfl_xor_sync(0xffffffffU, p[c], 1);
@@ -610,14 +608,14 @@ __global__ void __launch_bounds__(32 * kDnWarps, 1)
   if (t < kDnRows * M) {
     const int k = t / kDnRows, rl = t % kDnRows;
     int key[TOP_K];
-#pragma unroll
+  #pragma unroll
     for (int i = 0; i < TOP_K; ++i) key[i] = s_key[k * TOP_K + i];
     float total = 0.f, acc = 0.f;
     int last = -1, cls = -1;
-#pragma unroll
+  #pragma unroll
     for (int n = 0; n < TOP_K; ++n) {
       int best = 0x7fffffff, bi = 0;
-#pragma unroll
+  #pragma unroll
       for (int i = 0; i < TOP_K; ++i)
         if (key[i] > last && key[i] < best) {
           best = key[i];
@@ -635,7 +633,7 @@ __global__ void __launch_bounds__(32 * kDnWarps, 1)
     }
     if (cls >= 0) total += acc;
     out[k * N + row_base + row0 + rl] = __float2half_rn(total);
-#pragma unroll
+  #pragma unroll
     for (int o = 0; o < 4; ++o)
       if (o * rows_local != row_base)
         out[k * N + o * rows_local + row0 + rl] = __float2half_rn(0.f);

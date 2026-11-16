@@ -93,8 +93,8 @@ V41KF_HD void dec29_words(uint32_t a, uint32_t b, const uint32_t* book,
 // fast_dot with S = s0 m0 + s1 m1 (two chains) or, for equal multipliers,
 // S = (s0 + s1) m from one chain: the same integer. Float ops = fast_dot's.
 template <bool OneM>
-V41KF_HD float dot(const uint32_t (&w)[8], const int (&q)[8], float d,
-                   float xd, int m0, int m1, float acc) {
+V41KF_HD float dot(const uint32_t (&w)[8], const int (&q)[8], float d, float xd,
+                   int m0, int m1, float acc) {
   int S;
   if constexpr (OneM) {
     int s = 0;
@@ -111,8 +111,7 @@ V41KF_HD float dot(const uint32_t (&w)[8], const int (&q)[8], float d,
     S = s0 * m0 + s1 * m1;
   }
 #if defined(__CUDA_ARCH__)
-  return __fmaf_rn(__fmul_rn(__fmul_rn(d, xd), __int2float_rn(S)), 0.125f,
-                   acc);
+  return __fmaf_rn(__fmul_rn(__fmul_rn(d, xd), __int2float_rn(S)), 0.125f, acc);
 #else
   const volatile float a = d * xd;
   const volatile float b = a * float(S);
@@ -130,7 +129,7 @@ V41KF_HD float dot(const uint32_t (&w)[8], const int (&q)[8], float d,
 template <bool Mad = true>
 __device__ __forceinline__ const uint8_t* at(const uint8_t* base, uint32_t off,
                                              uint32_t one) {
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   if constexpr (Mad) {
     const uint8_t* p;
     asm("mad.wide.u32 %0, %1, %2, %3;"
@@ -138,7 +137,7 @@ __device__ __forceinline__ const uint8_t* at(const uint8_t* base, uint32_t off,
         : "r"(off), "r"(one), "l"(base));
     return p;
   }
-#endif
+  #endif
   (void)one;
   return base + off;
 }
@@ -216,7 +215,8 @@ struct DietRaw<16> {  // IQ2_XXS, 66-byte blocks
   }
   struct Lane {
     uint32_t sh;
-    __device__ __forceinline__ Lane(int, int l, uint32_t) : sh(l < 8 ? 16 : 0) {}
+    __device__ __forceinline__ Lane(int, int l, uint32_t)
+        : sh(l < 8 ? 16 : 0) {}
   };
   __device__ __forceinline__ void decode(const uint32_t* book, const Lane& ln,
                                          uint32_t lg, uint32_t ls,
@@ -233,7 +233,9 @@ struct DietRaw<17> {  // IQ2_XS, 74-byte blocks
   struct Base {
     const uint8_t *w, *d, *s;
     __device__ __forceinline__ Base(const uint8_t* m, int boff, int sub)
-        : w(m + diet_wofs<74>(boff, sub)), d(m + boff), s(m + boff + 66 + sub) {}
+        : w(m + diet_wofs<74>(boff, sub)),
+          d(m + boff),
+          s(m + boff + 66 + sub) {}
   };
   struct Addr {
     const uint8_t *w, *d, *s;
@@ -252,7 +254,8 @@ struct DietRaw<17> {  // IQ2_XS, 74-byte blocks
   }
   struct Lane {
     uint32_t sh;
-    __device__ __forceinline__ Lane(int, int l, uint32_t) : sh(l < 8 ? 16 : 0) {}
+    __device__ __forceinline__ Lane(int, int l, uint32_t)
+        : sh(l < 8 ? 16 : 0) {}
   };
   __device__ __forceinline__ void decode(const uint32_t* book, const Lane& ln,
                                          uint32_t, uint32_t ls,
@@ -310,11 +313,11 @@ __global__ void __launch_bounds__(512, 1)
   constexpr int STEPS = 10, SLABS = 18, STEP = Raw::STEP;
   constexpr int ACT0 = GuDiet<Type>::kBookBytes;
   constexpr bool kOneM = Type == 16;
-#if defined(V41K_HOST_EMU)  // host emulator: CTAs run one at a time
+  #if defined(V41K_HOST_EMU)  // host emulator: CTAs run one at a time
   alignas(16) static uint8_t dsm[GuDiet<Type>::smem(6)];
-#else
+  #else
   extern __shared__ __align__(16) uint8_t dsm[];
-#endif
+  #endif
   __shared__ float red[2][6][2][32];
   uint32_t* const book = reinterpret_cast<uint32_t*>(dsm);
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -329,9 +332,9 @@ __global__ void __launch_bounds__(512, 1)
     return uint32_t((e * 576 + (un % SLABS) * 32 + lrow) * row_stride);
   };
   uint32_t one = 1;
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   asm volatile("" : "+r"(one));
-#endif
+  #endif
   const Base bg(gate, boff, sub), bu(up, boff, sub);
   v41k_fast::GuUnit cur = v41k_fast::gu_unit(plan, unit);
   uint32_t uoff = rows(unit, cur.e);
@@ -376,9 +379,9 @@ __global__ void __launch_bounds__(512, 1)
     }
   }
   uint32_t lg = uint32_t(lane) * 4, ls = uint32_t(lane & 15) * 4;
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   asm volatile("" : "+r"(lg), "+r"(ls));
-#endif
+  #endif
   const typename Raw::Lane ln(sub, l, one);
   __syncthreads();
   int buf = 0;
@@ -389,7 +392,7 @@ __global__ void __launch_bounds__(512, 1)
     const uint32_t noff = more ? rows(nunit, nxt.e) : uoff;
     // member record offsets (+ the lane's group l); tok[c] = token * 160
     uint32_t mr[6];
-#pragma unroll
+  #pragma unroll
     for (int c = 0; c < 6; ++c)
       mr[c] = uint32_t(ACT0 + kRec * (cur.tok[c] + l));
     const int cnt = cur.cnt;
@@ -408,7 +411,7 @@ __global__ void __launch_bounds__(512, 1)
       ru.decode(book, ln, lg, ls, wu, du, mu0, mu1);
       rg.load(ag, imm);
       ru.load(au, imm);
-#pragma unroll
+  #pragma unroll
       for (int c = 0; c < 6; ++c) {
         if (c >= cnt) break;  // block-uniform; cnt >= 1
         const int a = c & 1, b = a ^ 1;
@@ -419,7 +422,7 @@ __global__ void __launch_bounds__(512, 1)
       }
     };
     uint32_t off = uoff;
-#pragma unroll 1
+  #pragma unroll 1
     for (int k = 0; k < STEPS / 2; ++k) {
       // loads of steps 2k + 2, 2k + 3; the last pair loads the next unit's
       // steps 0, 1 (or reloads this unit's when there is none: harmless)
@@ -429,10 +432,10 @@ __global__ void __launch_bounds__(512, 1)
       step(ga, ua, so, ag, au, 0);
       step(gb, ub, so + 16 * kRec, ag, au, STEP);
     }
-#pragma unroll
+  #pragma unroll
     for (int c = 0; c < 6; ++c) {
       if (c >= cur.cnt) break;
-#pragma unroll
+  #pragma unroll
       for (int o = 8; o; o >>= 1) {
         gs[c] += __shfl_xor_sync(0xffffffffU, gs[c], o);
         us[c] += __shfl_xor_sync(0xffffffffU, us[c], o);
@@ -455,8 +458,7 @@ __global__ void __launch_bounds__(512, 1)
       const float act = __fdiv_rn(g16, __fadd_rn(1.f, expf(-g16)));
       const float value = __half2float(
           __float2half_rn(__fmul_rn(__fmul_rn(act, u16), prob[route])));
-      v41k::q8_warp_aligned(hq, hd, int64_t(route) * 18 + unit % SLABS,
-                            value);
+      v41k::q8_warp_aligned(hq, hd, int64_t(route) * 18 + unit % SLABS, value);
     }
     if (!more) break;
     unit = nunit;
@@ -530,11 +532,11 @@ __device__ __forceinline__ void dn_act(const uint8_t* pq, const float* px,
 }
 
 __device__ __forceinline__ void prefetch_l2(const void* p) {
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
-#else
+  #else
   (void)p;
-#endif
+  #endif
 }
 
 // One raw K block of the lane's (row, sub): load from the block at byte
@@ -558,9 +560,9 @@ struct DnSlot<29> {  // IQ1_M, 56-byte blocks
     s01 = sc.x;
     s23 = sc.y;
   }
-  __device__ __forceinline__ void decode(const uint32_t* book,
-                                         const DnLane& ln, uint32_t (&w)[8],
-                                         float& d, int& m0, int& m1) const {
+  __device__ __forceinline__ void decode(const uint32_t* book, const DnLane& ln,
+                                         uint32_t (&w)[8], float& d, int& m0,
+                                         int& m1) const {
     uint32_t a, b;
     idx29(qs, qh, a, b);
     dec29_words(a, b, book, w);
@@ -587,9 +589,9 @@ struct DnSlot<16> : DnSlotIQ2<66> {
   __device__ __forceinline__ void load(const DnLane& ln, uint32_t o) {
     load_iq2(ln, o);
   }
-  __device__ __forceinline__ void decode(const uint32_t* book,
-                                         const DnLane& ln, uint32_t (&w)[8],
-                                         float& d, int& m0, int& m1) const {
+  __device__ __forceinline__ void decode(const uint32_t* book, const DnLane& ln,
+                                         uint32_t (&w)[8], float& d, int& m0,
+                                         int& m1) const {
     v41k_fast::dec16(__funnelshift_r(x0, x1, sh), __funnelshift_r(x1, x2, sh),
                      book, ln.lg, ln.ls, w, m0, m1);
     d = __half2float(__ushort_as_half((unsigned short)dh));
@@ -603,9 +605,9 @@ struct DnSlot<17> : DnSlotIQ2<74> {
     load_iq2(ln, o);
     sc = v41k_fast::ldw8(ln.down + o + 66 + ln.sub);
   }
-  __device__ __forceinline__ void decode(const uint32_t* book,
-                                         const DnLane& ln, uint32_t (&w)[8],
-                                         float& d, int& m0, int& m1) const {
+  __device__ __forceinline__ void decode(const uint32_t* book, const DnLane& ln,
+                                         uint32_t (&w)[8], float& d, int& m0,
+                                         int& m1) const {
     v41k_fast::dec17(__funnelshift_r(x0, x1, sh), __funnelshift_r(x1, x2, sh),
                      sc, book, ln.ls, w, m0, m1);
     d = __half2float(__ushort_as_half((unsigned short)dh));
@@ -617,8 +619,7 @@ struct DnSlot<17> : DnSlotIQ2<74> {
 // of dynamic shared memory.
 template <int Type, int M, bool SA>
 __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
-    down_rows_diet(half* __restrict__ out,
-                   const uint8_t* __restrict__ gathered,
+    down_rows_diet(half* __restrict__ out, const uint8_t* __restrict__ gathered,
                    const uint8_t* __restrict__ down, int row_stride,
                    int rows_local, int row_base,
                    const uint32_t* __restrict__ fbook, int classes,
@@ -628,11 +629,11 @@ __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
   using Slot = DnSlot<Type>;
   constexpr int LG = 18, N = 5120, TOP_K = 6, BB = Slot::BB;
   constexpr int RS = D::RS, QB = D::QB;
-#if defined(V41K_HOST_EMU)
+  #if defined(V41K_HOST_EMU)
   alignas(16) static uint8_t dsm[D::kSmem];
-#else
+  #else
   extern __shared__ __align__(16) uint8_t dsm[];
-#endif
+  #endif
   uint32_t* const book = reinterpret_cast<uint32_t*>(dsm);
   float* const s_p = reinterpret_cast<float*>(dsm + D::kBookBytes);
   uint8_t* const s_act = dsm + D::kBookBytes + D::kAccBytes;
@@ -658,9 +659,9 @@ __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
            uint32_t(row_stride);
   };
   uint32_t one = 1, lg = uint32_t(lane) * 4, ls = uint32_t(lane & 15) * 4;
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   asm volatile("" : "+r"(one), "+r"(lg), "+r"(ls));
-#endif
+  #endif
   const DnLane ln{down,
                   uint32_t(sub),
                   lg,
@@ -678,7 +679,7 @@ __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
     const int q0 = u >> 2;
     if constexpr (!SA) {
       const int c0 = __ldg(plan + 37 + q0);
-#pragma unroll
+  #pragma unroll
       for (int c = 0; c < 6; ++c) {
         if (c >= c0) break;
         dn_prefetch_route<RS, QB>(gathered, __ldg(plan + 73 + 6 * q0 + c),
@@ -686,7 +687,7 @@ __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
       }
     }
     ro = rowoff(u, __ldg(plan + 1 + q0));
-#pragma unroll
+  #pragma unroll
     for (int s = 0; s < 3; ++s) sl[s].load(ln, ro + BB * s);
     prefetch_l2(down + ro + pf_off);
   }
@@ -720,7 +721,7 @@ __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
       const int qn = nxt >> 2;
       if constexpr (!SA) {
         const int cn = s_cnt[qn];
-#pragma unroll
+  #pragma unroll
         for (int c = 0; c < 6; ++c) {
           if (c >= cn) break;
           dn_prefetch_route<RS, QB>(gathered, s_route[qn][c], lane);
@@ -735,14 +736,14 @@ __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
     const int rt0 = s_route[q][0];
     const uint8_t* const pq0 = gq + rt0 * (LG * 32);
     const float* const pd0 = gd + rt0 * LG;
-#pragma unroll 1
+  #pragma unroll 1
     for (int c = 1; c < cnt; ++c) myp[32 * (c - 1)] = 0.f;
     float p0 = 0.f;
-#pragma unroll 1
+  #pragma unroll 1
     for (int i = 0; i < 3; ++i) {
       const bool reload = i < 2 || more;
       const uint32_t lo = i < 2 ? ro + uint32_t(3 * BB) * uint32_t(i + 1) : nro;
-#pragma unroll
+  #pragma unroll
       for (int s = 0; s < 3; ++s) {
         const int j = 3 * i + s;
         const int rank = int(uint32_t(sub + 8 * j) / 18u);
@@ -762,7 +763,7 @@ __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
           float xc;
           int r = s_route[q][1];
           dn_act<SA>(gq + r * (LG * 32) + qo, gd + r * LG + dof, qc, xc);
-#pragma unroll 1
+  #pragma unroll 1
           for (int c = 1; c < cnt; ++c) {
             int qn[8];
             float xn = 0.f;
@@ -772,14 +773,14 @@ __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
             }
             float* const pc = myp + 32 * (c - 1);
             *pc = fast_dot(w, qc, d, xc, m0, m1, *pc);
-#pragma unroll
+  #pragma unroll
             for (int k = 0; k < 8; ++k) qc[k] = qn[k];
             xc = xn;
           }
         }
       }
     }
-#pragma unroll
+  #pragma unroll
     for (int c = 0; c < 6; ++c) {
       if (c >= cnt) break;
       float v = c == 0 ? p0 : myp[32 * (c - 1)];
@@ -795,14 +796,14 @@ __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
   if (t < kDnRows * M) {  // the old epilogue, verbatim
     const int k = t / kDnRows, rl = t % kDnRows;
     int key[TOP_K];
-#pragma unroll
+  #pragma unroll
     for (int i = 0; i < TOP_K; ++i) key[i] = s_key[k * TOP_K + i];
     float total = 0.f, acc = 0.f;
     int last = -1, cls = -1;
-#pragma unroll
+  #pragma unroll
     for (int n = 0; n < TOP_K; ++n) {
       int best = 0x7fffffff, bi = 0;
-#pragma unroll
+  #pragma unroll
       for (int i = 0; i < TOP_K; ++i)
         if (key[i] > last && key[i] < best) {
           best = key[i];
@@ -820,7 +821,7 @@ __global__ void __launch_bounds__(32 * v41k_fast::kDnWarps, 1)
     }
     if (cls >= 0) total += acc;
     out[k * N + row_base + row0 + rl] = __float2half_rn(total);
-#pragma unroll
+  #pragma unroll
     for (int o = 0; o < 4; ++o)
       if (o * rows_local != row_base)
         out[k * N + o * rows_local + row0 + rl] = __float2half_rn(0.f);

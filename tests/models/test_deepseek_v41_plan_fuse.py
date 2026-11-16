@@ -186,7 +186,7 @@ def _dispatch(fuse, ops):
         def call(*a):
             calls.append(name)
 
-        call.name = name
+        call.name = name  # type: ignore[attr-defined]
         return call
 
     v41k = types.SimpleNamespace(**{n: op(n) for n in ops})

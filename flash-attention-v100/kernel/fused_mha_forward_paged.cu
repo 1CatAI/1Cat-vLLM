@@ -90,19 +90,21 @@ template <int D, bool LOW_SMEM = false, bool LOW_SMEM_SCALAR_QK = false,
           bool D256_SW_PIPELINE_QK = false, bool D256_SW_PIPELINE_PV = false>
 struct KernelConfig {
   static constexpr int BLOCK_M =
-      (D == 16)   ? BLOCK_M_16
-      : (D == 32) ? BLOCK_M_32
-      : (D == 64) ? BLOCK_M_64
+      (D == 16)    ? BLOCK_M_16
+      : (D == 32)  ? BLOCK_M_32
+      : (D == 64)  ? BLOCK_M_64
       : (D == 128) ? BLOCK_M_128
-      : (D == 512) ? BLOCK_M_512
+      : (D == 512)
+          ? BLOCK_M_512
           : (LOW_SMEM ? (LOW_SMEM_BM32 ? BLOCK_M_256 : BLOCK_M_256_LOW_SMEM)
                       : BLOCK_M_256);
   static constexpr int BLOCK_N =
-      (D == 16)   ? BLOCK_N_16
-      : (D == 32) ? BLOCK_N_32
-      : (D == 64) ? BLOCK_N_64
+      (D == 16)    ? BLOCK_N_16
+      : (D == 32)  ? BLOCK_N_32
+      : (D == 64)  ? BLOCK_N_64
       : (D == 128) ? BLOCK_N_128
-      : (D == 512) ? BLOCK_N_512
+      : (D == 512)
+          ? BLOCK_N_512
           : (LOW_SMEM ? (LOW_SMEM_SCALAR_QK ? BLOCK_N_256_LOW_SMEM_SCALAR_QK
                                             : BLOCK_N_256_LOW_SMEM)
                       : BLOCK_N_256);

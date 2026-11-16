@@ -18,9 +18,10 @@
 #include "v41k_diet.cuh"
 
 static long g_bad = 0;
-#define CHECK(c)                                                    \
-  do {                                                              \
-    if (!(c) && g_bad++ < 10) std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); \
+#define CHECK(c)                                              \
+  do {                                                        \
+    if (!(c) && g_bad++ < 10)                                 \
+      std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); \
   } while (0)
 
 int main() {
@@ -34,13 +35,15 @@ int main() {
   // d29_bits == iq1m_d_bits: a bit permutation; random + all single bits.
   for (int i = 0; i < 4000000; ++i) {
     const uint32_t a = uint32_t(rng()), b = uint32_t(rng());
-    CHECK((v41k_diet::d29_bits(a, b) & 0xFFFFu) == v41k_fast::iq1m_d_bits(a, b));
+    CHECK((v41k_diet::d29_bits(a, b) & 0xFFFFu) ==
+          v41k_fast::iq1m_d_bits(a, b));
     ++n;
   }
   for (int bit = 0; bit < 64; ++bit) {
     const uint64_t x = uint64_t(1) << bit;
     const uint32_t a = uint32_t(x), b = uint32_t(x >> 32);
-    CHECK((v41k_diet::d29_bits(a, b) & 0xFFFFu) == v41k_fast::iq1m_d_bits(a, b));
+    CHECK((v41k_diet::d29_bits(a, b) & 0xFFFFu) ==
+          v41k_fast::iq1m_d_bits(a, b));
     ++n;
   }
 
@@ -48,7 +51,8 @@ int main() {
   // sub-blocks, random scale words.
   for (uint32_t qh = 0; qh < 65536; ++qh)
     for (int r = 0; r < 8; ++r) {
-      const uint32_t qs = uint32_t(rng()), s01 = uint32_t(rng()), s23 = uint32_t(rng());
+      const uint32_t qs = uint32_t(rng()), s01 = uint32_t(rng()),
+                     s23 = uint32_t(rng());
       const int sub = r;
       uint32_t w0[8], w1[8];
       int a0, a1, b0, b1;
@@ -80,7 +84,8 @@ int main() {
     }
     const int m0 = 1 + 2 * int(rng() % 16), m1 = 1 + 2 * int(rng() % 16);
     float d, xd, acc;
-    const uint32_t bd = uint32_t(rng()), bx = uint32_t(rng()), ba = uint32_t(rng());
+    const uint32_t bd = uint32_t(rng()), bx = uint32_t(rng()),
+                   ba = uint32_t(rng());
     // finite, varied magnitudes: fp16-range d, small xd, any accumulator
     d = float(int32_t(bd % 131072) - 65536) * 1e-5f;
     xd = float(bx % 100000) * 9e-8f + 1e-4f;

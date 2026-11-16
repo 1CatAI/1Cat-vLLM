@@ -512,3 +512,99 @@ direct_register_custom_op(
     mutates_args=["out"],
     fake_impl=_sm70_fp8_block32_linear_fake,
 )
+
+
+# ---------------------------------------------------------------------------
+# Fp8LinearMethod integration (kept here so the generic FP8 method stays free
+# of platform knowledge).
+
+
+def is_candidate(method) -> bool:
+    """A 32 x 32 block-FP8 layer this route may serve once its scales load."""
+    return bool(
+        method._sm70_without_fp8_hw
+        and method.sm70_policy.enabled
+        and not method.sm70_policy.force_marlin
+        and method.block_quant
+        and method.weight_block_size == [32, 32]
+        and method.input_dtype == torch.float16
+    )
+
+
+def prepare_layer(method, layer: torch.nn.Module) -> bool:
+    """Serve a 32 x 32 block-FP8 layer on SM70. Exact power-of-two scales keep
+    the weight FP8 in the TurboMind group-32 layout; other scales, or a build
+    without the native op, dequantize it once to FP16 (the dequant route).
+    False leaves grouped layers to the existing grouped implementation."""
+    from vllm.logger import init_logger
+    from vllm.model_executor.utils import replace_parameter
+
+    logger = init_logger(__name__)
+    if getattr(layer, "is_bmm", False):
+        return False
+    reason: str | None
+    if not hasattr(torch.ops._C, "fp8_sm70_prepare"):
+        reason = "native fp8_sm70_prepare is unavailable in vllm._C"
+    else:
+        reason = block32_scale_ineligibility(
+            tuple(layer.weight.shape), layer.weight_scale_inv
+        )
+    if reason is not None:
+        weight = method._dequantize_block_weight(
+            layer.weight, layer.weight_scale_inv.float(), layer.orig_dtype
+        )
+        replace_parameter(layer, "weight", weight)
+        layer.input_scale = None
+        layer.fp8_block32_route = "dequant"
+        logger.warning_once(
+            "SM70 FP8 32x32 blocks: %s; such layers are dequantized to %s "
+            "at load time.",
+            reason,
+            layer.orig_dtype,
+        )
+        return True
+    packed = prepare_fp8_block32(layer.weight, layer.weight_scale_inv)
+    replace_parameter(layer, "weight", packed.tm_weight)
+    replace_parameter(layer, "weight_scale_inv", packed.tm_scales)
+    layer.input_scale = None
+    layer.fp8_block32_route = "fp8"
+    layer.sm70_fp8_k_ld = packed.k_ld
+    layer.sm70_fp8_q_ld = packed.q_ld
+    logger.info_once(
+        "SM70 FP8 32x32 blocks: weights kept in FP8 (TurboMind W8A16 "
+        "group-32 layout; GEMV / HMMA / dequant + cuBLAS by batch size)."
+    )
+    return True
+
+
+def apply_layer(
+    layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    if layer.fp8_block32_route == "dequant":
+        return torch.nn.functional.linear(x, layer.weight, bias)
+    if x.dtype != torch.float16:
+        raise RuntimeError(
+            f"SM70 FP8 32x32 blocks require float16 activations, got {x.dtype}."
+        )
+    out_shape = (*x.shape[:-1], layer.output_size_per_partition)
+    x_2d = x.reshape(-1, x.shape[-1])
+    if x_2d.stride(-1) != 1:
+        x_2d = x_2d.contiguous()
+    out_2d = torch.empty(
+        (x_2d.shape[0], layer.output_size_per_partition),
+        device=x.device,
+        dtype=torch.float16,
+    )
+    if x_2d.shape[0]:
+        torch.ops.vllm.sm70_fp8_block32_linear(
+            out_2d,
+            x_2d,
+            layer.weight,
+            layer.weight_scale_inv,
+            int(layer.sm70_fp8_k_ld),
+            int(layer.sm70_fp8_q_ld),
+        )
+    out = out_2d.reshape(out_shape)
+    if bias is not None:
+        out.add_(bias)
+    return out

@@ -141,7 +141,7 @@ def check_gate_up(gtype, args, g, dev, report):
                 case.poison(g)
                 case.old()
                 case.new()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 for k, v in efc._compare_gu(case).items():
                     fail[k] += v
             bad += sum(fail.values())
@@ -173,7 +173,7 @@ def check_gate_up(gtype, args, g, dev, report):
         }
     report["gtype"].setdefault(str(gtype), {})["gate_up"] = res
     del gate, up
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     return bad
 
 
@@ -201,7 +201,7 @@ def check_down(gtype, args, g, dev, report):
                     case.out_new.fill_(float("nan"))
                     case.old(classes)
                     case.new(classes)
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                     for k, v in efc._compare(case).items():
                         fail[k] += v
                 bad += sum(fail.values())
@@ -241,7 +241,7 @@ def check_down(gtype, args, g, dev, report):
         res["us"][f"M{m}"] = row
     report["gtype"].setdefault(str(gtype), {})["down"] = res
     del down
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     return bad
 
 

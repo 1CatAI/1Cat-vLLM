@@ -1,5 +1,6 @@
-// Copy of index_scores_decode from benchmarks/deepseek_v41/v41k/v41k.cu (#1277).
-// Wrapped in namespace v41idx_ref; used only by the check op index_scores_ref. Do not edit.
+// Copy of index_scores_decode from benchmarks/deepseek_v41/v41k/v41k.cu
+// (#1277). Wrapped in namespace v41idx_ref; used only by the check op
+// index_scores_ref. Do not edit.
 namespace v41idx_ref {
 // ---- G4b decode indexer: scores over packed FP4 index keys ----------------
 // Packed key row (68 B): 64 B E2M1 nibbles (even element in the low nibble)

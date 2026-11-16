@@ -59,6 +59,7 @@ CHECK_IMPORTS = {
             # Pickling round trips are the subject of these tests.
             "tests/tokenizers_/test_gguf_bpe_encode.py",
             "tests/config/test_gguf_prefill_prepare.py",
+            "tests/config/test_v41_index_tiled_policy.py",
             # cloudpickle
             "vllm/v1/executor/multiproc_executor.py",
             "vllm/v1/executor/ray_executor.py",
@@ -90,6 +91,10 @@ CHECK_IMPORTS = {
         ),
         allowed_files={
             "vllm/triton_utils/importing.py",
+            # Load DeepSeek-V4.1 kernels by path under TRITON_INTERPRET=1,
+            # which must be set before triton (and vLLM) is imported.
+            "tests/models/test_deepseek_v41_coupled_fused.py",
+            "tests/models/test_deepseek_v41_coupled_drafts.py",
             # AOT inspection needs compiler/backend modules that the vLLM
             # runtime shim deliberately does not export.
             "benchmarks/kernels/deepseek_v4_sm70_aot_check.py",

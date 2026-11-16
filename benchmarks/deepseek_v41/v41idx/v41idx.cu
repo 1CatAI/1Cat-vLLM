@@ -8,8 +8,8 @@
 //   q   fp16 [tokens * heads, 128]  (token-major rows), w fp16 [tokens * heads]
 //   keys uint8 [capacity, 68]: 64 B E2M1 nibbles (even element low) + 4 biased
 //        power-of-two scale exponents, one per 32 elements
-//   positions int64 [>= tokens]; end = min((last_position + 1) / ratio, capacity)
-//   out fp16, row stride out.size(1): out[t, n] for n < end only =
+//   positions int64 [>= tokens]; end = min((last_position + 1) / ratio,
+//   capacity) out fp16, row stride out.size(1): out[t, n] for n < end only =
 //     fp16( sum_h fp16( relu( fp16( q[t,h] . k[n] ) ) * w[t,h] ) )
 //   with q . k accumulated as ONE fmaf chain over d = 0..127 in order, from
 //   0.f, the key values rounded to fp16 first, and the head sum in h order.
@@ -50,12 +50,13 @@
 
 namespace v41idx {
 
-constexpr int KB = 64;      // keys per block
-constexpr int KL = 16;      // key lanes per token (threads per token)
-constexpr int KJ = KB / KL; // keys per thread (4): kl, kl + 16, kl + 32, kl + 48
-constexpr int QS = 132;     // q row stride in floats (528 B: 16-B aligned)
-constexpr int KS = 132;     // key row stride in halves (264 B: 8-B aligned; 16
-                            // consecutive rows start on banks 0, 2, .., 30)
+constexpr int KB = 64;  // keys per block
+constexpr int KL = 16;  // key lanes per token (threads per token)
+constexpr int KJ =
+    KB / KL;             // keys per thread (4): kl, kl + 16, kl + 32, kl + 48
+constexpr int QS = 132;  // q row stride in floats (528 B: 16-B aligned)
+constexpr int KS = 132;  // key row stride in halves (264 B: 8-B aligned; 16
+                         // consecutive rows start on banks 0, 2, .., 30)
 constexpr int KEY_BYTES = 68;
 constexpr int MAX_ROWS = 64;
 constexpr int MAX_THREADS = 256;
@@ -96,9 +97,9 @@ __host__ __device__ inline void stage_q(int tid, int nt, const __half* q,
 
 // Decode keys [n0, n0 + KB) into ks (fp16), zeros past end (never read for
 // output). One item = one 4-byte word = 8 elements of one key row.
-__host__ __device__ inline void stage_keys(int tid, int nt,
-                                           const uint8_t* keys, int64_t n0,
-                                           int64_t end, __half* ks) {
+__host__ __device__ inline void stage_keys(int tid, int nt, const uint8_t* keys,
+                                           int64_t n0, int64_t end,
+                                           __half* ks) {
   for (int i = tid; i < KB * 16; i += nt) {
     const int k = i / 16, wd = i % 16;
     const int64_t n = n0 + k;
@@ -187,10 +188,10 @@ __host__ __device__ inline void tile(int t, int kl, const float* qs,
       memcpy(qv, qp, 16);
 #endif
 #ifdef V41IDX_MUTANT_ORDER
-#pragma unroll
+  #pragma unroll
       for (int c = 3; c >= 0; --c)
 #else
-#pragma unroll
+  #pragma unroll
       for (int c = 0; c < 4; ++c)
 #endif
 #pragma unroll
@@ -215,7 +216,7 @@ __host__ __device__ inline void tile(int t, int kl, const float* qs,
 
 // Shared host/device bound: stale positions cannot extend an allocation.
 __host__ __device__ inline int64_t live_end(int64_t position, int ratio,
-                                           int64_t capacity) {
+                                            int64_t capacity) {
   const int64_t end = (position + 1) / ratio;
   return end < capacity ? end : capacity;
 }
@@ -275,8 +276,8 @@ int sm_count(int device) {
   TORCH_CHECK(device >= 0 && device < 64, "v41idx: device index out of range");
   if (counts[device] == 0) {
     int c = 0;
-    C10_CUDA_CHECK(cudaDeviceGetAttribute(&c, cudaDevAttrMultiProcessorCount,
-                                          device));
+    C10_CUDA_CHECK(
+        cudaDeviceGetAttribute(&c, cudaDevAttrMultiProcessorCount, device));
     counts[device] = c;
   }
   return counts[device];
@@ -288,10 +289,10 @@ void allow_smem(int device) {
   static bool done[64] = {false};
   std::lock_guard<std::mutex> lock(mu);
   if (!done[device]) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        v41idx::index_scores_tiled<H>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        v41idx::smem_bytes(v41idx::MAX_ROWS)));
+    C10_CUDA_CHECK(
+        cudaFuncSetAttribute(v41idx::index_scores_tiled<H>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             v41idx::smem_bytes(v41idx::MAX_ROWS)));
     done[device] = true;
   }
 }
@@ -302,17 +303,17 @@ void check_args(const torch::Tensor& out, const torch::Tensor& q,
                 bool tiled) {
   const int64_t tokens = out.dim() == 2 ? out.size(0) : -1;
   TORCH_CHECK(out.is_cuda() && q.device() == out.device() &&
-                  w.device() == out.device() &&
-                  keys.device() == out.device() &&
+                  w.device() == out.device() && keys.device() == out.device() &&
                   positions.device() == out.device(),
               "v41idx: all tensors must be on one CUDA device");
   TORCH_CHECK(out.dim() == 2 && out.scalar_type() == torch::kHalf &&
                   out.stride(1) == 1 && out.stride(0) == out.size(1),
               "v41idx: out must be fp16 [tokens, n_out] with row stride n_out");
   if (tiled)
-    TORCH_CHECK(heads == 4 || heads == 8,
-                "v41idx: tiled scorer supports 4 or 8 index heads per rank, got ",
-                heads);
+    TORCH_CHECK(
+        heads == 4 || heads == 8,
+        "v41idx: tiled scorer supports 4 or 8 index heads per rank, got ",
+        heads);
   TORCH_CHECK(heads >= 1 && tokens >= 1 && tokens * heads <= 64,
               "v41idx: need 1 <= tokens * heads <= 64");
   TORCH_CHECK(q.scalar_type() == torch::kHalf && q.is_contiguous() &&
@@ -325,9 +326,10 @@ void check_args(const torch::Tensor& out, const torch::Tensor& q,
   TORCH_CHECK(keys.scalar_type() == torch::kUInt8 && keys.is_contiguous() &&
                   keys.dim() == 2 && keys.size(1) == 68 && keys.size(0) > 0,
               "v41idx: keys must be contiguous uint8 [capacity > 0, 68]");
-  TORCH_CHECK(positions.scalar_type() == torch::kInt64 &&
-                  positions.is_contiguous() && positions.numel() >= tokens,
-              "v41idx: positions must be contiguous int64 with >= tokens entries");
+  TORCH_CHECK(
+      positions.scalar_type() == torch::kInt64 && positions.is_contiguous() &&
+          positions.numel() >= tokens,
+      "v41idx: positions must be contiguous int64 with >= tokens entries");
   TORCH_CHECK(out.size(1) >= keys.size(0),
               "v41idx: output width must cover key capacity");
   TORCH_CHECK(ratio >= 1, "v41idx: ratio must be >= 1");
@@ -344,7 +346,8 @@ void index_scores_tiled(torch::Tensor out, torch::Tensor q, torch::Tensor w,
   const int threads = ((tokens * v41idx::KL + 31) / 32) * 32;
   const int smem = v41idx::smem_bytes(rows);
   const int64_t blocks = (keys.size(0) + v41idx::KB - 1) / v41idx::KB;
-  const int grid = int(std::min<int64_t>(blocks, 2 * int64_t(sm_count(device))));
+  const int grid =
+      int(std::min<int64_t>(blocks, 2 * int64_t(sm_count(device))));
   auto stream = at::cuda::getCurrentCUDAStream();
   const auto* qp = reinterpret_cast<const __half*>(q.data_ptr());
   const auto* wp = reinterpret_cast<const __half*>(w.data_ptr());
@@ -408,7 +411,7 @@ namespace {
 void index_scores_meta(torch::Tensor out, torch::Tensor q, torch::Tensor w,
                        torch::Tensor keys, torch::Tensor positions,
                        int64_t heads, int64_t ratio) {}
-}
+}  // namespace
 TORCH_LIBRARY_IMPL(v41idx, Meta, m) {
   m.impl("index_scores_tiled", &index_scores_meta);
 }

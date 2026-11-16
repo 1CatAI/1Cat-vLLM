@@ -143,20 +143,20 @@ def _same(a, b):
 
 def _graph_us(fn, reps):
     fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for _ in range(reps):
             fn()
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start, end = torch.cuda.Event(True), torch.cuda.Event(True)
     best = float("inf")
     for _ in range(5):
         start.record()
         graph.replay()
         end.record()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         best = min(best, start.elapsed_time(end) * 1000.0 / reps)
     return best
 

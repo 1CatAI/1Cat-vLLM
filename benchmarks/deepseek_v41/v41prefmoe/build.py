@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Build v41prefmoe.so, the SM70 prefill IQ GEMM library of VLLM_V41_PREFILL_IQ_GEMM.
 
 csrc/prefill_iq.cu reuses the OpenMMLab TurboMind / 1Cat SM70 GEMM headers in the

@@ -132,7 +132,7 @@ __device__ __forceinline__ GuUnit gu_unit(const int* __restrict__ plan,
   g.u = unit / 18;
   g.e = __ldg(plan + 1 + g.u);
   g.cnt = __ldg(plan + 37 + g.u);
-#pragma unroll
+  #pragma unroll
   for (int c = 0; c < 6; ++c)
     g.tok[c] = c < g.cnt ? __ldg(plan + 73 + 6 * g.u + c) / 6 * 160 : 0;
   return g;
@@ -142,13 +142,12 @@ __device__ __forceinline__ GuUnit gu_unit(const int* __restrict__ plan,
 // L1, one line per thread: t = 47 c + k, k = 0..39 the xq lines from its first
 // byte, 40 its last byte, 41..45 the xd lines, 46 its last byte. Threads past
 // 47 cnt do nothing; every address is inside the token's own bytes.
-__device__ __forceinline__ void gu_prefetch(const GuUnit& g,
-                                            const int8_t* xq, const float* xd,
-                                            int t) {
+__device__ __forceinline__ void gu_prefetch(const GuUnit& g, const int8_t* xq,
+                                            const float* xd, int t) {
   const int c = t / 47, k = t - 47 * c;
   if (c >= g.cnt) return;
   int base = g.tok[0];  // select tok[c] without a dynamic register index
-#pragma unroll
+  #pragma unroll
   for (int i = 1; i < 6; ++i) base = c == i ? g.tok[i] : base;
   const char* q = reinterpret_cast<const char*>(xq) + int64_t(base) * 32;
   const char* d = reinterpret_cast<const char*>(xd + base);
@@ -202,9 +201,9 @@ __global__ void __launch_bounds__(512, 1)
   ub.load(pu, 1);
   uint32_t lg = uint32_t(lane) * 4, ls = uint32_t(lane & 15) * 4;
   uint32_t sh = l < 8 ? 16 : 0;
-#if defined(__CUDA_ARCH__)
+  #if defined(__CUDA_ARCH__)
   asm volatile("" : "+r"(lg), "+r"(ls), "+r"(sh));
-#endif
+  #endif
   fill_book<Type>(book, fbook, t, 512);
   __syncthreads();
   int buf = 0;
@@ -231,7 +230,7 @@ __global__ void __launch_bounds__(512, 1)
         gs[0] = fast_dot(wg, q, dg, d, mg0, mg1, gs[0]);
         us[0] = fast_dot(wu, q, du, d, mu0, mu1, us[0]);
       }
-#pragma unroll
+  #pragma unroll
       for (int c = 1; c < 6; ++c) {
         if (c >= cur.cnt) break;  // block-uniform
         int q[8];
@@ -241,7 +240,7 @@ __global__ void __launch_bounds__(512, 1)
         us[c] = fast_dot(wu, q, du, d, mu0, mu1, us[c]);
       }
     };
-#pragma unroll 1
+  #pragma unroll 1
     for (int k = 0; k < STEPS / 2; ++k) {
       int ahead = 2 * k + 2;
       if (k == STEPS / 2 - 1) {  // steps 8, 9: load the next unit's 0, 1
@@ -256,10 +255,10 @@ __global__ void __launch_bounds__(512, 1)
       step(ga, ua, 2 * k, ahead);
       step(gb, ub, 2 * k + 1, ahead + 1);
     }
-#pragma unroll
+  #pragma unroll
     for (int c = 0; c < 6; ++c) {
       if (c >= cur.cnt) break;
-#pragma unroll
+  #pragma unroll
       for (int o = 8; o; o >>= 1) {
         gs[c] += __shfl_xor_sync(0xffffffffU, gs[c], o);
         us[c] += __shfl_xor_sync(0xffffffffU, us[c], o);
@@ -282,8 +281,7 @@ __global__ void __launch_bounds__(512, 1)
       const float act = __fdiv_rn(g16, __fadd_rn(1.f, expf(-g16)));
       const float value = __half2float(
           __float2half_rn(__fmul_rn(__fmul_rn(act, u16), prob[route])));
-      v41k::q8_warp_aligned(hq, hd, int64_t(route) * 18 + unit % SLABS,
-                            value);
+      v41k::q8_warp_aligned(hq, hd, int64_t(route) * 18 + unit % SLABS, value);
     }
     if (!more) break;
     unit = nunit;

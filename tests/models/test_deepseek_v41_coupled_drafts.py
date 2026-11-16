@@ -48,13 +48,13 @@ def _load():
     sys.modules.setdefault("vllm", types.ModuleType("vllm"))
     if "vllm.triton_utils" not in sys.modules:
         tu = types.ModuleType("vllm.triton_utils")
-        tu.tl, tu.triton = tl, triton
+        tu.tl, tu.triton = tl, triton  # type: ignore[attr-defined]
         sys.modules["vllm.triton_utils"] = tu
     name = "v41_coupled_draw_under_test"
     spec = importlib.util.spec_from_file_location(name, SRC)
-    mod = importlib.util.module_from_spec(spec)
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
     sys.modules[name] = mod
-    spec.loader.exec_module(mod)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
 
 

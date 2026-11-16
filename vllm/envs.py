@@ -18237,9 +18237,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=True,
     ),
     "VLLM_GPU_SYNC_CHECK": env_var(
-        env_with_choices(
-            "VLLM_GPU_SYNC_CHECK", None, ["warn", "error"]
-        ),
+        env_with_choices("VLLM_GPU_SYNC_CHECK", None, ["warn", "error"]),
         description=(
             "GPU sync debug mode: 'warn' logs unintended GPU<->CPU syncs, "
             "'error' raises. Unset disables."

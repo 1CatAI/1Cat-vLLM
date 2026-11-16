@@ -100,14 +100,14 @@ def _check_apply(method, layer, reference):
 
 def test_block32_power_of_two_scales_stay_fp8(monkeypatch):
     method = _method(monkeypatch, [32, 32])
-    assert method.sm70_fp8_block32_candidate
+    assert method.fp8_block32_candidate
     layer, reference = _layer(method, 32, _exponents(32))
     method.process_weights_after_loading(layer)
-    assert layer.sm70_fp8_block32
+    assert layer.fp8_block32_route == "fp8"
     assert layer.weight.dtype == torch.uint8 and layer.weight.numel() == N * K
     assert tuple(layer.weight_scale_inv.shape) == (K // 32, N)
     _check_apply(method, layer, reference)
-    # apply() runs exactly the sm70_fp8_block32 dispatch.
+    # apply() runs exactly the block32 dispatch.
     w = b32.Fp8Block32Weight(
         layer.weight,
         layer.weight_scale_inv,
@@ -134,7 +134,7 @@ def test_block32_e8m0_scale_parameter(monkeypatch):
         torch.exp2(exps.float()).to(torch.float8_e8m0fnu), requires_grad=False
     )
     method.process_weights_after_loading(layer)
-    assert layer.sm70_fp8_block32
+    assert layer.fp8_block32_route == "fp8"
     _check_apply(method, layer, reference)
 
 
@@ -154,8 +154,8 @@ def test_block32_inexact_scales_dequantize_at_load(monkeypatch, bad):
         layer.weight.data.clone(), layer.weight_scale_inv.data.clone(), torch.float16
     )
     method.process_weights_after_loading(layer)
-    assert not getattr(layer, "sm70_fp8_block32", False)
-    assert layer.sm70_fp8_block32_dequantized
+    assert getattr(layer, "fp8_block32_route", None) != "fp8"
+    assert layer.fp8_block32_route == "dequant"
     assert torch.equal(layer.weight, expected)
     x = torch.randn(3, K, device="cuda").half()
     torch.testing.assert_close(
@@ -178,7 +178,7 @@ def test_block32_grouped_bmm_keeps_the_existing_route(monkeypatch):
     layer.bmm_batch_size = 2
     layer.orig_dtype = torch.float16
     method.process_weights_after_loading(layer)
-    assert not getattr(layer, "sm70_fp8_block32", False)
+    assert getattr(layer, "fp8_block32_route", None) != "fp8"
 
 
 @pytest.mark.parametrize(
@@ -190,14 +190,14 @@ def test_block32_policy_switches_keep_previous_routes(monkeypatch, env):
         monkeypatch.setenv(name, value)
     envs.disable_envs_cache()
     method = _method(monkeypatch, [32, 32])
-    assert not method.sm70_fp8_block32_candidate
+    assert not method.fp8_block32_candidate
     layer, reference = _layer(method, 32, _exponents(32))
     if env.get("VLLM_SM70_QUANT_BACKEND") == "marlin":
         # The legacy Marlin backend keeps its own selection, unchanged here.
         assert method.use_marlin
         return
     method.process_weights_after_loading(layer)
-    assert not getattr(layer, "sm70_fp8_block32", False)
+    assert getattr(layer, "fp8_block32_route", None) != "fp8"
     assert method.use_sm70_dequant_fallback
     assert torch.equal(layer.weight, reference.half())
     _check_apply(method, layer, reference)
@@ -205,11 +205,11 @@ def test_block32_policy_switches_keep_previous_routes(monkeypatch, env):
 
 def test_block128_route_unchanged(monkeypatch):
     method = _method(monkeypatch, [128, 128])
-    assert not method.sm70_fp8_block32_candidate
+    assert not method.fp8_block32_candidate
     assert method.use_sm70_fp8_turbomind
     layer, reference = _layer(method, 128, _exponents(128, -12, -6))
     layer.prefix = "test.block128"
     method.process_weights_after_loading(layer)
     assert layer.sm70_fp8_turbomind
-    assert not getattr(layer, "sm70_fp8_block32", False)
+    assert getattr(layer, "fp8_block32_route", None) != "fp8"
     _check_apply(method, layer, reference)

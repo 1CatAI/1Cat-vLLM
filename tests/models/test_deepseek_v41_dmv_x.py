@@ -204,8 +204,8 @@ def test_bench_shapes_and_config_match_dense_tm(ops):
     spec = importlib.util.spec_from_file_location(
         "bench_dmv_x", path / "bench_dmv_x.py"
     )
-    bench = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(bench)
+    bench = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(bench)  # type: ignore[union-attr]
     for role, fmt, k, widths, grid in SHAPES:
         b_fmt, b_k, b_widths, _ = bench.SHAPES[role]
         assert (b_fmt, b_k, b_widths) == (fmt, k, widths)

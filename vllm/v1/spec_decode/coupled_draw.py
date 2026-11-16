@@ -35,13 +35,14 @@ import os
 
 import torch
 
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 
-ENABLED = os.getenv("VLLM_V41_COUPLED_DRAFTS", "0") == "1"
-DRAFT_TEMP_SCALE = float(os.getenv("VLLM_V41_COUPLED_DRAFT_TEMP", "0.5"))
+ENABLED = envs.VLLM_V41_COUPLED_DRAFTS == "1"
+DRAFT_TEMP_SCALE = float(envs.VLLM_V41_COUPLED_DRAFT_TEMP)
 if not DRAFT_TEMP_SCALE > 0.0:
     raise ValueError("VLLM_V41_COUPLED_DRAFT_TEMP must be > 0")
-TRACE = os.getenv("VLLM_V41_COUPLED_TRACE", "")
+TRACE = envs.VLLM_V41_COUPLED_TRACE
 
 M32 = 0xFFFFFFFF
 _GOLDEN = 0x9E3779B9

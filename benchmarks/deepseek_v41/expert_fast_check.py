@@ -229,20 +229,20 @@ def _compare(case):
 def _graph_us(fns, reps):
     for fn in fns:
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for i in range(reps):
             fns[i % len(fns)]()
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start, end = torch.cuda.Event(True), torch.cuda.Event(True)
     best = float("inf")
     for _ in range(7):
         start.record()
         graph.replay()
         end.record()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         best = min(best, start.elapsed_time(end) * 1000.0 / reps)
     return best
 
@@ -370,7 +370,7 @@ def check_gate_up(gtype, args, g, dev, report):
                 case.poison(g)
                 case.old()
                 case.new()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 for k, v in _compare_gu(case).items():
                     fail[k] += v
             # counts of failing trials only; good trials are never added
@@ -400,7 +400,7 @@ def check_gate_up(gtype, args, g, dev, report):
         }
     report["gtype"].setdefault(str(gtype), {})["gate_up"] = res
     del gate, up
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     return bad
 
 
@@ -426,7 +426,7 @@ def check_down(gtype, args, g, dev, report):
                 case.out_new.fill_(float("nan"))
                 case.old(classes)
                 case.new(classes)
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 for k, v in _compare(case).items():
                     fail[k] += v
             # every count is a count of failing trials; good trials are never
@@ -460,7 +460,7 @@ def check_down(gtype, args, g, dev, report):
         }
     report["gtype"].setdefault(str(gtype), {})["down"] = res
     del down
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     return bad
 
 
