@@ -426,12 +426,24 @@ def test_mixed_gdn_unquantized_projections_convert_to_qpn8_and_fuse_ba_tp2():
         ).item()
         assert rel_err < 3.5e-2
 
-        # Verify TP=2 fused qkvz + FP16 ba verification dispatch.
+        # Verify TP=2 fused qkvz + FP16 ba verification dispatch. The layer
+        # binds the engine's FP8 policy at build time (#1508); do the same.
+        from vllm.config import KernelConfig, set_current_vllm_config
+        from vllm.model_executor.layers.quantization import (
+            sm70_gdn_ba_verify as ba_verify,
+        )
+        from vllm.runtime_resources import release_runtime_resources
+
+        verify_cfg = SimpleNamespace(kernel_config=KernelConfig(), lora_config=None)
+        verify_cfg.kernel_config.capture_provider_inputs()
+        with set_current_vllm_config(verify_cfg):  # type: ignore[arg-type]
+            verify_native = ba_verify.bind_gdn_ba_verify_policy(verify_cfg)
+        assert verify_native is not None
         gdn_stub = SimpleNamespace(
             in_proj_qkvz=qkvz,
             in_proj_ba=ba,
             enable_sm70_dflash2_fused_gdn_verify=True,
-            enable_sm70_gdn_ba_verify=True,
+            sm70_gdn_ba_verify_native=verify_native,
             num_v_heads=48,
             tp_size=2,
             head_k_dim=128,
@@ -442,7 +454,9 @@ def test_mixed_gdn_unquantized_projections_convert_to_qpn8_and_fuse_ba_tp2():
             disable_tp_for_ba_proj=False,
         )
         x_in = torch.randn(5, 5120, device="cuda", dtype=torch.float16) * 0.1
-        fused = apply_gdn_ba_verify(gdn_stub, x_in)
+        with verify_native.owner.activate():
+            fused = apply_gdn_ba_verify(gdn_stub, x_in)
+        release_runtime_resources(verify_cfg)  # type: ignore[arg-type]
         assert fused is not None
         qkv_actual, z_actual, b_actual, a_actual = fused
         qkvz_expected = x_in.float() @ qkvz_ref.t()
