@@ -932,30 +932,28 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 object.__setattr__(self, "_hc_prefill_sequence_model", view)
             backbone = self._hc_prefill_sequence_model
         # Draft row stages keep the original replicated producer reductions;
-        # they must not inherit the target's partial-producer context.
-        from .sm70_hcx import (
-            hc_prefill_sequence_parallel_active,
-            hc_prefill_sequence_parallel_context,
+        # they must not inherit the target's partial-producer context. The
+        # speculator applies that context outside this compiled forward.
+        return backbone(
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=spec_step_idx,
         )
 
-        if not hc_prefill_sequence_parallel_active():
-            return backbone(
-                input_ids,
-                positions,
-                hidden_states,
-                intermediate_tensors,
-                inputs_embeds,
-                spec_step_idx=spec_step_idx,
-            )
-        with hc_prefill_sequence_parallel_context(False):
-            return backbone(
-                input_ids,
-                positions,
-                hidden_states,
-                intermediate_tensors,
-                inputs_embeds,
-                spec_step_idx=spec_step_idx,
-            )
+    def draft_forward_context(self):
+        """Context the uncompiled speculator enters around this forward.
+
+        Draft row stages keep the original replicated producer reductions, so
+        they must not inherit the target's partial-producer context. Setting
+        the ContextVar inside the compiled forward is not traceable by Dynamo,
+        so the speculator applies it here instead.
+        """
+        from .sm70_hcx import hc_prefill_sequence_parallel_context
+
+        return hc_prefill_sequence_parallel_context(False)
 
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0

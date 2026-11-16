@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import numpy as np
@@ -388,12 +389,20 @@ class EagleSpeculator(TargetSamplingHooks):
                 )
                 inputs_embeds = self.inputs_embeds[:num_tokens]
 
-            ret_hidden_states = self.model(
-                input_ids=self.input_buffers.input_ids[:num_tokens],
-                positions=self.input_buffers.positions[:num_tokens],
-                hidden_states=self.hidden_states[:num_tokens],
-                inputs_embeds=inputs_embeds,
+            # Models whose compiled draft forward must not enter a Python
+            # context (e.g. ContextVar.set under Dynamo) expose the context for
+            # this uncompiled caller instead.
+            draft_ctx = getattr(self.model, "draft_forward_context", None)
+            hc_ctx: AbstractContextManager[Any] = (
+                draft_ctx() if draft_ctx is not None else nullcontext()
             )
+            with hc_ctx:
+                ret_hidden_states = self.model(
+                    input_ids=self.input_buffers.input_ids[:num_tokens],
+                    positions=self.input_buffers.positions[:num_tokens],
+                    hidden_states=self.hidden_states[:num_tokens],
+                    inputs_embeds=inputs_embeds,
+                )
         # Some MTP models declare a single-tensor contract but return
         # (logits_hidden, feedback_hidden) for final-norm correctness.
         if isinstance(ret_hidden_states, tuple):
