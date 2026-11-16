@@ -1609,8 +1609,11 @@ class EngineCoreProc(EngineCore):
         try:
             outputs, model_executed = self.step_fn()
         except KVPartialHitDriftError as e:
+            recover = getattr(self.scheduler, "_recover_partial_hit_drift", None)
+            if recover is None:
+                raise
             try:
-                self.scheduler._recover_partial_hit_drift(e.request, e.entry)
+                recover(e.request, e.entry)
             except Exception:
                 logger.exception("partial hit drift recovery failed")
             return False

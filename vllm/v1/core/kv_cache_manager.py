@@ -55,9 +55,7 @@ class KVPartialHitDriftError(Exception):
         self.request = request
         self.entry = entry
         self.key = entry.key
-        super().__init__(
-            f"partial hit drift: req={request.request_id} key={entry.key}"
-        )
+        super().__init__(f"partial hit drift: req={request.request_id} key={entry.key}")
 
 
 _V41_SESSION_PREFIX = envs.VLLM_V41_SESSION_PREFIX == "1"
@@ -446,11 +444,10 @@ class KVCacheManager:
         # Verify every group before writing anything: a drift found halfway
         # through the loop would otherwise leave a half-updated request. On a
         # mismatch the scheduler drops the hit and recomputes the request.
-        req_blocks_by_group = []
+        req_blocks_by_group: list[list[KVCacheBlock]] = []
         for group_id, manager in enumerate(self.coordinator.single_type_managers):
             req_blocks = manager.req_to_blocks.get(request.request_id)
-            last = len(req_blocks) - 1 if req_blocks else -1
-            if last < 0 or req_blocks[last] is not entry.blocks[group_id][-1]:
+            if not req_blocks or req_blocks[-1] is not entry.blocks[group_id][-1]:
                 raise KVPartialHitDriftError(request, entry)
             req_blocks_by_group.append(req_blocks)
 

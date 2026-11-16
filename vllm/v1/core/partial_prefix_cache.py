@@ -115,6 +115,13 @@ class PartialPrefixCache:
         self.num_blocks -= entry.num_blocks
         self.block_pool.free_blocks([b for blocks in entry.blocks for b in blocks])
 
+    def remove(self, key: PartialKey) -> bool:
+        """Drop one entry and free its blocks; False if it is already gone."""
+        if key not in self.entries:
+            return False
+        self._remove(key)
+        return True
+
     def evict_one(self) -> bool:
         """Release the least recently used entry. Returns False if empty."""
         if not self.entries:

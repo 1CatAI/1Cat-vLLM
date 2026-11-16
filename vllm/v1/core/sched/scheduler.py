@@ -1962,7 +1962,7 @@ class Scheduler(SchedulerInterface):
         """
         cache = self.kv_cache_manager.partial_cache
         if cache is not None:
-            cache.remove_entry(entry.key)
+            cache.remove(entry.key)
         self.kv_cache_manager.free(request)
         request.partial_prefix_entry = None
         request.num_computed_tokens = 0
