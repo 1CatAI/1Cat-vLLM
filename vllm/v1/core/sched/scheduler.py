@@ -2847,7 +2847,46 @@ class Scheduler(SchedulerInterface):
                 # in the decoder's KV cache.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
-    def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+    def _prefill_chunk_req_ids(self, scheduler_output: SchedulerOutput) -> set[str]:
+        """Requests whose prompt was still unfinished after this step.
+
+        With pipeline parallelism the next step of a request (its final prompt
+        chunk) can be scheduled before this step's output is applied, and
+        scheduling sets ``request.is_prefill_chunk`` for that later step. Only
+        the step that produced the drafts can say whether they were proposed
+        from an intermediate chunk, whose sampled token is discarded.
+        """
+        computed = {
+            new_req.req_id: new_req.num_computed_tokens
+            for new_req in scheduler_output.scheduled_new_reqs
+        }
+        cached = scheduler_output.scheduled_cached_reqs
+        computed.update(zip(cached.req_ids, cached.num_computed_tokens))
+        chunks: set[str] = set()
+        for req_id, num_computed in computed.items():
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            reached = num_computed + scheduler_output.num_scheduled_tokens.get(
+                req_id, 0
+            )
+            if reached < request.num_prompt_tokens:
+                chunks.add(req_id)
+        return chunks
+
+    def update_draft_token_ids(
+        self,
+        draft_token_ids: DraftTokenIds,
+        scheduler_output: SchedulerOutput | None = None,
+    ) -> None:
+        # scheduler_output: the step that produced these drafts. Pipeline
+        # parallelism passes it, because a later step of the same request may
+        # already be scheduled (see _prefill_chunk_req_ids).
+        chunk_req_ids = (
+            self._prefill_chunk_req_ids(scheduler_output)
+            if scheduler_output is not None
+            else set()
+        )
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -2858,7 +2897,7 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
-            if request.is_prefill_chunk:
+            if request.is_prefill_chunk or req_id in chunk_req_ids:
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
