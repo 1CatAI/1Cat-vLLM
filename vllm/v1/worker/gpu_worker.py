@@ -26,6 +26,10 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from vllm.distributed.device_communicators.cuda_wrapper import (
+    CUDA_LIMIT_STACK_SIZE,
+    CudaRTLibrary,
+)
 from vllm.distributed.ec_transfer import (
     ensure_ec_transfer_initialized,
     ensure_ec_transfer_shutdown,
@@ -710,6 +714,18 @@ class Worker(WorkerBase):
             if current_platform.is_cuda() and current_platform.is_device_capability(70)
             else nullcontext()
         )
+        # A cold compile (empty Triton or Inductor cache) autotunes, and some
+        # candidate configurations spill registers heavily. Launching one grows
+        # the driver's per-thread stack limit, and the local memory reserved
+        # for it (stack size times every thread the device can hold) stays
+        # allocated after the tuning. On a Quadro RTX 8000 the limit went from
+        # 1 KiB to 10 KiB, 0.63 GiB that a warm boot does not hold, so the KV
+        # budget depended on the compile cache and GLM-5.3's longest context
+        # no longer fit after a cache rebuild. Restore the limit before the
+        # measured forward: kernels serving needs grow it again there and are
+        # counted.
+        cudart = CudaRTLibrary() if current_platform.is_cuda() else None
+        stack_limit = cudart.cudaDeviceGetLimit(CUDA_LIMIT_STACK_SIZE) if cudart else 0
         try:
             with warmup_allocator:
                 self.model_runner.profile_run()
@@ -731,6 +747,17 @@ class Worker(WorkerBase):
                 total,
             )
             raise
+        if cudart is not None:
+            grown_stack_limit = cudart.cudaDeviceGetLimit(CUDA_LIMIT_STACK_SIZE)
+            if grown_stack_limit > stack_limit:
+                torch.accelerator.synchronize()
+                cudart.cudaDeviceSetLimit(CUDA_LIMIT_STACK_SIZE, stack_limit)
+                logger.info(
+                    "The warm-up grew the device stack limit from %d to %d "
+                    "bytes; restored it before measuring the KV budget.",
+                    stack_limit,
+                    grown_stack_limit,
+                )
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             msg = (
