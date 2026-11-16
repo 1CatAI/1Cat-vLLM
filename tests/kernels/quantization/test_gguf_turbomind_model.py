@@ -9,6 +9,9 @@ from test_gguf_lattice_transcode import source as lattice_source
 from test_gguf_lut_transcode import source as lut_source
 from test_gguf_transcode import packed
 
+from tests.kernels.quantization.gguf_turbomind_support import (
+    requires_turbomind_gguf,
+)
 from vllm.model_executor.layers.quantization.gguf import GGUFConfig, GGUFLinearMethod
 from vllm.model_executor.layers.quantization.gguf_layout import GGUFHeadTilingLayout
 from vllm.model_executor.layers.quantization.gguf_turbomind import (
@@ -16,7 +19,10 @@ from vllm.model_executor.layers.quantization.gguf_turbomind import (
 )
 from vllm.sm70_profiles.acceleration import loaded_linear_kernels
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    requires_turbomind_gguf,
+]
 
 
 def source(weight_type, n=64, k=512):
@@ -66,6 +72,8 @@ def test_prepared_dense_projection_uses_family_kernel_and_graph(weight_type):
 def linear_method(layout=None, output_sizes=(64, 64, 64, 64)):
     method = GGUFLinearMethod(GGUFConfig(), layout)
     layer = torch.nn.Module()
+    # LinearBase records its prefix; GGUF preparation scopes projection planes by it.
+    layer.prefix = "test.linear"
     layer.quant_method = method
     method.create_weights(
         layer, 512, list(output_sizes), 512, sum(output_sizes), torch.float16

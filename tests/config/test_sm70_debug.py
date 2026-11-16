@@ -3,7 +3,7 @@
 
 import pytest
 
-from vllm import envs
+from vllm import envs, envs_metadata
 
 ALIASES = {
     "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE": "trace",
@@ -19,6 +19,8 @@ ALIASES = {
 @pytest.fixture(autouse=True)
 def clear_debug(monkeypatch):
     envs.disable_envs_cache()
+    # Legacy inputs warn once per process; every case observes its own warning.
+    monkeypatch.setattr(envs_metadata, "_warned_names", set())
     for name in (*ALIASES, "VLLM_SM70_DEBUG"):
         monkeypatch.delenv(name, raising=False)
     yield
@@ -29,7 +31,7 @@ def clear_debug(monkeypatch):
 @pytest.mark.parametrize("value", ("0", "1", "2"))
 def test_legacy_debug_parser_is_preserved_and_warns(name, value, monkeypatch):
     monkeypatch.setenv(name, value)
-    with pytest.warns(FutureWarning, match="compatibility release"):
+    with pytest.warns(FutureWarning, match="compatibility input remains supported"):
         assert getattr(envs, name) == bool(int(value))
 
 

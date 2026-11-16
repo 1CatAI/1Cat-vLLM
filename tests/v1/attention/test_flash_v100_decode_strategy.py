@@ -90,6 +90,9 @@ def source_interface(monkeypatch):
         "_shared_decode_source", path, submodule_search_locations=[str(path.parent)]
     )
     assert spec is not None and spec.loader is not None
+    # The interface tries ``from . import flash_attn_v100_cuda`` first; without
+    # this entry an in-place native build next to the source replaces the fake.
+    monkeypatch.setitem(sys.modules, f"{spec.name}.flash_attn_v100_cuda", native)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)

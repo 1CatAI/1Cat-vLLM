@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm.config import CompilationConfig, CUDAGraphMode
+from vllm.config import AttentionConfig, CompilationConfig, CUDAGraphMode
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 
@@ -17,17 +17,21 @@ def _make_config(max_num_seqs: int, verifier_sizes: list[int]):
         method="mtp",
         num_speculative_state_tokens=lambda: 4,
     )
+    compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_capture_sizes=verifier_sizes.copy(),
+        max_cudagraph_capture_size=max(verifier_sizes),
+    )
+    # The split switch is part of the engine's graph policy, not the environment.
+    compilation_config.runtime.split_draft_graphs = True
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=4,
             data_parallel_size=1,
         ),
-        compilation_config=CompilationConfig(
-            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
-            cudagraph_capture_sizes=verifier_sizes.copy(),
-            max_cudagraph_capture_size=max(verifier_sizes),
-        ),
+        compilation_config=compilation_config,
+        attention_config=AttentionConfig(),
         speculative_config=speculative_config,
     )
 
@@ -48,7 +52,6 @@ def test_split_managers_keep_exact_full_graph_shapes(
     verifier_sizes: list[int],
     capability: tuple[int, int],
 ):
-    monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "1")
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.cudagraph_utils.current_platform.is_cuda",
         lambda: True,
@@ -125,6 +128,7 @@ def test_dflash_lookup_captures_b1_q8_and_q16(monkeypatch) -> None:
             cudagraph_capture_sizes=[16],
             max_cudagraph_capture_size=16,
         ),
+        attention_config=AttentionConfig(),
         speculative_config=SimpleNamespace(
             method="dflash",
             ngram_assist=True,

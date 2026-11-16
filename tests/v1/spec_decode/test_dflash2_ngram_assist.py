@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.config.speculative import SpeculativeConfig
+from vllm.diagnostics import bind_diagnostics
 from vllm.v1.spec_decode.ngram_proposer import (
     _find_longest_matched_ngram_and_propose_tokens,
 )
@@ -92,6 +93,8 @@ class _CopyEvent:
 
 def _host_only_speculator() -> DFlash2Speculator:
     speculator = object.__new__(DFlash2Speculator)
+    # __init__ binds the engine diagnostics; the defaults keep profiling off.
+    speculator._diagnostics = bind_diagnostics()
     speculator._ngram_assist = DFlash2NgramAssist(
         2, 3, num_draft_tokens=2, max_model_len=64
     )
@@ -264,6 +267,7 @@ def test_lookup_controller_never_coasts_a_multi_request_batch() -> None:
 
 def test_lookup_controller_selects_q8_before_two_strong_hits(monkeypatch) -> None:
     speculator = object.__new__(DFlash2Speculator)
+    speculator._diagnostics = bind_diagnostics()
     speculator._lookup_enabled = True
     speculator._lookup_current_req_key = (0,)
     speculator._lookup_current_eligible = True

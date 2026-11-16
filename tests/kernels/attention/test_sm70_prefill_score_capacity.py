@@ -19,7 +19,9 @@ pytestmark = pytest.mark.skipif(
 _SCRIPT = """
 import json
 import torch
-from vllm.vllm_flash_attn import flash_attn_interface
+from vllm.vllm_flash_attn.flash_attn_interface import load_fa2_library
+# The FA2 library is loaded per device on first use, not at import.
+load_fa2_library(torch.device("cuda"))
 q = torch.randn(1, 8192, 6, 256, device="cuda", dtype=torch.float16)
 k = torch.randn(1, 16384, 1, 256, device="cuda", dtype=torch.float16)
 v = torch.randn_like(k)

@@ -60,6 +60,8 @@ def test_worker_shutdown_flushes_route_summary_once(monkeypatch):
     monkeypatch.setattr(gpu_worker, "ensure_kv_transfer_shutdown", lambda: None)
     monkeypatch.setattr(gpu_worker, "ensure_ec_transfer_shutdown", lambda: None)
     worker = object.__new__(gpu_worker.Worker)
+    # No engine runtime resources: the process-wide route counters are flushed.
+    worker.vllm_config = SimpleNamespace()
     worker.profiler = None
     worker._ple_offload_worker_handle = None
 
@@ -75,6 +77,7 @@ def test_worker_shutdown_flushes_route_summary_once(monkeypatch):
 
 def test_sm70_workspace_cleanup_releases_all_tensor_owners():
     from vllm.model_executor.kernels.linear.scaled_mm import sm70_fp8
+    from vllm.model_executor.layers.fused_moe.sm70 import fp4_workspace
     from vllm.model_executor.layers.quantization import (
         nvfp4_sm70_moe,
         sm70_turbomind,
@@ -106,7 +109,13 @@ def test_sm70_workspace_cleanup_releases_all_tensor_owners():
     sm70_fp8._sm70_fp8_prefill_dense_workspaces[(0, tensor.dtype)] = tensor
     sm70_fp8._sm70_fp8_qpn8_pp2_tp4_workspaces[(0, tensor.dtype)] = tensor
     sm70_turbomind._nvfp4_qpn4_dense_workspaces[(0, tensor.dtype)] = tensor
-    nvfp4_sm70_moe._qwen38_raw_scale_workspaces[0] = tensor
+    # The shutdown table clears the raw-scale workspace through nvfp4_sm70_moe;
+    # the workspace itself lives in the shared FP4 MoE module.
+    assert (
+        nvfp4_sm70_moe.clear_sm70_nvfp4_moe_workspaces
+        is fp4_workspace.clear_sm70_nvfp4_moe_workspaces
+    )
+    fp4_workspace._qwen38_raw_scale_workspaces[0] = tensor
     sm70_nvfp4_native._scale_workspaces[0] = tensor
     sm70_nvfp4_native._code_workspaces[(0, 1)] = tensor
 
@@ -120,7 +129,7 @@ def test_sm70_workspace_cleanup_releases_all_tensor_owners():
     assert not sm70_fp8._sm70_fp8_prefill_dense_workspaces
     assert not sm70_fp8._sm70_fp8_qpn8_pp2_tp4_workspaces
     assert not sm70_turbomind._nvfp4_qpn4_dense_workspaces
-    assert not nvfp4_sm70_moe._qwen38_raw_scale_workspaces
+    assert not fp4_workspace._qwen38_raw_scale_workspaces
     assert not sm70_nvfp4_native._scale_workspaces
     assert not sm70_nvfp4_native._code_workspaces
 

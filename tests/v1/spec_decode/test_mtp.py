@@ -24,6 +24,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.load import LoadConfig
+from vllm.config.sm70_moe import Sm70UnquantizedMoEConfig
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -65,6 +66,16 @@ def test_sm70_mtp_concurrency_warmup_is_default_off(monkeypatch):
         envs.disable_envs_cache()
 
 
+def _moe_warmup_vllm_config(**unquantized) -> SimpleNamespace:
+    # The warmup reads the engine's resolved unquantized MoE policy.
+    policy = Sm70UnquantizedMoEConfig(**unquantized)
+    policy.resolve()
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        kernel_config=SimpleNamespace(sm70_moe=SimpleNamespace(unquantized=policy)),
+    )
+
+
 def test_sm70_mtp_moe_warmup_runs_each_shape_once():
     dummy_run = mock.Mock()
     draft_model_config = SimpleNamespace(
@@ -80,9 +91,7 @@ def test_sm70_mtp_moe_warmup_runs_each_shape_once():
         method="mtp",
         device=torch.device("cuda"),
         draft_model_config=draft_model_config,
-        vllm_config=SimpleNamespace(
-            parallel_config=SimpleNamespace(tensor_parallel_size=4)
-        ),
+        vllm_config=_moe_warmup_vllm_config(),
         max_num_tokens=8192,
         dummy_run=dummy_run,
         _sm70_mtp_moe_warmed=False,
@@ -115,9 +124,7 @@ def test_sm70_mtp_moe_warmup_covers_opted_in_exact_tiles():
         method="mtp",
         device=torch.device("cuda"),
         draft_model_config=draft_model_config,
-        vllm_config=SimpleNamespace(
-            parallel_config=SimpleNamespace(tensor_parallel_size=4)
-        ),
+        vllm_config=_moe_warmup_vllm_config(mtp_tuned=True),
         max_num_tokens=8192,
         dummy_run=dummy_run,
         _sm70_mtp_moe_warmed=False,
@@ -126,7 +133,6 @@ def test_sm70_mtp_moe_warmup_covers_opted_in_exact_tiles():
     with (
         mock.patch.object(current_platform, "is_device_capability", return_value=True),
         mock.patch.object(torch.accelerator, "synchronize"),
-        mock.patch.object(envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", True),
     ):
         assert SpecDecodeBaseProposer.warmup_sm70_mtp_moe_kernels(proposer) == (
             "mtp_draft_moe",
@@ -158,9 +164,7 @@ def test_sm70_mtp_moe_warmup_covers_qwen38_exact_tiles():
         method="mtp",
         device=torch.device("cuda"),
         draft_model_config=draft_model_config,
-        vllm_config=SimpleNamespace(
-            parallel_config=SimpleNamespace(tensor_parallel_size=4)
-        ),
+        vllm_config=_moe_warmup_vllm_config(mtp_tuned=True),
         max_num_tokens=8192,
         dummy_run=dummy_run,
         _sm70_mtp_moe_warmed=False,
@@ -169,7 +173,6 @@ def test_sm70_mtp_moe_warmup_covers_qwen38_exact_tiles():
     with (
         mock.patch.object(current_platform, "is_device_capability", return_value=True),
         mock.patch.object(torch.accelerator, "synchronize"),
-        mock.patch.object(envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", True),
     ):
         assert SpecDecodeBaseProposer.warmup_sm70_mtp_moe_kernels(proposer) == (
             "mtp_draft_moe",

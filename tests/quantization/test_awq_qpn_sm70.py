@@ -150,7 +150,7 @@ def test_runtime_layout_and_rollback():
 
 
 @pytest.mark.parametrize("compact", [False, True])
-def test_real_moe_branch_calls_native_with_existing_banks(monkeypatch, compact):
+def test_real_moe_branch_calls_native_with_existing_banks(compact):
     current = layer()
     current.sm70_awq_moe_compact_metadata = compact
     for name in ("w13_tm_weight", "w13_tm_scales", "w2_tm_weight", "w2_tm_scales"):
@@ -166,14 +166,17 @@ def test_real_moe_branch_calls_native_with_existing_banks(monkeypatch, compact):
         seen.append(args)
         args[0].fill_(7)
 
-    monkeypatch.setattr(moe.sm70_ops, "awq_moe_qpn_m1_sm70_out", native)
-    monkeypatch.setattr(
-        moe.sm70_ops,
-        "awq_moe_single_token_sm70_out",
-        lambda *args: pytest.fail("unexpected legacy route"),
+    # The method calls the native ops it bound in process_weights_after_loading.
+    method = SimpleNamespace(
+        native_ops=SimpleNamespace(
+            awq_moe_qpn_m1_sm70_out=native,
+            awq_moe_single_token_sm70_out=lambda *args: pytest.fail(
+                "unexpected legacy route"
+            ),
+        )
     )
     result = moe.AWQSM70MoEMethod._apply_legacy_single_token_compact(
-        cast(Any, object()),
+        cast(Any, method),
         cast(Any, current),
         x,
         weights,

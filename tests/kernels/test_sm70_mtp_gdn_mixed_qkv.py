@@ -84,6 +84,8 @@ def test_standard_mtp_core_keeps_output_conv_and_ssm_bits(
         gdn_preparation=GdnPreparation(GdnHeadContract(16, 48, 128, 128, 4)),
         _gdn_profiler=GdnPrefillProfiler(profiling),
         verification_update=None,
+        # Speculative replay is off by default (kernel_config.sm70_gdn_spec_replay).
+        _spec_replay=False,
         prefix="test",
         tp_size=4,
         num_k_heads=16,

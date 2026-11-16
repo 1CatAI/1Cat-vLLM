@@ -318,6 +318,20 @@ def test_native_loading_workspace_and_scalar_long_calculations_match_parent():
                 node.module = "vllm.v1.attention.ops.sm70_e4m3_long"
             return node
 
+    # 495fb442a reads the long-attention switches from the engine policy
+    # instead of the environment.
+    policy_bound = {
+        "sm70_grouped_long": {
+            "long_attention_enabled",
+            "resolve_long_attention",
+            "long_attention_graph_contract",
+            "long_attention_max_batch_size",
+            # fb6320531 runs several KV heads in one grid with a workspace
+            # panel per head and request when the operator advertises it.
+            "wrap_long_attention",
+            "run_six_head_groups",
+        }
+    }
     for module, expected in fixture["native_methods"].items():
         path = Path(grouped.__file__).with_name(f"{module}.py")
         actual = {
@@ -327,7 +341,11 @@ def test_native_loading_workspace_and_scalar_long_calculations_match_parent():
             for node in ast.parse(path.read_text()).body
             if isinstance(node, ast.FunctionDef)
         }
-        assert actual == expected
+        changed = policy_bound.get(module, set())
+        assert actual.keys() == expected.keys()
+        assert {k: v for k, v in actual.items() if k not in changed} == {
+            k: v for k, v in expected.items() if k not in changed
+        }
 
 
 def test_shared_clear_reaches_the_only_fp16_workspace_owner(monkeypatch):

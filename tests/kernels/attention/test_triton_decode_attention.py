@@ -280,6 +280,10 @@ def _quantize_to_fp8(tensor: torch.Tensor):
 def test_decode_attention_fp8(B, L, H_Q, H_KV, D_QK, D_V, CACHE_SIZE, PAGE_SIZE):
     """Test FP8 KV cache path: quantize K/V to FP8, run kernel with scales,
     and compare against BF16 reference output."""
+    if not current_platform.has_device_capability(89):
+        pytest.skip(
+            "Triton limitation: fp8e4nv data type is not supported on CUDA arch < 89"
+        )
     assert CACHE_SIZE % PAGE_SIZE == 0
     dtype = torch.bfloat16
     seq_len = L

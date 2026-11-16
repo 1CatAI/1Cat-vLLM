@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from vllm import envs
+from vllm._sm70.policy import native_policy_abi_available
 from vllm.config.kernel import KernelConfig
 from vllm.config.sm70_moe import (
     MXFP4_ALIASES,
@@ -18,6 +19,7 @@ from vllm.config.sm70_moe import (
     Sm70MxFp4MoEConfig,
     Sm70NvFp4MoEConfig,
 )
+from vllm.config.sm70_native import NATIVE_FIELDS
 from vllm.model_executor.layers.fused_moe.sm70 import fp4_codec, fp4_stages
 from vllm.model_executor.layers.quantization import mxfp4_sm70_moe, nvfp4_sm70_moe
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
@@ -196,6 +198,10 @@ def test_frozen_apply_call_order(monkeypatch, family, route, m):
             monkeypatch.setattr(module, helper, record(helper))
         if hasattr(fp4_stages, helper):
             monkeypatch.setattr(fp4_stages, helper, record(helper))
+    if family == "nvfp4":
+        # #1369 serves 81..1024 routed Qwen3.8 slots with one fused permute
+        # that frozen main lacks; compare the generic route it replaces.
+        monkeypatch.setattr(module, "_use_qwen38_dense_permute", lambda *a: False)
 
     h, intermediate, e, k = (
         (2560, 160, 512, 10) if family == "nvfp4" else (4096, 512, 256, 6)
@@ -204,6 +210,7 @@ def test_frozen_apply_call_order(monkeypatch, family, route, m):
     layer.moe_config = NS(tp_size=4)
     layer.sm70_moe_policy = policy
     layer.local_num_experts = layer.global_num_experts = e
+    layer.top_k = k
     layer.expert_map = None
     layer.swiglu_limit = 7.0 if route == "clamp" or family == "mxfp4" else None
     layer.apply_router_weight_on_input = False
@@ -285,7 +292,9 @@ def test_frozen_apply_call_order(monkeypatch, family, route, m):
     source = json.loads(
         (Path(__file__).parent / "fixtures/sm70_fp4_stage_legacy.json").read_text()
     )[family]
-    legacy = dict(vars(module), envs=envs, os=os)
+    # Frozen main also read its DFlash target-layer trace switch (default off)
+    # from a module global, now part of the runtime trace policy.
+    legacy = dict(vars(module), envs=envs, os=os, _DFLASH_NVFP4_TRACE_ARMED=False)
     for code in source.values():
         exec(code, legacy)
     trace.clear()
@@ -351,6 +360,7 @@ def test_workspace_persistent_views_overflow_and_weight_rebinding(monkeypatch, f
     layer = torch.nn.Module()
     layer.w13_tm_weight = torch.zeros(1)
     layer.local_num_experts = layer.global_num_experts = 4
+    layer.top_k = 6
     for key, value in dict(
         hidden_size=64, intermediate_size=32, num_experts=4, top_k=6, w13_n_dim=64
     ).items():
@@ -424,9 +434,18 @@ def test_shared_gguf_skinny_reduction_preserves_rounding(dtype):
 
 
 def test_native_owned_switch_cannot_silently_conflict(monkeypatch):
-    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL", "0")
-    with pytest.raises(ValueError, match="native ABI"):
-        Sm70NvFp4MoEConfig(fast_prefill=True).resolve()
+    alias = "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL"
+    monkeypatch.setenv(alias, "0")
+    explicit = Sm70NvFp4MoEConfig(fast_prefill=True)
+    if native_policy_abi_available():
+        # The policy-argument ABI hands the typed request to native code.
+        explicit.resolve()
+        assert explicit.fast_prefill
+        native_aliases = [name for _, name, _, _ in NATIVE_FIELDS]
+        assert explicit.native.values[native_aliases.index(alias)] == "1"
+    else:
+        with pytest.raises(ValueError, match="native ABI"):
+            explicit.resolve()
     allowed = Sm70NvFp4MoEConfig(fast_prefill=False)
     allowed.resolve()
     assert not allowed.fast_prefill
