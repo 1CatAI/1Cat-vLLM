@@ -267,11 +267,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
             requested = runtime_resources_for(engine).get("gpu_memory_budget_bytes")
             if requested is None:
-                raise RuntimeError(
-                    "automatic FP8 bridge budgeting requires the GPU "
-                    "worker memory snapshot; initialize the worker or set "
-                    "fp8_bridge_workspace_bytes/fp8_bridge_head_groups"
+                logger.warning_once(
+                    "FP8 bridge workspace: no GPU memory snapshot at init; "
+                    "skipping automatic budgeting. Set fp8_bridge_workspace_"
+                    "bytes or fp8_bridge_head_groups to enable.",
+                    scope="process",
                 )
+                return
             budget = requested // 32
         self.fp8_bridge_workspace_plan = _config.Fp8BridgeWorkspacePlan.build(
             budget_bytes=budget,
