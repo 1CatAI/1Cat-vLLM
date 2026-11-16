@@ -22,6 +22,7 @@ from tests.kernels.moe.utils import (
     modular_triton_fused_moe,
 )
 from tests.kernels.utils import opcheck, stack_and_dev, torch_experts, torch_moe
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import (
     MoEActivation,
@@ -676,6 +677,10 @@ def test_fused_moe_wn16(
     torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
 
 
+# The SM70 Marlin build serves fp16 activations and outputs with full K and
+# without act_order; it rejects the rest on purpose.
+SM70_MARLIN = ops.sm70_marlin_available()
+
 MARLIN_MOE_SCENARIOS = [
     # (m, n, k, e, topk, ep_size, act_order, is_k_full)
     # No act_order: is_k_full=True matches usual case (marlin_is_k_full).
@@ -726,6 +731,13 @@ def marlin_moe_generate_valid_test_cases():
         if group_size in [k, n]:
             return False
         if b_type == scalar_types.float8_e4m3fn and group_size == 32 and is_k_full:
+            return False
+        if SM70_MARLIN and (
+            act_order
+            or not is_k_full
+            or a_type is not scalar_types.float16
+            or c_type is not scalar_types.float16
+        ):
             return False
         return a_type.size_bits < 16 or a_type is c_type
 
@@ -1102,7 +1114,8 @@ def test_fused_marlin_moe_non_gated(
     group_size = 16  # NVFP4 group size
     is_k_full = True
     quant_type = scalar_types.float4_e2m1f
-    dtype = torch.bfloat16
+    # The SM70 Marlin build serves fp16 activations only.
+    dtype = torch.float16 if SM70_MARLIN else torch.bfloat16
 
     a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
     # Non-gated: w1 shape is (e, n, k) not (e, 2*n, k)
@@ -1347,7 +1360,8 @@ def _batched_fused_marlin_moe_cases() -> list[Any]:
             e,
             topk,
             max_tokens_per_batch,
-            torch.bfloat16,
+            # The SM70 Marlin build serves fp16 activations only.
+            torch.float16 if SM70_MARLIN else torch.bfloat16,
             scalar_types.float4_e2m1f,
             None,
             1e-3,
@@ -1373,6 +1387,10 @@ def _batched_fused_marlin_moe_cases() -> list[Any]:
             scalar_types.int8,
             4e-2,
             id="awq-int8-activation-metadata",
+            marks=pytest.mark.skipif(
+                SM70_MARLIN,
+                reason="The SM70 Marlin build has no int8 activations.",
+            ),
         )
     )
     return cases

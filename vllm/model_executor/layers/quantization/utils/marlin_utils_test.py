@@ -10,7 +10,9 @@ from vllm.scalar_type import ScalarType, scalar_types
 
 from .marlin_utils import GPTQ_MARLIN_TILE, marlin_permute_scales, marlin_zero_points
 from .quant_utils import (
+    awq_pack,
     get_pack_factor,
+    gptq_pack,
     gptq_quantize_weights,
     quantize_weights,
     sort_weights,
@@ -154,10 +156,16 @@ def marlin_quantize(
     if act_order:
         q_w, g_idx, sort_indices = sort_weights(q_w, g_idx)
 
-    # Reformat to marlin
-    weight_perm = get_weight_perm(num_bits, is_a_8bit)
-    marlin_q_w = marlin_weights(
-        q_w, size_k, size_n, num_bits, weight_perm, is_a_8bit=is_a_8bit
+    # Reformat to marlin through the repack op the loaders use, so the weights
+    # come in the layout this build's kernels read. marlin_weights builds the
+    # reference Marlin layout; test_gptq_marlin_repack compares the two.
+    marlin_q_w = ops.gptq_marlin_repack(
+        gptq_pack(q_w, num_bits, size_k, size_n),
+        torch.empty(0, dtype=torch.int, device=w.device),
+        size_k,
+        size_n,
+        num_bits,
+        is_a_8bit,
     )
     marlin_s = marlin_permute_scales(s, size_k, size_n, group_size, is_a_8bit=is_a_8bit)
 
@@ -201,10 +209,13 @@ def awq_marlin_quantize(
         q_w[q_w < 0] = 15 - q_w_old[q_w < 0]
         s = s * 512
 
-    # Reformat to marlin
-    weight_perm = get_weight_perm(quant_type.size_bits, is_a_8bit)
-    marlin_q_w = marlin_weights(
-        q_w, size_k, size_n, quant_type.size_bits, weight_perm, is_a_8bit=is_a_8bit
+    # Reformat to marlin through the loaders' repack op (see marlin_quantize).
+    marlin_q_w = ops.awq_marlin_repack(
+        awq_pack(q_w, quant_type.size_bits, size_k, size_n),
+        size_k,
+        size_n,
+        quant_type.size_bits,
+        is_a_8bit,
     )
     marlin_s = marlin_permute_scales(s, size_k, size_n, group_size, is_a_8bit=is_a_8bit)
     marlin_zp = marlin_zero_points(
