@@ -2008,3 +2008,90 @@ def test_streaming_string_parameter_emits_incremental_chunks_and_literal_tags(
     )
     assert len(non_stream.tool_calls) == 1
     assert json.loads(non_stream.tool_calls[0].function.arguments) == parsed_stream
+
+
+def test_get_structural_tag_supports_parallel_newlines_leading_ws_and_schema_relax(
+    qwen3_tool_parser: Qwen3CoderToolParser,
+    sample_tools: list[ChatCompletionToolsParam],
+) -> None:
+    from xgrammar import Grammar
+
+    request_tools = _as_chat_completion_tools(sample_tools)
+    req = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=request_tools,
+        tool_choice="required",
+    )
+    tag = qwen3_tool_parser.get_structural_tag(req)
+    assert isinstance(tag, StructuralTag)
+    tag_dump = tag.model_dump()
+    Grammar.from_structural_tag(json.dumps(tag_dump))
+    fmt = tag_dump["format"]
+    assert fmt["type"] == "sequence"
+    assert fmt["elements"][0]["type"] == "optional"
+    assert fmt["elements"][1]["separator"] == "\n"
+
+    # Incompatible regex lookahead schema degrades gracefully to unconstrained args.
+    bad_tools = [t.model_copy(deep=True) for t in request_tools]
+    bad_tools[0].function.parameters = {
+        "type": "object",
+        "properties": {"city": {"type": "string", "pattern": "(?=Dallas)"}},
+    }
+    bad_req = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=bad_tools,
+        tool_choice="required",
+    )
+    relaxed = qwen3_tool_parser.get_structural_tag(bad_req)
+    assert isinstance(relaxed, StructuralTag)
+    Grammar.from_structural_tag(json.dumps(relaxed.model_dump()))
+
+
+def test_streaming_duplicate_parameter_emits_single_key_matching_non_streaming(
+    qwen3_tokenizer,
+) -> None:
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "line": {"type": "integer"},
+                    },
+                },
+            },
+        )
+    ]
+    model_output = (
+        "<tool_call>\n"
+        "<function=read_file>\n"
+        "<parameter=path>\nsrc/a.py\n</parameter>\n"
+        "<parameter=path>\nsrc/b.py\n</parameter>\n"
+        "<parameter=line>\n10\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+    chunks = []
+    for delta in stream_delta_message_generator(
+        parser, qwen3_tokenizer, model_output, request
+    ):
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                if tc.function and tc.function.arguments:
+                    chunks.append(tc.function.arguments)
+    raw_json = "".join(chunks)
+    assert raw_json.count('"path":') == 1
+    non_stream = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools).extract_tool_calls(
+        model_output, request=request
+    )
+    assert json.loads(raw_json) == {"path": "src/a.py", "line": 10}
+    assert json.loads(non_stream.tool_calls[0].function.arguments) == json.loads(
+        raw_json
+    )

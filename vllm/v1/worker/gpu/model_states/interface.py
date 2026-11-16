@@ -67,6 +67,19 @@ class ModelState(ABC):
         """Release optional model-owned host state for a finished request slot."""
         return None
 
+    def mount_decode_ckpt_blocks(
+        self,
+        req_index: int,
+        even_ids: list[int],
+        odd_ids: list[int],
+    ) -> None:
+        """Bind ping-pong Mamba state block IDs for 64-token decode checkpoints."""
+        return None
+
+    def flush_decode_ckpt_blocks(self) -> None:
+        """Flush staged decode checkpoint slot updates to device."""
+        return None
+
     def apply_staged_writes(self) -> None:
         return None
 

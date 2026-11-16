@@ -107,6 +107,7 @@ class SpecReplayState:
         block_table_ptrs: torch.Tensor,
         block_table_stride: int,
         mamba_block_size: int,
+        decode_ckpt_slots: torch.Tensor | None = None,
     ) -> None:
         """Fill this step's row tables before the forward (eager)."""
         if num_reqs == 0:
@@ -130,6 +131,7 @@ class SpecReplayState:
         rows_np[self.max_rows : self.max_rows + num_plain] = plain_rows
         self._rows.copy_(self._rows_host, non_blocking=True)
         block = triton.next_power_of_2(max(self.max_rows, 16))
+        has_decode_ckpt = decode_ckpt_slots is not None and mamba_block_size >= 128
         _prepare_replay_rows_kernel[(2,)](
             self._rows,
             idx_mapping,
@@ -146,6 +148,7 @@ class SpecReplayState:
             self.plain_map,
             block_table_ptrs,
             block_table_stride,
+            decode_ckpt_slots if has_decode_ckpt else self.spec_ckpt_slot,
             num_spec,
             num_plain,
             MAX_ROWS=self.max_rows,
@@ -153,6 +156,10 @@ class SpecReplayState:
             NUM_GROUPS=block_table_ptrs.numel(),
             MAMBA_BLOCK_SIZE=mamba_block_size,
             BLOCK=block,
+            HAS_DECODE_CKPT=has_decode_ckpt,
+            DECODE_CKPT_MAX_REQS=(
+                decode_ckpt_slots.shape[1] if decode_ckpt_slots is not None else 0
+            ),
         )
 
     def record_accepted(self, idx_mapping: torch.Tensor, accepted: torch.Tensor):
@@ -180,12 +187,15 @@ def _prepare_replay_rows_kernel(
     plain_map_ptr,
     block_table_ptrs_ptr,
     block_table_stride,
+    decode_ckpt_slots_ptr,
     num_spec,
     num_plain,
     MAX_ROWS: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_DECODE_CKPT: tl.constexpr = False,
+    DECODE_CKPT_MAX_REQS: tl.constexpr = 0,
 ):
     which = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
@@ -204,20 +214,53 @@ def _prepare_replay_rows_kernel(
         tl.store(
             spec_map_ptr + offsets, tl.where(live, 2 * req + side, 0), mask=in_table
         )
-        # The in-round position (if any) that completes a Mamba block.
+        # The in-round position (if any) that completes a Mamba block or a
+        # 64-token decode checkpoint. Since end - start <= TMAX (8) < 64 and
+        # MAMBA_BLOCK_SIZE is a multiple of 64, at most one 64-token boundary
+        # lies in (computed, computed + end - start].
         computed = tl.load(num_computed_ptr + req, mask=live, other=0)
         start = tl.load(query_start_loc_ptr + rows, mask=live, other=0)
         end = tl.load(query_start_loc_ptr + rows + 1, mask=live, other=0)
         boundary = ((computed + end - start) // MAMBA_BLOCK_SIZE) * MAMBA_BLOCK_SIZE
-        has_ckpt = live & (boundary > computed)
-        ckpt_token = tl.where(has_ckpt, boundary - 1 - computed, -1)
+        has_full_ckpt = live & (boundary > computed)
+        if HAS_DECODE_CKPT:
+            boundary64 = ((computed + end - start) // 64) * 64
+            has_dec_ckpt = (
+                live & (boundary64 > computed) & (boundary64 % MAMBA_BLOCK_SIZE != 0)
+            )
+            parity = (boundary64 // 64) & 1
+            slot0 = tl.load(
+                decode_ckpt_slots_ptr + req * 2 + parity,
+                mask=has_dec_ckpt,
+                other=-1,
+            )
+            has_dec_ckpt = has_dec_ckpt & (slot0 >= 0)
+            has_ckpt = has_full_ckpt | has_dec_ckpt
+            active_boundary = tl.where(has_full_ckpt, boundary, boundary64)
+            ckpt_token = tl.where(has_ckpt, active_boundary - 1 - computed, -1)
+        else:
+            has_ckpt = has_full_ckpt
+            ckpt_token = tl.where(has_ckpt, boundary - 1 - computed, -1)
         tl.store(spec_ckpt_token_ptr + offsets, ckpt_token, mask=in_table)
         column = boundary // MAMBA_BLOCK_SIZE - 1
         for group in tl.static_range(NUM_GROUPS):
             table = tl.load(block_table_ptrs_ptr + group).to(tl.pointer_type(tl.int32))
-            slot = tl.load(
-                table + rows * block_table_stride + column, mask=has_ckpt, other=-1
+            full_slot = tl.load(
+                table + rows * block_table_stride + column,
+                mask=has_full_ckpt,
+                other=-1,
             )
+            if HAS_DECODE_CKPT:
+                dec_slot = tl.load(
+                    decode_ckpt_slots_ptr
+                    + (group * DECODE_CKPT_MAX_REQS + req) * 2
+                    + parity,
+                    mask=has_dec_ckpt,
+                    other=-1,
+                )
+                slot = tl.where(has_full_ckpt, full_slot, dec_slot)
+            else:
+                slot = full_slot
             tl.store(
                 spec_ckpt_slot_ptr + group * MAX_ROWS + offsets,
                 tl.where(has_ckpt, slot, -1),

@@ -314,6 +314,7 @@ class Scheduler(SchedulerInterface):
             partial_prefix_cache=self.cache_config.partial_prefix_cache,
             num_speculative_tokens=self.num_spec_tokens,
             retention_policy=self.cache_config.retention,
+            enable_decode_ckpt=vllm_config.use_v2_model_runner,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -1439,6 +1440,27 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    _wait_snap = getattr(
+                        self.kv_cache_manager,
+                        "should_wait_for_inflight_snapshot",
+                        None,
+                    )
+                    if num_scheduled_tokens and _wait_snap is not None:
+                        _leaders = [
+                            (
+                                r,
+                                r.num_computed_tokens,
+                                r.num_computed_tokens
+                                + num_scheduled_tokens[r.request_id],
+                            )
+                            for r in self.running
+                            if r.request_id in num_scheduled_tokens
+                            and r.num_computed_tokens < r.num_prompt_tokens
+                        ]
+                        if _wait_snap(request, _leaders):
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
@@ -1824,6 +1846,8 @@ class Scheduler(SchedulerInterface):
         kv_block_copies, kv_block_copy_groups = (
             self.kv_cache_manager.take_block_copies_with_groups()
         )
+        _take_mounts = getattr(self.kv_cache_manager, "take_decode_ckpt_mounts", None)
+        decode_ckpt_mounts = _take_mounts() if _take_mounts is not None else []
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1864,6 +1888,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=new_block_ids_to_zero,
             kv_block_copies=kv_block_copies or None,
             kv_block_copy_groups=kv_block_copy_groups if kv_block_copies else None,
+            decode_ckpt_mounts=decode_ckpt_mounts or None,
             boundary_state_offloads=(
                 boundary_state_offloads if self.connector is not None else None
             ),

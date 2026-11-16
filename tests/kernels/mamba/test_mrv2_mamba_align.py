@@ -25,6 +25,7 @@ def _make_context(
     *,
     block_size: int = 4,
     max_num_reqs: int | None = None,
+    temporal_replay: bool = False,
 ) -> SimpleNamespace:
     states = (conv, temporal)
     device = block_table.device
@@ -62,6 +63,7 @@ def _make_context(
         ),
         state_group_indices=torch.zeros(2, dtype=torch.int32, device=device),
         block_size=block_size,
+        temporal_replay=temporal_replay,
         num_accepted_tokens_out=torch.empty(
             max_num_reqs or block_table.shape[0],
             dtype=torch.int32,
@@ -255,3 +257,149 @@ def test_speculative_to_single_token_tail_materializes_accepted_state(
         torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
         torch.testing.assert_close(temporal, expected_temporal, rtol=0, atol=0)
         assert int(accepted[0]) == (1 if query_len == 1 else accepted_count)
+
+
+def test_mrv2_decode_ckpt_64_boundary_spec_replay_and_plain_decode() -> None:
+    import numpy as np
+
+    from vllm.model_executor.layers.mamba.gdn.spec_replay import SpecReplayState
+
+    torch.manual_seed(45)
+    device = torch.device("cuda")
+    block_table = torch.tensor([[1, 2]], dtype=torch.int32, device=device)
+    conv = torch.randn(8, 8, 128, dtype=torch.float16, device=device)
+    temporal = torch.randn(8, 4, 16, 16, dtype=torch.float32, device=device)
+
+    state = SpecReplayState(max_reqs=4, max_rows=4, num_groups=1, device=device)
+    # Mount even=5, odd=6 for req_idx=2.
+    decode_ckpt = torch.full((1, 4, 2), -1, dtype=torch.int32, device=device)
+    decode_ckpt[0, 2, 0] = 5
+    decode_ckpt[0, 2, 1] = 6
+
+    idx_mapping = torch.tensor([2], dtype=torch.int32, device=device)
+    qsl = torch.tensor([0, 5], dtype=torch.int32, device=device)
+    num_computed = torch.tensor([0, 0, 125, 0], dtype=torch.int32, device=device)
+    ctx = _make_context(
+        conv,
+        temporal,
+        block_table,
+        block_size=2048,
+        max_num_reqs=4,
+        temporal_replay=True,
+    )
+
+    # 1. Speculative round crossing B64=128 (parity=0 -> slot 5, ckpt_token=2).
+    state.prepare(
+        idx_mapping,
+        qsl,
+        num_computed,
+        np.array([4], dtype=np.int32),
+        np.array([False]),
+        1,
+        ctx.block_table_ptrs,
+        ctx.block_table_stride_req,
+        2048,
+        decode_ckpt_slots=decode_ckpt,
+    )
+    torch.accelerator.synchronize()
+    assert int(state.spec_ckpt_token[0]) == 2
+    assert int(state.spec_ckpt_slot[0, 0]) == 5
+    assert int(state.verified[2]) == 1
+
+    # Simulate verifier having written temporal[5] directly; postprocess must
+    # preserve temporal[5] and shift conv from src_block=1 (bias=2) into conv[5].
+    verifier_sentinel = torch.full_like(temporal[5], 77.5)
+    temporal[5].copy_(verifier_sentinel)
+    conv_before = conv.clone()
+    accepted = torch.tensor([1, 1, 4, 1], dtype=torch.int32, device=device)
+    state_idx = torch.tensor([0, 0, 0, 0], dtype=torch.int32, device=device)
+    new_computed = torch.tensor([0, 0, 129, 0], dtype=torch.int32, device=device)
+    run_mamba_align_postprocess(
+        ctx,
+        1,
+        accepted,
+        state_idx,
+        new_computed,
+        idx_mapping,
+        decode_ckpt_slots=decode_ckpt,
+        spec_verified=state.verified,
+    )
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(temporal[5], verifier_sentinel, rtol=0, atol=0)
+    torch.testing.assert_close(conv[5, :6], conv_before[1, 2:], rtol=0, atol=0)
+
+    # 2. Plain 1-token decode landing on B64=192 (parity=1 -> slot 6):
+    # verified[2]==0, so BOTH temporal and conv copy from src_block=1 (bias=0).
+    qsl_plain = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    num_computed[2] = 191
+    state.prepare(
+        idx_mapping,
+        qsl_plain,
+        num_computed,
+        np.array([0], dtype=np.int32),
+        np.array([False]),
+        1,
+        ctx.block_table_ptrs,
+        ctx.block_table_stride_req,
+        2048,
+        decode_ckpt_slots=decode_ckpt,
+    )
+    accepted[2] = 1
+    new_computed[2] = 192
+    conv_before2 = conv.clone()
+    temporal_before2 = temporal.clone()
+    run_mamba_align_postprocess(
+        ctx,
+        1,
+        accepted,
+        state_idx,
+        new_computed,
+        idx_mapping,
+        decode_ckpt_slots=decode_ckpt,
+        spec_verified=state.verified,
+    )
+    torch.accelerator.synchronize()
+    assert int(state.verified[2]) == 0
+    torch.testing.assert_close(temporal[6], temporal_before2[1], rtol=0, atol=0)
+    torch.testing.assert_close(conv[6], conv_before2[1], rtol=0, atol=0)
+
+
+def test_mrv2_decode_ckpt_multi_request_staging_ring_no_async_overwrite() -> None:
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    device = torch.device("cuda")
+    dummy_state = object.__new__(MambaHybridModelState)
+    dummy_state._align_mode = True
+    dummy_state.max_num_reqs = 8
+    dummy_state.device = device
+    dummy_state._decode_ckpt_slots_gpu = torch.full(
+        (8, 8, 2), -1, dtype=torch.int32, device=device
+    )
+    dummy_state._decode_ckpt_cpu = torch.full((8, 8, 2), -1, dtype=torch.int32)
+    dummy_state._decode_ckpt_stage_ring = [
+        torch.empty((8, 8, 2), dtype=torch.int32, pin_memory=True) for _ in range(4)
+    ]
+    dummy_state._decode_ckpt_ring_idx = 0
+    dummy_state._decode_ckpt_dirty = False
+
+    # Mount 4 concurrent requests in the same step without synchronization.
+    for r in range(4):
+        dummy_state.mount_decode_ckpt_blocks(
+            r,
+            [100 + r * 10 + g for g in range(4)],
+            [200 + r * 10 + g for g in range(4)],
+        )
+    dummy_state.flush_decode_ckpt_blocks()
+    # Immediately mutate slot 0 across two subsequent async steps before sync.
+    dummy_state.remove_request(0)
+    dummy_state.flush_decode_ckpt_blocks()
+    dummy_state.mount_decode_ckpt_blocks(0, [901, 902, 903, 904], [911, 912, 913, 914])
+    dummy_state.flush_decode_ckpt_blocks()
+    torch.accelerator.synchronize()
+
+    got = dummy_state._decode_ckpt_slots_gpu[:4, :4, :].cpu()
+    assert got[:, 0, 0].tolist() == [901, 902, 903, 904]
+    assert got[:, 0, 1].tolist() == [911, 912, 913, 914]
+    for r in (1, 2, 3):
+        assert got[:, r, 0].tolist() == [100 + r * 10 + g for g in range(4)]
+        assert got[:, r, 1].tolist() == [200 + r * 10 + g for g in range(4)]

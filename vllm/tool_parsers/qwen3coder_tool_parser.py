@@ -6,6 +6,14 @@ from collections.abc import Sequence
 from typing import Any
 
 import regex as re
+from xgrammar import Grammar, StructuralTag
+from xgrammar.structural_tag import (
+    OptionalFormat,
+    RegexFormat,
+    SequenceFormat,
+    TagFormat,
+    TagsWithSeparatorFormat,
+)
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -370,9 +378,10 @@ class Qwen3CoderToolParser(ToolParser):
             if param_value.endswith("\n"):
                 param_value = param_value[:-1]
 
-            param_dict[param_name] = self._convert_param_value(
-                param_value, param_name, param_config, function_name
-            )
+            if param_name not in param_dict:
+                param_dict[param_name] = self._convert_param_value(
+                    param_value, param_name, param_config, function_name
+                )
         return ToolCall(
             type="function",
             function=FunctionCall(
@@ -989,6 +998,11 @@ class Qwen3CoderToolParser(ToolParser):
                         # Recover a missing final close before function/tool end.
                         value_end = container_end
                     else:
+                        if (
+                            not self.in_param
+                            and current_param_name in self.accumulated_params
+                        ):
+                            break
                         if self._is_streamable_string_param(
                             current_param_name, param_config
                         ):
@@ -1005,7 +1019,7 @@ class Qwen3CoderToolParser(ToolParser):
                             if not self.in_param:
                                 key_prefix = (
                                     f'"{current_param_name}": "'
-                                    if self.param_count == 0
+                                    if not self.accumulated_params
                                     else f', "{current_param_name}": "'
                                 )
                                 escaped = json.dumps(
@@ -1032,6 +1046,11 @@ class Qwen3CoderToolParser(ToolParser):
                 if param_value.endswith("\n"):
                     param_value = param_value[:-1]
 
+                if not self.in_param and current_param_name in self.accumulated_params:
+                    self.param_count += 1
+                    continue
+
+                is_first_emitted = len(self.accumulated_params) == 0
                 self.current_param_name = current_param_name
                 self.accumulated_params[current_param_name] = param_value
 
@@ -1054,7 +1073,7 @@ class Qwen3CoderToolParser(ToolParser):
 
                 serialized_value = json.dumps(converted_value, ensure_ascii=False)
 
-                if self.param_count == 0:
+                if is_first_emitted:
                     json_fragment = f'"{current_param_name}": {serialized_value}'
                 else:
                     json_fragment = f', "{current_param_name}": {serialized_value}'
@@ -1126,9 +1145,59 @@ class Qwen3CoderToolParser(ToolParser):
         return super().adjust_request(request)
 
     def get_structural_tag(self, request: ChatCompletionRequest):
-        return get_model_structural_tag(
-            model="qwen_3_5",
-            tools=request.tools,
-            tool_choice=request.tool_choice,
-            reasoning=get_enable_structured_outputs_in_reasoning(),
-        )
+        if not request.tools:
+            return None
+        reasoning = get_enable_structured_outputs_in_reasoning()
+
+        def _build(tools):
+            tag = get_model_structural_tag(
+                model="qwen_3_5",
+                tools=tools,
+                tool_choice=request.tool_choice,
+                reasoning=reasoning,
+            )
+            if tag is None:
+                return None
+            fmt = tag.format
+            if reasoning and isinstance(fmt, SequenceFormat) and len(fmt.elements) == 2:
+                prefix_fmt, suffix_fmt = fmt.elements
+                if isinstance(suffix_fmt, TagsWithSeparatorFormat):
+                    suffix_fmt = suffix_fmt.model_copy(update={"separator": "\n"})
+                    fmt = SequenceFormat(elements=[prefix_fmt, suffix_fmt])
+            else:
+                if isinstance(fmt, TagsWithSeparatorFormat):
+                    fmt = fmt.model_copy(update={"separator": "\n"})
+                if isinstance(fmt, TagsWithSeparatorFormat | TagFormat):
+                    fmt = SequenceFormat(
+                        elements=[
+                            OptionalFormat(
+                                content=RegexFormat(pattern="[ \\n\\t]{1,8}")
+                            ),
+                            fmt,
+                        ]
+                    )
+            return StructuralTag(format=fmt)
+
+        tag = _build(request.tools)
+        if tag is None:
+            return None
+        try:
+            Grammar.from_structural_tag(json.dumps(tag.model_dump()))
+            return tag
+        except Exception as exc:
+            logger.warning(
+                "Qwen3CoderToolParser: tool schemas are not xgrammar-compatible "
+                "(%s); retrying with unconstrained tool arguments.",
+                exc,
+            )
+            relaxed_tools = [tool.model_copy(deep=True) for tool in request.tools]
+            for tool in relaxed_tools:
+                tool.function.parameters = None
+            relaxed_tag = _build(relaxed_tools)
+            if relaxed_tag is None:
+                return None
+            try:
+                Grammar.from_structural_tag(json.dumps(relaxed_tag.model_dump()))
+                return relaxed_tag
+            except Exception:
+                return tag

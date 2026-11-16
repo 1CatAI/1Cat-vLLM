@@ -18,11 +18,11 @@ _TEMPORAL_TILES = 16
 
 
 @triton.jit
-def _copy_mamba_state_block(
+def _copy_mamba_state_to_block_id(
     state_idx,
     block_table_row,
     src_col,
-    dst_col,
+    dst_block_id,
     token_bias,
     block_table_ptrs_ptr,
     block_table_stride_req,
@@ -37,12 +37,6 @@ def _copy_mamba_state_block(
     TEMPORAL_TILES: tl.constexpr,
     TEMPORAL_REPLAY: tl.constexpr = False,
 ):
-    """Copy one SD-layout conv or temporal state using V1 align semantics.
-
-    With TEMPORAL_REPLAY the temporal state has no speculative columns: the
-    source column holds the committed state, and the verifier replays the
-    accepted tokens itself.
-    """
     state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
     state_block_stride = tl.load(state_block_strides_ptr + state_idx)
     state_elem_size = tl.load(state_elem_sizes_ptr + state_idx).to(tl.int64)
@@ -54,8 +48,7 @@ def _copy_mamba_state_block(
     block_table = group_base_addr.to(tl.pointer_type(tl.int32))
     block_table += block_table_row * block_table_stride_req
 
-    dst_block_id = tl.load(block_table + dst_col).to(tl.int64)
-    dst_addr = state_base_addr + dst_block_id * state_block_stride
+    dst_addr = state_base_addr + dst_block_id.to(tl.int64) * state_block_stride
     is_conv_state = conv_width > 0
 
     if is_conv_state:
@@ -98,6 +91,58 @@ def _copy_mamba_state_block(
         if is_left_overlap:
             tl.debug_barrier()
         tl.store(dst, data, mask=mask)
+
+
+@triton.jit
+def _copy_mamba_state_block(
+    state_idx,
+    block_table_row,
+    src_col,
+    dst_col,
+    token_bias,
+    block_table_ptrs_ptr,
+    block_table_stride_req,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    tile_idx,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    TEMPORAL_TILES: tl.constexpr,
+    TEMPORAL_REPLAY: tl.constexpr = False,
+):
+    """Copy one SD-layout conv or temporal state using V1 align semantics.
+
+    With TEMPORAL_REPLAY the temporal state has no speculative columns: the
+    source column holds the committed state, and the verifier replays the
+    accepted tokens itself.
+    """
+    group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
+    group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
+    block_table = group_base_addr.to(tl.pointer_type(tl.int32))
+    block_table += block_table_row * block_table_stride_req
+    dst_block_id = tl.load(block_table + dst_col).to(tl.int64)
+    _copy_mamba_state_to_block_id(
+        state_idx,
+        block_table_row,
+        src_col,
+        dst_block_id,
+        token_bias,
+        block_table_ptrs_ptr,
+        block_table_stride_req,
+        state_base_addrs_ptr,
+        state_block_strides_ptr,
+        state_elem_sizes_ptr,
+        state_inner_sizes_ptr,
+        state_conv_widths_ptr,
+        state_group_indices_ptr,
+        tile_idx,
+        COPY_BLOCK_SIZE,
+        TEMPORAL_TILES,
+        TEMPORAL_REPLAY,
+    )
 
 
 @triton.jit
@@ -221,11 +266,15 @@ def _postprocess_mamba_align_kernel(
     state_conv_widths_ptr,
     state_group_indices_ptr,
     idx_mapping_ptr,
+    decode_ckpt_slots_ptr,
+    spec_verified_ptr,
     num_reqs,
     MAMBA_BLOCK_SIZE: tl.constexpr,
     COPY_BLOCK_SIZE: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
     TEMPORAL_REPLAY: tl.constexpr,
+    HAS_DECODE_CKPT: tl.constexpr = False,
+    DECODE_CKPT_MAX_REQS: tl.constexpr = 0,
 ):
     batch_idx = tl.program_id(0)
     state_meta_idx = tl.program_id(1)
@@ -241,39 +290,81 @@ def _postprocess_mamba_align_kernel(
     new_num_computed = tl.load(new_num_computed_tokens_ptr + req_idx)
     num_tokens_running_state = new_num_computed - num_accepted + 1
     aligned_new_computed = (new_num_computed // MAMBA_BLOCK_SIZE) * MAMBA_BLOCK_SIZE
-    if aligned_new_computed < num_tokens_running_state:
-        return
+    if aligned_new_computed >= num_tokens_running_state:
+        token_bias = aligned_new_computed - num_tokens_running_state
+        dst_col = aligned_new_computed // MAMBA_BLOCK_SIZE - 1
+        if src_col == dst_col and state_meta_idx == 0 and tile_idx == 0:
+            tl.store(num_accepted_out_ptr + req_idx, 1)
+        skip_full = src_col == dst_col and token_bias == 0
+        # Constexpr guard first: the load only exists in replay specializations.
+        if TEMPORAL_REPLAY:
+            skip_full = skip_full | (
+                tl.load(state_conv_widths_ptr + state_meta_idx) == 0
+            )
+        if not skip_full:
+            _copy_mamba_state_block(
+                state_meta_idx,
+                batch_idx,
+                src_col,
+                dst_col,
+                token_bias,
+                block_table_ptrs_ptr,
+                block_table_stride_req,
+                state_base_addrs_ptr,
+                state_block_strides_ptr,
+                state_elem_sizes_ptr,
+                state_inner_sizes_ptr,
+                state_conv_widths_ptr,
+                state_group_indices_ptr,
+                tile_idx,
+                COPY_BLOCK_SIZE,
+                TEMPORAL_TILES,
+                TEMPORAL_REPLAY,
+            )
 
-    token_bias = aligned_new_computed - num_tokens_running_state
-    dst_col = aligned_new_computed // MAMBA_BLOCK_SIZE - 1
-    if src_col == dst_col and state_meta_idx == 0 and tile_idx == 0:
-        tl.store(num_accepted_out_ptr + req_idx, 1)
-    if src_col == dst_col and token_bias == 0:
-        return
-    # Constexpr guard first: the load only exists in replay specializations.
-    if TEMPORAL_REPLAY:  # noqa: SIM102
-        if tl.load(state_conv_widths_ptr + state_meta_idx) == 0:
-            return
-
-    _copy_mamba_state_block(
-        state_meta_idx,
-        batch_idx,
-        src_col,
-        dst_col,
-        token_bias,
-        block_table_ptrs_ptr,
-        block_table_stride_req,
-        state_base_addrs_ptr,
-        state_block_strides_ptr,
-        state_elem_sizes_ptr,
-        state_inner_sizes_ptr,
-        state_conv_widths_ptr,
-        state_group_indices_ptr,
-        tile_idx,
-        COPY_BLOCK_SIZE,
-        TEMPORAL_TILES,
-        TEMPORAL_REPLAY,
-    )
+    if HAS_DECODE_CKPT:
+        aligned_64 = (new_num_computed // 64) * 64
+        if (
+            aligned_64 >= num_tokens_running_state
+            and aligned_64 > 0
+            and aligned_64 % MAMBA_BLOCK_SIZE != 0
+            and num_accepted < 64
+            and src_col >= 0
+        ):
+            parity = (aligned_64 // 64) & 1
+            group_idx = tl.load(state_group_indices_ptr + state_meta_idx).to(tl.int64)
+            ckpt_dst_id = tl.load(
+                decode_ckpt_slots_ptr
+                + (group_idx * DECODE_CKPT_MAX_REQS + req_idx) * 2
+                + parity
+            ).to(tl.int64)
+            if ckpt_dst_id >= 0:
+                bias_64 = aligned_64 - num_tokens_running_state
+                skip_ckpt = False
+                if TEMPORAL_REPLAY:
+                    was_spec = tl.load(spec_verified_ptr + req_idx) != 0
+                    if was_spec:
+                        skip_ckpt = tl.load(state_conv_widths_ptr + state_meta_idx) == 0
+                if not skip_ckpt:
+                    _copy_mamba_state_to_block_id(
+                        state_meta_idx,
+                        batch_idx,
+                        src_col,
+                        ckpt_dst_id,
+                        bias_64,
+                        block_table_ptrs_ptr,
+                        block_table_stride_req,
+                        state_base_addrs_ptr,
+                        state_block_strides_ptr,
+                        state_elem_sizes_ptr,
+                        state_inner_sizes_ptr,
+                        state_conv_widths_ptr,
+                        state_group_indices_ptr,
+                        tile_idx,
+                        COPY_BLOCK_SIZE,
+                        TEMPORAL_TILES,
+                        TEMPORAL_REPLAY,
+                    )
 
 
 def run_mamba_align_precopy(
@@ -288,6 +379,7 @@ def run_mamba_align_precopy(
     if num_reqs == 0 or not ctx.is_initialized:
         return
     grid = (num_reqs, ctx.num_states, _TEMPORAL_TILES)
+    temporal_replay = bool(getattr(ctx, "temporal_replay", False))
     _precopy_mamba_align_kernel[grid](
         state_idx,
         src_col,
@@ -305,7 +397,7 @@ def run_mamba_align_precopy(
         num_reqs,
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
-        TEMPORAL_REPLAY=ctx.temporal_replay,
+        TEMPORAL_REPLAY=temporal_replay,
     )
 
 
@@ -316,6 +408,8 @@ def run_mamba_align_postprocess(
     state_idx: torch.Tensor,
     new_num_computed_tokens: torch.Tensor,
     idx_mapping: torch.Tensor,
+    decode_ckpt_slots: torch.Tensor | None = None,
+    spec_verified: torch.Tensor | None = None,
 ) -> None:
     if num_reqs == 0 or not ctx.is_initialized:
         return
@@ -323,6 +417,12 @@ def run_mamba_align_postprocess(
     # output count while programs copying other state tensors still read it.
     snapshot = ctx.num_accepted_tokens_out
     snapshot.copy_(num_accepted_tokens)
+    temporal_replay = bool(getattr(ctx, "temporal_replay", False))
+    has_decode_ckpt = (
+        decode_ckpt_slots is not None
+        and ctx.block_size >= 128
+        and (not temporal_replay or spec_verified is not None)
+    )
     grid = (num_reqs, ctx.num_states, _TEMPORAL_TILES)
     _postprocess_mamba_align_kernel[grid](
         snapshot,
@@ -338,9 +438,15 @@ def run_mamba_align_postprocess(
         ctx.state_conv_widths,
         ctx.state_group_indices,
         idx_mapping,
+        decode_ckpt_slots if has_decode_ckpt else state_idx,
+        spec_verified if (has_decode_ckpt and spec_verified is not None) else state_idx,
         num_reqs,
         MAMBA_BLOCK_SIZE=ctx.block_size,
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
-        TEMPORAL_REPLAY=ctx.temporal_replay,
+        TEMPORAL_REPLAY=temporal_replay,
+        HAS_DECODE_CKPT=has_decode_ckpt,
+        DECODE_CKPT_MAX_REQS=(
+            decode_ckpt_slots.shape[1] if decode_ckpt_slots is not None else 0
+        ),
     )

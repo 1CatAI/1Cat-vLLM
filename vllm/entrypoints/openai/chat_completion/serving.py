@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import hashlib
 import io
 import json
 import time
@@ -318,6 +319,135 @@ class _PrefixCacheBoundaries:
         return sorted(set(boundaries))
 
 
+class _AssistantReasoningCache:
+    """Restore omitted assistant ``reasoning_content`` across multi-turn chats.
+
+    Many OpenAI-compatible SDKs and agent loops append only ``content`` and
+    ``tool_calls`` to conversation history. For templates that retain
+    ``reasoning_content`` on prior assistant turns, omitting it changes the
+    rendered tokens right after ``<think>\\n`` and invalidates the KV/recurrent
+    prefix generated during decode.
+    """
+
+    def __init__(self, max_entries: int = 2048) -> None:
+        self._entries: OrderedDict[tuple[Any, ...], str] = OrderedDict()
+        self._max_entries = max_entries
+
+    @staticmethod
+    def _canonical_json(raw: Any) -> str:
+        if isinstance(raw, dict | list):
+            return json.dumps(
+                raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        if not isinstance(raw, str):
+            return str(raw or "")
+        text = raw.strip()
+        if not text:
+            return ""
+        try:
+            parsed = json.loads(text)
+            return json.dumps(
+                parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        except Exception:
+            return text
+
+    @classmethod
+    def _canonical_tool_calls(cls, tool_calls: Any) -> tuple[tuple[str, str], ...]:
+        if not tool_calls:
+            return ()
+        items: list[tuple[str, str]] = []
+        for tc in tool_calls:
+            if isinstance(tc, tuple) and len(tc) == 2:
+                name, args = tc
+            elif isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                name = fn.get("name", "") if isinstance(fn, dict) else ""
+                args = fn.get("arguments", "") if isinstance(fn, dict) else ""
+            else:
+                fn = getattr(tc, "function", None)
+                name = getattr(fn, "name", "") if fn is not None else ""
+                args = getattr(fn, "arguments", "") if fn is not None else ""
+            items.append((str(name or ""), cls._canonical_json(args)))
+        return tuple(items)
+
+    @staticmethod
+    def _context_digest(prior_messages: GenericSequence[Any]) -> str:
+        if not prior_messages:
+            return ""
+        tail = prior_messages[-2:]
+        canonical = []
+        for m in tail:
+            if isinstance(m, dict):
+                canonical.append(
+                    (
+                        m.get("role", ""),
+                        m.get("tool_call_id", ""),
+                        m.get("content", ""),
+                    )
+                )
+            else:
+                canonical.append(
+                    (
+                        getattr(m, "role", ""),
+                        getattr(m, "tool_call_id", ""),
+                        getattr(m, "content", ""),
+                    )
+                )
+        payload = json.dumps(canonical, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.blake2b(payload, digest_size=12).hexdigest()
+
+    def _put(self, key: tuple[Any, ...], reasoning: str) -> None:
+        self._entries[key] = reasoning
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def record(
+        self,
+        prior_messages: GenericSequence[Any],
+        content: str | None,
+        tool_calls: Any,
+        reasoning: str | None,
+    ) -> None:
+        if not reasoning:
+            return
+        content_norm = (content or "").strip()
+        tc_norm = self._canonical_tool_calls(tool_calls)
+        ctx = self._context_digest(prior_messages)
+        self._put(("ctx", ctx, content_norm, tc_norm), reasoning)
+        if content_norm or tc_norm:
+            self._put(("any", "", content_norm, tc_norm), reasoning)
+
+    def lookup(
+        self,
+        prior_messages: GenericSequence[Any],
+        content: Any,
+        tool_calls: Any,
+    ) -> str | None:
+        content_str = content if isinstance(content, str) else ""
+        if isinstance(content, list):
+            parts = [
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            content_str = "".join(parts)
+        content_norm = (content_str or "").strip()
+        tc_norm = self._canonical_tool_calls(tool_calls)
+        ctx = self._context_digest(prior_messages)
+        ctx_key = ("ctx", ctx, content_norm, tc_norm)
+        if ctx_key in self._entries:
+            self._entries.move_to_end(ctx_key)
+            return self._entries[ctx_key]
+        if content_norm or tc_norm:
+            any_key = ("any", "", content_norm, tc_norm)
+            if any_key in self._entries:
+                self._entries.move_to_end(any_key)
+                return self._entries[any_key]
+        return None
+
+
 class OpenAIServingChat(OpenAIServing):
     def __init__(
         self,
@@ -352,6 +482,7 @@ class OpenAIServingChat(OpenAIServing):
         self.response_role = response_role
         self.chat_template = chat_template
         self._prefix_cache_boundaries = _PrefixCacheBoundaries()
+        self._assistant_reasoning_cache = _AssistantReasoningCache()
         self.chat_template_content_format: Final = chat_template_content_format
         self.trust_request_chat_template = trust_request_chat_template
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
@@ -435,6 +566,43 @@ class OpenAIServingChat(OpenAIServing):
             .chat_template_kwargs
         )
 
+    def _restore_historical_assistant_reasoning(
+        self, request: ChatCompletionRequest
+    ) -> ChatCompletionRequest:
+        messages = request.messages
+        if len(messages) < 2:
+            return request
+        updated: list[Any] | None = None
+        for idx in range(len(messages) - 1):
+            msg = messages[idx]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            existing = msg.get("reasoning")
+            if existing is None:
+                existing = msg.get("reasoning_content")
+            if existing is not None:
+                if msg.get("reasoning_content") is None:
+                    if updated is None:
+                        updated = list(messages)
+                    updated[idx] = {**msg, "reasoning_content": existing}
+                continue
+            restored = self._assistant_reasoning_cache.lookup(
+                messages[:idx],
+                msg.get("content"),
+                msg.get("tool_calls"),
+            )
+            if restored is not None:
+                if updated is None:
+                    updated = list(messages)
+                updated[idx] = {
+                    **msg,
+                    "reasoning": restored,
+                    "reasoning_content": restored,
+                }
+        if updated is None:
+            return request
+        return request.model_copy(update={"messages": updated})
+
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
@@ -493,6 +661,7 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
+            request = self._restore_historical_assistant_reasoning(request)
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
@@ -1279,6 +1448,44 @@ class OpenAIServingChat(OpenAIServing):
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
+            if reasoning_parser is not None and previous_texts:
+                for i, full_raw_text in enumerate(previous_texts):
+                    if not full_raw_text:
+                        continue
+                    raw_reasoning, raw_content = reasoning_parser.extract_reasoning(
+                        full_raw_text, request=request
+                    )
+                    if not raw_reasoning:
+                        continue
+                    streamed_tcs = [
+                        (tc.name, "".join(tc.arguments))
+                        for _, tc in sorted(sent_tool_calls[i].items())
+                        if tc.name
+                    ]
+                    visible_content = raw_content or ""
+                    choice_parser = parsers[i] if i < len(parsers) else None
+                    choice_tool_parser = (
+                        choice_parser.tool_parser if choice_parser is not None else None
+                    )
+                    if (
+                        streamed_tcs
+                        and visible_content
+                        and choice_tool_parser is not None
+                    ):
+                        extracted = choice_tool_calls = (
+                            choice_tool_parser.extract_tool_calls(
+                                visible_content, request=request
+                            )
+                        )
+                        if choice_tool_calls.tools_called:
+                            visible_content = extracted.content or ""
+                    self._assistant_reasoning_cache.record(
+                        request.messages,
+                        visible_content,
+                        streamed_tcs,
+                        raw_reasoning,
+                    )
+
             reasoning_tokens = _count_reasoning_tokens(
                 reasoning_parser, generated_ids_per_choice
             )
@@ -1481,12 +1688,14 @@ class OpenAIServingChat(OpenAIServing):
                 choices.append(choice_data)
                 continue
 
+            raw_reasoning: str | None = None
             if reasoning_parser:
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
                 reasoning, content = reasoning_parser.extract_reasoning(
                     output.text, request=request
                 )
+                raw_reasoning = reasoning
                 if not request.include_reasoning:
                     reasoning = None
             else:
@@ -1676,6 +1885,13 @@ class OpenAIServingChat(OpenAIServing):
                     "completion."
                 )
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
+            if raw_reasoning:
+                self._assistant_reasoning_cache.record(
+                    request.messages,
+                    message.content,
+                    message.tool_calls,
+                    raw_reasoning,
+                )
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
             # and "stop" for named tool calls.
