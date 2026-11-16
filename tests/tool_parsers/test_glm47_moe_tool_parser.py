@@ -174,3 +174,85 @@ class TestGlm47Streaming:
             )
         args = json.loads(glm47_tool_parser.prev_tool_call_arr[0]["arguments"])
         assert args["city"] == "Beijing"
+
+
+TYPED_TOOL = ChatCompletionToolsParam(
+    function=FunctionDefinition(
+        name="delegate",
+        parameters={
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "count": {"type": "integer"},
+                "flag": {"type": "boolean"},
+                "items": {"type": "array"},
+                "data": {"type": "object"},
+                "note": {"type": ["string", "array"]},
+                "optional": {"type": ["string", "null"]},
+            },
+        },
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<arg_key>task</arg_key><arg_value>Fasse die Daten zusammen</arg_value>",
+        "<arg_key>count</arg_key><arg_value>12</arg_value>",
+        "<arg_key>flag</arg_key><arg_value>True</arg_value>",
+        "<arg_key>flag</arg_key><arg_value>false</arg_value>",
+        "<arg_key>items</arg_key><arg_value>['a', 'b']</arg_value>",
+        "<arg_key>items</arg_key><arg_value>[\n  1,\n  2\n]</arg_value>",
+        "<arg_key>note</arg_key><arg_value>siehe oben</arg_value>",
+        "<arg_key>extra</arg_key><arg_value>frei formuliert</arg_value>",
+        "<arg_key>optional</arg_key><arg_value> mit Leerzeichen </arg_value>",
+        "<arg_key>count</arg_key><arg_value>3</arg_value>"
+        '<arg_key>note</arg_key><arg_value>Text mit "Zitat" und \\</arg_value>'
+        "<arg_key>task</arg_key><arg_value>Grüße</arg_value>",
+        "<arg_key>count</arg_key><arg_value>\n5\n</arg_value>"
+        "<arg_key>task</arg_key><arg_value>weiter</arg_value>",
+        '<arg_key>data</arg_key><arg_value>{"title":"Notiz","done":false}</arg_value>',
+    ],
+)
+def test_streamed_arguments_stay_a_prefix_of_the_finish(glm47_tokenizer, body):
+    """Every delta must extend toward what extract_tool_calls returns at the
+    finish; flush_tool_calls rejects a stream that does not."""
+    from vllm.entrypoints.openai.chat_completion.tool_stream import (
+        StreamedToolCall,
+        flush_tool_calls,
+        record_tool_calls,
+    )
+
+    parser = Glm47MoeModelToolParser(glm47_tokenizer, tools=[TYPED_TOOL])
+    request = Mock(spec=ChatCompletionRequest)
+    request.tools = [TYPED_TOOL]
+    request.tool_choice = "auto"
+    text = "<tool_call>delegate" + body + "</tool_call>"
+    final = parser.extract_tool_calls(text, request).tool_calls[0].function.arguments
+    seen: dict[int, StreamedToolCall] = {}
+    previous = ""
+    for end in range(1, len(text) + 1):
+        current = text[:end]
+        delta = parser.extract_tool_calls_streaming(
+            previous_text=previous,
+            current_text=current,
+            delta_text=current[len(previous) :],
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[],
+            request=request,
+        )
+        if delta is not None and delta.tool_calls:
+            record_tool_calls(delta.tool_calls, seen)
+        streamed = "".join(seen[0].arguments) if 0 in seen else ""
+        assert final.startswith(streamed), (current, streamed, final)
+        previous = current
+    assert "".join(seen[0].arguments) == final
+    json.loads(final)
+    flushed, called = flush_tool_calls(parser, text, request, None, seen)
+    assert called
+    assert not any(
+        call.function is not None and call.function.arguments
+        for call in (flushed.tool_calls if flushed else [])
+    )
