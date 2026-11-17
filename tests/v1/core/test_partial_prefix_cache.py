@@ -492,6 +492,8 @@ def test_assistant_reasoning_cache_restores_omitted_reasoning_across_turns():
         "",
         [("read_file", '{"path":"src/wal.py","start":1}')],
         "Need to inspect WAL header invariants first.",
+        cache_salt="session-a",
+        reasoning_ended=True,
     )
     restored = cache.lookup(
         prior_msgs,
@@ -506,18 +508,93 @@ def test_assistant_reasoning_cache_restores_omitted_reasoning_across_turns():
                 },
             }
         ],
+        cache_salt="session-a",
     )
     assert restored == "Need to inspect WAL header invariants first."
 
-    # 2. Empty-content length-truncated thinking turn matches via context digest
-    # without colliding across different conversation contexts.
-    other_prior = [
+    # 2. Identical tool call in a different conversation prefix or different
+    # cache_salt MUST NOT leak reasoning across turns or sessions (no any_key).
+    other_prior_same_tail = [
+        {"role": "system", "content": "different repo"},
+        {"role": "user", "content": "fix auth bug"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "ls", "arguments": "{}"}}],
+        },
         {"role": "system", "content": "you are an agent"},
-        {"role": "user", "content": "unrelated task"},
+        {"role": "user", "content": "inspect src/wal.py"},
     ]
-    cache.record(prior_msgs, "", [], "Partial truncated reasoning trace")
-    assert cache.lookup(prior_msgs, "", []) == "Partial truncated reasoning trace"
-    assert cache.lookup(other_prior, "", []) is None
+    same_tc = [
+        {
+            "id": "call_other",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": '{"path":"src/wal.py","start":1}',
+            },
+        }
+    ]
+    assert (
+        cache.lookup(other_prior_same_tail, "", same_tc, cache_salt="session-a") is None
+    )
+    assert cache.lookup(prior_msgs, "", same_tc, cache_salt="session-b") is None
+
+    # 3. Prior assistant tool_calls participate in context digest so distinct
+    # tool trajectories with identical tool outputs do not collide.
+    traj_a = prior_msgs + [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "read_file", "arguments": '{"path":"a.py"}'}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "not found"},
+    ]
+    traj_b = prior_msgs + [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "read_file", "arguments": '{"path":"b.py"}'}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "not found"},
+    ]
+    cache.record(
+        traj_a, "File a.py is missing.", [], "Checked a.py.", cache_salt="session-a"
+    )
+    assert (
+        cache.lookup(traj_a, "File a.py is missing.", [], cache_salt="session-a")
+        == "Checked a.py."
+    )
+    assert (
+        cache.lookup(traj_b, "File a.py is missing.", [], cache_salt="session-a")
+        is None
+    )
+
+    # 4. Length-truncated unfinished thinking turns (reasoning_ended=False or
+    # empty content + empty tool_calls) are never cached or fabricated as closed
+    # </think> blocks on subsequent turns.
+    cache.record(
+        prior_msgs,
+        "",
+        [],
+        "Partial truncated reasoning cut off mid-",
+        cache_salt="session-a",
+        reasoning_ended=False,
+    )
+    assert cache.lookup(prior_msgs, "", [], cache_salt="session-a") is None
+    cache.record(
+        prior_msgs,
+        "",
+        [],
+        "Empty output turn",
+        cache_salt="session-a",
+        reasoning_ended=True,
+    )
+    assert cache.lookup(prior_msgs, "", [], cache_salt="session-a") is None
 
 
 def test_decode_ckpt_promotes_64_aligned_output_and_coalesces_warm_tail():
