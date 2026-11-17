@@ -372,30 +372,36 @@ class _AssistantReasoningCache:
         return tuple(items)
 
     @staticmethod
-    def _context_digest(prior_messages: GenericSequence[Any]) -> str:
+    def _extract_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        return ""
+
+    @classmethod
+    def _context_digest(cls, prior_messages: GenericSequence[Any]) -> str:
         if not prior_messages:
             return ""
-        tail = prior_messages[-2:]
         canonical = []
-        for m in tail:
+        for m in prior_messages:
             if isinstance(m, dict):
-                canonical.append(
-                    (
-                        m.get("role", ""),
-                        m.get("tool_call_id", ""),
-                        m.get("content", ""),
-                    )
-                )
+                role = m.get("role", "")
+                tool_call_id = m.get("tool_call_id", "")
+                content = cls._extract_text(m.get("content")).strip()
+                tcs = cls._canonical_tool_calls(m.get("tool_calls"))
             else:
-                canonical.append(
-                    (
-                        getattr(m, "role", ""),
-                        getattr(m, "tool_call_id", ""),
-                        getattr(m, "content", ""),
-                    )
-                )
+                role = getattr(m, "role", "")
+                tool_call_id = getattr(m, "tool_call_id", "")
+                content = cls._extract_text(getattr(m, "content", None)).strip()
+                tcs = cls._canonical_tool_calls(getattr(m, "tool_calls", None))
+            canonical.append((role or "", tool_call_id or "", content, tcs))
         payload = json.dumps(canonical, sort_keys=True, default=str).encode("utf-8")
-        return hashlib.blake2b(payload, digest_size=12).hexdigest()
+        return hashlib.blake2b(payload, digest_size=16).hexdigest()
 
     def _put(self, key: tuple[Any, ...], reasoning: str) -> None:
         self._entries[key] = reasoning
@@ -409,42 +415,38 @@ class _AssistantReasoningCache:
         content: str | None,
         tool_calls: Any,
         reasoning: str | None,
+        *,
+        cache_salt: str | None = None,
+        reasoning_ended: bool = True,
     ) -> None:
-        if not reasoning:
+        if not reasoning or not reasoning_ended:
             return
         content_norm = (content or "").strip()
         tc_norm = self._canonical_tool_calls(tool_calls)
+        if not content_norm and not tc_norm:
+            return
         ctx = self._context_digest(prior_messages)
-        self._put(("ctx", ctx, content_norm, tc_norm), reasoning)
-        if content_norm or tc_norm:
-            self._put(("any", "", content_norm, tc_norm), reasoning)
+        salt_norm = cache_salt or ""
+        self._put(("ctx", salt_norm, ctx, content_norm, tc_norm), reasoning)
 
     def lookup(
         self,
         prior_messages: GenericSequence[Any],
         content: Any,
         tool_calls: Any,
+        *,
+        cache_salt: str | None = None,
     ) -> str | None:
-        content_str = content if isinstance(content, str) else ""
-        if isinstance(content, list):
-            parts = [
-                p.get("text", "")
-                for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            ]
-            content_str = "".join(parts)
-        content_norm = (content_str or "").strip()
+        content_norm = self._extract_text(content).strip()
         tc_norm = self._canonical_tool_calls(tool_calls)
+        if not content_norm and not tc_norm:
+            return None
         ctx = self._context_digest(prior_messages)
-        ctx_key = ("ctx", ctx, content_norm, tc_norm)
+        salt_norm = cache_salt or ""
+        ctx_key = ("ctx", salt_norm, ctx, content_norm, tc_norm)
         if ctx_key in self._entries:
             self._entries.move_to_end(ctx_key)
             return self._entries[ctx_key]
-        if content_norm or tc_norm:
-            any_key = ("any", "", content_norm, tc_norm)
-            if any_key in self._entries:
-                self._entries.move_to_end(any_key)
-                return self._entries[any_key]
         return None
 
 
@@ -590,6 +592,7 @@ class OpenAIServingChat(OpenAIServing):
                 messages[:idx],
                 msg.get("content"),
                 msg.get("tool_calls"),
+                cache_salt=request.cache_salt,
             )
             if restored is not None:
                 if updated is None:
@@ -1484,6 +1487,8 @@ class OpenAIServingChat(OpenAIServing):
                         visible_content,
                         streamed_tcs,
                         raw_reasoning,
+                        cache_salt=request.cache_salt,
+                        reasoning_ended=bool(raw_content) or bool(streamed_tcs),
                     )
 
             reasoning_tokens = _count_reasoning_tokens(
@@ -1891,6 +1896,8 @@ class OpenAIServingChat(OpenAIServing):
                     message.content,
                     message.tool_calls,
                     raw_reasoning,
+                    cache_salt=request.cache_salt,
+                    reasoning_ended=bool(message.content) or bool(message.tool_calls),
                 )
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
