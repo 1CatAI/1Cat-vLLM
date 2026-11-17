@@ -150,6 +150,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_DUMP_TENSOR_MAX: str | None = None
     VLLM_SM70_QSA_GROUPED_PAD_FIX: str | None = None
     VLLM_SM70_QSA_GROUPED_PAGE4: str | None = None
+    VLLM_SM70_QSA_HOST_KV: bool = False
     VLLM_SM70_QSA_INDEXER_CUBLAS: str | None = None
     VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS: str | None = None
     VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS: str | None = None
@@ -20458,6 +20459,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=("'1' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
         acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=False,
+    ),
+    "VLLM_SM70_QSA_HOST_KV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_HOST_KV", "0"))),
+        description=(
+            "Set to 1 to admit QSA per-vector host-KV history storage when "
+            "the model and runtime qualify. The flag is applied to "
+            "kernel_config.qsa_host_kv before QSA history resolution, which "
+            "carries the remaining capability gates."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=("'1' at vllm/config/vllm.py:VllmConfig.__post_init__",),
+        acceleration_paths=("QSA host-KV history storage",),
+        user_visible=True,
     ),
     "VLLM_SM70_QSA_INDEXER_CUBLAS": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS"),
