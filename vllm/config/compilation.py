@@ -764,8 +764,14 @@ class CompilationConfig:
         "vllm::mamba_mixer",
         "vllm::short_conv",
         "vllm::qwen4_exp_compute_ple_ngram_ids",
-        "vllm::qwen4_exp_ple_short_conv",
-        "vllm::qwen4_exp_qsa_with_output",
+        *(
+            f"{op}{suffix}"
+            for op in (
+                "vllm::qwen4_exp_ple_short_conv",
+                "vllm::qwen4_exp_qsa_with_output",
+            )
+            for suffix in ("", "_amd")
+        ),
         "vllm::linear_attention",
         "vllm::plamo2_mamba_mixer",
         "vllm::qwen_gdn_attention_core",

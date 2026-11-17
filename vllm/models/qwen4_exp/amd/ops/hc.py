@@ -408,28 +408,29 @@ def _hc_combine_norm_fake(
     return residual.new_empty(residual.shape), residual.new_empty(residual.shape)
 
 
+# Keep registrations distinct when both platform modules share a process.
 direct_register_custom_op(
-    op_name="qwen4_exp_grouped_gemma_rmsnorm",
+    op_name="qwen4_exp_grouped_gemma_rmsnorm_amd",
     op_func=_grouped_gemma_rmsnorm,
     fake_impl=_same_shape_fake,
 )
 direct_register_custom_op(
-    op_name="qwen4_exp_hc_silu",
+    op_name="qwen4_exp_hc_silu_amd",
     op_func=_hc_silu,
     fake_impl=_same_shape_fake,
 )
 direct_register_custom_op(
-    op_name="qwen4_exp_hc_gate_mix",
+    op_name="qwen4_exp_hc_gate_mix_amd",
     op_func=_hc_gate_mix,
     fake_impl=_hc_gate_mix_fake,
 )
 direct_register_custom_op(
-    op_name="qwen4_exp_hc_combine",
+    op_name="qwen4_exp_hc_combine_amd",
     op_func=_hc_combine,
     fake_impl=_hc_combine_fake,
 )
 direct_register_custom_op(
-    op_name="qwen4_exp_hc_combine_norm",
+    op_name="qwen4_exp_hc_combine_norm_amd",
     op_func=_hc_combine_norm,
     fake_impl=_hc_combine_norm_fake,
 )
@@ -438,15 +439,17 @@ direct_register_custom_op(
 def grouped_gemma_rmsnorm(
     x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
 ) -> torch.Tensor:
-    return torch.ops.vllm.qwen4_exp_grouped_gemma_rmsnorm(x, weight, eps, num_groups)
+    return torch.ops.vllm.qwen4_exp_grouped_gemma_rmsnorm_amd(
+        x, weight, eps, num_groups
+    )
 
 
 def hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
-    return torch.ops.vllm.qwen4_exp_hc_silu(x, hc_count)
+    return torch.ops.vllm.qwen4_exp_hc_silu_amd(x, hc_count)
 
 
 def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
-    return torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, hc_count)
+    return torch.ops.vllm.qwen4_exp_hc_gate_mix_amd(x, gate, hc_count)
 
 
 def hc_combine(
@@ -455,7 +458,7 @@ def hc_combine(
     injection_logits: torch.Tensor,
     hc_count: int,
 ) -> torch.Tensor:
-    return torch.ops.vllm.qwen4_exp_hc_combine(
+    return torch.ops.vllm.qwen4_exp_hc_combine_amd(
         residual, block_output, injection_logits, hc_count
     )
 
@@ -468,7 +471,7 @@ def hc_combine_norm(
     eps: float,
     hc_count: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.qwen4_exp_hc_combine_norm(
+    return torch.ops.vllm.qwen4_exp_hc_combine_norm_amd(
         residual,
         block_output,
         injection_logits,
