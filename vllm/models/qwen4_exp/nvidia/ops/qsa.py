@@ -1845,7 +1845,7 @@ def qsa_select_paged_tokens(
 
                 qsa_partition_topk(logits, visible_blocks, blocks)
                 logger.info_once("Using exact SM70 QSA partitioned decode Top-K.")
-            elif sparse_policy().value("qsa_mtp_topk") and blocks.shape[0] in (5, 10):
+            elif sparse_policy().value("qsa_mtp_topk") and 2 <= blocks.shape[0] <= 64:
                 torch.ops._C.qsa_lexicographic_topk(
                     logits, visible_blocks, blocks, block_topk, True
                 )

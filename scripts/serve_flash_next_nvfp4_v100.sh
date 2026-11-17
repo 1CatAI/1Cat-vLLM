@@ -49,7 +49,7 @@ if [[ -n $draft ]]; then
   draft_json=$(printf '%s' "$draft" | sed 's/\\/\\\\/g; s/"/\\"/g')
   speculative="{\"method\": \"mtp\", \"model\": \"$draft_json\", \"num_speculative_tokens\": 4, \"draft_sample_method\": \"greedy\"}"
 fi
-kernel_config='{"sm70_hcx": true, "sm70_qsa_prep": true, "sm70_hcx_local_schedule": true, "qsa_host_kv": true, "qsa_host_kv_dtype": "fp8_e4m3", "qsa_host_kv_hot_dtype": "fp8_e4m3", "qsa_host_kv_hot_tokens": 32768, "qsa_host_kv_prefill_stage_tokens": 262144}'
+kernel_config='{"sm70_hcx": true, "sm70_qsa_prep": true, "sm70_hcx_local_schedule": true, "hc_weight_storage": "sharded", "qsa_host_kv": true, "qsa_host_kv_dtype": "fp8_e4m3", "qsa_host_kv_hot_dtype": "fp8_e4m3", "qsa_host_kv_hot_tokens": 131072, "qsa_host_kv_prefill_stage_tokens": 262144, "qsa_host_kv_trim_warmup_cache": true}'
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 vllm_cli=vllm
@@ -59,7 +59,7 @@ fi
 vllm_cli=$(command -v "$vllm_cli")
 exec "$vllm_cli" serve "$model" \
   --tensor-parallel-size 4 --dtype half --kv-cache-dtype float16 \
-  --language-model-only --max-model-len 262144 \
+  --limit-mm-per-prompt '{"video": 0, "audio": 0}' --max-model-len 262144 \
   --max-num-batched-tokens 4096 --max-num-seqs 8 \
   --gpu-memory-utilization 0.89 --attention-backend FLASH_ATTN_V100 \
   --enable-prefix-caching --partial-prefix-cache \

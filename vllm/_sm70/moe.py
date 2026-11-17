@@ -9,6 +9,7 @@ from .common import (
     _qwen38_qpn8_op,
     has_nvfp4_grouped_batch_reduce_dispatch,
     has_nvfp4_grouped_decode_dispatch,
+    has_nvfp4_grouped_raw_scale_dispatch,
     register_fake,
 )
 from .policy import call_native, direct_native
@@ -32,6 +33,36 @@ def nvfp4_grouped_w13_sm70_out(
     )
 
 
+def nvfp4_grouped_w13_raw_sm70_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scale_codes: torch.Tensor,
+    global_scales: torch.Tensor,
+    ids: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+    split: int,
+    interleaved: bool,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w13_raw_sm70_out(
+        out,
+        x,
+        w,
+        scale_codes,
+        global_scales,
+        ids,
+        rows,
+        experts,
+        sizes,
+        total,
+        split,
+        interleaved,
+    )
+
+
 def nvfp4_grouped_w2_sm70_out(
     out: torch.Tensor,
     routed: torch.Tensor,
@@ -49,6 +80,24 @@ def nvfp4_grouped_w2_sm70_out(
     )
 
 
+def nvfp4_grouped_w2_raw_sm70_out(
+    out: torch.Tensor,
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scale_codes: torch.Tensor,
+    global_scales: torch.Tensor,
+    topk: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w2_raw_sm70_out(
+        out, routed, x, w, scale_codes, global_scales, topk, rows, experts, sizes, total
+    )
+
+
 def nvfp4_grouped_w2_batch_reduce_sm70_out(
     out: torch.Tensor,
     routed: torch.Tensor,
@@ -63,6 +112,24 @@ def nvfp4_grouped_w2_batch_reduce_sm70_out(
 ) -> None:
     torch.ops._C.nvfp4_grouped_w2_batch_reduce_sm70_out(
         out, routed, x, w, s, topk, rows, experts, sizes, total
+    )
+
+
+def nvfp4_grouped_w2_batch_reduce_raw_sm70_out(
+    out: torch.Tensor,
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scale_codes: torch.Tensor,
+    global_scales: torch.Tensor,
+    topk: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w2_batch_reduce_raw_sm70_out(
+        out, routed, x, w, scale_codes, global_scales, topk, rows, experts, sizes, total
     )
 
 
@@ -97,6 +164,61 @@ if has_nvfp4_grouped_batch_reduce_dispatch():
     @register_fake("_C::nvfp4_grouped_w2_batch_reduce_sm70_out")
     def _grouped_w2_batch_fake(
         out, routed, x, w, s, topk, rows, experts, sizes, total, native_policy=()
+    ):
+        return None
+
+
+if has_nvfp4_grouped_raw_scale_dispatch():
+
+    @register_fake("_C::nvfp4_grouped_w13_raw_sm70_out")
+    def _grouped_w13_raw_fake(
+        out,
+        x,
+        w,
+        scale_codes,
+        global_scales,
+        ids,
+        rows,
+        experts,
+        sizes,
+        total,
+        split,
+        interleaved,
+        native_policy=(),
+    ):
+        return None
+
+    @register_fake("_C::nvfp4_grouped_w2_raw_sm70_out")
+    def _grouped_w2_raw_fake(
+        out,
+        routed,
+        x,
+        w,
+        scale_codes,
+        global_scales,
+        topk,
+        rows,
+        experts,
+        sizes,
+        total,
+        native_policy=(),
+    ):
+        return None
+
+    @register_fake("_C::nvfp4_grouped_w2_batch_reduce_raw_sm70_out")
+    def _grouped_w2_batch_raw_fake(
+        out,
+        routed,
+        x,
+        w,
+        scale_codes,
+        global_scales,
+        topk,
+        rows,
+        experts,
+        sizes,
+        total,
+        native_policy=(),
     ):
         return None
 

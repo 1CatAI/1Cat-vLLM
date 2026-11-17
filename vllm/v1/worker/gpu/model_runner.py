@@ -848,6 +848,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        self.profile_torch_peak = 0
+        self.language_profile_peak_increase = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -864,6 +866,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_mm_inputs, mm_budget
                 )
 
+        pre_lm_stats = torch.accelerator.memory_stats(self.device)
+        pre_lm_peak = pre_lm_stats.get("allocated_bytes.all.peak", 0)
+        pre_lm_alloc = pre_lm_stats.get("allocated_bytes.all.current", 0)
+        torch.accelerator.reset_peak_memory_stats(self.device)
+
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -877,6 +884,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._dummy_pooler_run(hidden_states)
 
         torch.accelerator.synchronize()
+        lm_peak = torch.accelerator.memory_stats(self.device).get(
+            "allocated_bytes.all.peak", 0
+        )
+        self.language_profile_peak_increase = max(0, lm_peak - pre_lm_alloc)
+        self.profile_torch_peak = max(pre_lm_peak, lm_peak)
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
         gc.collect()

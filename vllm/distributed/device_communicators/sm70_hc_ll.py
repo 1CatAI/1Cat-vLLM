@@ -198,6 +198,26 @@ class Sm70HcLLCommunicator:
         m = x.shape[0]
         output = x.new_empty((m, 2560))
         injection = x.new_empty((m, 4))
+        if self.optimized_loads and hasattr(
+            torch.ops._C, "sm70_hc_ll_fused_down_up_out"
+        ):
+            torch.ops._C.sm70_hc_ll_fused_down_up_out(
+                x,
+                down,
+                up,
+                self.partial,
+                self.down_counter,
+                self.up_counter,
+                self.down_pointers,
+                self.up_pointers,
+                self.down_seq,
+                self.up_seq,
+                self.logical_rank,
+                output,
+                self._empty_lora,
+                injection,
+            )
+            return output, injection
         torch.ops._C.sm70_hc_ll_down_out(
             x,
             down,

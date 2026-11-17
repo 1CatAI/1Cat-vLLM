@@ -888,7 +888,25 @@ void sm70_hcx_out(
     if (full && local_schedule) {
       TORCH_CHECK(bar.numel() >= 4,
                   "HCX local schedule needs four counter words");
-      hcx::hcx_kernel<true, -1, true><<<hcx::NC, 256, 0, st>>>(a);
+      switch ((a.M + 7) / 8) {
+        case 1:
+          hcx::hcx_kernel<true, -1, true><<<hcx::NC, 256, 0, st>>>(a);
+          break;
+        case 2:
+          hcx::hcx_batch_kernel<true, -1, 2, true><<<hcx::NC, 256, 0, st>>>(a);
+          break;
+        case 3:
+          hcx::hcx_batch_kernel<true, -1, 3, true><<<hcx::NC, 256, 0, st>>>(a);
+          break;
+        case 4:
+          hcx::hcx_batch_kernel<true, -1, 4, true><<<hcx::NC, 256, 0, st>>>(a);
+          break;
+        case 5:
+          hcx::hcx_batch_kernel<true, -1, 5, true><<<hcx::NC, 256, 0, st>>>(a);
+          break;
+        default:
+          TORCH_CHECK(false, "HCX: M1..40");
+      }
     } else {
       // The plain (no producer) batch kernel is specialized per group count.
       switch ((a.M + 7) / 8) {

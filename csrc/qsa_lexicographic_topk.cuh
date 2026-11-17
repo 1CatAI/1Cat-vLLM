@@ -15,8 +15,8 @@ namespace vllm::qsa {
 
 constexpr int kLexicographicTopKThreads = 1024;
 constexpr int kLexicographicTopKBins = 256;
-constexpr int kLexicographicTopKDecodeCandidateCapacity = 2304;
-constexpr int kLexicographicTopKCompactMinLength = 4096;
+constexpr int kLexicographicTopKDecodeCandidateCapacity = 3584;
+constexpr int kLexicographicTopKCompactMinLength = 2048;
 
 __device__ __forceinline__ uint32_t ordered_float_bits(float value) {
   // IEEE -0.0 and +0.0 compare equal, so keep them in the same score bucket
@@ -626,18 +626,12 @@ void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
     qsa_lexicographic_decode_topk_kernel<TopK>
         <<<1, kLexicographicTopKThreads, 0, stream>>>(logits, lengths, output,
                                                       columns, stride);
-  } else if (decode_batch && (num_rows == 5 || num_rows == 10) &&
-             columns <= 9216) {
+  } else if (decode_batch && num_rows <= 64 && columns <= 9216) {
     // Qualified through 32K context, allowing physical page padding. Longer
     // score buffers retain the original kernel and its resource allocation.
     qsa_lexicographic_mtp_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
             logits, lengths, output, num_rows, columns, stride);
-  } else if (decode_batch && num_rows <= 16 && num_rows != 5 &&
-             num_rows != 10) {
-    qsa_lexicographic_decode_topk_kernel<TopK>
-        <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
-            logits, lengths, output, columns, stride);
   } else {
     qsa_lexicographic_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(

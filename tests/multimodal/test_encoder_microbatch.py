@@ -44,6 +44,19 @@ def test_encoder_forward_retains_every_item(limit):
 
 def test_encoder_batch_config_hash_and_count_are_independent():
     default = MultiModalConfig()
+    assert default.get_limit_per_prompt("image") == 2147483647
+    assert default.get_limit_per_prompt("video") == 999
+    assert (
+        MultiModalConfig(
+            limit_per_prompt={"image": {"width": 512, "height": 512}}
+        ).get_limit_per_prompt("image")
+        == 2147483647
+    )
+    assert (
+        MultiModalConfig(limit_per_prompt={"image": 16}).get_limit_per_prompt("image")
+        == 16
+    )
+    assert MultiModalConfig(language_model_only=True).get_limit_per_prompt("image") == 0
     assert (
         default.compute_hash()
         == MultiModalConfig(mm_encoder_batch_size=0).compute_hash()

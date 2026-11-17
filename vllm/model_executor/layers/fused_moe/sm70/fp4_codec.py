@@ -30,6 +30,7 @@ class Fp4MoECodec:
     raw_scale: bool = False
     swiglu_limit: float | None = None
     bindings: Any = None
+    raw_fast_qpn: bool = True
 
     @property
     def operators(self):
@@ -46,15 +47,22 @@ class Fp4MoECodec:
             )
         return prepare(packed, scales, group_size)
 
+    def _use_raw_op(self, mode: str) -> bool:
+        if not self.raw_scale:
+            return False
+        if mode in ("active_grouped", "grouped_batch_reduce"):
+            return True
+        return self.raw_fast_qpn
+
     def _op(self, stage: str, mode: str, *, qpn_mtp=False):
         mode = fp4_binding_mode(
-            self.family, mode, raw_scale=self.raw_scale, qpn_mtp=qpn_mtp
+            self.family, mode, raw_scale=self._use_raw_op(mode), qpn_mtp=qpn_mtp
         )
         return getattr(self.operators, fp4_native_binding(self.family, stage, mode))
 
-    def _bank(self, stage: str) -> tuple[torch.Tensor, ...]:
+    def _bank(self, stage: str, *, raw: bool | None = None) -> tuple[torch.Tensor, ...]:
         w = self.weights
-        if self.raw_scale:
+        if self.raw_scale if raw is None else raw:
             return (
                 getattr(w, stage + "_tm_weight"),
                 getattr(w, stage + "_raw_scale_codes"),
@@ -94,10 +102,13 @@ class Fp4MoECodec:
     def _qpn(self, stage, out, x, ids, plan) -> None:
         w13 = stage == "w13"
         split_k = plan.w13_split_k if w13 else plan.w2_split_k
-        args = (out, x, *self._bank(stage), ids, w13)
+        use_raw = self._use_raw_op("qpn")
+        if self.raw_scale and not use_raw:
+            self._expand(stage, plan.interleaved if w13 else False)
+        args = (out, x, *self._bank(stage, raw=use_raw), ids, w13)
         if self.family == "mxfp4":
             self._op(stage, "qpn")(*args)
-        elif self.raw_scale:
+        elif use_raw:
             self._op(stage, "qpn")(*args, plan.interleaved if w13 else False, split_k)
         else:
             op = self._op(stage, "qpn", qpn_mtp=plan.qpn_mtp)
@@ -129,12 +140,23 @@ class Fp4MoECodec:
         elif mode == "qpn":
             self._qpn("w13", out, x, ids, plan)
         elif mode == "fused_qpn":
+            if self.raw_scale:
+                self._expand("w13", plan.interleaved)
             self._op("w13", "fused_qpn")(
-                buffers["intermediate"], x, *self._bank("w13"), ids
+                buffers["intermediate"], x, *self._bank("w13", raw=False), ids
             )
         elif mode == "fused_batch_qpn":
+            use_raw = self._use_raw_op(mode)
+            if self.raw_scale and not use_raw:
+                self._expand("w13", plan.interleaved)
             op = self._op("w13", mode)
-            op(buffers["intermediate"], x, *self._bank("w13"), ids, plan.interleaved)
+            op(
+                buffers["intermediate"],
+                x,
+                *self._bank("w13", raw=use_raw),
+                ids,
+                plan.interleaved,
+            )
         elif mode == "prepare_w13":
             self._op("w13", "prepare_w13")(
                 out,
@@ -213,12 +235,17 @@ class Fp4MoECodec:
         elif mode == "qpn":
             self._qpn("w2", buffers["sorted_output"], x, ids, plan)
         elif mode == "direct_reduce":
+            if self.raw_scale:
+                self._expand("w2", False)
             self._op("w2", "direct_reduce")(
-                buffers["output"], x, *self._bank("w2"), ids, topk_weights
+                buffers["output"], x, *self._bank("w2", raw=False), ids, topk_weights
             )
         elif mode == "batch_reduce":
+            use_raw = self._use_raw_op(mode)
+            if self.raw_scale and not use_raw:
+                self._expand("w2", False)
             op = self._op("w2", mode)
-            op(buffers["output"], x, *self._bank("w2"), ids, topk_weights)
+            op(buffers["output"], x, *self._bank("w2", raw=use_raw), ids, topk_weights)
         else:
             self._expand("w2", False)
             self._op("w2", "dense")(

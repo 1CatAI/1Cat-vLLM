@@ -78,17 +78,35 @@ FP4_STAGE_BINDINGS = {
         "shared compact route groups",
         "split4/8; original fused SwiGLU rounding",
     ),
+    ("nvfp4", "w13", "active_grouped_raw"): (
+        "nvfp4_grouped_w13_raw_sm70_out",
+        "w13+activation",
+        "shared compact route groups + raw E4M3 scales",
+        "split4/8; strict E4M3 scale + original fused SwiGLU rounding",
+    ),
     ("nvfp4", "w2", "active_grouped"): (
         "nvfp4_grouped_w2_sm70_out",
         "w2+reduce",
         "shared compact route groups",
         "original grouped W2 reduction",
     ),
+    ("nvfp4", "w2", "active_grouped_raw"): (
+        "nvfp4_grouped_w2_raw_sm70_out",
+        "w2+reduce",
+        "shared compact route groups + raw E4M3 scales",
+        "strict E4M3 scale + original grouped W2 reduction",
+    ),
     ("nvfp4", "w2", "grouped_batch_reduce"): (
         "nvfp4_grouped_w2_batch_reduce_sm70_out",
         "w2+reduce",
         "shared MTP5 route groups",
         "original grouped batch reduction",
+    ),
+    ("nvfp4", "w2", "grouped_batch_reduce_raw"): (
+        "nvfp4_grouped_w2_batch_reduce_raw_sm70_out",
+        "w2+reduce",
+        "shared MTP5 route groups + raw E4M3 scales",
+        "strict E4M3 scale + original grouped batch reduction",
     ),
     ("nvfp4", "w13", "dense"): (
         "nvfp4_moe_dense_stage_sm70_out",
@@ -239,6 +257,11 @@ def fp4_binding_mode(family: str, mode: str, *, raw_scale=False, qpn_mtp=False):
     """Normalize a codec layout variant without selecting a different route."""
     if family == "nvfp4" and mode == "qpn":
         return "qpn_raw" if raw_scale else "qpn_mtp" if qpn_mtp else "qpn"
-    if raw_scale and mode in ("fused_batch_qpn", "batch_reduce"):
+    if raw_scale and mode in (
+        "fused_batch_qpn",
+        "batch_reduce",
+        "active_grouped",
+        "grouped_batch_reduce",
+    ):
         return mode + "_raw"
     return mode
