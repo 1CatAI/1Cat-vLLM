@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS: str | None = None
     VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG: str | None = None
     VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD: str | None = None
+    VLLM_SM70_RANK_NUMA_BIND: str | None = None
     VLLM_SM70_SPEC_TARGET_FORWARD_NVTX: str | None = None
     VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP: str | None = None
     VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR: str | None = None
@@ -11009,6 +11010,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
         user_visible=False,
+    ),
+    "VLLM_SM70_RANK_NUMA_BIND": env_var(
+        lambda: os.getenv("VLLM_SM70_RANK_NUMA_BIND"),
+        description=(
+            "Per-rank NUMA binding for host-side pinned allocations, e.g. "
+            "'0-3:0;4-7:1' binds ranks 0-3 to node 0 and ranks 4-7 to node "
+            "1 (rank-range:node, semicolon-separated). Requires a guest "
+            "that exposes at least two NUMA nodes; unset disables binding."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_SM70_REJECTION_PROFILE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_REJECTION_PROFILE", "0"))),
@@ -21963,6 +21979,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION",
+        "VLLM_SM70_RANK_NUMA_BIND",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",

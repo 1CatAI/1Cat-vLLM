@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+import ctypes
 import gc
+import glob
 import os
 import time
 from collections.abc import Callable
@@ -233,6 +235,53 @@ class AsyncIntermediateTensors(IntermediateTensors):
         if name == "tensors" and not object.__getattribute__(self, "_comm_waited"):
             object.__getattribute__(self, "wait_for_comm")()
         return object.__getattribute__(self, name)
+
+
+def _sm70_parse_rank_numa_spec(spec: str, rank: int) -> int | None:
+    """Map *rank* to a NUMA node through a ``"lo-hi:node;..."`` spec."""
+    for part in spec.split(";"):
+        if not part:
+            continue
+        rng, sep, node = part.partition(":")
+        if not sep:
+            raise ValueError(f"malformed rank NUMA segment: {part!r}")
+        lo, dash, hi = rng.partition("-")
+        if not dash:
+            hi = lo
+        if int(lo) <= rank <= int(hi):
+            return int(node)
+    return None
+
+
+def _sm70_node_cpus(node: int) -> set[int]:
+    """CPU ids listed for NUMA *node* in sysfs."""
+    cpus: set[int] = set()
+    with open(f"/sys/devices/system/node/node{node}/cpulist") as cpulist:
+        for seg in cpulist.read().split(","):
+            seg = seg.strip()
+            if not seg:
+                continue
+            if "-" in seg:
+                start, _, end = seg.partition("-")
+                cpus.update(range(int(start), int(end) + 1))
+            else:
+                cpus.add(int(seg))
+    return cpus
+
+
+def _sm70_set_mempolicy(node: int) -> int | None:
+    """Request MPOL_PREFERRED for *node*; return the raw syscall result.
+
+    Uses the x86_64 set_mempolicy syscall number directly because glibc does
+    not export the ``set_mempolicy`` symbol. Returns None on other
+    architectures, where CPU affinity still applies.
+    """
+    if os.uname().machine != "x86_64":
+        return None
+    nodemask = ctypes.c_ulong(1 << node)
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    # syscall 238 is set_mempolicy(MPOL_PREFERRED, nodemask, maxnode).
+    return int(libc.syscall(238, 1, ctypes.byref(nodemask), 64))
 
 
 class Worker(WorkerBase):
@@ -515,8 +564,42 @@ class Worker(WorkerBase):
         finally:
             set_allocator_settings(conf)
 
+    def _sm70_bind_rank_numa(self) -> None:
+        """Bind this rank's CPUs and memory policy to its NUMA node.
+
+        ``VLLM_SM70_RANK_NUMA_BIND`` maps rank ranges to nodes, e.g.
+        ``"0-3:0;4-7:1"`` binds ranks 0-3 to node 0 and ranks 4-7 to node 1.
+        Requires a guest that exposes at least two NUMA nodes; any failure
+        is logged and never fatal.
+        """
+        spec = envs.VLLM_SM70_RANK_NUMA_BIND
+        if not spec:
+            return
+        try:
+            if len(glob.glob("/sys/devices/system/node/node*/cpulist")) < 2:
+                logger.warning("SM70 rank NUMA bind: guest has <2 NUMA nodes, skipping")
+                return
+            rank = self.local_rank
+            node = _sm70_parse_rank_numa_spec(spec, rank)
+            if node is None:
+                return
+            cpus = _sm70_node_cpus(node)
+            if cpus:
+                os.sched_setaffinity(0, cpus)
+            rc = _sm70_set_mempolicy(node)
+            logger.info(
+                "SM70 rank NUMA bind: rank=%d -> node=%d cpus=%s set_mempolicy rc=%s",
+                rank,
+                node,
+                sorted(cpus)[:6],
+                rc,
+            )
+        except Exception as e:
+            logger.warning("SM70 rank NUMA bind failed (non-fatal): %s", e)
+
     @instrument(span_name="Init device")
     def init_device(self):
+        self._sm70_bind_rank_numa()
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
