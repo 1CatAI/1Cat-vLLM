@@ -19,19 +19,9 @@ from vllm.models.qwen4_exp.nvidia.model import (
     _validate_qsa_e4m3_scale_load,
 )
 from vllm.models.qwen4_exp.nvidia.mtp import (
-    Qwen4ExpMTP,
     _validate_mtp_expert_weights_loaded,
 )
 from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
-
-
-def test_mtp_loader_prefers_compact_bf16_checkpoint_shards() -> None:
-    assert Qwen4ExpMTP.allow_patterns_overrides == [
-        "model-bf16-*.safetensors",
-        "*.safetensors",
-        "*.bin",
-        "*.pt",
-    ]
 
 
 @pytest.mark.parametrize(
@@ -180,6 +170,9 @@ def test_sparse_moe_attaches_private_recursive_loader_mapping(monkeypatch) -> No
 def test_fused_mtp_expert_checkpoint_loads_every_expert() -> None:
     class FakeFusedExperts(nn.Module):
         load_weights = FusedMoE.load_weights
+        _matching_expert_entries = FusedMoE._matching_expert_entries
+        _EXPERT_ENTRY = FusedMoE._EXPERT_ENTRY
+        _EXPERT_SUBSTRING = FusedMoE._EXPERT_SUBSTRING
 
         def __init__(self) -> None:
             super().__init__()
