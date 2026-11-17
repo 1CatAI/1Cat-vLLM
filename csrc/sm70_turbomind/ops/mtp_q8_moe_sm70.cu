@@ -40,8 +40,9 @@ __global__ __launch_bounds__(256) void mtp_quantize_q8_1_kernel(
       out + static_cast<size_t>(token) * hidden_groups + group, val);
 }
 
-template <int Warps>
-__global__ __launch_bounds__(Warps * 32) void mtp_q8_0_w13_swiglu_q8_1_kernel(
+template <int Warps, int MinBlocks = 0>
+__global__
+__launch_bounds__(Warps * 32, MinBlocks) void mtp_q8_0_w13_swiglu_q8_1_kernel(
     Q8_1* __restrict__ inter_out, const Q8_1* __restrict__ x_q8,
     const uint8_t* __restrict__ w13, const int32_t* __restrict__ topk_ids,
     int num_experts, int inter, int hidden_groups, int top_k) {
@@ -281,20 +282,26 @@ void sm70_mtp_q8_0_moe_out(torch::Tensor out, torch::Tensor workspace,
       x_q8, reinterpret_cast<const half*>(x.data_ptr()), hidden_groups);
 
   if (routes <= 40) {
-    mtp_q8_0_w13_swiglu_q8_1_kernel<16>
+    mtp_q8_0_w13_swiglu_q8_1_kernel<16, 0>
+        <<<dim3(inter_groups, routes), 512, w13_smem, stream>>>(
+            inter_q8, x_q8, w13.data_ptr<uint8_t>(),
+            topk_ids.data_ptr<int32_t>(), num_experts, inter, hidden_groups,
+            top_k);
+  } else if (routes <= 160) {
+    mtp_q8_0_w13_swiglu_q8_1_kernel<16, 2>
         <<<dim3(inter_groups, routes), 512, w13_smem, stream>>>(
             inter_q8, x_q8, w13.data_ptr<uint8_t>(),
             topk_ids.data_ptr<int32_t>(), num_experts, inter, hidden_groups,
             top_k);
   } else {
-    mtp_q8_0_w13_swiglu_q8_1_kernel<8>
+    mtp_q8_0_w13_swiglu_q8_1_kernel<8, 3>
         <<<dim3(inter_groups, routes), 256, w13_smem, stream>>>(
             inter_q8, x_q8, w13.data_ptr<uint8_t>(),
             topk_ids.data_ptr<int32_t>(), num_experts, inter, hidden_groups,
             top_k);
   }
 
-  if (tokens <= 4) {
+  if (tokens < 4) {
     mtp_q8_0_w2_reduce_kernel<8>
         <<<dim3((hidden + 7) / 8, tokens), 256, w2_smem, stream>>>(
             reinterpret_cast<half*>(out.data_ptr()), inter_q8,

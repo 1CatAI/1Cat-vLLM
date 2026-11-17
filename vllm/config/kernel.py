@@ -860,8 +860,10 @@ class KernelConfig:
 
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
-    hc_weight_storage: Literal["replicated", "sharded"] = "replicated"
+    hc_weight_storage: Literal["replicated", "sharded"] | None = None
     """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
+    hc_weight_storage_auto: bool = Field(default=False, init=False)
+    """Whether sharded HC storage was selected automatically."""
     sm70_router_weight_storage: Literal["dual", "row_major"] = "dual"
     """Read the FP16 checkpoint router directly or retain its packed duplicate."""
 
@@ -1075,7 +1077,7 @@ class KernelConfig:
     """Shared prefix staging buffers. One slot reuses the current layer's
     buffer after its attention completion event; prefetch still overlaps the
     following non-QSA computation. Two preserves the alternating layout."""
-    qsa_host_kv_trim_warmup_cache: bool = False
+    qsa_host_kv_trim_warmup_cache: bool | None = None
     """Return unused allocator pages once after host-QSA kernel/graph warmup.
     Active tensors and captured private pools remain owned; inference does
     not trim pages. This initialization resource policy does not change
@@ -1220,6 +1222,27 @@ class KernelConfig:
             )
         if self.sm70_hcx_local_schedule is None:
             self.sm70_hcx_local_schedule = bool(self.sm70_hcx)
+        if self.hc_weight_storage is None:
+            model = getattr(cfg, "model_config", None)
+            text = getattr(model, "hf_text_config", None)
+            parallel = getattr(cfg, "parallel_config", None)
+            tp_size = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
+            if (
+                qwen4_sm70
+                and self.hc_ll_shard
+                and tp_size == 4
+                and getattr(cfg, "lora_config", None) is None
+                and (
+                    getattr(text, "hc_count", None),
+                    getattr(text, "hidden_size", None),
+                    getattr(text, "hc_lowrank", None),
+                )
+                == (4, 2560, 320)
+            ):
+                self.hc_weight_storage = "sharded"
+                self.hc_weight_storage_auto = True
+            else:
+                self.hc_weight_storage = "replicated"
         if self.sm70_top1x is None:
             self.sm70_top1x = qwen4_sm70
         if self.sm70_greedy_verify is None:
@@ -1279,7 +1302,10 @@ class KernelConfig:
     def resolve_attention_history(self, cfg) -> bool:
         from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_host_kv
 
-        return resolve_qsa_host_kv(cfg)
+        active = resolve_qsa_host_kv(cfg)
+        if self.qsa_host_kv_trim_warmup_cache is None:
+            self.qsa_host_kv_trim_warmup_cache = bool(active)
+        return active
 
     @property
     def capture_all_draft_steps(self) -> bool:
@@ -1381,6 +1407,7 @@ class KernelConfig:
             "linear_kernel_selections",
             "collective_kernel_selections",
             "sm70_hcx_local_schedule",  # Native dispatch inside the opaque HC op.
+            "hc_weight_storage_auto",  # Diagnostic origin only.
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",

@@ -58,6 +58,11 @@ __device__ __forceinline__ unsigned ld_vol(const unsigned* p) {
 __device__ __forceinline__ void st_vol(unsigned* p, unsigned v) {
   asm volatile("st.volatile.global.u32 [%0], %1;" ::"l"(p), "r"(v));
 }
+__device__ __forceinline__ void st_vol4(uint32_t* p, uint4 v) {
+  asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(p),
+               "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+               : "memory");
+}
 __device__ __forceinline__ uint32_t pk(half v, uint32_t tag) {
   return (tag << 16) | __half_as_ushort(v);
 }
@@ -434,11 +439,632 @@ __global__ void __launch_bounds__(32 * WARPS)
   }
   __syncthreads();
   if (threadIdx.x == 0) {
-    __threadfence();
     if (atomicAdd(cnt, 1u) == gridDim.x - 1) {
+      __threadfence();
       *cnt = 0;
       if (dirty_m) st_vol(dirty_m + page, static_cast<unsigned>(total_m));
       st_vol(pr.seq, ld_vol(pr.seq) + 1);
+    }
+  }
+}
+
+struct PeerPtrs {
+  uint32_t* self;
+  uint32_t* p1;
+  uint32_t* p2;
+  uint32_t* p3;
+  unsigned* seq;
+  int rank;
+};
+
+// ---------------------------------------------------------------- fused
+// down+up Stage 1: pure split-K MMA write into `part` across all 80 SMs (3 x 20
+// x groups_m CTAs x 8 warps), 0 fences / 0 atomics / 8 KB smem.
+template <int S, int WARPS>
+__global__ void __launch_bounds__(32 * WARPS, 4)
+    down3_part_only(const half* __restrict__ x, const half* __restrict__ wd,
+                    float* __restrict__ part, int total_m) {
+  constexpr int KC = KD / S, KW = KC / WARPS, G = KW / 16, NP = 96;
+  static_assert(KD % S == 0 && KC % WARPS == 0 && KW % 16 == 0, "");
+  static_assert(WARPS == 8, "down3_part_only expects 8 warps");
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x, s = blockIdx.y, grp = blockIdx.z;
+  const int first_row = grp * 8;
+  const int gm = min(8, total_m - first_row);
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int quad = (lane >> 2) & 3;
+  const int col = quad * 8 + r;
+  const int kbase = s * KC + warp * KW;
+  const half* w = wd + static_cast<size_t>(tile) * KD * 32;
+  const half* xg = x + first_row * KD;
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    const int kg = (kbase + g * 16) >> 4;
+    const uint4 wlo = ordered_weight_load(
+        reinterpret_cast<const uint4*>(w + (kg * 64 + col) * 8));
+    const uint4 whi = ordered_weight_load(
+        reinterpret_cast<const uint4*>(w + (kg * 64 + 32 + col) * 8));
+    const int k = kbase + g * 16;
+    uint4 a = make_uint4(0, 0, 0, 0), b = a;
+    if (r < gm) {
+      a = __ldg(reinterpret_cast<const uint4*>(xg + r * KD + k));
+      b = __ldg(reinterpret_cast<const uint4*>(xg + r * KD + k + 8));
+    }
+    mma(acc, a.x, a.y, wlo.x, wlo.y);
+    mma(acc, a.z, a.w, wlo.z, wlo.w);
+    mma(acc, b.x, b.y, whi.x, whi.y);
+    mma(acc, b.z, b.w, whi.z, whi.w);
+  }
+  __shared__ float red[WARPS][8][32];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) red[warp][i][lane] = acc[i];
+  __syncthreads();
+  // Warp `warp` reduces element `i = warp` in exact q = 0..7 order.
+  float v = red[0][warp][lane];
+#pragma unroll
+  for (int q = 1; q < WARPS; ++q) v += red[q][warp][lane];
+  const int row = (warp & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+  const int n = tile * 32 + quad * 8 +
+                ((warp & 1) | (((lane >> 1) & 1) << 1) | ((warp >> 2) << 2));
+  if (row < gm) part[(s * kPageRows + first_row + row) * NP + n] = v;
+}
+
+// Fast unchunked multi-group Stage 2 for M <= 40 (Groups = 1..5):
+// - Scalar PeerPtrs keep STACK = 0 (no local-memory spills).
+// - Static shared memory <= 32,000 B (< 32 KB Volta carveout threshold).
+// - Single NVLink poll pass across all `total_m` rows, register-resident
+//   `acc[Groups][8]` MMA loop, and 160-thread parallel NVLink `up` push.
+template <int S, int Groups>
+__global__ void __launch_bounds__(160)
+    up3_fused_groups(const float* __restrict__ part,
+                     const half* __restrict__ wu, const half* __restrict__ x,
+                     unsigned* __restrict__ up_cnt,
+                     unsigned* __restrict__ down_dirty_m,
+                     unsigned* __restrict__ up_dirty_m, PeerPtrs down_pr,
+                     PeerPtrs up_pr, half* __restrict__ out,
+                     half* __restrict__ lora_out, half* __restrict__ inj_out,
+                     int total_m) {
+  constexpr int WARPS = 5, GW = 20 / WARPS, SW = 640, NP = 96;
+  constexpr int kRows = Groups * 8;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;  // 0..79
+
+  const unsigned dseq_next = ld_vol(down_pr.seq) + 1u;
+  const unsigned dpage = dseq_next & 1u;
+  const uint32_t dtag = tag_of(dseq_next);
+  const size_t dpage_off = static_cast<size_t>(dpage) * kPageRows * LW;
+  uint32_t* d_self = down_pr.self + dpage_off;
+  uint32_t* d_p1 = down_pr.p1 + dpage_off;
+  uint32_t* d_p2 = down_pr.p2 + dpage_off;
+  uint32_t* d_p3 = down_pr.p3 ? (down_pr.p3 + dpage_off) : nullptr;
+
+  const unsigned useq_next = ld_vol(up_pr.seq) + 1u;
+  const unsigned upage = useq_next & 1u;
+  const uint32_t utag = tag_of(useq_next);
+  const size_t upage_off = static_cast<size_t>(upage) * kPageRows * HD;
+  uint32_t* u_self = up_pr.self + upage_off;
+  uint32_t* u_p1 = up_pr.p1 + upage_off;
+  uint32_t* u_p2 = up_pr.p2 + upage_off;
+  uint32_t* u_p3 = up_pr.p3 ? (up_pr.p3 + upage_off) : nullptr;
+
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int branch = (lane >> 2) & 3;
+  const int col = branch * 8 + r;
+  const int rk = up_pr.rank, p1 = rk ^ 1, p2 = rk ^ 2, p3 = rk ^ 3;
+  const bool full_mesh = (u_p3 != nullptr && d_p3 != nullptr);
+
+  const int d_prev_m =
+      down_dirty_m ? static_cast<int>(ld_vol(down_dirty_m + dpage)) : kMaxRows;
+  if (total_m < d_prev_m) {
+    const int clean_words = (d_prev_m - total_m) * LW;
+    for (int i = tile * 160 + threadIdx.x; i < clean_words; i += 80 * 160) {
+      d_self[total_m * LW + i] = 0u;
+    }
+  }
+  const int u_prev_m =
+      up_dirty_m ? static_cast<int>(ld_vol(up_dirty_m + upage)) : kMaxRows;
+  if (total_m < u_prev_m) {
+    const int clean_rows = u_prev_m - total_m;
+    for (int idx = threadIdx.x; idx < clean_rows * 6; idx += 160) {
+      const int peer_sel = idx % 3;
+      const int src = (peer_sel == 0) ? p1 : ((peer_sel == 1) ? p2 : p3);
+      const int rh = idx / 3;
+      const int row = total_m + (rh >> 1), h4 = (rh & 1) * 4;
+      *reinterpret_cast<uint4*>(u_self + row * HD + src * SW + tile * 8 + h4) =
+          make_uint4(0u, 0u, 0u, 0u);
+    }
+  }
+
+  // 1. Coalesced warp-per-(row, down_tile) reduction of `part` from L2 cache.
+  const int global_warp = tile * WARPS + warp;
+  for (int task = global_warp; task < 3 * total_m; task += 80 * WARPS) {
+    const int d_tile = task % 3;
+    const int row = task / 3;
+    const int n = d_tile * 32 + lane;
+    const bool valid_col = (n < 80) || (rk == 3 && n < 84);
+    if (valid_col) {
+      float tot = 0.f;
+#pragma unroll
+      for (int sp = 0; sp < S; ++sp)
+        tot += __ldg(part + (sp * kPageRows + row) * NP + n);
+      half v = __float2half_rn(tot);
+      if (n < 80) {
+        const float xx = div_full(__half2float(v), 4.0f);
+        v = __float2half_rn(xx * sigm(xx));
+      }
+      const uint32_t word = pk(v, dtag);
+      const int gcol = (n < 80) ? (rk * 80 + n) : (320 + n - 80);
+      const int o = row * LW + gcol;
+      st_vol(d_self + o, word);
+      st_vol(d_p1 + o, word);
+      st_vol(d_p2 + o, word);
+      if (full_mesh) st_vol(d_p3 + o, word);
+    }
+  }
+  if (!full_mesh) {
+    for (int task = global_warp; task < 3 * total_m; task += 80 * WARPS) {
+      const int d_tile = task % 3;
+      const int row = task / 3;
+      const int n = d_tile * 32 + lane;
+      const bool valid_col = (n < 80) || (p1 == 3 && n < 84);
+      if (valid_col) {
+        const int gcol = (n < 80) ? (p1 * 80 + n) : (320 + n - 80);
+        const int o = row * LW + gcol;
+        st_vol(d_p2 + o, poll1(d_self + o, dtag));
+      }
+    }
+  }
+
+  // 2. Overlap `wu` HBM loads while `down` NVLink words are in flight.
+  const half* w = wu + static_cast<size_t>(tile) * 320 * 32;
+  uint4 wlo[GW], whi[GW];
+#pragma unroll
+  for (int gg = 0; gg < GW; ++gg) {
+    const int g = warp * GW + gg;
+    wlo[gg] = __ldg(reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8));
+    whi[gg] =
+        __ldg(reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8));
+  }
+
+  __shared__ __align__(16) half ls[kRows][328];
+  __shared__ __align__(16) half tout[kRows][8];
+  __shared__ float red[WARPS][8][32];
+
+  if (tile == 0) {
+    for (int idx = threadIdx.x; idx < total_m * 4; idx += 160) {
+      const int row = idx >> 2, c = idx & 3;
+      inj_out[row * 4 + c] =
+          __ushort_as_half(poll1(d_self + row * LW + 320 + c, dtag) & 0xffffu);
+    }
+  }
+
+  // 3. Poll all `total_m` rows of `ll_lora` in one pass.
+  for (int idx = threadIdx.x; idx < total_m * 80; idx += 160) {
+    const int r_loc = idx / 80, c4 = (idx % 80) * 4;
+    const uint4 v = poll4(d_self + r_loc * LW + c4, dtag);
+    const half2 h01 = __halves2half2(__ushort_as_half(v.x & 0xffffu),
+                                     __ushort_as_half(v.y & 0xffffu));
+    const half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffffu),
+                                     __ushort_as_half(v.w & 0xffffu));
+    *reinterpret_cast<uint2*>(&ls[r_loc][c4]) =
+        make_uint2(*reinterpret_cast<const uint32_t*>(&h01),
+                   *reinterpret_cast<const uint32_t*>(&h23));
+  }
+  __syncthreads();
+  if (tile == 0 && lora_out != nullptr) {
+    for (int idx = threadIdx.x; idx < total_m * 320; idx += 160) {
+      lora_out[idx] = ls[idx / 320][idx % 320];
+    }
+  }
+
+  // 4. Compute all `Groups` MMA tiles in registers without inner barriers.
+  float acc[Groups][8] = {};
+#pragma unroll
+  for (int gg = 0; gg < GW; ++gg) {
+    const int g = warp * GW + gg;
+#pragma unroll
+    for (int grp = 0; grp < Groups; ++grp) {
+      const int row_idx = grp * 8 + r;
+      uint4 a = make_uint4(0, 0, 0, 0), b = a;
+      if (row_idx < total_m) {
+        a = *reinterpret_cast<const uint4*>(&ls[row_idx][g * 16]);
+        b = *reinterpret_cast<const uint4*>(&ls[row_idx][g * 16 + 8]);
+      }
+      mma(acc[grp], a.x, a.y, wlo[gg].x, wlo[gg].y);
+      mma(acc[grp], a.z, a.w, wlo[gg].z, wlo[gg].w);
+      mma(acc[grp], b.x, b.y, whi[gg].x, whi[gg].y);
+      mma(acc[grp], b.z, b.w, whi[gg].z, whi[gg].w);
+    }
+  }
+
+#pragma unroll
+  for (int grp = 0; grp < Groups; ++grp) {
+    if (grp > 0) __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) red[warp][i][lane] = acc[grp][i];
+    __syncthreads();
+    if (warp < 4) {
+      const int first_row = grp * 8;
+      const int gm = min(8, total_m - first_row);
+      const half* xg = x + first_row * KD + branch * HD + rk * SW + tile * 8;
+#pragma unroll
+      for (int sub = 0; sub < 2; ++sub) {
+        const int i = warp * 2 + sub;
+        const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        const int hh = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+        const half xv =
+            row < gm ? __ldg(xg + row * KD + hh) : __float2half_rn(0.f);
+        float v_acc = red[0][i][lane];
+#pragma unroll
+        for (int q = 1; q < WARPS; ++q) v_acc += red[q][i][lane];
+        const float sg = sigm(__half2float(__float2half_rn(v_acc)));
+        const float vf = __half2float(xv);
+        float mixed = 0.f;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          const int src = (lane & ~12) | (b << 2);
+          mixed = fmaf(__shfl_sync(0xffffffff, sg, src),
+                       __shfl_sync(0xffffffff, vf, src), mixed);
+        }
+        if (branch == 0 && row < gm)
+          tout[first_row + row][hh] = __float2half_rn(div_full(mixed, 4.0f));
+      }
+    }
+  }
+  __syncthreads();
+
+  // Push all `total_m * 2` uint4 packets over NVLink across all 160 threads!
+  for (int idx = threadIdx.x; idx < total_m * 2; idx += 160) {
+    const int row = idx >> 1, h4 = (idx & 1) * 4;
+    uint4 wv;
+    wv.x = pk(tout[row][h4 + 0], utag);
+    wv.y = pk(tout[row][h4 + 1], utag);
+    wv.z = pk(tout[row][h4 + 2], utag);
+    wv.w = pk(tout[row][h4 + 3], utag);
+    const int o = row * HD + rk * SW + tile * 8 + h4;
+    st_vol4(u_p1 + o, wv);
+    st_vol4(u_p2 + o, wv);
+    if (full_mesh) st_vol4(u_p3 + o, wv);
+    *reinterpret_cast<uint2*>(out + o) =
+        *reinterpret_cast<const uint2*>(&tout[row][h4]);
+  }
+
+  // 5. Collect peer `up` shards into `out`.
+  if (full_mesh) {
+    for (int idx = threadIdx.x; idx < total_m * 6; idx += 160) {
+      const int peer_sel = idx % 3;
+      const int src = (peer_sel == 0) ? p1 : ((peer_sel == 1) ? p2 : p3);
+      const int rh = idx / 3;
+      const int row = rh >> 1, h4 = (rh & 1) * 4;
+      const int o = row * HD + src * SW + tile * 8 + h4;
+      const uint4 v = poll4(u_self + o, utag);
+      half2 h01 = __halves2half2(__ushort_as_half(v.x & 0xffffu),
+                                 __ushort_as_half(v.y & 0xffffu));
+      half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffffu),
+                                 __ushort_as_half(v.w & 0xffffu));
+      *reinterpret_cast<uint2*>(out + o) =
+          make_uint2(*reinterpret_cast<uint32_t*>(&h01),
+                     *reinterpret_cast<uint32_t*>(&h23));
+    }
+  } else {
+    for (int t = threadIdx.x; t < 2 * total_m; t += 160) {
+      const int row = t >> 1, h4 = (t & 1) * 4;
+      const int o = row * HD + p1 * SW + tile * 8 + h4;
+      const uint4 v = poll4(u_self + o, utag);
+      st_vol4(u_p2 + o, v);
+      half2 h01 = __halves2half2(__ushort_as_half(v.x & 0xffffu),
+                                 __ushort_as_half(v.y & 0xffffu));
+      half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffffu),
+                                 __ushort_as_half(v.w & 0xffffu));
+      *reinterpret_cast<uint2*>(out + o) =
+          make_uint2(*reinterpret_cast<uint32_t*>(&h01),
+                     *reinterpret_cast<uint32_t*>(&h23));
+    }
+    for (int t = threadIdx.x; t < 4 * total_m; t += 160) {
+      const int src = (t & 2) ? p3 : p2;
+      const int row = t >> 2, h4 = (t & 1) * 4;
+      const int o = row * HD + src * SW + tile * 8 + h4;
+      const uint4 v = poll4(u_self + o, utag);
+      half2 h01 = __halves2half2(__ushort_as_half(v.x & 0xffffu),
+                                 __ushort_as_half(v.y & 0xffffu));
+      half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffffu),
+                                 __ushort_as_half(v.w & 0xffffu));
+      *reinterpret_cast<uint2*>(out + o) =
+          make_uint2(*reinterpret_cast<uint32_t*>(&h01),
+                     *reinterpret_cast<uint32_t*>(&h23));
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (atomicAdd(up_cnt, 1u) == gridDim.x - 1) {
+      __threadfence();
+      *up_cnt = 0u;
+      if (down_dirty_m)
+        st_vol(down_dirty_m + dpage, static_cast<unsigned>(total_m));
+      st_vol(down_pr.seq, dseq_next);
+      if (up_dirty_m)
+        st_vol(up_dirty_m + upage, static_cast<unsigned>(total_m));
+      st_vol(up_pr.seq, useq_next);
+    }
+  }
+}
+
+// Fallback chunked Stage 2 for 41 <= M <= 64.
+template <int S>
+__global__ void __launch_bounds__(160)
+    up3_fused(const float* __restrict__ part, const half* __restrict__ wu,
+              const half* __restrict__ x, unsigned* __restrict__ up_cnt,
+              unsigned* __restrict__ down_dirty_m,
+              unsigned* __restrict__ up_dirty_m, PeerPtrs down_pr,
+              PeerPtrs up_pr, half* __restrict__ out,
+              half* __restrict__ lora_out, half* __restrict__ inj_out,
+              int total_m) {
+  constexpr int WARPS = 5, GW = 20 / WARPS, SW = 640, NP = 96;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;  // 0..79
+
+  const unsigned dseq_next = ld_vol(down_pr.seq) + 1u;
+  const unsigned dpage = dseq_next & 1u;
+  const uint32_t dtag = tag_of(dseq_next);
+  const size_t dpage_off = static_cast<size_t>(dpage) * kPageRows * LW;
+  uint32_t* d_self = down_pr.self + dpage_off;
+  uint32_t* d_p1 = down_pr.p1 + dpage_off;
+  uint32_t* d_p2 = down_pr.p2 + dpage_off;
+  uint32_t* d_p3 = down_pr.p3 ? (down_pr.p3 + dpage_off) : nullptr;
+
+  const unsigned useq_next = ld_vol(up_pr.seq) + 1u;
+  const unsigned upage = useq_next & 1u;
+  const uint32_t utag = tag_of(useq_next);
+  const size_t upage_off = static_cast<size_t>(upage) * kPageRows * HD;
+  uint32_t* u_self = up_pr.self + upage_off;
+  uint32_t* u_p1 = up_pr.p1 + upage_off;
+  uint32_t* u_p2 = up_pr.p2 + upage_off;
+  uint32_t* u_p3 = up_pr.p3 ? (up_pr.p3 + upage_off) : nullptr;
+
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int branch = (lane >> 2) & 3;
+  const int col = branch * 8 + r;
+  const int rk = up_pr.rank, p1 = rk ^ 1, p2 = rk ^ 2, p3 = rk ^ 3;
+  const bool full_mesh = (u_p3 != nullptr && d_p3 != nullptr);
+
+  const int d_prev_m =
+      down_dirty_m ? static_cast<int>(ld_vol(down_dirty_m + dpage)) : kMaxRows;
+  if (total_m < d_prev_m) {
+    const int clean_words = (d_prev_m - total_m) * LW;
+    for (int i = tile * 160 + threadIdx.x; i < clean_words; i += 80 * 160) {
+      d_self[total_m * LW + i] = 0u;
+    }
+  }
+  const int u_prev_m =
+      up_dirty_m ? static_cast<int>(ld_vol(up_dirty_m + upage)) : kMaxRows;
+  if (total_m < u_prev_m) {
+    const int clean_rows = u_prev_m - total_m;
+    for (int idx = threadIdx.x; idx < clean_rows * 6; idx += 160) {
+      const int peer_sel = idx % 3;
+      const int src = (peer_sel == 0) ? p1 : ((peer_sel == 1) ? p2 : p3);
+      const int rh = idx / 3;
+      const int row = total_m + (rh >> 1), h4 = (rh & 1) * 4;
+      *reinterpret_cast<uint4*>(u_self + row * HD + src * SW + tile * 8 + h4) =
+          make_uint4(0u, 0u, 0u, 0u);
+    }
+  }
+
+  const int global_warp = tile * WARPS + warp;
+  for (int task = global_warp; task < 3 * total_m; task += 80 * WARPS) {
+    const int d_tile = task % 3;
+    const int row = task / 3;
+    const int n = d_tile * 32 + lane;
+    const bool valid_col = (n < 80) || (rk == 3 && n < 84);
+    if (valid_col) {
+      float tot = 0.f;
+#pragma unroll
+      for (int sp = 0; sp < S; ++sp)
+        tot += __ldg(part + (sp * kPageRows + row) * NP + n);
+      half v = __float2half_rn(tot);
+      if (n < 80) {
+        const float xx = div_full(__half2float(v), 4.0f);
+        v = __float2half_rn(xx * sigm(xx));
+      }
+      const uint32_t word = pk(v, dtag);
+      const int gcol = (n < 80) ? (rk * 80 + n) : (320 + n - 80);
+      const int o = row * LW + gcol;
+      st_vol(d_self + o, word);
+      st_vol(d_p1 + o, word);
+      st_vol(d_p2 + o, word);
+      if (full_mesh) st_vol(d_p3 + o, word);
+    }
+  }
+  if (!full_mesh) {
+    for (int task = global_warp; task < 3 * total_m; task += 80 * WARPS) {
+      const int d_tile = task % 3;
+      const int row = task / 3;
+      const int n = d_tile * 32 + lane;
+      const bool valid_col = (n < 80) || (p1 == 3 && n < 84);
+      if (valid_col) {
+        const int gcol = (n < 80) ? (p1 * 80 + n) : (320 + n - 80);
+        const int o = row * LW + gcol;
+        st_vol(d_p2 + o, poll1(d_self + o, dtag));
+      }
+    }
+  }
+
+  const half* w = wu + static_cast<size_t>(tile) * 320 * 32;
+  uint4 wlo[GW], whi[GW];
+#pragma unroll
+  for (int gg = 0; gg < GW; ++gg) {
+    const int g = warp * GW + gg;
+    wlo[gg] = __ldg(reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8));
+    whi[gg] =
+        __ldg(reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8));
+  }
+
+  constexpr int kChunkRows = 32;
+  __shared__ __align__(16) half ls[kChunkRows][328];
+  __shared__ __align__(16) half tout[8][8];
+  __shared__ float red[WARPS][8][32];
+
+  const uint32_t* ll_lora = d_self;
+  if (tile == 0) {
+    for (int idx = threadIdx.x; idx < total_m * 4; idx += 160) {
+      const int row = idx >> 2, c = idx & 3;
+      inj_out[row * 4 + c] =
+          __ushort_as_half(poll1(ll_lora + row * LW + 320 + c, dtag) & 0xffffu);
+    }
+  }
+
+  for (int chunk_base = 0; chunk_base < total_m; chunk_base += kChunkRows) {
+    const int chunk_m = min(kChunkRows, total_m - chunk_base);
+    if (chunk_base > 0) __syncthreads();
+    for (int idx = threadIdx.x; idx < chunk_m * 80; idx += 160) {
+      const int r_loc = idx / 80, c4 = (idx % 80) * 4;
+      const uint4 v = poll4(ll_lora + (chunk_base + r_loc) * LW + c4, dtag);
+      const half2 h01 = __halves2half2(__ushort_as_half(v.x & 0xffffu),
+                                       __ushort_as_half(v.y & 0xffffu));
+      const half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffffu),
+                                       __ushort_as_half(v.w & 0xffffu));
+      *reinterpret_cast<uint2*>(&ls[r_loc][c4]) =
+          make_uint2(*reinterpret_cast<const uint32_t*>(&h01),
+                     *reinterpret_cast<const uint32_t*>(&h23));
+    }
+    __syncthreads();
+    if (tile == 0 && lora_out != nullptr) {
+      for (int idx = threadIdx.x; idx < chunk_m * 320; idx += 160) {
+        lora_out[chunk_base * 320 + idx] = ls[idx / 320][idx % 320];
+      }
+    }
+
+    const int chunk_groups = (chunk_m + 7) / 8;
+    for (int grp = 0; grp < chunk_groups; ++grp) {
+      const int local_first = grp * 8;
+      const int first_row = chunk_base + local_first;
+      const int gm = min(8, total_m - first_row);
+      half xv[2];
+      if (warp < 4) {
+        const half* xg = x + first_row * KD + branch * HD + rk * SW + tile * 8;
+#pragma unroll
+        for (int sub = 0; sub < 2; ++sub) {
+          const int i = warp * 2 + sub;
+          const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+          const int hh = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+          xv[sub] = row < gm ? __ldg(xg + row * KD + hh) : __float2half_rn(0.f);
+        }
+      }
+      float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+      for (int gg = 0; gg < GW; ++gg) {
+        const int g = warp * GW + gg;
+        uint4 a = make_uint4(0, 0, 0, 0), b = a;
+        if (r < gm) {
+          a = *reinterpret_cast<const uint4*>(&ls[local_first + r][g * 16]);
+          b = *reinterpret_cast<const uint4*>(&ls[local_first + r][g * 16 + 8]);
+        }
+        mma(acc, a.x, a.y, wlo[gg].x, wlo[gg].y);
+        mma(acc, a.z, a.w, wlo[gg].z, wlo[gg].w);
+        mma(acc, b.x, b.y, whi[gg].x, whi[gg].y);
+        mma(acc, b.z, b.w, whi[gg].z, whi[gg].w);
+      }
+#pragma unroll
+      for (int i = 0; i < 8; ++i) red[warp][i][lane] = acc[i];
+      __syncthreads();
+      if (warp < 4) {
+#pragma unroll
+        for (int sub = 0; sub < 2; ++sub) {
+          const int i = warp * 2 + sub;
+          float v_acc = red[0][i][lane];
+#pragma unroll
+          for (int q = 1; q < WARPS; ++q) v_acc += red[q][i][lane];
+          const int row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+          const int hh = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+          const float sg = sigm(__half2float(__float2half_rn(v_acc)));
+          const float v = __half2float(xv[sub]);
+          float mixed = 0.f;
+#pragma unroll
+          for (int b = 0; b < 4; ++b) {
+            const int src = (lane & ~12) | (b << 2);
+            mixed = fmaf(__shfl_sync(0xffffffff, sg, src),
+                         __shfl_sync(0xffffffff, v, src), mixed);
+          }
+          if (branch == 0 && row < gm)
+            tout[row][hh] = __float2half_rn(div_full(mixed, 4.0f));
+        }
+      }
+      __syncthreads();
+      if (warp == 0 && lane < 2 * gm) {
+        const int row = lane >> 1, h4 = (lane & 1) * 4;
+        uint4 wv;
+        wv.x = pk(tout[row][h4 + 0], utag);
+        wv.y = pk(tout[row][h4 + 1], utag);
+        wv.z = pk(tout[row][h4 + 2], utag);
+        wv.w = pk(tout[row][h4 + 3], utag);
+        const int o = (first_row + row) * HD + rk * SW + tile * 8 + h4;
+        st_vol4(u_p1 + o, wv);
+        st_vol4(u_p2 + o, wv);
+        if (full_mesh) st_vol4(u_p3 + o, wv);
+        *reinterpret_cast<uint2*>(out + o) =
+            *reinterpret_cast<const uint2*>(&tout[row][h4]);
+      }
+    }
+  }
+
+  // 5. Collect peer `up` shards into `out`.
+  if (full_mesh) {
+    for (int idx = threadIdx.x; idx < total_m * 6; idx += 160) {
+      const int peer_sel = idx % 3;
+      const int src = (peer_sel == 0) ? p1 : ((peer_sel == 1) ? p2 : p3);
+      const int rh = idx / 3;
+      const int row = rh >> 1, h4 = (rh & 1) * 4;
+      const int o = row * HD + src * SW + tile * 8 + h4;
+      const uint4 v = poll4(u_self + o, utag);
+      half2 h01 = __halves2half2(__ushort_as_half(v.x & 0xffffu),
+                                 __ushort_as_half(v.y & 0xffffu));
+      half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffffu),
+                                 __ushort_as_half(v.w & 0xffffu));
+      *reinterpret_cast<uint2*>(out + o) =
+          make_uint2(*reinterpret_cast<uint32_t*>(&h01),
+                     *reinterpret_cast<uint32_t*>(&h23));
+    }
+  } else {
+    for (int t = threadIdx.x; t < 2 * total_m; t += 160) {
+      const int row = t >> 1, h4 = (t & 1) * 4;
+      const int o = row * HD + p1 * SW + tile * 8 + h4;
+      const uint4 v = poll4(u_self + o, utag);
+      st_vol4(u_p2 + o, v);
+      half2 h01 = __halves2half2(__ushort_as_half(v.x & 0xffffu),
+                                 __ushort_as_half(v.y & 0xffffu));
+      half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffffu),
+                                 __ushort_as_half(v.w & 0xffffu));
+      *reinterpret_cast<uint2*>(out + o) =
+          make_uint2(*reinterpret_cast<uint32_t*>(&h01),
+                     *reinterpret_cast<uint32_t*>(&h23));
+    }
+    for (int t = threadIdx.x; t < 4 * total_m; t += 160) {
+      const int src = (t & 2) ? p3 : p2;
+      const int row = t >> 2, h4 = (t & 1) * 4;
+      const int o = row * HD + src * SW + tile * 8 + h4;
+      const uint4 v = poll4(u_self + o, utag);
+      half2 h01 = __halves2half2(__ushort_as_half(v.x & 0xffffu),
+                                 __ushort_as_half(v.y & 0xffffu));
+      half2 h23 = __halves2half2(__ushort_as_half(v.z & 0xffffu),
+                                 __ushort_as_half(v.w & 0xffffu));
+      *reinterpret_cast<uint2*>(out + o) =
+          make_uint2(*reinterpret_cast<uint32_t*>(&h01),
+                     *reinterpret_cast<uint32_t*>(&h23));
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (atomicAdd(up_cnt, 1u) == gridDim.x - 1) {
+      __threadfence();
+      *up_cnt = 0u;
+      if (down_dirty_m)
+        st_vol(down_dirty_m + dpage, static_cast<unsigned>(total_m));
+      st_vol(down_pr.seq, dseq_next);
+      if (up_dirty_m)
+        st_vol(up_dirty_m + upage, static_cast<unsigned>(total_m));
+      st_vol(up_pr.seq, useq_next);
     }
   }
 }
@@ -452,10 +1078,17 @@ Peer make_peer(const std::vector<int64_t>& ll, torch::Tensor seq,
   return p;
 }
 
-__device__ __forceinline__ void st_vol4(uint32_t* p, uint4 v) {
-  asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(p),
-               "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
-               : "memory");
+PeerPtrs make_peer_ptrs(const std::vector<int64_t>& ll, torch::Tensor seq,
+                        int64_t rank) {
+  const int rk = static_cast<int>(rank);
+  PeerPtrs p;
+  p.self = reinterpret_cast<uint32_t*>(ll[rk]);
+  p.p1 = reinterpret_cast<uint32_t*>(ll[rk ^ 1]);
+  p.p2 = reinterpret_cast<uint32_t*>(ll[rk ^ 2]);
+  p.p3 = reinterpret_cast<uint32_t*>(ll[rk ^ 3]);
+  p.seq = reinterpret_cast<unsigned*>(seq.data_ptr<int>());
+  p.rank = rk;
+  return p;
 }
 
 struct PhysOrder4 {
@@ -584,8 +1217,8 @@ __global__ void __launch_bounds__(128) fc_add_all_gather_kernel(
 
   __syncthreads();
   if (tid == 0) {
-    __threadfence();
     if (atomicAdd(cnt, 1u) == 79u) {
+      __threadfence();
       *cnt = 0u;
       st_vol(dirty_m + page, static_cast<unsigned>(total_m));
       st_vol(pr.seq, next_seq);
@@ -593,14 +1226,27 @@ __global__ void __launch_bounds__(128) fc_add_all_gather_kernel(
   }
 }
 
-struct ArPeer4 {
-  uint32_t* ar[4];
+struct ArPeerPtrs {
+  uint32_t* self;
+  uint32_t* p1;
+  uint32_t* p2;
+  uint32_t* p3;
 };
+
+__device__ __forceinline__ float ar_rank_sum(float v_self, uint32_t u1,
+                                             uint32_t u2, uint32_t u3, int rk) {
+  const float x1 = __half2float(__ushort_as_half(u1 & 0xffffu));
+  const float x2 = __half2float(__ushort_as_half(u2 & 0xffffu));
+  const float x3 = __half2float(__ushort_as_half(u3 & 0xffffu));
+  const float near_s = (rk & 1) ? (x1 + v_self) : (v_self + x1);
+  const float far_s = (rk & 1) ? (x3 + x2) : (x2 + x3);
+  const float sum = (rk & 2) ? (far_s + near_s) : (near_s + far_s);
+  return __half2float(__float2half_rn(sum));
+}
 
 // 1 CTA per row, 640 threads (KPT = 4): full-mesh TP4 LL (16-bit tag | FP16)
 // AllReduce + FP32 deterministic rank-order sum + hc_combine + optional
-// GroupedGemmaRMSNorm in a single launch. Every row 0..total_m-1<=64 gets its
-// own dedicated V100 SM simultaneously.
+// GroupedGemmaRMSNorm in a single launch. Scalar ArPeerPtrs keep STACK = 0.
 template <bool WITH_NORM>
 __global__ void __launch_bounds__(640) allreduce_combine_norm_kernel(
     half* __restrict__ res_out, half* __restrict__ norm_out,
@@ -608,7 +1254,7 @@ __global__ void __launch_bounds__(640) allreduce_combine_norm_kernel(
     const half* __restrict__ res, const half* __restrict__ inj,
     const half* __restrict__ nw, int nw_full, float eps,
     unsigned* __restrict__ cnt, unsigned* __restrict__ dirty_m,
-    unsigned* __restrict__ seq, ArPeer4 peers, int rk, int total_m) {
+    unsigned* __restrict__ seq, ArPeerPtrs peers, int rk, int total_m) {
   constexpr int THREADS = 640;
   constexpr int WARPS = THREADS / 32;
   constexpr int KPT = HD / THREADS;  // 4
@@ -623,60 +1269,61 @@ __global__ void __launch_bounds__(640) allreduce_combine_norm_kernel(
   const unsigned page = next_ep & 1u;
   const uint32_t tag = tag_of(next_ep);
   const size_t page_words = static_cast<size_t>(page) * 4 * kPageRows * HD;
-  uint32_t* ar[4];
-#pragma unroll
-  for (int q = 0; q < 4; ++q) ar[q] = peers.ar[q] + page_words;
+  uint32_t* ar_self = peers.self + page_words;
+  uint32_t* ar_p1 = peers.p1 + page_words;
+  uint32_t* ar_p2 = peers.p2 + page_words;
+  uint32_t* ar_p3 = peers.p3 + page_words;
 
   const int prev_m = static_cast<int>(ld_vol(dirty_m + page));
   if (total_m < prev_m) {
     const uint4 zero4 = make_uint4(0u, 0u, 0u, 0u);
     for (int clean_r = total_m + row; clean_r < prev_m; clean_r += total_m) {
-      st_vol4(
-          ar[rk] + static_cast<size_t>(peer1 * kPageRows + clean_r) * HD + col0,
-          zero4);
-      st_vol4(
-          ar[rk] + static_cast<size_t>(peer2 * kPageRows + clean_r) * HD + col0,
-          zero4);
-      st_vol4(
-          ar[rk] + static_cast<size_t>(peer3 * kPageRows + clean_r) * HD + col0,
-          zero4);
+      st_vol4(ar_self + static_cast<size_t>(peer1 * kPageRows + clean_r) * HD +
+                  col0,
+              zero4);
+      st_vol4(ar_self + static_cast<size_t>(peer2 * kPageRows + clean_r) * HD +
+                  col0,
+              zero4);
+      st_vol4(ar_self + static_cast<size_t>(peer3 * kPageRows + clean_r) * HD +
+                  col0,
+              zero4);
     }
   }
 
   // 1. Load local partials and push 4 tagged FP16 words (1 uint4) per peer.
-  const uint2 p0_vec = *reinterpret_cast<const uint2*>(
-      p0 + static_cast<size_t>(row) * HD + col0);
+  const uint2 p0_vec = __ldg(reinterpret_cast<const uint2*>(
+      p0 + static_cast<size_t>(row) * HD + col0));
   const half* p0_h = reinterpret_cast<const half*>(&p0_vec);
-  half loc_h[4];
-  float v[4];
+  half loc_h0, loc_h1, loc_h2, loc_h3;
+  float v0, v1, v2, v3;
   if (p1_in != nullptr) {
-    const uint2 p1_vec = *reinterpret_cast<const uint2*>(
-        p1_in + static_cast<size_t>(row) * HD + col0);
+    const uint2 p1_vec = __ldg(reinterpret_cast<const uint2*>(
+        p1_in + static_cast<size_t>(row) * HD + col0));
     const half* p1_h = reinterpret_cast<const half*>(&p1_vec);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const half s =
-          __float2half_rn(__half2float(p0_h[j]) + __half2float(p1_h[j]));
-      loc_h[j] = s;
-      v[j] = __half2float(s);
-    }
+    loc_h0 = __float2half_rn(__half2float(p0_h[0]) + __half2float(p1_h[0]));
+    loc_h1 = __float2half_rn(__half2float(p0_h[1]) + __half2float(p1_h[1]));
+    loc_h2 = __float2half_rn(__half2float(p0_h[2]) + __half2float(p1_h[2]));
+    loc_h3 = __float2half_rn(__half2float(p0_h[3]) + __half2float(p1_h[3]));
   } else {
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      loc_h[j] = p0_h[j];
-      v[j] = __half2float(p0_h[j]);
-    }
+    loc_h0 = p0_h[0];
+    loc_h1 = p0_h[1];
+    loc_h2 = p0_h[2];
+    loc_h3 = p0_h[3];
   }
+  v0 = __half2float(loc_h0);
+  v1 = __half2float(loc_h1);
+  v2 = __half2float(loc_h2);
+  v3 = __half2float(loc_h3);
 
   uint4 wv;
-  wv.x = pk(loc_h[0], tag);
-  wv.y = pk(loc_h[1], tag);
-  wv.z = pk(loc_h[2], tag);
-  wv.w = pk(loc_h[3], tag);
+  wv.x = pk(loc_h0, tag);
+  wv.y = pk(loc_h1, tag);
+  wv.z = pk(loc_h2, tag);
+  wv.w = pk(loc_h3, tag);
   const size_t self_off = static_cast<size_t>(rk * kPageRows + row) * HD + col0;
-  st_vol4(ar[peer1] + self_off, wv);
-  st_vol4(ar[peer2] + self_off, wv);
-  st_vol4(ar[peer3] + self_off, wv);
+  st_vol4(ar_p1 + self_off, wv);
+  st_vol4(ar_p2 + self_off, wv);
+  st_vol4(ar_p3 + self_off, wv);
 
   // 2. Overlap local HBM reads of residual, norm weight, and injection while
   //    NVLink writes are in flight.
@@ -685,80 +1332,87 @@ __global__ void __launch_bounds__(640) allreduce_combine_norm_kernel(
   float g[4];
 #pragma unroll
   for (int s = 0; s < 4; ++s) {
-    res_vec[s] = *reinterpret_cast<const uint2*>(
-        res + static_cast<size_t>(row) * KD + s * HD + col0);
+    res_vec[s] = __ldg(reinterpret_cast<const uint2*>(
+        res + static_cast<size_t>(row) * KD + s * HD + col0));
     if constexpr (WITH_NORM) {
-      nw_vec[s] =
-          *reinterpret_cast<const uint2*>(nw + (nw_full ? s * HD : 0) + col0);
+      nw_vec[s] = __ldg(
+          reinterpret_cast<const uint2*>(nw + (nw_full ? s * HD : 0) + col0));
     }
-    g[s] = 2.0f * sigm(__half2float(inj[row * 4 + s]) * 0.25f);
+    g[s] = 2.0f * sigm(__half2float(__ldg(inj + row * 4 + s)) * 0.25f);
   }
   asm volatile("" ::: "memory");
 
   // 3. Poll all 3 NVLink peers concurrently (1 uint4 each) and reduce in
   //    deterministic FP32 rank order (rank0 + rank1) + (rank2 + rank3).
   const uint32_t* p1_poll =
-      ar[rk] + static_cast<size_t>(peer1 * kPageRows + row) * HD + col0;
+      ar_self + static_cast<size_t>(peer1 * kPageRows + row) * HD + col0;
   const uint32_t* p2_poll =
-      ar[rk] + static_cast<size_t>(peer2 * kPageRows + row) * HD + col0;
+      ar_self + static_cast<size_t>(peer2 * kPageRows + row) * HD + col0;
   const uint32_t* p3_poll =
-      ar[rk] + static_cast<size_t>(peer3 * kPageRows + row) * HD + col0;
+      ar_self + static_cast<size_t>(peer3 * kPageRows + row) * HD + col0;
   uint4 r1, r2, r3;
+  bool ok1 = false, ok2 = false, ok3 = false;
   const long long t0 = clock64();
   do {
-    asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r1.x), "=r"(r1.y), "=r"(r1.z), "=r"(r1.w)
-                 : "l"(p1_poll));
-    asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r2.x), "=r"(r2.y), "=r"(r2.z), "=r"(r2.w)
-                 : "l"(p2_poll));
-    asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r3.x), "=r"(r3.y), "=r"(r3.z), "=r"(r3.w)
-                 : "l"(p3_poll));
+    if (!ok1) {
+      asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(r1.x), "=r"(r1.y), "=r"(r1.z), "=r"(r1.w)
+                   : "l"(p1_poll));
+      ok1 = ((r1.x >> 16) == tag && (r1.y >> 16) == tag &&
+             (r1.z >> 16) == tag && (r1.w >> 16) == tag);
+    }
+    if (!ok2) {
+      asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(r2.x), "=r"(r2.y), "=r"(r2.z), "=r"(r2.w)
+                   : "l"(p2_poll));
+      ok2 = ((r2.x >> 16) == tag && (r2.y >> 16) == tag &&
+             (r2.z >> 16) == tag && (r2.w >> 16) == tag);
+    }
+    if (!ok3) {
+      asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(r3.x), "=r"(r3.y), "=r"(r3.z), "=r"(r3.w)
+                   : "l"(p3_poll));
+      ok3 = ((r3.x >> 16) == tag && (r3.y >> 16) == tag &&
+             (r3.z >> 16) == tag && (r3.w >> 16) == tag);
+    }
     if (clock64() - t0 > 4000000000LL) __trap();
-  } while ((r1.x >> 16) != tag || (r1.y >> 16) != tag || (r1.z >> 16) != tag ||
-           (r1.w >> 16) != tag || (r2.x >> 16) != tag || (r2.y >> 16) != tag ||
-           (r2.z >> 16) != tag || (r2.w >> 16) != tag || (r3.x >> 16) != tag ||
-           (r3.y >> 16) != tag || (r3.z >> 16) != tag || (r3.w >> 16) != tag);
+  } while (!(ok1 && ok2 && ok3));
 
-  const uint32_t u1[4] = {r1.x, r1.y, r1.z, r1.w};
-  const uint32_t u2[4] = {r2.x, r2.y, r2.z, r2.w};
-  const uint32_t u3[4] = {r3.x, r3.y, r3.z, r3.w};
-  float B[4];
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const float x1 = __half2float(__ushort_as_half(u1[j] & 0xffffu));
-    const float x2 = __half2float(__ushort_as_half(u2[j] & 0xffffu));
-    const float x3 = __half2float(__ushort_as_half(u3[j] & 0xffffu));
-    const float near_s = (rk & 1) ? (x1 + v[j]) : (v[j] + x1);
-    const float far_s = (rk & 1) ? (x3 + x2) : (x2 + x3);
-    const float sum = (rk & 2) ? (far_s + near_s) : (near_s + far_s);
-    B[j] = __half2float(__float2half_rn(sum));
-  }
+  const float B0 = ar_rank_sum(v0, r1.x, r2.x, r3.x, rk);
+  const float B1 = ar_rank_sum(v1, r1.y, r2.y, r3.y, rk);
+  const float B2 = ar_rank_sum(v2, r1.z, r2.z, r3.z, rk);
+  const float B3 = ar_rank_sum(v3, r1.w, r2.w, r3.w, rk);
 
   // 4. Combine + optional GroupedGemmaRMSNorm.
   __shared__ float warp_sq[4][WARPS];
   __shared__ float s_rrms[4];
-  float o[4][4];
+  float o0[4], o1[4], o2[4], o3[4];
 #pragma unroll
   for (int s = 0; s < 4; ++s) {
     const half* rh = reinterpret_cast<const half*>(&res_vec[s]);
     uint2 out_vec;
     half* oh = reinterpret_cast<half*>(&out_vec);
-    float sq = 0.f;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const half h = __float2half_rn(__half2float(rh[j]) + B[j] * g[s]);
-      oh[j] = h;
-      if constexpr (WITH_NORM) {
-        const float of = __half2float(h);
-        o[s][j] = of;
-        sq = __fmaf_rn(of, of, sq);
-      }
-    }
+    const half h0 = __float2half_rn(__half2float(rh[0]) + B0 * g[s]);
+    const half h1 = __float2half_rn(__half2float(rh[1]) + B1 * g[s]);
+    const half h2 = __float2half_rn(__half2float(rh[2]) + B2 * g[s]);
+    const half h3 = __float2half_rn(__half2float(rh[3]) + B3 * g[s]);
+    oh[0] = h0;
+    oh[1] = h1;
+    oh[2] = h2;
+    oh[3] = h3;
     *reinterpret_cast<uint2*>(res_out + static_cast<size_t>(row) * KD + s * HD +
                               col0) = out_vec;
     if constexpr (WITH_NORM) {
+      const float f0 = __half2float(h0);
+      const float f1 = __half2float(h1);
+      const float f2 = __half2float(h2);
+      const float f3 = __half2float(h3);
+      o0[s] = f0;
+      o1[s] = f1;
+      o2[s] = f2;
+      o3[s] = f3;
+      float sq =
+          __fmaf_rn(f3, f3, __fmaf_rn(f2, f2, __fmaf_rn(f1, f1, f0 * f0)));
 #pragma unroll
       for (int off = 16; off > 0; off >>= 1)
         sq += __shfl_down_sync(0xffffffffu, sq, off);
@@ -781,11 +1435,14 @@ __global__ void __launch_bounds__(640) allreduce_combine_norm_kernel(
       const half* wh = reinterpret_cast<const half*>(&nw_vec[s]);
       uint2 n_vec;
       half* nh = reinterpret_cast<half*>(&n_vec);
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const float y = o[s][j] * rrms;
-        nh[j] = __float2half_rn(__fmaf_rn(y, __half2float(wh[j]), y));
-      }
+      const float y0 = o0[s] * rrms;
+      const float y1 = o1[s] * rrms;
+      const float y2 = o2[s] * rrms;
+      const float y3 = o3[s] * rrms;
+      nh[0] = __float2half_rn(__fmaf_rn(y0, __half2float(wh[0]), y0));
+      nh[1] = __float2half_rn(__fmaf_rn(y1, __half2float(wh[1]), y1));
+      nh[2] = __float2half_rn(__fmaf_rn(y2, __half2float(wh[2]), y2));
+      nh[3] = __float2half_rn(__fmaf_rn(y3, __half2float(wh[3]), y3));
       *reinterpret_cast<uint2*>(norm_out + static_cast<size_t>(row) * KD +
                                 s * HD + col0) = n_vec;
     }
@@ -793,8 +1450,8 @@ __global__ void __launch_bounds__(640) allreduce_combine_norm_kernel(
 
   __syncthreads();
   if (tid == 0) {
-    __threadfence();
     if (atomicAdd(cnt, 1u) == static_cast<unsigned>(total_m - 1)) {
+      __threadfence();
       *cnt = 0u;
       st_vol(dirty_m + page, static_cast<unsigned>(total_m));
       st_vol(seq, next_ep);
@@ -802,6 +1459,92 @@ __global__ void __launch_bounds__(640) allreduce_combine_norm_kernel(
   }
 }
 }  // namespace
+
+void sm70_hc_ll_fused_down_up_out(
+    torch::Tensor x, torch::Tensor wd, torch::Tensor wu, torch::Tensor part,
+    torch::Tensor down_cnt, torch::Tensor up_cnt, std::vector<int64_t> down_ll,
+    std::vector<int64_t> up_ll, torch::Tensor down_seq, torch::Tensor up_seq,
+    int64_t rank, torch::Tensor out, torch::Tensor lora_out,
+    torch::Tensor inj_out) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
+                  x.size(0) >= 1 && x.size(0) <= kMaxRows &&
+                  x.size(1) == 10240 && x.is_contiguous(),
+              "HC LL fused down+up requires CUDA FP16 [1..64,10240]");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "SM70 required");
+  TORCH_CHECK(down_ll.size() == 4 && up_ll.size() == 4 && rank >= 0 &&
+                  rank < 4 && down_ll[rank] && down_ll[rank ^ 1] &&
+                  down_ll[rank ^ 2] && up_ll[rank] && up_ll[rank ^ 1] &&
+                  up_ll[rank ^ 2],
+              "HC LL fused down+up requires local and two direct NVLink peers");
+  auto local = [&](const torch::Tensor& t, at::ScalarType dtype) {
+    TORCH_CHECK(t.device() == x.device() && t.scalar_type() == dtype &&
+                    t.is_contiguous(),
+                "HC LL storage dtype/device mismatch");
+  };
+  local(wd, at::kHalf);
+  local(wu, at::kHalf);
+  local(part, at::kFloat);
+  local(down_cnt, at::kInt);
+  local(up_cnt, at::kInt);
+  local(down_seq, at::kInt);
+  local(up_seq, at::kInt);
+  local(out, at::kHalf);
+  local(lora_out, at::kHalf);
+  local(inj_out, at::kHalf);
+  const int M = x.size(0);
+  TORCH_CHECK(wd.sizes() == at::IntArrayRef({3, 640, 2, 32, 8}) &&
+                  wu.sizes() == at::IntArrayRef({80, 20, 2, 4, 8, 8}) &&
+                  part.numel() >= 20 * kPageRows * 96 &&
+                  down_cnt.numel() >= 4 && up_cnt.numel() >= 1 &&
+                  down_seq.numel() == 1 && up_seq.numel() == 1 &&
+                  out.sizes() == at::IntArrayRef({M, 2560}) &&
+                  (lora_out.numel() == 0 ||
+                   lora_out.sizes() == at::IntArrayRef({M, 320})) &&
+                  inj_out.sizes() == at::IntArrayRef({M, 4}),
+              "HC LL fused down+up workspace or shape mismatch");
+  auto st = at::cuda::getCurrentCUDAStream().stream();
+  PeerPtrs dp = make_peer_ptrs(down_ll, down_seq, rank);
+  PeerPtrs up = make_peer_ptrs(up_ll, up_seq, rank);
+  auto* dc = reinterpret_cast<unsigned*>(down_cnt.data_ptr<int>());
+  auto* uc = reinterpret_cast<unsigned*>(up_cnt.data_ptr<int>());
+  unsigned* d_dm = (down_cnt.numel() >= 6) ? (dc + 4) : nullptr;
+  unsigned* u_dm = (up_cnt.numel() >= 3) ? (uc + 1) : nullptr;
+  half* lora_ptr =
+      lora_out.numel() ? reinterpret_cast<half*>(lora_out.data_ptr()) : nullptr;
+  const int groups_m = (M + 7) / 8;
+  down3_part_only<20, 8><<<dim3(3, 20, groups_m), 256, 0, st>>>(
+      reinterpret_cast<const half*>(x.data_ptr()),
+      reinterpret_cast<const half*>(wd.data_ptr()), part.data_ptr<float>(), M);
+  auto launch_up_groups = [&](auto g_tag) {
+    constexpr int G = decltype(g_tag)::value;
+    up3_fused_groups<20, G><<<80, 160, 0, st>>>(
+        part.data_ptr<float>(), reinterpret_cast<const half*>(wu.data_ptr()),
+        reinterpret_cast<const half*>(x.data_ptr()), uc, d_dm, u_dm, dp, up,
+        reinterpret_cast<half*>(out.data_ptr()), lora_ptr,
+        reinterpret_cast<half*>(inj_out.data_ptr()), M);
+  };
+  if (M <= 8) {
+    launch_up_groups(std::integral_constant<int, 1>{});
+  } else if (M <= 16) {
+    launch_up_groups(std::integral_constant<int, 2>{});
+  } else if (M <= 24) {
+    launch_up_groups(std::integral_constant<int, 3>{});
+  } else if (M <= 32) {
+    launch_up_groups(std::integral_constant<int, 4>{});
+  } else if (M <= 40) {
+    launch_up_groups(std::integral_constant<int, 5>{});
+  } else {
+    up3_fused<20><<<80, 160, 0, st>>>(
+        part.data_ptr<float>(), reinterpret_cast<const half*>(wu.data_ptr()),
+        reinterpret_cast<const half*>(x.data_ptr()), uc, d_dm, u_dm, dp, up,
+        reinterpret_cast<half*>(out.data_ptr()), lora_ptr,
+        reinterpret_cast<half*>(inj_out.data_ptr()), M);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
                          torch::Tensor cnt, std::vector<int64_t> ll,
@@ -1057,11 +1800,15 @@ void sm70_hc_ll_allreduce_combine_norm_out(
   TORCH_CHECK(ar_ptrs.size() == 4 && rank >= 0 && rank < 4 && ar_ptrs[0] &&
                   ar_ptrs[1] && ar_ptrs[2] && ar_ptrs[3],
               "HC LL allreduce requires full-mesh 4-rank peer pointers");
-  ArPeer4 peers{};
-  for (int i = 0; i < 4; ++i) {
-    peers.ar[i] =
-        reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ar_ptrs[i]));
-  }
+  const int rk = static_cast<int>(rank);
+  ArPeerPtrs peers{};
+  peers.self = reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ar_ptrs[rk]));
+  peers.p1 =
+      reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ar_ptrs[rk ^ 1]));
+  peers.p2 =
+      reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ar_ptrs[rk ^ 2]));
+  peers.p3 =
+      reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ar_ptrs[rk ^ 3]));
   const half* p1_ptr =
       has_p1 ? reinterpret_cast<const half*>(p1.data_ptr()) : nullptr;
   auto st = at::cuda::getCurrentCUDAStream().stream();
@@ -1074,7 +1821,6 @@ void sm70_hc_ll_allreduce_combine_norm_out(
   auto* dm_ptr = reinterpret_cast<unsigned*>(dirty_m.data_ptr<int>());
   auto* seq_ptr = reinterpret_cast<unsigned*>(seq.data_ptr<int>());
   const float eps_f = static_cast<float>(eps);
-  const int rk = static_cast<int>(rank);
   if (with_norm) {
     allreduce_combine_norm_kernel<true><<<m, 640, 0, st>>>(
         ro, norm_ptr, p0_ptr, p1_ptr, res_ptr, inj_ptr, nw_ptr, nw_full, eps_f,
@@ -1089,6 +1835,12 @@ void sm70_hc_ll_allreduce_combine_norm_out(
 
 TORCH_LIBRARY_FRAGMENT(_C, m) {
   m.def(
+      "sm70_hc_ll_fused_down_up_out(Tensor x, Tensor wd, Tensor wu, "
+      "Tensor(a!) part, Tensor(b!) down_cnt, Tensor(c!) up_cnt, "
+      "int[] down_ll, int[] up_ll, Tensor(d!) down_seq, Tensor(e!) up_seq, "
+      "int logical_rank, Tensor(f!) out, Tensor(g!) lora_out, "
+      "Tensor(h!) inj_out) -> ()");
+  m.def(
       "sm70_hc_ll_add_all_gather_fc_out(Tensor(a!) out, Tensor el, Tensor hl, "
       "Tensor(b!) cnt, Tensor(c!) dirty_m, int[] ll_ptrs, Tensor(d!) seq, "
       "int logical_rank, int[] phys_order) -> ()");
@@ -1100,6 +1852,7 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
 }
 
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
+  m.impl("sm70_hc_ll_fused_down_up_out", &sm70_hc_ll_fused_down_up_out);
   m.impl("sm70_hc_ll_add_all_gather_fc_out", &sm70_hc_ll_add_all_gather_fc_out);
   m.impl("sm70_hc_ll_allreduce_combine_norm_out",
          &sm70_hc_ll_allreduce_combine_norm_out);

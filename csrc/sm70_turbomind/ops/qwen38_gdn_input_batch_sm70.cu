@@ -450,13 +450,34 @@ __global__ __launch_bounds__(256, 4) void shared_up_fused_silu_kernel(
   }
 }
 
-__global__ void shared_gate_mul_kernel(const half* logits, const half* source,
-                                       half* out, int m) {
-  const int index = blockIdx.x * 128 + threadIdx.x;
-  if (index >= m * 2560) return;
-  const float value = __half2float(logits[index / 2560]);
-  const half factor = __float2half_rn(1.f / __fadd_rn(1.f, expf(-value)));
-  out[index] = __hmul(source[index], factor);
+__global__ __launch_bounds__(320) void shared_gate_mul_kernel(
+    const half* __restrict__ logits, const half* __restrict__ source,
+    half* __restrict__ out) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  __shared__ half s_factor;
+  if (tid == 0) {
+    const float value = __half2float(__ldg(logits + row));
+    s_factor = __float2half_rn(1.f / __fadd_rn(1.f, expf(-value)));
+  }
+  __syncthreads();
+  const size_t off = static_cast<size_t>(row) * 2560 + tid * 8;
+  if ((reinterpret_cast<uintptr_t>(source) | reinterpret_cast<uintptr_t>(out)) %
+          16 ==
+      0) {
+    const half2 f2 = __half2half2(s_factor);
+    const uint4 sv = __ldg(reinterpret_cast<const uint4*>(source + off));
+    uint4 dv;
+    const half2* sh = reinterpret_cast<const half2*>(&sv);
+    half2* dh = reinterpret_cast<half2*>(&dv);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) dh[i] = __hmul2(sh[i], f2);
+    *reinterpret_cast<uint4*>(out + off) = dv;
+  } else {
+    const half f = s_factor;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) out[off + j] = __hmul(source[off + j], f);
+  }
 }
 
 __device__ __forceinline__ float warp_sum_down(float val) {
@@ -464,6 +485,45 @@ __device__ __forceinline__ float warp_sum_down(float val) {
   for (int offset = 16; offset > 0; offset >>= 1)
     val = __fadd_rn(val, __shfl_down_sync(0xffffffffu, val, offset));
   return val;
+}
+
+__global__ __launch_bounds__(320) void shared_gate_dot_mul_kernel(
+    half* __restrict__ inout, const half* __restrict__ x,
+    const half* __restrict__ gate_w) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  const size_t off = static_cast<size_t>(row) * 2560 + tid * 8;
+  const uint4 xv = __ldg(reinterpret_cast<const uint4*>(x + off));
+  const uint4 gw = __ldg(reinterpret_cast<const uint4*>(gate_w + tid * 8));
+  const half* xh = reinterpret_cast<const half*>(&xv);
+  const half* wh = reinterpret_cast<const half*>(&gw);
+  float sum = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    sum = __fmaf_rn(__half2float(xh[j]), __half2float(wh[j]), sum);
+  }
+  sum = warp_sum_down(sum);
+  __shared__ float s_warp[10];
+  __shared__ half s_factor;
+  if (lane == 0) s_warp[warp] = sum;
+  __syncthreads();
+  if (tid == 0) {
+    float tot = s_warp[0];
+#pragma unroll
+    for (int w = 1; w < 10; ++w) tot = __fadd_rn(tot, s_warp[w]);
+    const float value = __half2float(__float2half_rn(tot));
+    s_factor = __float2half_rn(1.f / __fadd_rn(1.f, expf(-value)));
+  }
+  __syncthreads();
+  const half2 f2 = __half2half2(s_factor);
+  const uint4 sv = *reinterpret_cast<const uint4*>(inout + off);
+  uint4 dv;
+  const half2* sh = reinterpret_cast<const half2*>(&sv);
+  half2* dh = reinterpret_cast<half2*>(&dv);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) dh[i] = __hmul2(sh[i], f2);
+  *reinterpret_cast<uint4*>(inout + off) = dv;
 }
 
 template <int K_DOWN>
@@ -610,6 +670,190 @@ __global__ __launch_bounds__(64, 8) void shared_down_gated_batch_kernel(
           out[static_cast<size_t>(row_base + rr) * 2560 + col_base + cc] =
               __hmul(dv, gate_s[rr]);
         }
+      }
+    }
+  }
+}
+
+template <int Groups>
+__global__ __launch_bounds__(128, 4) void gdn_input_split4_packed_kernel(
+    const half* __restrict__ x, const half* __restrict__ qw,
+    const half* __restrict__ bw, half* __restrict__ qkv, half* __restrict__ z,
+    half* __restrict__ b_out, half* __restrict__ a_out, int m) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int row_offset = blockIdx.y * (Groups * 8);
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int quad = (lane >> 2) & 3;
+  float acc[Groups][8] = {};
+
+  if (blockIdx.x < 128) {
+    __shared__ float smem[4][8][33];
+    const int tile = blockIdx.x;
+    const int col = quad * 8 + r;
+    const half* w = qw + static_cast<size_t>(tile) * 2560 * 32;
+#pragma unroll 8
+    for (int g = warp * 40; g < (warp + 1) * 40; ++g) {
+      const uint4 lo =
+          __ldcs(reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8));
+      const uint4 hi =
+          __ldcs(reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8));
+#pragma unroll
+      for (int p = 0; p < Groups; ++p) {
+        const int row = row_offset + p * 8 + r;
+        uint4 a = make_uint4(0, 0, 0, 0), b = a;
+        if (row < m) {
+          const half* input = x + static_cast<size_t>(row) * 2560 + g * 16;
+          a = __ldg(reinterpret_cast<const uint4*>(input));
+          b = __ldg(reinterpret_cast<const uint4*>(input + 8));
+        }
+        GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+        GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+        GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+        GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
+      }
+    }
+#pragma unroll
+    for (int p = 0; p < Groups; ++p) {
+      if (p > 0) __syncthreads();
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int rr_loc = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        const int cc =
+            quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+        smem[warp][rr_loc][cc] = acc[p][i];
+      }
+      __syncthreads();
+      const int outcol = tile * 32 + lane;
+#pragma unroll
+      for (int sub = 0; sub < 2; ++sub) {
+        const int rr_loc = warp + sub * 4;
+        const int rr = row_offset + p * 8 + rr_loc;
+        if (rr < m) {
+          const float s01 =
+              __fadd_rn(smem[0][rr_loc][lane], smem[1][rr_loc][lane]);
+          const float s23 =
+              __fadd_rn(smem[2][rr_loc][lane], smem[3][rr_loc][lane]);
+          const half value = __float2half_rn(__fadd_rn(s01, s23));
+          if (tile < 80)
+            qkv[static_cast<size_t>(rr) * 2560 + outcol] = value;
+          else
+            z[static_cast<size_t>(rr) * 1536 + outcol - 2560] = value;
+        }
+      }
+    }
+  } else if (warp < 3) {
+    const int ba_tile = warp;
+    const int split = quad;
+    const int col = ba_tile * 8 + r;
+#pragma unroll 10
+    for (int g = split * 40; g < (split + 1) * 40; ++g) {
+      const uint4 lo = *reinterpret_cast<const uint4*>(bw + (g * 64 + col) * 8);
+      const uint4 hi =
+          *reinterpret_cast<const uint4*>(bw + (g * 64 + 32 + col) * 8);
+#pragma unroll
+      for (int p = 0; p < Groups; ++p) {
+        const int row = row_offset + p * 8 + r;
+        uint4 a = make_uint4(0, 0, 0, 0), b = a;
+        if (row < m) {
+          const half* input = x + static_cast<size_t>(row) * 2560 + g * 16;
+          a = __ldg(reinterpret_cast<const uint4*>(input));
+          b = __ldg(reinterpret_cast<const uint4*>(input + 8));
+        }
+        GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+        GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+        GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+        GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
+      }
+    }
+    const int base = lane & ~12;
+#pragma unroll
+    for (int p = 0; p < Groups; ++p) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int rr =
+            row_offset + p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+        const int cc = ba_tile * 8 +
+                       ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+        float value = __shfl_sync(0xffffffff, acc[p][i], base);
+#pragma unroll
+        for (int s = 1; s < 4; ++s) {
+          value = __fadd_rn(
+              value, __shfl_sync(0xffffffff, acc[p][i], base | (s << 2)));
+        }
+        if (split == 0 && rr < m) {
+          if (cc < 12)
+            b_out[rr * 12 + cc] = __float2half_rn(value);
+          else
+            a_out[rr * 12 + cc - 12] = __float2half_rn(value);
+        }
+      }
+    }
+  }
+}
+
+template <int Groups>
+__global__ __launch_bounds__(128, 4) void qsa_input_split4_packed_kernel(
+    const half* __restrict__ x, const half* __restrict__ qw,
+    const half* __restrict__ iw, half* __restrict__ qkv,
+    half* __restrict__ idx_qk, int m) {
+  __shared__ float smem[4][8][33];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const bool is_idx = blockIdx.x >= 112;
+  const int tile = is_idx ? (blockIdx.x - 112) : blockIdx.x;
+  const int row_offset = blockIdx.y * (Groups * 8);
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int quad = (lane >> 2) & 3;
+  const int col = quad * 8 + r;
+  const half* w = (is_idx ? iw : qw) + static_cast<size_t>(tile) * 2560 * 32;
+  float acc[Groups][8] = {};
+
+#pragma unroll 8
+  for (int g = warp * 40; g < (warp + 1) * 40; ++g) {
+    const uint4 lo =
+        __ldcs(reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8));
+    const uint4 hi =
+        __ldcs(reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8));
+#pragma unroll
+    for (int p = 0; p < Groups; ++p) {
+      const int row = row_offset + p * 8 + r;
+      uint4 a = make_uint4(0, 0, 0, 0), b = a;
+      if (row < m) {
+        const half* input = x + static_cast<size_t>(row) * 2560 + g * 16;
+        a = __ldg(reinterpret_cast<const uint4*>(input));
+        b = __ldg(reinterpret_cast<const uint4*>(input + 8));
+      }
+      GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+      GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+      GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+      GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
+    }
+  }
+
+  half* dst = is_idx ? idx_qk : qkv;
+  const int out_stride = is_idx ? 640 : 3584;
+  const int outcol = tile * 32 + lane;
+#pragma unroll
+  for (int p = 0; p < Groups; ++p) {
+    if (p > 0) __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int rr_loc = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int cc =
+          quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+      smem[warp][rr_loc][cc] = acc[p][i];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int sub = 0; sub < 2; ++sub) {
+      const int rr_loc = warp + sub * 4;
+      const int rr = row_offset + p * 8 + rr_loc;
+      if (rr < m) {
+        const float s01 =
+            __fadd_rn(smem[0][rr_loc][lane], smem[1][rr_loc][lane]);
+        const float s23 =
+            __fadd_rn(smem[2][rr_loc][lane], smem[3][rr_loc][lane]);
+        dst[static_cast<size_t>(rr) * out_stride + outcol] =
+            __float2half_rn(__fadd_rn(s01, s23));
       }
     }
   }
@@ -899,11 +1143,35 @@ void shared_gate_mul(torch::Tensor output, torch::Tensor logits,
   TORCH_CHECK(output.sizes() == source.sizes() &&
                   logits.sizes() == at::IntArrayRef({m, 1}),
               "Invalid shared gate geometry");
-  shared_gate_mul_kernel<<<(m * 2560 + 127) / 128, 128, 0,
-                           at::cuda::getCurrentCUDAStream()>>>(
+  shared_gate_mul_kernel<<<m, 320, 0, at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const half*>(logits.data_ptr()),
       reinterpret_cast<const half*>(source.data_ptr()),
-      reinterpret_cast<half*>(output.data_ptr()), m);
+      reinterpret_cast<half*>(output.data_ptr()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void shared_gate_dot_mul(torch::Tensor inout, torch::Tensor x,
+                         torch::Tensor gate_w) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) >= 1 &&
+                  x.size(0) <= 64 && x.size(1) == 2560,
+              "Shared gate dot+mul requires M1..64, K2560");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const auto* props = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
+  for (const auto& t : {inout, x, gate_w}) {
+    TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.is_contiguous() &&
+                    t.scalar_type() == at::kHalf &&
+                    reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                "Shared gate dot+mul requires 16B-aligned contiguous FP16");
+  }
+  const int m = x.size(0);
+  TORCH_CHECK(inout.sizes() == at::IntArrayRef({m, 2560}) &&
+                  gate_w.sizes() == at::IntArrayRef({1, 2560}),
+              "Invalid shared gate dot+mul geometry");
+  shared_gate_dot_mul_kernel<<<m, 320, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<half*>(inout.data_ptr()),
+      reinterpret_cast<const half*>(x.data_ptr()),
+      reinterpret_cast<const half*>(gate_w.data_ptr()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -979,6 +1247,107 @@ void shared_down_gated(torch::Tensor out, torch::Tensor hidden_x,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void gdn_input_mtp_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
+                         torch::Tensor a, torch::Tensor x, torch::Tensor qw,
+                         torch::Tensor bw) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 2560 &&
+                  x.size(0) >= 2 && x.size(0) <= 64,
+              "Qwen3.8 MTP batched GDN requires CUDA [2..64, 2560] input");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "Qwen3.8 MTP batched GDN is SM70 only");
+  for (const auto& t : {qkv, z, b, a, x, qw, bw}) {
+    TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.is_contiguous() &&
+                    t.scalar_type() == at::kHalf &&
+                    reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                "Qwen3.8 MTP batched GDN requires 16B-aligned FP16");
+  }
+  TORCH_CHECK(qw.sizes() == at::IntArrayRef({128, 160, 2, 32, 8}) &&
+                  bw.sizes() == at::IntArrayRef({1, 160, 2, 32, 8}),
+              "Invalid Qwen3.8 packed GDN weight geometry");
+  const int m = x.size(0);
+  TORCH_CHECK(qkv.sizes() == at::IntArrayRef({m, 2560}) &&
+                  z.sizes() == at::IntArrayRef({m, 1536}) &&
+                  b.sizes() == at::IntArrayRef({m, 12}) &&
+                  a.sizes() == at::IntArrayRef({m, 12}),
+              "Invalid Qwen3.8 GDN output geometry");
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  auto launch = [&](auto groups_tag, int row_blocks) {
+    constexpr int G = decltype(groups_tag)::value;
+    gdn_input_split4_packed_kernel<G>
+        <<<dim3(129, row_blocks), 128, 0, stream>>>(
+            reinterpret_cast<const half*>(x.data_ptr()),
+            reinterpret_cast<const half*>(qw.data_ptr()),
+            reinterpret_cast<const half*>(bw.data_ptr()),
+            reinterpret_cast<half*>(qkv.data_ptr()),
+            reinterpret_cast<half*>(z.data_ptr()),
+            reinterpret_cast<half*>(b.data_ptr()),
+            reinterpret_cast<half*>(a.data_ptr()), m);
+  };
+  if (m <= 8)
+    launch(std::integral_constant<int, 1>{}, 1);
+  else if (m <= 16)
+    launch(std::integral_constant<int, 2>{}, 1);
+  else if (m <= 24)
+    launch(std::integral_constant<int, 3>{}, 1);
+  else if (m <= 32)
+    launch(std::integral_constant<int, 4>{}, 1);
+  else if (m <= 40)
+    launch(std::integral_constant<int, 5>{}, 1);
+  else
+    launch(std::integral_constant<int, 4>{}, 2);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void qsa_input_mtp_batch(torch::Tensor qkv, torch::Tensor idx_qk,
+                         torch::Tensor x, torch::Tensor qw, torch::Tensor iw) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 2560 &&
+                  x.size(0) >= 2 && x.size(0) <= 64,
+              "Qwen3.8 MTP batched QSA requires CUDA [2..64, 2560] input");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "Qwen3.8 MTP batched QSA is SM70 only");
+  for (const auto& t : {qkv, idx_qk, x, qw, iw}) {
+    TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.is_contiguous() &&
+                    t.scalar_type() == at::kHalf &&
+                    reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                "Qwen3.8 MTP batched QSA requires 16B-aligned FP16");
+  }
+  TORCH_CHECK(qw.sizes() == at::IntArrayRef({112, 160, 2, 32, 8}) &&
+                  iw.sizes() == at::IntArrayRef({20, 160, 2, 32, 8}),
+              "Invalid Qwen3.8 packed QSA weight geometry");
+  const int m = x.size(0);
+  TORCH_CHECK(qkv.sizes() == at::IntArrayRef({m, 3584}) &&
+                  idx_qk.sizes() == at::IntArrayRef({m, 640}),
+              "Invalid Qwen3.8 QSA output geometry");
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  auto launch = [&](auto groups_tag, int row_blocks) {
+    constexpr int G = decltype(groups_tag)::value;
+    qsa_input_split4_packed_kernel<G>
+        <<<dim3(132, row_blocks), 128, 0, stream>>>(
+            reinterpret_cast<const half*>(x.data_ptr()),
+            reinterpret_cast<const half*>(qw.data_ptr()),
+            reinterpret_cast<const half*>(iw.data_ptr()),
+            reinterpret_cast<half*>(qkv.data_ptr()),
+            reinterpret_cast<half*>(idx_qk.data_ptr()), m);
+  };
+  if (m <= 8)
+    launch(std::integral_constant<int, 1>{}, 1);
+  else if (m <= 16)
+    launch(std::integral_constant<int, 2>{}, 1);
+  else if (m <= 24)
+    launch(std::integral_constant<int, 3>{}, 1);
+  else if (m <= 32)
+    launch(std::integral_constant<int, 4>{}, 1);
+  else if (m <= 40)
+    launch(std::integral_constant<int, 5>{}, 1);
+  else
+    launch(std::integral_constant<int, 4>{}, 2);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(_C, m) {
@@ -993,6 +1362,9 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
       "qwen38_shared_gate_mul_sm70_out(Tensor(a!) out, Tensor logits, "
       "Tensor source) -> ()");
   m.def(
+      "qwen38_shared_gate_dot_mul_sm70_out(Tensor(a!) inout, Tensor x, "
+      "Tensor gate_w) -> ()");
+  m.def(
       "qwen38_shared_down_gated_sm70_out(Tensor(a!) out, Tensor hidden_x, "
       "Tensor act_out, Tensor down_w, Tensor gate_w) -> ()");
   m.def(
@@ -1005,16 +1377,25 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
       "qwen38_gdn_input_batch_sm70_out(Tensor(a!) qkv, Tensor(b!) z, "
       "Tensor(c!) b, Tensor(d!) a, Tensor x, Tensor qw, Tensor bw) -> ()");
   m.def(
+      "qwen38_gdn_input_mtp_batch_sm70_out(Tensor(a!) qkv, Tensor(b!) z, "
+      "Tensor(c!) b, Tensor(d!) a, Tensor x, Tensor qw, Tensor bw) -> ()");
+  m.def(
       "qwen38_qsa_input_batch_sm70_out(Tensor(a!) qkv, Tensor(b!) idx_qk, "
+      "Tensor x, Tensor qw, Tensor iw) -> ()");
+  m.def(
+      "qwen38_qsa_input_mtp_batch_sm70_out(Tensor(a!) qkv, Tensor(b!) idx_qk, "
       "Tensor x, Tensor qw, Tensor iw) -> ()");
 }
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("qwen38_shared_up_batch_sm70_out", &shared_up_batch);
   m.impl("qwen38_shared_up_batch_fp32_sm70_out", &shared_up_batch_fp32);
   m.impl("qwen38_shared_gate_mul_sm70_out", &shared_gate_mul);
+  m.impl("qwen38_shared_gate_dot_mul_sm70_out", &shared_gate_dot_mul);
   m.impl("qwen38_shared_down_gated_sm70_out", &shared_down_gated);
   m.impl("qwen38_router_batch_sm70_out", &router_batch);
   m.impl("qwen38_dense_batch_sm70_out", &dense_batch);
   m.impl("qwen38_gdn_input_batch_sm70_out", &gdn_input_batch);
+  m.impl("qwen38_gdn_input_mtp_batch_sm70_out", &gdn_input_mtp_batch);
   m.impl("qwen38_qsa_input_batch_sm70_out", &qsa_input_batch);
+  m.impl("qwen38_qsa_input_mtp_batch_sm70_out", &qsa_input_mtp_batch);
 }

@@ -800,9 +800,19 @@ class Worker(WorkerBase):
                 torch.cuda.memory._dump_snapshot(snapshot_path)
                 torch.cuda.memory._record_memory_history(enabled=None)
 
-            profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
-                "allocated_bytes.all.peak", 0
+            profile_torch_peak = max(
+                torch.accelerator.memory_stats(self.device).get(
+                    "allocated_bytes.all.peak", 0
+                ),
+                getattr(self.model_runner, "profile_torch_peak", 0),
             )
+            language_peak_increase = getattr(
+                self.model_runner, "language_profile_peak_increase", None
+            )
+            if language_peak_increase is None:
+                language_peak_increase = (
+                    profile_torch_peak - profile_result.before_profile.torch_peak
+                )
 
             # Profile CUDA graph memory if graphs will be captured and the
             # estimator is enabled. 0.0.3-style SM70 runs disable this startup
@@ -824,7 +834,7 @@ class Worker(WorkerBase):
 
                     cudagraph_memory_estimate = get_sm70_cudagraph_memory_reserve(
                         self.vllm_config.compilation_config.cudagraph_mode,
-                        profile_torch_peak - profile_result.before_profile.torch_peak,
+                        language_peak_increase,
                     )
                     logger.info(
                         "SM70 graph memory reserve before KV allocation: %.2f GiB",
@@ -853,7 +863,7 @@ class Worker(WorkerBase):
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
             if graph_policy(self.vllm_config).estimate_graph_memory
-            else self._prefill_graph_reserve(profile_result.torch_peak_increase)
+            else self._prefill_graph_reserve(language_peak_increase)
         )
 
         self.non_torch_memory = profile_result.non_torch_increase

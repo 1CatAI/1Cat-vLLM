@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Reuse each compressed key across a request's speculative queries. One CTA
 // row per request; each request's rows are contiguous (sorted token_to_req).
+#include <algorithm>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -33,113 +34,186 @@ __global__ void mqa_multiquery(const half* q, const half* cache,
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int quad = (lane >> 2) & 3;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
-  const int column_base = blockIdx.x * 32 + warp * 8;
-  const int col = column_base + r;
   const int req = blockIdx.y, nreq = gridDim.y;
   const long long length = lengths[req];
-  int end = 0, first = m, count = 0;
-  for (int row = 0; row < m; ++row) {
-    const int owner = requests[row];
-    if (owner != req) {
-      // Rows outside every request still report an empty visible range.
-      if (req == 0 && blockIdx.x == 0 && threadIdx.x == row &&
-          (owner < 0 || owner >= nreq))
-        visible[row] = 0;
-      continue;
-    }
-    first = min(first, row);
-    ++count;
-    const long long prefix = positions[row] + 1;
-    const long long causal = prefix < length ? prefix : length;
-    // Triton's signed integer division truncates toward zero, including
-    // negative padded positions. Keep its visible-length metadata unchanged.
-    const int n = causal / compress;
-    end = max(end, min(n, columns));
-    if (blockIdx.x == 0 && threadIdx.x == row) visible[row] = n;
-  }
-  if (!count || blockIdx.x * 32 >= end) return;
-  table += static_cast<int64_t>(req) * st0;
-  int page = col < end && col / page_size < table_width
-                 ? table[(col / page_size) * st1]
-                 : -1;
-  const bool key_valid = col < end && page >= 0 && page < pages;
-  const int qhead = quad * 8 + r;
-  // Eight query rows (32 heads) per MMA tile; keys are re-read from L1.
-  for (int t0 = 0; t0 < count; t0 += 8) {
-    const int tm = min(8, count - t0), qrow = qhead / 4;
-    const half* const qt = q + static_cast<int64_t>(first + t0) * sq0;
-    float acc[8] = {};
-#pragma unroll
-    for (int g = 0; g < 8; ++g) {
-      // General strides include transposed paged storage and sliced Q views.
-      uint4 a = {}, b = {}, lo = {}, hi = {};
-      half* av = reinterpret_cast<half*>(&a);
-      half* bv = reinterpret_cast<half*>(&b);
-      half* lv = reinterpret_cast<half*>(&lo);
-      half* hv = reinterpret_cast<half*>(&hi);
-      if (sc3 == 1 && sq2 == 1 && sc0 % 8 == 0 && sc1 % 8 == 0 &&
-          sq0 % 8 == 0 && sq1 % 8 == 0 &&
-          (reinterpret_cast<uintptr_t>(q) |
-           reinterpret_cast<uintptr_t>(cache)) %
-                  16 ==
-              0) {
-        if (key_valid) {
-          const half* k = cache + static_cast<int64_t>(page) * sc0 +
-                          (col % page_size) * sc1 + g * 16;
-          a = *reinterpret_cast<const uint4*>(k);
-          b = *reinterpret_cast<const uint4*>(k + 8);
-        }
-        if (qrow < tm) {
-          const half* query = qt + qrow * sq0 + (qhead % 4) * sq1 + g * 16;
-          lo = *reinterpret_cast<const uint4*>(query);
-          hi = *reinterpret_cast<const uint4*>(query + 8);
-        }
+
+  __shared__ int s_first[2], s_count[2], s_end[2];
+  if (warp < 2) {
+    const int row = threadIdx.x;
+    int my_first = m, my_count = 0, my_end = 0;
+    if (row < m) {
+      const int owner = requests[row];
+      if (owner != req) {
+        // Rows outside every request still report an empty visible range.
+        if (req == 0 && blockIdx.x == 0 && (owner < 0 || owner >= nreq))
+          visible[row] = 0;
       } else {
+        my_first = row;
+        my_count = 1;
+        const long long prefix = positions[row] + 1;
+        const long long causal = prefix < length ? prefix : length;
+        // Triton's signed integer division truncates toward zero, including
+        // negative padded positions. Keep its visible-length metadata
+        // unchanged.
+        const int n = causal / compress;
+        my_end = max(0, min(n, columns));
+        if (blockIdx.x == 0) visible[row] = n;
+      }
+    }
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          if (key_valid) {
-            const half* k = cache + static_cast<int64_t>(page) * sc0 +
-                            (col % page_size) * sc1;
-            av[j] = k[(g * 16 + j) * sc3];
-            bv[j] = k[(g * 16 + 8 + j) * sc3];
+    for (int off = 16; off > 0; off >>= 1) {
+      my_first = min(my_first, __shfl_down_sync(0xffffffff, my_first, off));
+      my_count += __shfl_down_sync(0xffffffff, my_count, off);
+      my_end = max(my_end, __shfl_down_sync(0xffffffff, my_end, off));
+    }
+    if (lane == 0) {
+      s_first[warp] = my_first;
+      s_count[warp] = my_count;
+      s_end[warp] = my_end;
+    }
+  }
+  __syncthreads();
+  const int first = min(s_first[0], s_first[1]);
+  const int count = s_count[0] + s_count[1];
+  const int end = max(s_end[0], s_end[1]);
+  if (!count || blockIdx.x * 32 >= end) return;
+
+  table += static_cast<int64_t>(req) * st0;
+  const int qhead = quad * 8 + r;
+  const bool fast_aligned =
+      (sc3 == 1 && sq2 == 1 && sc0 % 8 == 0 && sc1 % 8 == 0 && sq0 % 8 == 0 &&
+       sq1 % 8 == 0 &&
+       (reinterpret_cast<uintptr_t>(q) | reinterpret_cast<uintptr_t>(cache)) %
+               16 ==
+           0);
+
+  __shared__ __align__(16) half s_q[32][136];
+  __shared__ __align__(16) half s_k[4][8][136];
+
+  if (fast_aligned && count <= 8) {
+    const int total_q_vec = count * 4 * 16;  // count * 4 heads * (128 / 8)
+    for (int idx = threadIdx.x; idx < total_q_vec; idx += 128) {
+      const int qh_all = idx >> 4;  // 0 .. count*4 - 1
+      const int v8 = (idx & 15) * 8;
+      const int qr = qh_all >> 2;
+      const int qh = qh_all & 3;
+      const half* query =
+          q + static_cast<int64_t>(first + qr) * sq0 + qh * sq1 + v8;
+      *reinterpret_cast<uint4*>(&s_q[qh_all][v8]) =
+          __ldg(reinterpret_cast<const uint4*>(query));
+    }
+    __syncthreads();
+  }
+
+  for (int blk_x = blockIdx.x; blk_x * 32 < end; blk_x += gridDim.x) {
+    const int column_base = blk_x * 32 + warp * 8;
+    const int col = column_base + r;
+    int page = col < end && col / page_size < table_width
+                   ? table[(col / page_size) * st1]
+                   : -1;
+    const bool key_valid = col < end && page >= 0 && page < pages;
+
+    if (fast_aligned) {
+      // Coalesced 128B cacheline loads: 4 threads per key load 4 x uint4 (128
+      // halves = 256B) per key.
+      const int key_sub = lane >> 2;  // 0..7
+      const int vec_sub = lane & 3;   // 0..3
+      const int col_k = column_base + key_sub;
+      const int page_k = col_k < end && col_k / page_size < table_width
+                             ? table[(col_k / page_size) * st1]
+                             : -1;
+      uint4 kv[4] = {};
+      if (col_k < end && page_k >= 0 && page_k < pages) {
+        const half* k_ptr = cache + static_cast<int64_t>(page_k) * sc0 +
+                            (col_k % page_size) * sc1;
+#pragma unroll
+        for (int p4 = 0; p4 < 4; ++p4) {
+          kv[p4] = __ldg(
+              reinterpret_cast<const uint4*>(k_ptr + (p4 * 4 + vec_sub) * 8));
+        }
+      }
+      if (blk_x > blockIdx.x) __syncwarp();
+#pragma unroll
+      for (int p4 = 0; p4 < 4; ++p4) {
+        *reinterpret_cast<uint4*>(&s_k[warp][key_sub][(p4 * 4 + vec_sub) * 8]) =
+            kv[p4];
+      }
+      __syncwarp();
+    }
+
+    // Eight query rows (32 heads) per MMA tile; keys are re-read from smem/L1.
+    for (int t0 = 0; t0 < count; t0 += 8) {
+      const int tm = min(8, count - t0), qrow = qhead / 4;
+      const half* const qt = q + static_cast<int64_t>(first + t0) * sq0;
+      float acc[8] = {};
+#pragma unroll
+      for (int g = 0; g < 8; ++g) {
+        // General strides include transposed paged storage and sliced Q views.
+        uint4 a = {}, b = {}, lo = {}, hi = {};
+        half* av = reinterpret_cast<half*>(&a);
+        half* bv = reinterpret_cast<half*>(&b);
+        half* lv = reinterpret_cast<half*>(&lo);
+        half* hv = reinterpret_cast<half*>(&hi);
+        if (fast_aligned) {
+          a = *reinterpret_cast<const uint4*>(&s_k[warp][r][g * 16]);
+          b = *reinterpret_cast<const uint4*>(&s_k[warp][r][g * 16 + 8]);
+          if (count <= 8) {
+            if (qrow < tm) {
+              lo = *reinterpret_cast<const uint4*>(&s_q[qhead][g * 16]);
+              hi = *reinterpret_cast<const uint4*>(&s_q[qhead][g * 16 + 8]);
+            }
+          } else if (qrow < tm) {
+            const half* query = qt + qrow * sq0 + (qhead % 4) * sq1 + g * 16;
+            lo = __ldg(reinterpret_cast<const uint4*>(query));
+            hi = __ldg(reinterpret_cast<const uint4*>(query + 8));
           }
-          if (qrow < tm) {
-            const half* query = qt + qrow * sq0 + (qhead % 4) * sq1;
-            lv[j] = query[(g * 16 + j) * sq2];
-            hv[j] = query[(g * 16 + 8 + j) * sq2];
+        } else {
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            if (key_valid) {
+              const half* k = cache + static_cast<int64_t>(page) * sc0 +
+                              (col % page_size) * sc1;
+              av[j] = k[(g * 16 + j) * sc3];
+              bv[j] = k[(g * 16 + 8 + j) * sc3];
+            }
+            if (qrow < tm) {
+              const half* query = qt + qrow * sq0 + (qhead % 4) * sq1;
+              lv[j] = query[(g * 16 + j) * sq2];
+              hv[j] = query[(g * 16 + 8 + j) * sq2];
+            }
+          }
+        }
+        QSA_MMA(acc, a.x, a.y, lo.x, lo.y);
+        QSA_MMA(acc, a.z, a.w, lo.z, lo.w);
+        QSA_MMA(acc, b.x, b.y, hi.x, hi.y);
+        QSA_MMA(acc, b.z, b.w, hi.z, hi.w);
+      }
+#pragma unroll
+      for (int p = 0; p < 2; ++p) {
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+          const int i = p * 4 + k * 2;
+          const float h0 = fmaxf(acc[i], 0.f), h1 = fmaxf(acc[i + 1], 0.f);
+          const float h2 = __shfl_xor_sync(0xffffffff, h0, 2);
+          const float h3 = __shfl_xor_sync(0xffffffff, h1, 2);
+          const float sum = __fadd_rn(__fadd_rn(__fadd_rn(h0, h1), h2), h3);
+          const int local = quad * 2 + p, row = first + t0 + local;
+          const int column =
+              column_base + k * 2 + ((lane & 16) ? 4 : 0) + (lane & 1);
+          // Keys for this output row reside in the lane with r==key-column.
+          const int key_lane = (lane & ~3) | (k * 2 + (lane & 1));
+          const bool valid =
+              __shfl_sync(0xffffffff, static_cast<int>(key_valid), key_lane);
+          if ((lane & 2) == 0 && local < tm && column < columns &&
+              column < (positions[row] + 1) / compress &&
+              column < length / compress) {
+            scores[static_cast<int64_t>(row) * columns + column] =
+                valid ? sum / divisor : -CUDART_INF_F;
           }
         }
       }
-      QSA_MMA(acc, a.x, a.y, lo.x, lo.y);
-      QSA_MMA(acc, a.z, a.w, lo.z, lo.w);
-      QSA_MMA(acc, b.x, b.y, hi.x, hi.y);
-      QSA_MMA(acc, b.z, b.w, hi.z, hi.w);
-    }
-#pragma unroll
-    for (int p = 0; p < 2; ++p) {
-#pragma unroll
-      for (int k = 0; k < 2; ++k) {
-        const int i = p * 4 + k * 2;
-        const float h0 = fmaxf(acc[i], 0.f), h1 = fmaxf(acc[i + 1], 0.f);
-        const float h2 = __shfl_xor_sync(0xffffffff, h0, 2);
-        const float h3 = __shfl_xor_sync(0xffffffff, h1, 2);
-        const float sum = __fadd_rn(__fadd_rn(__fadd_rn(h0, h1), h2), h3);
-        const int local = quad * 2 + p, row = first + t0 + local;
-        const int column =
-            column_base + k * 2 + ((lane & 16) ? 4 : 0) + (lane & 1);
-        // Keys for this output row reside in the lane with r==key-column.
-        const int key_lane = (lane & ~3) | (k * 2 + (lane & 1));
-        const bool valid =
-            __shfl_sync(0xffffffff, static_cast<int>(key_valid), key_lane);
-        if ((lane & 2) == 0 && local < tm && column < columns &&
-            column < (positions[row] + 1) / compress &&
-            column < length / compress) {
-          scores[static_cast<int64_t>(row) * columns + column] =
-              valid ? sum / divisor : -CUDART_INF_F;
-        }
-      }
-    }
-  }  // row tile
+    }  // row tile
+  }  // persistent column tile
 }
 
 #undef QSA_MMA
@@ -178,9 +252,12 @@ void mqa_out(torch::Tensor scores, torch::Tensor visible, torch::Tensor q,
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
   if (!columns) return;
+  const int nreq = static_cast<int>(table.size(0));
+  const int total_col_tiles = (columns + 31) / 32;
+  const int max_col_ctas = std::max(16, 320 / nreq);
+  const dim3 grid(std::min(total_col_tiles, max_col_ctas), nreq);
   if (positions.scalar_type() == at::kLong) {
-    mqa_multiquery<int64_t><<<dim3((columns + 31) / 32, table.size(0)), 128, 0,
-                              at::cuda::getCurrentCUDAStream()>>>(
+    mqa_multiquery<int64_t><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const half*>(q.data_ptr()),
         reinterpret_cast<const half*>(cache.data_ptr()), table.data_ptr<int>(),
         requests.data_ptr<int>(), positions.data_ptr<int64_t>(),
@@ -190,8 +267,7 @@ void mqa_out(torch::Tensor scores, torch::Tensor visible, torch::Tensor q,
         cache.stride(1), cache.stride(3), table.stride(0), table.stride(1),
         divisor, compress);
   } else {
-    mqa_multiquery<int32_t><<<dim3((columns + 31) / 32, table.size(0)), 128, 0,
-                              at::cuda::getCurrentCUDAStream()>>>(
+    mqa_multiquery<int32_t><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const half*>(q.data_ptr()),
         reinterpret_cast<const half*>(cache.data_ptr()), table.data_ptr<int>(),
         requests.data_ptr<int>(), positions.data_ptr<int>(),

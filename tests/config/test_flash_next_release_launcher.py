@@ -39,8 +39,16 @@ def test_flash_launcher_uses_adjacent_cli_and_preserves_overrides(tmp_path):
     assert args[args.index("--kv-cache-dtype") + 1] == "float16"
     assert args[args.index("--max-model-len") + 1] == "262144"
     assert args[args.index("--max-num-seqs") + 1] == "8"
-    assert args[args.index("--prefix-cache-retention-interval") + 1] == "8192"
-    assert json.loads(args[args.index("--kernel-config") + 1])["qsa_host_kv"] is True
+    assert "--language-model-only" not in args
+    assert json.loads(args[args.index("--limit-mm-per-prompt") + 1]) == {
+        "video": 0,
+        "audio": 0,
+    }
+    kc = json.loads(args[args.index("--kernel-config") + 1])
+    assert kc["qsa_host_kv"] is True
+    assert kc["hc_weight_storage"] == "sharded"
+    assert kc["qsa_host_kv_hot_tokens"] == 131072
+    assert kc["qsa_host_kv_trim_warmup_cache"] is True
     assert json.loads(args[args.index("--speculative-config") + 1]) == {
         "method": "mtp",
         "num_speculative_tokens": 4,

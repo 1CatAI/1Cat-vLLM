@@ -12397,6 +12397,10 @@ class GPUModelRunner(
                             self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
+        pre_lm_stats = torch.accelerator.memory_stats(self.device)
+        pre_lm_peak = pre_lm_stats.get("allocated_bytes.all.peak", 0)
+        pre_lm_alloc = pre_lm_stats.get("allocated_bytes.all.current", 0)
+        torch.accelerator.reset_peak_memory_stats(self.device)
         _sm70_profile_trace("profile_run dummy_run enter")
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
@@ -12426,6 +12430,11 @@ class GPUModelRunner(
         _sm70_profile_trace("profile_run sync enter")
         self._sync_device()
         _sm70_profile_trace("profile_run sync exit")
+        lm_peak = torch.accelerator.memory_stats(self.device).get(
+            "allocated_bytes.all.peak", 0
+        )
+        self.language_profile_peak_increase = max(0, lm_peak - pre_lm_alloc)
+        self.profile_torch_peak = max(pre_lm_peak, lm_peak)
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()

@@ -1062,9 +1062,33 @@ def prepare_sharded_hc_storage(model, vllm_config) -> None:
             if communicator is None
             else communicator.status["reason"]
         )
-        raise ValueError(
-            f"Sharded HC storage requires qualified TP4 transport: {reason}"
+        if not getattr(vllm_config.kernel_config, "hc_weight_storage_auto", False):
+            raise ValueError(
+                f"Sharded HC storage requires qualified TP4 transport: {reason}"
+            )
+        target_dev = getattr(group.device_communicator, "device", None)
+        if target_dev is not None:
+            for module in model.modules():
+                if not isinstance(module, GatedResidual):
+                    continue
+                down_layer = (
+                    module.input_mix_weight_down_block_inject
+                    if module.use_combine
+                    else module.input_mix_weight_down
+                )
+                for layer in (down_layer, module.input_mix_weight_up):
+                    if getattr(layer, "_hc_cpu_staging", False):
+                        layer.weight = nn.Parameter(
+                            layer.weight.detach().to(target_dev), requires_grad=False
+                        )
+                        layer._hc_cpu_staging = False
+                        _prepare_hc_batch_weight(layer)
+        vllm_config.kernel_config.hc_weight_storage = "replicated"
+        logger.info_once(
+            "Retaining replicated HC weights (%s); TP4 LL transport unavailable.",
+            reason,
         )
+        return
     if vllm_config.lora_config is not None:
         raise ValueError("Sharded HC storage does not support LoRA adapters")
     count = 0
@@ -1093,17 +1117,24 @@ def prepare_sharded_hc_storage(model, vllm_config) -> None:
         if not module.use_combine:
             down = torch.nn.functional.pad(down, (0, 0, 0, 16))
         rank = communicator.logical_rank
+        use_hcx_bank = (
+            hasattr(module, "_hcx_down")
+            and getattr(
+                getattr(vllm_config, "scheduler_config", None), "max_num_seqs", 8
+            )
+            <= 1
+        )
         module.register_buffer(
             "hc_shard_down",
-            getattr(module, "_hcx_down", None)
-            if hasattr(module, "_hcx_down")
+            module._hcx_down
+            if use_hcx_bank
             else _pack_hc_batch_weight(down, "down", rank).to(communicator.device),
             persistent=False,
         )
         module.register_buffer(
             "hc_shard_up",
-            getattr(module, "_hcx_up", None)
-            if hasattr(module, "_hcx_up")
+            module._hcx_up
+            if use_hcx_bank
             else _pack_hc_batch_weight(up, "up", rank).to(communicator.device),
             persistent=False,
         )

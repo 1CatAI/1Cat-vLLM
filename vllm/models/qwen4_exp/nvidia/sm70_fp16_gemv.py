@@ -498,11 +498,9 @@ def _qwen38_sm70_shared_down_gated(
     m = x.shape[0]
     reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
     max_m = 8 if _mtp_active() else (1 if reduced else 64)
-    if (
-        sm70_ops.has_qwen38_shared_down_gated()
-        and not envs.VLLM_BATCH_INVARIANT
+    aligned_ok = (
+        not envs.VLLM_BATCH_INVARIANT
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
-        and (m == 1 or (batch_allowed and 2 <= m <= max_m))
         and x.ndim == 2
         and act_out.ndim == 2
         and act_out.shape[0] == m
@@ -519,6 +517,11 @@ def _qwen38_sm70_shared_down_gated(
             for t in (x, act_out, down_weight, gate_weight)
         )
         and current_platform.is_device_capability(70)
+    )
+    if (
+        sm70_ops.has_qwen38_shared_down_gated()
+        and aligned_ok
+        and (m == 1 or (batch_allowed and 2 <= m <= max_m))
     ):
         down_out = x.new_empty((m, 2560))
         sm70_ops.qwen38_shared_down_gated_sm70_out(
@@ -527,6 +530,16 @@ def _qwen38_sm70_shared_down_gated(
         logger.info_once("SM70 Qwen3.8 fused shared-expert down+gate path enabled.")
         return down_out
     down_out = torch.nn.functional.linear(act_out, down_weight)
+    if (
+        batch_allowed
+        and aligned_ok
+        and 2 <= m <= 64
+        and down_out.is_contiguous()
+        and down_out.data_ptr() % 16 == 0
+        and hasattr(torch.ops._C, "qwen38_shared_gate_dot_mul_sm70_out")
+    ):
+        torch.ops._C.qwen38_shared_gate_dot_mul_sm70_out(down_out, x, gate_weight)
+        return down_out
     gate_logits = torch.nn.functional.linear(x, gate_weight)
     return _qwen38_sm70_shared_gate_mul(gate_logits, down_out)
 
@@ -558,7 +571,7 @@ def _forward_shared_batch_silu(layer, x):
 
 
 def _router_batch_runtime_ok(x, packed) -> bool:
-    rows_ok = 2 <= x.shape[0] <= 8 if _mtp_active() else _batch_rows_ok(x.shape[0])
+    rows_ok = 2 <= x.shape[0] <= 16 if _mtp_active() else _batch_rows_ok(x.shape[0])
     return bool(
         mtp_batch_enabled("router_batch")
         and not envs.VLLM_BATCH_INVARIANT
@@ -607,7 +620,7 @@ def _qwen38_sm70_fp16_gemv(
         and not envs.VLLM_BATCH_INVARIANT
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and x.ndim == 2
-        and 2 <= x.shape[0] <= 32
+        and 2 <= x.shape[0] <= (64 if _mtp_active() else 32)
         and x.shape[1] == 2560
         and 0 < weight.shape[0] <= 32
         and _is_packed_row_major(x)
@@ -760,6 +773,7 @@ def _pack_qsa_input_weight(weight: torch.Tensor) -> torch.Tensor:
 
 
 def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
+    max_rows = 64 if _mtp_active() else _GDN_BATCH_ROWS
     return bool(
         projection_policy().value("input_batch")
         and layer_policy().batch_fastpath
@@ -768,7 +782,7 @@ def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
         # Let cuBLAS honor an explicit request for FP16 accumulation.
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and x.ndim == 2
-        and 2 <= x.shape[0] <= _GDN_BATCH_ROWS
+        and 2 <= x.shape[0] <= max_rows
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -790,13 +804,14 @@ def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
 
 
 def _can_use_packed_qsa_input(x, packed_qkv, packed_idx) -> bool:
+    max_rows = 64 if _mtp_active() else _GDN_BATCH_ROWS
     return bool(
         layer_policy().batch_fastpath
         and not envs.VLLM_BATCH_INVARIANT
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and hasattr(torch.ops._C, "qwen38_qsa_input_batch_sm70_out")
         and x.ndim == 2
-        and 2 <= x.shape[0] <= _GDN_BATCH_ROWS
+        and 2 <= x.shape[0] <= max_rows
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -826,9 +841,16 @@ def _qwen38_sm70_fp16_gdn_input(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if _can_use_packed_gdn_input(x, packed_qkvz, packed_ba):
         qkv, z, b, a = (x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
-        torch.ops._C.qwen38_gdn_input_batch_sm70_out(
-            qkv, z, b, a, x, packed_qkvz, packed_ba
-        )
+        if _mtp_active() and hasattr(
+            torch.ops._C, "qwen38_gdn_input_mtp_batch_sm70_out"
+        ):
+            torch.ops._C.qwen38_gdn_input_mtp_batch_sm70_out(
+                qkv, z, b, a, x, packed_qkvz, packed_ba
+            )
+        else:
+            torch.ops._C.qwen38_gdn_input_batch_sm70_out(
+                qkv, z, b, a, x, packed_qkvz, packed_ba
+            )
         logger.info_once("SM70 Qwen3.8 checkpoint-FP16 batched GDN input enabled.")
         return qkv, z, b, a
     if not (
@@ -905,9 +927,16 @@ def _qwen38_sm70_fp16_qsa_input(
     if x2.is_contiguous() and _can_use_packed_qsa_input(x2, packed_qkv, packed_idx):
         qkv = x2.new_empty((x2.shape[0], 3584))
         idx_qk = x2.new_empty((x2.shape[0], 640))
-        torch.ops._C.qwen38_qsa_input_batch_sm70_out(
-            qkv, idx_qk, x2, packed_qkv, packed_idx
-        )
+        if _mtp_active() and hasattr(
+            torch.ops._C, "qwen38_qsa_input_mtp_batch_sm70_out"
+        ):
+            torch.ops._C.qwen38_qsa_input_mtp_batch_sm70_out(
+                qkv, idx_qk, x2, packed_qkv, packed_idx
+            )
+        else:
+            torch.ops._C.qwen38_qsa_input_batch_sm70_out(
+                qkv, idx_qk, x2, packed_qkv, packed_idx
+            )
         logger.info_once("SM70 Qwen3.8 checkpoint-FP16 batched QSA input enabled.")
         return qkv.reshape(*batch_shape, 3584), idx_qk.reshape(*batch_shape, 640)
     if (

@@ -12,6 +12,8 @@ from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+UNLIMITED_MM_ITEMS_PER_PROMPT = 2_147_483_647
+
 
 @dataclass
 class BaseDummyOptions:
@@ -33,6 +35,7 @@ class VideoDummyOptions(BaseDummyOptions):
 class ImageDummyOptions(BaseDummyOptions):
     """Options for generating dummy image data during profiling."""
 
+    count: int = Field(UNLIMITED_MM_ITEMS_PER_PROMPT, ge=0)
     width: int | None = Field(None, gt=0)
     height: int | None = Field(None, gt=0)
 
@@ -81,7 +84,8 @@ class MultiModalConfig:
     """The maximum number of input items and options allowed per
     prompt for each modality.
 
-    Defaults to 999 for each modality.
+    Defaults to unlimited (`UNLIMITED_MM_ITEMS_PER_PROMPT`) for `"image"` and
+    999 for other modalities.
 
     Legacy format (count only):
         {"image": 16, "video": 2}
@@ -325,7 +329,9 @@ class MultiModalConfig:
         limit_data = self.limit_per_prompt.get(modality)
 
         if limit_data is None:
-            # Unspecified modality is set to 999 by default
+            if modality == "image":
+                return UNLIMITED_MM_ITEMS_PER_PROMPT
+            # Unspecified non-image modality is set to 999 by default
             return 999
 
         return limit_data.count

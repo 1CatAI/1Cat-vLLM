@@ -652,7 +652,10 @@ __global__ __launch_bounds__(256, 3) void partial_hot_fp8_lite(Args a) {
   const int r8 = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int nr =
       nt * 32 + ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
-  constexpr int kChunks = C * 32 / 256;
+  constexpr int kChunks = C * 16 / 256;
+  const bool kv_aligned16 = ((reinterpret_cast<uintptr_t>(a.hot) |
+                              reinterpret_cast<uintptr_t>(a.history)) &
+                             15u) == 0u;
   float running_max = __int_as_float(0xff800000), running_sum = 0.f;
   float result[H] = {};
   for (int tl = 0; tl < a.tiles; ++tl) {
@@ -702,30 +705,41 @@ __global__ __launch_bounds__(256, 3) void partial_hot_fp8_lite(Args a) {
       }
     }
     const bool all_hot = __syncthreads_and(my_hot_or_inv);
-    uint2 vraw[kChunks];
+    uint4 vraw[kChunks];
 #pragma unroll
     for (int i = 0; i < kChunks; ++i) {
-      const int v = t + i * 256, token = v / 32, dim = (v % 32) * 8;
+      const int v = t + i * 256, token = v >> 4, dim = (v & 15) << 4;
       const int64_t slot = slots[token];
-      uint2 kraw = make_uint2(0, 0);
-      vraw[i] = make_uint2(0, 0);
+      uint4 kraw = make_uint4(0, 0, 0, 0);
+      vraw[i] = make_uint4(0, 0, 0, 0);
       if (slot >= 0) {
         const int hot = hots[token];
+        const unsigned char* src_k;
+        const unsigned char* src_v;
         if (all_hot || hot >= 0) {
-          const auto* hb = reinterpret_cast<const unsigned char*>(a.hot) +
-                           int64_t(hot) * 2 * D + dim;
-          kraw = __ldg(reinterpret_cast<const uint2*>(hb));
-          vraw[i] = __ldg(reinterpret_cast<const uint2*>(hb + D));
+          src_k = reinterpret_cast<const unsigned char*>(a.hot) +
+                  int64_t(hot) * 2 * D + dim;
+          src_v = src_k + D;
         } else {
           const int block = slot / a.page, off = slot % a.page;
-          const auto* mb =
-              a.history + (int64_t(block) * 2 * a.page + off) * D + dim;
-          kraw = __ldg(reinterpret_cast<const uint2*>(mb));
-          vraw[i] =
-              __ldg(reinterpret_cast<const uint2*>(mb + int64_t(a.page) * D));
+          src_k = a.history + (int64_t(block) * 2 * a.page + off) * D + dim;
+          src_v = src_k + int64_t(a.page) * D;
+        }
+        if (kv_aligned16) {
+          kraw = __ldg(reinterpret_cast<const uint4*>(src_k));
+          vraw[i] = __ldg(reinterpret_cast<const uint4*>(src_v));
+        } else {
+          const uint2 kl = __ldg(reinterpret_cast<const uint2*>(src_k));
+          const uint2 kh = __ldg(reinterpret_cast<const uint2*>(src_k + 8));
+          const uint2 vl = __ldg(reinterpret_cast<const uint2*>(src_v));
+          const uint2 vh = __ldg(reinterpret_cast<const uint2*>(src_v + 8));
+          kraw = make_uint4(kl.x, kl.y, kh.x, kh.y);
+          vraw[i] = make_uint4(vl.x, vl.y, vh.x, vh.y);
         }
       }
-      *reinterpret_cast<uint2*>(&tile[token][dim]) = kraw;
+      *reinterpret_cast<uint2*>(&tile[token][dim]) = make_uint2(kraw.x, kraw.y);
+      *reinterpret_cast<uint2*>(&tile[token][dim + 8]) =
+          make_uint2(kraw.z, kraw.w);
     }
     __syncthreads();
     float acc[8] = {};
@@ -802,8 +816,11 @@ __global__ __launch_bounds__(256, 3) void partial_hot_fp8_lite(Args a) {
     __syncthreads();
 #pragma unroll
     for (int i = 0; i < kChunks; ++i) {
-      const int v = t + i * 256, token = v / 32, dim = (v % 32) * 8;
-      *reinterpret_cast<uint2*>(&tile[token][dim]) = vraw[i];
+      const int v = t + i * 256, token = v >> 4, dim = (v & 15) << 4;
+      *reinterpret_cast<uint2*>(&tile[token][dim]) =
+          make_uint2(vraw[i].x, vraw[i].y);
+      *reinterpret_cast<uint2*>(&tile[token][dim + 8]) =
+          make_uint2(vraw[i].z, vraw[i].w);
     }
     __syncthreads();
 #pragma unroll
