@@ -37,6 +37,13 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
+_FLOAT8_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2fnuz,
+)
+
 DEFAULT_VOCAB_PADDING_SIZE = 64
 logger = init_logger(__name__)
 
@@ -557,6 +564,15 @@ class VocabParallelEmbedding(PluggableLayer):
             if output_dim is not None:
                 shape[output_dim] = self.num_embeddings_per_partition
             param.materialize(tuple(shape), dtype=loaded_weight.dtype)
+        elif (
+            loaded_weight.dtype in _FLOAT8_DTYPES and param.dtype not in _FLOAT8_DTYPES
+        ):
+            raise ValueError(
+                f"{self.prefix or type(self).__name__}: the checkpoint stores a "
+                f"{loaded_weight.dtype} weight, but the layer was built unquantized "
+                f"({param.dtype}). The quantization config leaves it out while "
+                "the checkpoint quantizes it."
+            )
 
         # If parameter does not have output dim, then it should
         # be copied onto all gpus (e.g. g_idx for act_order gptq).
