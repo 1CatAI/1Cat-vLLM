@@ -1361,6 +1361,8 @@ class GPUModelRunner(
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config
         )
+        mm_config = model_config.multimodal_config
+        self.mm_encoder_batch_size = mm_config.mm_encoder_batch_size if mm_config else 0
 
         if self.model_config.is_encoder_decoder:
             # Maximum length of the encoder input, only for encoder-decoder
@@ -12410,16 +12412,24 @@ class GPUModelRunner(
                             dummy_modality,
                         )
 
-                        # Create dummy batch of multimodal inputs.
-                        batched_dummy_mm_inputs = self._get_mm_dummy_batch(
-                            dummy_modality,
-                            max_mm_items_per_batch,
+                        # Create and run dummy multimodal inputs in bounded chunks.
+                        enc_bs = (
+                            self.mm_encoder_batch_size
+                            if self.mm_encoder_batch_size > 0
+                            else max_mm_items_per_batch
                         )
-
-                        # Run multimodal encoder.
-                        dummy_encoder_outputs = self.model.embed_multimodal(
-                            **batched_dummy_mm_inputs
-                        )
+                        dummy_encoder_outputs = []
+                        remaining = max_mm_items_per_batch
+                        while remaining > 0:
+                            chunk_n = min(enc_bs, remaining)
+                            batched_dummy_mm_inputs = self._get_mm_dummy_batch(
+                                dummy_modality,
+                                chunk_n,
+                            )
+                            dummy_encoder_outputs.extend(
+                                self.model.embed_multimodal(**batched_dummy_mm_inputs)
+                            )
+                            remaining -= chunk_n
 
                         sanity_check_mm_encoder_outputs(
                             dummy_encoder_outputs,

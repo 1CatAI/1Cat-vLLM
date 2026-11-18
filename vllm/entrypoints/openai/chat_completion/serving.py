@@ -200,6 +200,23 @@ class _PrefixCacheBoundaries:
             suffix = tuple(with_prompt[len(without) :])
         return self._put_generation(key, suffix)
 
+    @staticmethod
+    def _has_non_text_parts(messages: GenericSequence[dict[str, Any]]) -> bool:
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list) and any(
+                isinstance(p, dict) and p.get("type") != "text" for p in content
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _digest_obj(obj: Any) -> str:
+        payload = json.dumps(
+            obj, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+        return hashlib.blake2b(payload, digest_size=16).hexdigest()
+
     def _trailing_turn_suffix(
         self,
         tokenizer,
@@ -207,9 +224,15 @@ class _PrefixCacheBoundaries:
         chat_template,
         kwargs,
     ):
-        base_key = json.dumps(
-            ["__turn_base__", chat_template, kwargs], sort_keys=True, default=str
+        if self._has_non_text_parts(trailing_messages):
+            return None
+        turn_key = "__turn_sfx__:" + self._digest_obj(
+            [trailing_messages, chat_template, kwargs]
         )
+        if turn_key in self._generation:
+            self._generation.move_to_end(turn_key)
+            return self._generation[turn_key]
+        base_key = "__turn_base__:" + self._digest_obj([chat_template, kwargs])
         base_msgs = [
             {"role": "user", "content": "a"},
             {"role": "assistant", "content": "b"},
@@ -225,7 +248,7 @@ class _PrefixCacheBoundaries:
                 base_key, tuple(base_tokens) if base_tokens else None
             )
         if not base:
-            return None
+            return self._put_generation(turn_key, None)
         probed = self._render(
             tokenizer,
             base_msgs + trailing_messages,
@@ -234,18 +257,31 @@ class _PrefixCacheBoundaries:
             None,
             True,
         )
+        suffix = None
         if (
             probed is not None
             and len(probed) > len(base)
             and tuple(probed[: len(base)]) == base
         ):
-            return tuple(probed[len(base) :])
-        return None
+            suffix = tuple(probed[len(base) :])
+        return self._put_generation(turn_key, suffix)
 
-    def _system_prompt(self, tokenizer, sys_messages, chat_template, kwargs, tools):
-        key = json.dumps(
-            [sys_messages, tools, chat_template, kwargs], sort_keys=True, default=str
+    def _system_prompt(
+        self,
+        tokenizer,
+        sys_messages,
+        chat_template,
+        kwargs,
+        tools,
+        *,
+        tools_digest: str | None = None,
+    ):
+        td = (
+            tools_digest
+            if tools_digest is not None
+            else (self._digest_obj(tools) if tools else "")
         )
+        key = self._digest_obj([sys_messages, td, chat_template, kwargs])
         if key in self._system:
             self._system.move_to_end(key)
             return self._system[key]
@@ -333,20 +369,29 @@ class _PrefixCacheBoundaries:
         has_non_sys = len(resolved_messages) > len(sys_msgs)
         req_tools = tools if tools is not None else getattr(request, "tools", None)
         if (sys_msgs and has_non_sys) or (resolved_messages and req_tools):
-            dumped_tools = (
-                [
-                    tool.model_dump() if hasattr(tool, "model_dump") else tool
-                    for tool in req_tools
-                ]
-                if req_tools
-                else None
+            cached_dumped = (
+                getattr(request, "_cached_tool_dicts", None) if tools is None else None
             )
+            dumped_tools = (
+                cached_dumped
+                if cached_dumped is not None
+                else (
+                    [
+                        tool.model_dump() if hasattr(tool, "model_dump") else tool
+                        for tool in req_tools
+                    ]
+                    if req_tools
+                    else None
+                )
+            )
+            tools_digest = self._digest_obj(dumped_tools) if dumped_tools else ""
             system = self._system_prompt(
                 tokenizer,
                 sys_msgs if has_non_sys else None,
                 chat_template,
                 kwargs,
                 dumped_tools,
+                tools_digest=tools_digest,
             )
             if (
                 system
@@ -356,7 +401,12 @@ class _PrefixCacheBoundaries:
                 boundaries.append(len(system))
             if dumped_tools and sys_msgs:
                 tools_only = self._system_prompt(
-                    tokenizer, None, chat_template, kwargs, dumped_tools
+                    tokenizer,
+                    None,
+                    chat_template,
+                    kwargs,
+                    dumped_tools,
+                    tools_digest=tools_digest,
                 )
                 if tools_only:
                     common = self._common_prefix_len(prompt_token_ids, tools_only)
@@ -378,7 +428,12 @@ class _PrefixCacheBoundaries:
                             }
                         ]
                         sub_tokens = self._system_prompt(
-                            tokenizer, sub_sys, chat_template, kwargs, dumped_tools
+                            tokenizer,
+                            sub_sys,
+                            chat_template,
+                            kwargs,
+                            dumped_tools,
+                            tools_digest=tools_digest,
                         )
                         if sub_tokens:
                             common = self._common_prefix_len(
@@ -395,6 +450,7 @@ class _PrefixCacheBoundaries:
                         chat_template,
                         kwargs,
                         dumped_tools,
+                        tools_digest=tools_digest,
                     )
                     if sub_tokens:
                         common = self._common_prefix_len(prompt_token_ids, sub_tokens)
@@ -521,25 +577,103 @@ class _AssistantReasoningCache:
             )
         return ""
 
+    @staticmethod
+    def _extract_media_sig(content: Any) -> tuple[tuple[str, str], ...]:
+        if not isinstance(content, list):
+            return ()
+        sigs: list[tuple[str, str]] = []
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            ptype = str(p.get("type") or "")
+            if ptype == "text":
+                continue
+            raw_val: Any = None
+            for k in (
+                "image_url",
+                "input_image",
+                "image",
+                "video_url",
+                "video",
+                "audio_url",
+                "input_audio",
+                "audio",
+            ):
+                if k in p and p[k] is not None:
+                    v = p[k]
+                    raw_val = v.get("url", v) if isinstance(v, dict) else v
+                    break
+            if raw_val is None:
+                raw_str = json.dumps(p, sort_keys=True, default=str)
+            elif isinstance(raw_val, str):
+                raw_str = raw_val
+            else:
+                raw_str = str(raw_val)
+            part_hash = hashlib.blake2b(
+                raw_str.encode("utf-8", errors="replace"), digest_size=12
+            ).hexdigest()
+            sigs.append((ptype, part_hash))
+        return tuple(sigs)
+
+    @classmethod
+    def _message_digest(cls, m: Any) -> bytes:
+        if isinstance(m, dict):
+            role = m.get("role", "")
+            tool_call_id = m.get("tool_call_id", "")
+            raw_content = m.get("content")
+            tcs = cls._canonical_tool_calls(m.get("tool_calls"))
+        else:
+            role = getattr(m, "role", "")
+            tool_call_id = getattr(m, "tool_call_id", "")
+            raw_content = getattr(m, "content", None)
+            tcs = cls._canonical_tool_calls(getattr(m, "tool_calls", None))
+        content = cls._extract_text(raw_content).strip()
+        media = cls._extract_media_sig(raw_content)
+        h = hashlib.blake2b(digest_size=16)
+        h.update(str(role or "").encode("utf-8"))
+        h.update(b"\x00")
+        h.update(str(tool_call_id or "").encode("utf-8"))
+        h.update(b"\x00")
+        h.update(content.encode("utf-8"))
+        h.update(b"\x00")
+        if media:
+            for ptype, phash in media:
+                h.update(ptype.encode("utf-8"))
+                h.update(b":")
+                h.update(phash.encode("ascii"))
+                h.update(b";")
+        h.update(b"\x00")
+        if tcs:
+            for name, args in tcs:
+                h.update(name.encode("utf-8"))
+                h.update(b"=")
+                h.update(args.encode("utf-8"))
+                h.update(b"\x01")
+        return h.digest()
+
     @classmethod
     def _context_digest(cls, prior_messages: GenericSequence[Any]) -> str:
         if not prior_messages:
             return ""
-        canonical = []
+        h = hashlib.blake2b(digest_size=16)
         for m in prior_messages:
-            if isinstance(m, dict):
-                role = m.get("role", "")
-                tool_call_id = m.get("tool_call_id", "")
-                content = cls._extract_text(m.get("content")).strip()
-                tcs = cls._canonical_tool_calls(m.get("tool_calls"))
-            else:
-                role = getattr(m, "role", "")
-                tool_call_id = getattr(m, "tool_call_id", "")
-                content = cls._extract_text(getattr(m, "content", None)).strip()
-                tcs = cls._canonical_tool_calls(getattr(m, "tool_calls", None))
-            canonical.append((role or "", tool_call_id or "", content, tcs))
-        payload = json.dumps(canonical, sort_keys=True, default=str).encode("utf-8")
-        return hashlib.blake2b(payload, digest_size=16).hexdigest()
+            h.update(cls._message_digest(m))
+        return h.hexdigest()
+
+    @classmethod
+    def prefix_digests(cls, messages: GenericSequence[Any]) -> list[str]:
+        """Compute ``_context_digest(messages[:idx])`` for all ``idx`` in O(L)."""
+        n = len(messages)
+        if n == 0:
+            return []
+        out = [""]
+        if n == 1:
+            return out
+        h = hashlib.blake2b(digest_size=16)
+        for idx in range(n - 1):
+            h.update(cls._message_digest(messages[idx]))
+            out.append(h.hexdigest())
+        return out
 
     def _put(self, key: tuple[Any, ...], reasoning: str) -> None:
         self._entries[key] = reasoning
@@ -608,12 +742,17 @@ class _AssistantReasoningCache:
         tool_calls: Any,
         *,
         cache_salt: str | None = None,
+        ctx_digest: str | None = None,
     ) -> str | None:
         content_norm = self._extract_text(content).strip()
         tc_norm = self._canonical_tool_calls(tool_calls)
         if not content_norm and not tc_norm:
             return None
-        ctx = self._context_digest(prior_messages)
+        ctx = (
+            ctx_digest
+            if ctx_digest is not None
+            else self._context_digest(prior_messages)
+        )
         salt_norm = cache_salt or ""
         ctx_key = ("ctx", salt_norm, ctx, content_norm, tc_norm)
         if ctx_key in self._entries:
@@ -628,12 +767,17 @@ class _AssistantReasoningCache:
         tool_calls: Any,
         *,
         cache_salt: str | None = None,
+        ctx_digest: str | None = None,
     ) -> tuple[str, int, bytes, tuple[int, ...]] | None:
         content_norm = self._extract_text(content).strip()
         tc_norm = self._canonical_tool_calls(tool_calls)
         if not content_norm and not tc_norm:
             return None
-        ctx = self._context_digest(prior_messages)
+        ctx = (
+            ctx_digest
+            if ctx_digest is not None
+            else self._context_digest(prior_messages)
+        )
         salt_norm = cache_salt or ""
         ctx_key = ("ctx", salt_norm, ctx, content_norm, tc_norm)
         if ctx_key in self._token_spans:
@@ -649,6 +793,7 @@ class _AssistantReasoningCache:
         *,
         cache_salt: str | None = None,
         max_model_len: int | None = None,
+        mm_placeholders: Any = None,
     ) -> list[int]:
         """Replace re-rendered historical assistant spans with exact decoded IDs.
 
@@ -675,15 +820,17 @@ class _AssistantReasoningCache:
         nl_list = list(nl_ids)
         nl_len = len(nl_list)
         tokens = list(prompt_token_ids)
+        ctx_digests = self.prefix_digests(messages)
         for idx in range(len(messages) - 1):
             msg = messages[idx]
             if not isinstance(msg, dict) or msg.get("role") != "assistant":
                 continue
             span_entry = self.lookup_token_span(
-                messages[:idx],
+                (),
                 msg.get("content"),
                 msg.get("tool_calls"),
                 cache_salt=cache_salt,
+                ctx_digest=ctx_digests[idx],
             )
             if span_entry is None:
                 continue
@@ -714,12 +861,33 @@ class _AssistantReasoningCache:
                 think_id in tokens[prefix_len:after_msg]
             ):
                 continue
-            new_len = len(tokens) - (after_msg - prefix_len) + len(assistant_span)
+            delta = len(assistant_span) - (after_msg - prefix_len)
+            new_len = len(tokens) + delta
             if max_model_len is not None and new_len >= max_model_len:
                 continue
+            if delta != 0 and isinstance(mm_placeholders, dict) and mm_placeholders:
+                overlaps = any(
+                    r.offset < after_msg and r.offset + r.length > prefix_len
+                    for ranges in mm_placeholders.values()
+                    for r in ranges
+                )
+                if overlaps:
+                    continue
             span_list = list(assistant_span)
             if tokens[prefix_len:after_msg] != span_list:
                 tokens = tokens[:prefix_len] + span_list + tokens[after_msg:]
+                if delta != 0 and isinstance(mm_placeholders, dict) and mm_placeholders:
+                    for mod_key, ranges in list(mm_placeholders.items()):
+                        mm_placeholders[mod_key] = [
+                            type(r)(
+                                offset=r.offset + delta,
+                                length=r.length,
+                                is_embed=r.is_embed,
+                            )
+                            if r.offset >= after_msg
+                            else r
+                            for r in ranges
+                        ]
         return tokens
 
 
@@ -863,6 +1031,7 @@ class OpenAIServingChat(OpenAIServing):
         if len(messages) < 2:
             return request
         updated: list[Any] | None = None
+        ctx_digests: list[str] | None = None
         for idx in range(len(messages) - 1):
             msg = messages[idx]
             if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -876,11 +1045,14 @@ class OpenAIServingChat(OpenAIServing):
                         updated = list(messages)
                     updated[idx] = {**msg, "reasoning_content": existing}
                 continue
+            if ctx_digests is None:
+                ctx_digests = self._assistant_reasoning_cache.prefix_digests(messages)
             restored = self._assistant_reasoning_cache.lookup(
-                messages[:idx],
+                (),
                 msg.get("content"),
                 msg.get("tool_calls"),
                 cache_salt=request.cache_salt,
+                ctx_digest=ctx_digests[idx],
             )
             if restored is not None:
                 if updated is None:
@@ -1009,8 +1181,7 @@ class OpenAIServingChat(OpenAIServing):
                 prompt_token_ids
                 and isinstance(engine_input, dict)
                 and "prompt_token_ids" in engine_input
-                and not engine_input.get("multi_modal_data")
-                and not engine_input.get("multi_modal_placeholders")
+                and not engine_input.get("prompt_embeds")
             ):
                 spliced = self._assistant_reasoning_cache.splice_prompt_tokens(
                     request.messages,
@@ -1018,6 +1189,7 @@ class OpenAIServingChat(OpenAIServing):
                     tokenizer,
                     cache_salt=request.cache_salt,
                     max_model_len=max_model_len,
+                    mm_placeholders=engine_input.get("mm_placeholders"),
                 )
                 if spliced != list(prompt_token_ids):
                     cast(dict[str, Any], engine_input)["prompt_token_ids"] = spliced

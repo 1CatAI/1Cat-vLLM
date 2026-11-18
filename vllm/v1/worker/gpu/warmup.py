@@ -257,8 +257,21 @@ def warmup_kernels(
             model_runner.scheduler_config.max_num_batched_tokens,
             model_runner.max_model_len - 1 - num_spec_steps,
         )
-        if full_chunk > default_prompt_len:
-            prompt_lengths = tuple(sorted({*prompt_lengths, full_chunk}))
+        extra_lengths = [full_chunk]
+        if (
+            num_spec_steps > 0
+            and default_prompt_len < 16
+            and model_runner.max_model_len - 1 - num_spec_steps >= 16
+        ):
+            extra_lengths.append(16)
+        prompt_lengths = tuple(
+            sorted(
+                {
+                    *prompt_lengths,
+                    *(n for n in extra_lengths if n > default_prompt_len),
+                }
+            )
+        )
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     block_count = _warmup_block_counter(model_runner)

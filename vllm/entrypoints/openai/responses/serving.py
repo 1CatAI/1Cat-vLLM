@@ -652,6 +652,7 @@ class OpenAIServingResponses(OpenAIServing):
         if len(messages) < 2:
             return messages
         restored = list(messages)
+        ctx_digests: list[str] | None = None
         for idx in range(len(restored) - 1):
             msg = restored[idx]
             if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -663,11 +664,14 @@ class OpenAIServingResponses(OpenAIServing):
                     patched["reasoning_content"] = existing
                     restored[idx] = patched  # type: ignore[call-overload]
                 continue
+            if ctx_digests is None:
+                ctx_digests = self._assistant_reasoning_cache.prefix_digests(messages)
             cached = self._assistant_reasoning_cache.lookup(
-                restored[:idx],
+                (),
                 msg.get("content"),
                 msg.get("tool_calls"),
                 cache_salt=cache_salt,
+                ctx_digest=ctx_digests[idx],
             )
             if cached:
                 patched = dict(msg)
@@ -707,7 +711,11 @@ class OpenAIServingResponses(OpenAIServing):
         for eng_in in engine_inputs:
             eng_dict = cast(dict[str, Any], eng_in)
             raw_ids = eng_dict.get("prompt_token_ids")
-            if isinstance(raw_ids, list) and raw_ids:
+            if (
+                isinstance(raw_ids, list)
+                and raw_ids
+                and not eng_dict.get("prompt_embeds")
+            ):
                 eng_dict["prompt_token_ids"] = (
                     self._assistant_reasoning_cache.splice_prompt_tokens(
                         messages,
@@ -715,6 +723,7 @@ class OpenAIServingResponses(OpenAIServing):
                         tokenizer,
                         cache_salt=request.cache_salt,
                         max_model_len=self.model_config.max_model_len,
+                        mm_placeholders=eng_dict.get("mm_placeholders"),
                     )
                 )
         return messages, engine_inputs
@@ -749,7 +758,11 @@ class OpenAIServingResponses(OpenAIServing):
         for eng_in in engine_inputs:
             eng_dict = cast(dict[str, Any], eng_in)
             raw_ids = eng_dict.get("prompt_token_ids")
-            if isinstance(raw_ids, list) and raw_ids:
+            if (
+                isinstance(raw_ids, list)
+                and raw_ids
+                and not eng_dict.get("prompt_embeds")
+            ):
                 eng_dict["prompt_token_ids"] = (
                     self._assistant_reasoning_cache.splice_prompt_tokens(
                         new_messages,
@@ -757,6 +770,7 @@ class OpenAIServingResponses(OpenAIServing):
                         tokenizer,
                         cache_salt=request.cache_salt,
                         max_model_len=self.model_config.max_model_len,
+                        mm_placeholders=eng_dict.get("mm_placeholders"),
                     )
                 )
         return engine_inputs

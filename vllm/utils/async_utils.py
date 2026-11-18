@@ -46,6 +46,7 @@ class AsyncMicrobatchTokenizer:
             asyncio.Queue[tuple[str, dict, Future] | tuple[list[int], Future]],
         ] = {}
         self._batcher_tasks: list[Task] = []
+        self._executor_busy: int = 0
 
         # Single-thread executor for blocking tokenizer calls.
         # Accept an external executor to serialize with other tokenizer users.
@@ -102,6 +103,15 @@ class AsyncMicrobatchTokenizer:
             deadline = self._loop.time() + self.batch_wait_timeout_s
 
             while len(prompts) < self.max_batch_size:
+                if not queue.empty():
+                    prompt, kwargs, result_future = queue.get_nowait()
+                    prompts.append(prompt)
+                    result_futures.append(result_future)
+                    if not can_batch:
+                        kwargs_list.append(kwargs)
+                    continue
+                if self._executor_busy == 0:
+                    break
                 timeout = deadline - self._loop.time()
                 if timeout <= 0:
                     break
@@ -116,6 +126,7 @@ class AsyncMicrobatchTokenizer:
                 except asyncio.TimeoutError:
                     break
 
+            self._executor_busy += 1
             try:
                 # If every request uses identical kwargs we can run a single
                 # batched tokenizer call for a big speed-up.
@@ -150,6 +161,8 @@ class AsyncMicrobatchTokenizer:
                 for fut in result_futures:
                     if not fut.done():
                         fut.set_exception(e)
+            finally:
+                self._executor_busy -= 1
 
     async def _batch_decode_loop(self, queue: asyncio.Queue):
         """Batch incoming decode requests for efficiency."""

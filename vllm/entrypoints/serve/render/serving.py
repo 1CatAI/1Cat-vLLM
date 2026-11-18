@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
+from contextlib import suppress
 from http import HTTPStatus
 from typing import Any, cast
 
@@ -237,34 +238,39 @@ class OpenAIServingRender:
             tool_dicts = None
         else:
             tool_dicts = [tool.model_dump() for tool in request.tools]
+            with suppress(Exception):
+                object.__setattr__(request, "_cached_tool_dicts", tool_dicts)
 
-        if not self.use_harmony:
-            # Common case.
-            error_check_ret = self.validate_chat_template(
-                request_chat_template=request.chat_template,
-                chat_template_kwargs=request.chat_template_kwargs,
-                trust_request_chat_template=self.trust_request_chat_template,
-            )
-            if error_check_ret is not None:
-                return error_check_ret
+        try:
+            if not self.use_harmony:
+                # Common case.
+                error_check_ret = self.validate_chat_template(
+                    request_chat_template=request.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    trust_request_chat_template=self.trust_request_chat_template,
+                )
+                if error_check_ret is not None:
+                    return error_check_ret
 
-            conversation, engine_inputs = await self.preprocess_chat(
-                request,
-                request.messages,
-                default_template=self.chat_template,
-                default_template_content_format=self.chat_template_content_format,
-                default_template_kwargs=self.default_chat_template_kwargs,
-                tool_dicts=tool_dicts,
-                tool_parser=tool_parser,
-                skip_mm_cache=skip_mm_cache,
-                reasoning_parser=self.reasoning_parser,
-            )
-        else:
-            # For GPT-OSS.
-            should_include_tools = tool_dicts is not None
-            conversation, engine_inputs = self._make_request_with_harmony(
-                request, should_include_tools
-            )
+                conversation, engine_inputs = await self.preprocess_chat(
+                    request,
+                    request.messages,
+                    default_template=self.chat_template,
+                    default_template_content_format=self.chat_template_content_format,
+                    default_template_kwargs=self.default_chat_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    tool_parser=tool_parser,
+                    skip_mm_cache=skip_mm_cache,
+                    reasoning_parser=self.reasoning_parser,
+                )
+            else:
+                # For GPT-OSS.
+                should_include_tools = tool_dicts is not None
+                conversation, engine_inputs = self._make_request_with_harmony(
+                    request, should_include_tools
+                )
+        except ValueError as e:
+            return self.create_error_response(str(e))
 
         return conversation, engine_inputs
 

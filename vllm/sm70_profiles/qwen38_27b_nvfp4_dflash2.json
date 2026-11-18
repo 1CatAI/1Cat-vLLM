@@ -36,7 +36,6 @@
     "enable_prompt_tokens_details": true,
     "served_model_name": "qwen3.8-27b-dflash2",
     "limit_mm_per_prompt": {
-      "image": 0,
       "video": 0
     },
     "enable_auto_tool_choice": true,

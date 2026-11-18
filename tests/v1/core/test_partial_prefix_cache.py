@@ -1121,9 +1121,7 @@ def test_spec_decode_crosses_2048_mamba_block_and_hits_full_and_partial_on_turn2
     )
     comp_blocks, hit = cm.get_computed_blocks(t2)
     assert hit == 2112
-    assert cm.partial_prefix_stops(t2, hit, len(t2_tokens)) == (
-        (len(t2_tokens) - 5) // 64 * 64,
-    )
+    assert cm.partial_prefix_stops(t2, hit, len(t2_tokens)) == ()
     assert cm.allocate_slots(t2, len(t2_tokens) - hit, hit, comp_blocks) is not None
     t2.status = RequestStatus.FINISHED_ABORTED
     cm.free(t2)
@@ -1325,3 +1323,178 @@ def test_agent_prefix_boundaries_and_decoded_span_splicing():
         tools=tools,
     )
     assert len(expected_decode_prefix) in b2
+
+
+def test_reasoning_cache_rolling_digests_multimodal_isolation_and_placeholder_shift():
+    from dataclasses import dataclass
+
+    from vllm.entrypoints.openai.chat_completion.serving import _AssistantReasoningCache
+
+    @dataclass
+    class _FakePlaceholder:
+        offset: int
+        length: int
+        is_embed: object = None
+
+    class _MockTok:
+        def get_vocab(self):
+            return {"<|im_start|>": 1, "<|im_end|>": 2, "<think>": 3}
+
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return [10] if text == "\n" else [ord(c) for c in text]
+
+    tok = _MockTok()
+    rcache = _AssistantReasoningCache()
+
+    img_a_user = {
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+            {"type": "text", "text": "What is in this image?"},
+        ],
+    }
+    img_b_user = {
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBB"}},
+            {"type": "text", "text": "What is in this image?"},
+        ],
+    }
+    assert rcache._context_digest([img_a_user]) != rcache._context_digest([img_b_user])
+
+    prompt_a = [1, 50, 99, 99, 99, 2, 10, 1, 60, 10, 3, 10]
+    gen_sfx = (1, 60, 10, 3, 10)
+    out_a = [10, 77, 78, 2]  # 4 tokens (1 extra leading newline token)
+    rcache.record(
+        [img_a_user],
+        "A cat",
+        [],
+        "saw ears",
+        prompt_token_ids=prompt_a,
+        output_token_ids=out_a,
+        gen_suffix=gen_sfx,
+        im_end_id=2,
+        nl_ids=(10,),
+    )
+    assert rcache.lookup([img_a_user], "A cat", []) == "saw ears"
+    # Distinct image with identical text must NOT collide!
+    assert rcache.lookup([img_b_user], "A cat", []) is None
+
+    # Verify O(L) prefix_digests matches _context_digest(messages[:i]) for every i.
+    conv = [
+        img_a_user,
+        {"role": "assistant", "content": "A cat"},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,CCC"},
+                },
+                {"type": "text", "text": "Compare with this second image"},
+            ],
+        },
+    ]
+    rolling = rcache.prefix_digests(conv)
+    assert rolling == [rcache._context_digest(conv[:i]) for i in range(len(conv))]
+
+    # Turn 2 has a historical image at offset 2 AND a new image after assistant_1.
+    # Re-rendered assistant_1 dropped token 10 (length 8 instead of 9 -> delta = +1).
+    rerendered_t2 = (
+        [1, 50, 99, 99, 99, 2, 10]  # prefix_len = 7
+        + [1, 60, 10, 3, 10, 77, 78, 2, 10]  # 9 tokens -> wait: cached span is 5+4+1=10
+        + [1, 50, 88, 88, 88, 88, 2, 10]  # Turn 2 user with 4-token image at 7+9+2=18
+        + [1, 60, 10, 3, 10]
+    )
+    mm_placeholders = {
+        "image": [
+            _FakePlaceholder(offset=2, length=3),
+            _FakePlaceholder(offset=18, length=4),
+        ]
+    }
+    spliced = rcache.splice_prompt_tokens(
+        conv, rerendered_t2, tok, mm_placeholders=mm_placeholders
+    )
+    assert len(spliced) == len(rerendered_t2) + 1
+    # Earlier placeholder unchanged; trailing placeholder shifted by +1!
+    assert mm_placeholders["image"][0].offset == 2
+    assert mm_placeholders["image"][1].offset == 19
+    assert spliced[19 : 19 + 4] == [88, 88, 88, 88]
+
+
+def test_prefix_tokenize_cache_exact_parity_and_incremental_encode():
+    from vllm.renderers.base import _PrefixTokenizeCache
+
+    class _CountingChatTokenizer:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_vocab(self):
+            return {"<|im_start|>": 1000, "<|im_end|>": 1001}
+
+        def encode(self, text: str, **kwargs) -> list[int]:
+            self.calls.append(text)
+            out: list[int] = []
+            idx = 0
+            while idx < len(text):
+                if text.startswith("<|im_start|>", idx):
+                    out.append(1000)
+                    idx += len("<|im_start|>")
+                elif text.startswith("<|im_end|>", idx):
+                    out.append(1001)
+                    idx += len("<|im_end|>")
+                else:
+                    out.append(ord(text[idx]))
+                    idx += 1
+            return out
+
+    tok = _CountingChatTokenizer()
+    cache = _PrefixTokenizeCache(tok)
+    assert cache.enabled
+    tok.calls.clear()
+
+    sys_part = "<|im_start|>system\n" + ("S" * 1800) + "<|im_end|>\n"
+    u1_part = "<|im_start|>user\n" + ("U" * 600) + "<|im_end|>\n"
+    gen_part = "<|im_start|>assistant\n<think>\n"
+    t1_text = sys_part + u1_part + gen_part
+
+    plan1 = cache.plan(t1_text, {"add_special_tokens": False})
+    assert plan1 is not None
+    starts1, ckpts1, hit1 = plan1
+    assert hit1 == -1
+    ids1 = tok.encode(t1_text, add_special_tokens=False)
+    cache.record_full(starts1, ckpts1, ids1)
+    assert len(tok.calls) == 1
+
+    # Turn 2 appends assistant_1 + tool_1 + gen_part; prefix cache must hit sys+u1!
+    a1_part = "<|im_start|>assistant\n<think>\nok\n</think>\nhi<|im_end|>\n"
+    u2_part = "<|im_start|>user\nfollow up<|im_end|>\n"
+    t2_text = sys_part + u1_part + a1_part + u2_part + gen_part
+
+    tok.calls.clear()
+    plan2 = cache.plan(t2_text, {"add_special_tokens": False})
+    assert plan2 is not None
+    starts2, ckpts2, hit2 = plan2
+    assert hit2 >= 0
+    _, hit_pos, hit_digest = ckpts2[hit2]
+    assert hit_pos == len(sys_part + u1_part)
+    tail_ids = tok.encode(t2_text[hit_pos:], add_special_tokens=False)
+    assert tok.calls == [a1_part + u2_part + gen_part]
+    ids2 = cache.lookup(hit_digest) + tail_ids
+    cache.record_full(starts2, ckpts2, ids2, hit2)
+
+    ref_tok = _CountingChatTokenizer()
+    assert ids2 == ref_tok.encode(t2_text, add_special_tokens=False)
+
+
+def test_sm70_vision_default_unlimited_images_and_vit_triton_order():
+    from vllm.config.multimodal import UNLIMITED_MM_ITEMS_PER_PROMPT, MultiModalConfig
+    from vllm.platforms.cuda import CudaPlatform
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    mm = MultiModalConfig()
+    assert mm.get_limit_per_prompt("image") == UNLIMITED_MM_ITEMS_PER_PROMPT
+    backends = CudaPlatform.get_supported_vit_attn_backends()
+    assert backends.index(AttentionBackendEnum.TRITON_ATTN) < backends.index(
+        AttentionBackendEnum.TORCH_SDPA
+    )
