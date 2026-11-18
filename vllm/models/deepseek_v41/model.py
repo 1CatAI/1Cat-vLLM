@@ -1733,13 +1733,14 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             state = getattr(compressor, "state_batch", None)
             if state is not None:
                 state.position[slot] = cached
-        if self.hash_batch is None:
+        hash_state = self.hash_state
+        if self.hash_batch is None or hash_state is None:
             return
-        device = self.hash_state.history.device
+        device = hash_state.history.device
         ids = torch.tensor(
             [-1] * (3 - len(tail)) + list(tail), dtype=torch.long, device=device
         )
-        mapped = self.hash_state.token_map[ids.clamp_min(0)].long()
+        mapped = hash_state.token_map[ids.clamp_min(0)].long()
         history = self.hash_batch.history[slot]
         history[:3].copy_(torch.where(ids >= 0, mapped, -1))
         history[3] = cached
