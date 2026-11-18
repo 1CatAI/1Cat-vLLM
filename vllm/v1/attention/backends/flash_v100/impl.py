@@ -33,12 +33,14 @@ from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
     FP8_E5M2,
     FP16,
+    INT8_PER_TOKEN_HEAD,
     KVCodec,
     resolve_kv_codec,
 )
 from vllm.v1.attention.ops.sm70_grouped import (
     load_grouped_e4m3_fp32,
     load_grouped_fp16_fp32,
+    load_grouped_int8_pth_fp32,
 )
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
@@ -187,20 +189,29 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.flash_attn_prefill_paged_splitkv,
         ) = _ops.get_flash_ops()
         self.flash_attn_grouped_verify_paged = _ops.get_flash_grouped_verify_op()
-        use_e4m3_fp32 = (
-            _config.options().value("e4m3_grouped_fp32")
-            and self.kv_codec is FP8_E4M3
-            and current_platform.is_device_capability(70)
+        is_sm70 = current_platform.is_device_capability(70)
+        grouped_opt = _config.options().value("e4m3_grouped_fp32")
+        use_e4m3_fp32 = grouped_opt and self.kv_codec is FP8_E4M3 and is_sm70
+        use_int8_pth_fp32 = (
+            grouped_opt and self.kv_codec is INT8_PER_TOKEN_HEAD and is_sm70
         )
         self.flash_attn_grouped_e4m3_fp32_paged = (
-            load_grouped_e4m3_fp32() if use_e4m3_fp32 else None
-        )
-        self.flash_attn_grouped_fp16_fp32_paged = (
-            load_grouped_fp16_fp32()
-            if self.kv_codec is FP16 and current_platform.is_device_capability(70)
+            load_grouped_e4m3_fp32()
+            if use_e4m3_fp32
+            else load_grouped_int8_pth_fp32()
+            if use_int8_pth_fp32
             else None
         )
-        self.spec_attention.initialize_scalar_tail(use_e4m3_fp32)
+        self.flash_attn_grouped_fp16_fp32_paged = (
+            load_grouped_fp16_fp32() if self.kv_codec is FP16 and is_sm70 else None
+        )
+        self.spec_attention.initialize_scalar_tail(
+            use_e4m3_fp32,
+            use_int8_pth=bool(
+                use_int8_pth_fp32
+                and self.flash_attn_grouped_e4m3_fp32_paged is not None
+            ),
+        )
         if use_e4m3_fp32 and self.flash_attn_grouped_e4m3_fp32_paged is None:
             logger.warning_once(
                 "E4M3 grouped FP32 requires Flash-V100 precision revision 4; "
@@ -215,6 +226,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.fp8_e5m2_paged_kv_to_fp16 = _ops.get_fp8_e5m2_paged_kv_bridge_op()
         self.fp8_e4m3_paged_kv_to_fp16 = (
             _ops.get_sm70_v37_e4m3_bridge_op() if self.kv_codec is FP8_E4M3 else None
+        )
+        self.int8_pth_paged_kv_to_fp16 = (
+            _ops.get_sm70_v37_int8_pth_bridge_op()
+            if self.kv_codec is INT8_PER_TOKEN_HEAD and is_sm70
+            else None
+        )
+        self.sm70_reshape_and_cache_int8_pth = (
+            _ops.get_sm70_reshape_and_cache_int8_pth_op()
+            if self.kv_codec is INT8_PER_TOKEN_HEAD and is_sm70
+            else None
         )
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
@@ -254,7 +275,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         options = engine.attention_config.flash_v100.options
         if (
             options.value("fp8_bridge_head_groups") is not None
-            or self.kv_codec not in (FP8_E4M3, FP8_E5M2)
+            or self.kv_codec not in (FP8_E4M3, FP8_E5M2, INT8_PER_TOKEN_HEAD)
             or self.head_size != 256
             or not self.use_fp8_prefill_bridge
             or not self.use_flash_v100_prefill_paged
@@ -295,6 +316,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.use_fp8_prefill_bridge = (
             self.fp8_e4m3_paged_kv_to_fp16 is not None
             if self.kv_codec is FP8_E4M3
+            else self.int8_pth_paged_kv_to_fp16 is not None
+            if self.kv_codec is INT8_PER_TOKEN_HEAD
             else self.fp8_e5m2_paged_kv_to_fp16 is not None
         ) and _config.options().value("fp8_prefill_bridge")
         self.fp8_bridge_workspace_plan = None
@@ -546,6 +569,43 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and self.sinks is None
             and supported_kv_dtype
         )
+
+    def _supports_int8_pth_path(self) -> bool:
+        return (
+            self.head_size == 256
+            and self.num_heads == 6 * self.num_kv_heads
+            and not self._flash_v100_has_sliding_window()
+            and self.prefix_anchored_decode_window is None
+            and self.flash_attn_grouped_e4m3_fp32_paged is not None
+            and self.int8_pth_paged_kv_to_fp16 is not None
+        )
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        if (
+            self.kv_codec is INT8_PER_TOKEN_HEAD
+            and self.sm70_reshape_and_cache_int8_pth is not None
+            and self.attn_type
+            not in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER)
+            and key.is_cuda
+            and key.dtype == torch.float16
+            and value.dtype == torch.float16
+            and key.shape == value.shape
+            and key.shape[-1] == self.head_size
+            and self.head_size % 8 == 0
+            and self.head_size <= 512
+        ):
+            self._ensure_scale_caches(kv_cache)
+            self.sm70_reshape_and_cache_int8_pth(
+                key,
+                value,
+                self._key_cache_view,
+                self._value_cache_view,
+                self._k_scale_cache,
+                self._v_scale_cache,
+                slot_mapping,
+            )
+            return
+        super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
 
     def _flash_v100_has_sliding_window(self) -> bool:
         sliding_window = self.sliding_window
@@ -850,15 +910,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward path.
-
-        - Prefill: use Flash-V100 by default. Triton prefill is an explicit
-          diagnostic fallback only.
-        - Decode: use scalar paged Flash-V100 by default, including CUDA graph
-          capture/replay, so selecting this backend is not a no-op in
-          production decode. Mixed Triton/Flash routes are never silent.
-        """
-
+        """Flash-V100 prefill and CUDA-graph-safe paged decode forward."""
         if attn_metadata is None:
             assert output is not None
             if (
@@ -885,11 +937,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         _feature.validate_contract(self._contract_validator(), layer, attn_metadata)
 
-        if not self._supports_flash_v100_path():
-            layer_info = self._layer_debug_info(layer)
-            feature_fallback = _feature.fallback_kind(layer_info)
-            message = self._unsupported_layer_message(layer_info, self.use_flash_v100)
-            _feature.unsupported(self._policy(), layer_info, message, feature_fallback)
+        int8_fallback = (
+            self.kv_codec is INT8_PER_TOKEN_HEAD and not self._supports_int8_pth_path()
+        )
+        if int8_fallback or not self._supports_flash_v100_path():
+            if not int8_fallback:
+                layer_info = self._layer_debug_info(layer)
+                feature_fallback = _feature.fallback_kind(layer_info)
+                message = self._unsupported_layer_message(
+                    layer_info, self.use_flash_v100
+                )
+                _feature.unsupported(
+                    self._policy(), layer_info, message, feature_fallback
+                )
             return super().forward(
                 layer,
                 query,

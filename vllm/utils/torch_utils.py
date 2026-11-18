@@ -103,6 +103,7 @@ TORCH_DTYPE_TO_NUMPY_DTYPE = {
     torch.float32: np.float32,
     torch.float64: np.float64,
     torch.uint8: np.uint8,
+    torch.int8: np.int8,
     torch.int32: np.int32,
     torch.int64: np.int64,
 }
@@ -124,6 +125,7 @@ PIN_MEMORY = "microsoft" not in " ".join(platform.uname()).lower()
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return (
         kv_cache_dtype.startswith("fp8")
+        or kv_cache_dtype == "int8"
         or kv_cache_dtype.endswith("per_token_head")
         or kv_cache_dtype == "nvfp4"
     )
@@ -131,7 +133,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
 
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
     """Return True if *kv_cache_dtype* needs per-token-head scales."""
-    return kv_cache_dtype.endswith("per_token_head")
+    return kv_cache_dtype == "int8" or kv_cache_dtype.endswith("per_token_head")
 
 
 def is_strictly_contiguous(t: torch.Tensor) -> bool:

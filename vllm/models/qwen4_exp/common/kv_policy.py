@@ -112,8 +112,13 @@ def resolve_qsa_host_kv(cfg) -> bool:
         cfg.parallel_config.prefill_context_parallel_size != 1
     ):
         reason = "host QSA storage requires DCP1 and PCP1"
-    elif cfg.cache_config.cache_dtype not in ("auto", "float16"):
-        reason = "host E4M3 uses separate per-vector scales; keep draft KV FP16"
+    elif cfg.cache_config.cache_dtype not in (
+        "auto",
+        "float16",
+        "int8",
+        "int8_per_token_head",
+    ):
+        reason = "host KV uses separate per-vector scales; keep draft KV FP16 or INT8"
     elif cfg.cache_config.kv_offloading_size is not None:
         reason = "active host storage cannot share a prefix-offloading connector"
     elif getattr(getattr(cfg, "kv_transfer_config", None), "kv_connector", None):

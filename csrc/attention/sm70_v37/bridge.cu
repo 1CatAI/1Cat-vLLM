@@ -324,12 +324,453 @@ void sm70_v37_e4m3_paged_kv_to_fp16(const at::Tensor& key_cache,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+namespace {
+
+__device__ __forceinline__ __half2 bridge_int8_pair_unscaled(uint32_t word,
+                                                             uint32_t sel) {
+  const uint32_t biased = __byte_perm(word, 0x64646464u, sel) ^ 0x00800080u;
+  const uint32_t offset = 0x64806480u;
+  return __hsub2(*reinterpret_cast<const __half2*>(&biased),
+                 *reinterpret_cast<const __half2*>(&offset));
+}
+
+__device__ __forceinline__ uint8_t quant_int8_rni_byte(float x) {
+  int q;
+  asm("cvt.rni.s32.f32 %0, %1;" : "=r"(q) : "f"(x));
+  q = max(-127, min(127, q));
+  return static_cast<uint8_t>(static_cast<int8_t>(q));
+}
+
+__device__ __forceinline__ uint64_t pack_int8_8(const float vals[8],
+                                                float inv_scale) {
+  uint32_t lo =
+      static_cast<uint32_t>(quant_int8_rni_byte(vals[0] * inv_scale)) |
+      (static_cast<uint32_t>(quant_int8_rni_byte(vals[1] * inv_scale)) << 8) |
+      (static_cast<uint32_t>(quant_int8_rni_byte(vals[2] * inv_scale)) << 16) |
+      (static_cast<uint32_t>(quant_int8_rni_byte(vals[3] * inv_scale)) << 24);
+  uint32_t hi =
+      static_cast<uint32_t>(quant_int8_rni_byte(vals[4] * inv_scale)) |
+      (static_cast<uint32_t>(quant_int8_rni_byte(vals[5] * inv_scale)) << 8) |
+      (static_cast<uint32_t>(quant_int8_rni_byte(vals[6] * inv_scale)) << 16) |
+      (static_cast<uint32_t>(quant_int8_rni_byte(vals[7] * inv_scale)) << 24);
+  return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+}
+
+template <typename SlotT>
+__global__ __launch_bounds__(128) void sm70_reshape_and_cache_int8_pth_kernel(
+    const __half* __restrict__ key, const __half* __restrict__ value,
+    int8_t* __restrict__ key_cache, int8_t* __restrict__ value_cache,
+    float* __restrict__ k_scales, float* __restrict__ v_scales,
+    const SlotT* __restrict__ slot_mapping, int64_t total_items, int num_heads,
+    int head_dim, int block_size, int num_blocks, int64_t key_tok_stride,
+    int64_t key_head_stride, int64_t val_tok_stride, int64_t val_head_stride,
+    int64_t kc_blk_stride, int64_t kc_tok_stride, int64_t kc_head_stride,
+    int64_t vc_blk_stride, int64_t vc_tok_stride, int64_t vc_head_stride,
+    int64_t ks_blk_stride, int64_t ks_tok_stride, int64_t ks_head_stride,
+    int64_t vs_blk_stride, int64_t vs_tok_stride, int64_t vs_head_stride) {
+  const int warp_in_cta = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int64_t item_idx = static_cast<int64_t>(blockIdx.x) * 4 + warp_in_cta;
+  if (item_idx >= total_items) {
+    return;
+  }
+  const int64_t tok_idx = item_idx / num_heads;
+  const int head_idx = static_cast<int>(item_idx % num_heads);
+  const int64_t slot = static_cast<int64_t>(slot_mapping[tok_idx]);
+  if (slot < 0) {
+    return;
+  }
+  const int64_t block_idx = slot / block_size;
+  if (block_idx >= num_blocks) {
+    return;
+  }
+  const int64_t block_offset = slot - block_idx * block_size;
+
+  const __half* k_src =
+      key + tok_idx * key_tok_stride + head_idx * key_head_stride;
+  const __half* v_src =
+      value + tok_idx * val_tok_stride + head_idx * val_head_stride;
+  int8_t* k_dst = key_cache + block_idx * kc_blk_stride +
+                  block_offset * kc_tok_stride + head_idx * kc_head_stride;
+  int8_t* v_dst = value_cache + block_idx * vc_blk_stride +
+                  block_offset * vc_tok_stride + head_idx * vc_head_stride;
+
+  const int num_vecs = head_dim >> 3;  // head_dim / 8, <= 64 (max 2 iters)
+  float k_vals[2][8];
+  float v_vals[2][8];
+  float k_amax = 0.0f;
+  float v_amax = 0.0f;
+
+#pragma unroll
+  for (int iter = 0; iter < 2; ++iter) {
+    const int vec_idx = lane + iter * 32;
+    if (vec_idx < num_vecs) {
+      const int col = vec_idx << 3;
+      if ((reinterpret_cast<uintptr_t>(k_src + col) & 15u) == 0u) {
+        union {
+          uint4 u;
+          __half2 h[4];
+        } kv_u;
+        kv_u.u = *reinterpret_cast<const uint4*>(k_src + col);
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+          const float2 f2 = __half22float2(kv_u.h[p]);
+          k_vals[iter][2 * p + 0] = f2.x;
+          k_vals[iter][2 * p + 1] = f2.y;
+          k_amax = fmaxf(k_amax, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+        }
+      } else {
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+          const float fk = __half2float(k_src[col + c]);
+          k_vals[iter][c] = fk;
+          k_amax = fmaxf(k_amax, fabsf(fk));
+        }
+      }
+      if ((reinterpret_cast<uintptr_t>(v_src + col) & 15u) == 0u) {
+        union {
+          uint4 u;
+          __half2 h[4];
+        } vv_u;
+        vv_u.u = *reinterpret_cast<const uint4*>(v_src + col);
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+          const float2 f2 = __half22float2(vv_u.h[p]);
+          v_vals[iter][2 * p + 0] = f2.x;
+          v_vals[iter][2 * p + 1] = f2.y;
+          v_amax = fmaxf(v_amax, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+        }
+      } else {
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+          const float fv = __half2float(v_src[col + c]);
+          v_vals[iter][c] = fv;
+          v_amax = fmaxf(v_amax, fabsf(fv));
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int mask = 16; mask >= 1; mask >>= 1) {
+    k_amax = fmaxf(k_amax, __shfl_xor_sync(0xffffffffu, k_amax, mask));
+    v_amax = fmaxf(v_amax, __shfl_xor_sync(0xffffffffu, v_amax, mask));
+  }
+
+  const float k_sc = k_amax > 0.0f ? k_amax * (1.0f / 127.0f) : 1.0f;
+  const float v_sc = v_amax > 0.0f ? v_amax * (1.0f / 127.0f) : 1.0f;
+  const float k_inv = k_amax > 0.0f ? 127.0f / k_amax : 0.0f;
+  const float v_inv = v_amax > 0.0f ? 127.0f / v_amax : 0.0f;
+
+#pragma unroll
+  for (int iter = 0; iter < 2; ++iter) {
+    const int vec_idx = lane + iter * 32;
+    if (vec_idx < num_vecs) {
+      reinterpret_cast<uint64_t*>(k_dst)[vec_idx] =
+          pack_int8_8(k_vals[iter], k_inv);
+      reinterpret_cast<uint64_t*>(v_dst)[vec_idx] =
+          pack_int8_8(v_vals[iter], v_inv);
+    }
+  }
+  if (lane == 0) {
+    k_scales[block_idx * ks_blk_stride + block_offset * ks_tok_stride +
+             head_idx * ks_head_stride] = k_sc;
+    v_scales[block_idx * vs_blk_stride + block_offset * vs_tok_stride +
+             head_idx * vs_head_stride] = v_sc;
+  }
+}
+
+__global__ void int8_pth_paged_kv_to_fp16_kernel(
+    const int8_t* __restrict__ key_cache,
+    const int8_t* __restrict__ value_cache, const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales, const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens, __half* __restrict__ key_out,
+    __half* __restrict__ value_out, int batch_size, int max_num_blocks,
+    int input_block_size, int output_blocks_per_seq, int output_block_size,
+    int num_heads, int head_dim, int64_t key_block_stride,
+    int64_t key_token_stride, int64_t key_head_stride,
+    int64_t value_block_stride, int64_t value_token_stride,
+    int64_t value_head_stride, int64_t ks_block_stride, int64_t ks_token_stride,
+    int64_t ks_head_stride, int64_t vs_block_stride, int64_t vs_token_stride,
+    int64_t vs_head_stride, int64_t key_out_block_stride,
+    int64_t key_out_token_stride, int64_t key_out_head_stride,
+    int64_t value_out_block_stride, int64_t value_out_token_stride,
+    int64_t value_out_head_stride) {
+  const int batch_idx = blockIdx.y;
+  if (batch_idx >= batch_size) {
+    return;
+  }
+
+  const int vecs_per_head = head_dim >> 3;  // 8 elements per thread
+  const int64_t vecs_per_token =
+      static_cast<int64_t>(num_heads) * vecs_per_head;
+  const int max_tokens = output_blocks_per_seq * output_block_size;
+  const int64_t total_vecs = static_cast<int64_t>(max_tokens) * vecs_per_token;
+  const int64_t vec_idx =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (vec_idx >= total_vecs) {
+    return;
+  }
+
+  const int token_idx = static_cast<int>(vec_idx / vecs_per_token);
+  const int seq_len = seq_lens[batch_idx];
+  const int padded_seq_len = min(max_tokens, (seq_len + 15) & ~15);
+  if (token_idx >= padded_seq_len) {
+    return;
+  }
+  const int vec_in_token = static_cast<int>(vec_idx % vecs_per_token);
+  const int head_idx = vec_in_token / vecs_per_head;
+  const int element_idx = (vec_in_token % vecs_per_head) << 3;
+
+  union {
+    uint4 u;
+    __half2 h[4];
+  } kr, vr;
+  kr.u = make_uint4(0, 0, 0, 0);
+  vr.u = make_uint4(0, 0, 0, 0);
+
+  if (token_idx < seq_len) {
+    const int logical_block = token_idx / input_block_size;
+    const int input_block_offset = token_idx - logical_block * input_block_size;
+    const int physical_block =
+        __ldg(&block_table[batch_idx * max_num_blocks + logical_block]);
+    const int64_t key_input_offset =
+        static_cast<int64_t>(physical_block) * key_block_stride +
+        static_cast<int64_t>(input_block_offset) * key_token_stride +
+        static_cast<int64_t>(head_idx) * key_head_stride + element_idx;
+    const int64_t value_input_offset =
+        static_cast<int64_t>(physical_block) * value_block_stride +
+        static_cast<int64_t>(input_block_offset) * value_token_stride +
+        static_cast<int64_t>(head_idx) * value_head_stride + element_idx;
+    const float k_sc = __ldg(
+        &k_scales[static_cast<int64_t>(physical_block) * ks_block_stride +
+                  static_cast<int64_t>(input_block_offset) * ks_token_stride +
+                  static_cast<int64_t>(head_idx) * ks_head_stride]);
+    const float v_sc = __ldg(
+        &v_scales[static_cast<int64_t>(physical_block) * vs_block_stride +
+                  static_cast<int64_t>(input_block_offset) * vs_token_stride +
+                  static_cast<int64_t>(head_idx) * vs_head_stride]);
+    const uint64_t kraw =
+        *reinterpret_cast<const uint64_t*>(key_cache + key_input_offset);
+    const uint64_t vraw =
+        *reinterpret_cast<const uint64_t*>(value_cache + value_input_offset);
+    const __half2 k_sc2 = __float2half2_rn(k_sc);
+    const __half2 v_sc2 = __float2half2_rn(v_sc);
+    const uint32_t klo = static_cast<uint32_t>(kraw);
+    const uint32_t khi = static_cast<uint32_t>(kraw >> 32);
+    const uint32_t vlo = static_cast<uint32_t>(vraw);
+    const uint32_t vhi = static_cast<uint32_t>(vraw >> 32);
+    kr.h[0] = __hmul2(bridge_int8_pair_unscaled(klo, 0x5140u), k_sc2);
+    kr.h[1] = __hmul2(bridge_int8_pair_unscaled(klo, 0x5342u), k_sc2);
+    kr.h[2] = __hmul2(bridge_int8_pair_unscaled(khi, 0x5140u), k_sc2);
+    kr.h[3] = __hmul2(bridge_int8_pair_unscaled(khi, 0x5342u), k_sc2);
+    vr.h[0] = __hmul2(bridge_int8_pair_unscaled(vlo, 0x5140u), v_sc2);
+    vr.h[1] = __hmul2(bridge_int8_pair_unscaled(vlo, 0x5342u), v_sc2);
+    vr.h[2] = __hmul2(bridge_int8_pair_unscaled(vhi, 0x5140u), v_sc2);
+    vr.h[3] = __hmul2(bridge_int8_pair_unscaled(vhi, 0x5342u), v_sc2);
+  }
+
+  const int output_block_offset = token_idx / output_block_size;
+  const int output_token_offset =
+      token_idx - output_block_offset * output_block_size;
+  const int output_block =
+      batch_idx * output_blocks_per_seq + output_block_offset;
+  const int64_t key_output_offset =
+      static_cast<int64_t>(output_block) * key_out_block_stride +
+      static_cast<int64_t>(output_token_offset) * key_out_token_stride +
+      static_cast<int64_t>(head_idx) * key_out_head_stride + element_idx;
+  const int64_t value_output_offset =
+      static_cast<int64_t>(output_block) * value_out_block_stride +
+      static_cast<int64_t>(output_token_offset) * value_out_token_stride +
+      static_cast<int64_t>(head_idx) * value_out_head_stride + element_idx;
+  *reinterpret_cast<uint4*>(key_out + key_output_offset) = kr.u;
+  *reinterpret_cast<uint4*>(value_out + value_output_offset) = vr.u;
+}
+
+}  // namespace
+
+void sm70_reshape_and_cache_int8_pth(const at::Tensor& key,
+                                     const at::Tensor& value,
+                                     at::Tensor& key_cache,
+                                     at::Tensor& value_cache,
+                                     at::Tensor& k_scales, at::Tensor& v_scales,
+                                     const at::Tensor& slot_mapping) {
+  TORCH_CHECK(key.is_cuda() && value.is_cuda() && key_cache.is_cuda() &&
+                  value_cache.is_cuda() && k_scales.is_cuda() &&
+                  v_scales.is_cuda() && slot_mapping.is_cuda(),
+              "INT8 PTH cache writer requires CUDA tensors");
+  TORCH_CHECK(
+      key.scalar_type() == at::kHalf && value.scalar_type() == at::kHalf,
+      "INT8 PTH cache writer requires FP16 key/value");
+  TORCH_CHECK(key_cache.scalar_type() == at::kChar &&
+                  value_cache.scalar_type() == at::kChar,
+              "INT8 PTH caches must be int8");
+  TORCH_CHECK(k_scales.scalar_type() == at::kFloat &&
+                  v_scales.scalar_type() == at::kFloat,
+              "INT8 PTH scale caches must be float32");
+  TORCH_CHECK(key.dim() == 3 && value.sizes() == key.sizes(),
+              "INT8 PTH key/value shape mismatch");
+  TORCH_CHECK(key_cache.dim() == 4 && value_cache.sizes() == key_cache.sizes(),
+              "INT8 PTH key_cache/value_cache shape mismatch");
+  TORCH_CHECK(k_scales.dim() == 3 && v_scales.sizes() == k_scales.sizes(),
+              "INT8 PTH scale cache shape mismatch");
+  const int64_t num_tokens = key.size(0);
+  if (num_tokens == 0) {
+    return;
+  }
+  const int num_heads = static_cast<int>(key.size(1));
+  const int head_dim = static_cast<int>(key.size(2));
+  TORCH_CHECK(head_dim > 0 && head_dim % 8 == 0 && head_dim <= 512,
+              "INT8 PTH writer requires head_dim divisible by 8 and <= 512");
+  TORCH_CHECK(key.stride(2) == 1 && value.stride(2) == 1 &&
+                  key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
+              "INT8 PTH writer requires contiguous head dimension");
+  TORCH_CHECK(slot_mapping.dim() == 1 && slot_mapping.size(0) >= num_tokens &&
+                  slot_mapping.is_contiguous(),
+              "INT8 PTH writer requires contiguous 1D slot_mapping");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(key_cache.data_ptr()) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(value_cache.data_ptr()) % 8 == 0,
+              "INT8 PTH cache pointers must be 8-byte aligned");
+  for (int axis = 0; axis < 3; ++axis) {
+    TORCH_CHECK(
+        key_cache.stride(axis) % 8 == 0 && value_cache.stride(axis) % 8 == 0,
+        "INT8 PTH cache strides must be multiples of 8");
+  }
+
+  c10::cuda::CUDAGuard device_guard(key.device());
+  const int64_t total_items = num_tokens * num_heads;
+  const dim3 grid(static_cast<unsigned>((total_items + 3) / 4));
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  if (slot_mapping.scalar_type() == at::kLong) {
+    sm70_reshape_and_cache_int8_pth_kernel<int64_t><<<grid, 128, 0, stream>>>(
+        reinterpret_cast<const __half*>(key.data_ptr()),
+        reinterpret_cast<const __half*>(value.data_ptr()),
+        key_cache.data_ptr<int8_t>(), value_cache.data_ptr<int8_t>(),
+        k_scales.data_ptr<float>(), v_scales.data_ptr<float>(),
+        slot_mapping.data_ptr<int64_t>(), total_items, num_heads, head_dim,
+        static_cast<int>(key_cache.size(1)),
+        static_cast<int>(key_cache.size(0)), key.stride(0), key.stride(1),
+        value.stride(0), value.stride(1), key_cache.stride(0),
+        key_cache.stride(1), key_cache.stride(2), value_cache.stride(0),
+        value_cache.stride(1), value_cache.stride(2), k_scales.stride(0),
+        k_scales.stride(1), k_scales.stride(2), v_scales.stride(0),
+        v_scales.stride(1), v_scales.stride(2));
+  } else {
+    TORCH_CHECK(slot_mapping.scalar_type() == at::kInt,
+                "slot_mapping must be int64 or int32");
+    sm70_reshape_and_cache_int8_pth_kernel<int32_t><<<grid, 128, 0, stream>>>(
+        reinterpret_cast<const __half*>(key.data_ptr()),
+        reinterpret_cast<const __half*>(value.data_ptr()),
+        key_cache.data_ptr<int8_t>(), value_cache.data_ptr<int8_t>(),
+        k_scales.data_ptr<float>(), v_scales.data_ptr<float>(),
+        slot_mapping.data_ptr<int32_t>(), total_items, num_heads, head_dim,
+        static_cast<int>(key_cache.size(1)),
+        static_cast<int>(key_cache.size(0)), key.stride(0), key.stride(1),
+        value.stride(0), value.stride(1), key_cache.stride(0),
+        key_cache.stride(1), key_cache.stride(2), value_cache.stride(0),
+        value_cache.stride(1), value_cache.stride(2), k_scales.stride(0),
+        k_scales.stride(1), k_scales.stride(2), v_scales.stride(0),
+        v_scales.stride(1), v_scales.stride(2));
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sm70_v37_int8_pth_paged_kv_to_fp16(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& k_scales, const at::Tensor& v_scales,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out) {
+  TORCH_CHECK(key_cache.is_cuda() && value_cache.is_cuda() &&
+                  k_scales.is_cuda() && v_scales.is_cuda() &&
+                  key_out.is_cuda() && value_out.is_cuda() &&
+                  block_table.is_cuda() && seq_lens.is_cuda(),
+              "INT8 PTH KV bridge requires CUDA tensors");
+  TORCH_CHECK(key_cache.scalar_type() == at::kChar &&
+                  value_cache.scalar_type() == at::kChar,
+              "INT8 PTH input caches must be int8");
+  TORCH_CHECK(k_scales.scalar_type() == at::kFloat &&
+                  v_scales.scalar_type() == at::kFloat,
+              "INT8 PTH scale caches must be float32");
+  TORCH_CHECK(key_out.scalar_type() == at::kHalf &&
+                  value_out.scalar_type() == at::kHalf,
+              "INT8 PTH bridge output caches must be fp16");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt &&
+                  seq_lens.scalar_type() == at::kInt &&
+                  block_table.is_contiguous() && seq_lens.is_contiguous(),
+              "INT8 PTH bridge metadata must be contiguous int32");
+  TORCH_CHECK(key_cache.dim() == 4 &&
+                  value_cache.sizes() == key_cache.sizes() &&
+                  key_out.dim() == 4 && value_out.sizes() == key_out.sizes() &&
+                  k_scales.dim() == 3 && v_scales.sizes() == k_scales.sizes(),
+              "INT8 PTH bridge shape mismatch");
+  TORCH_CHECK(key_cache.size(2) == key_out.size(2) &&
+                  key_cache.size(3) == key_out.size(3) &&
+                  key_cache.size(3) % 8 == 0,
+              "INT8 PTH bridge requires matching head shape with D % 8 == 0");
+  const int batch_size = static_cast<int>(block_table.size(0));
+  TORCH_CHECK(batch_size > 0 && key_out.size(0) % batch_size == 0,
+              "INT8 PTH bridge invalid batch geometry");
+  const int output_blocks_per_seq =
+      static_cast<int>(key_out.size(0)) / batch_size;
+  const int input_capacity =
+      static_cast<int>(block_table.size(1) * key_cache.size(1));
+  const int output_capacity =
+      output_blocks_per_seq * static_cast<int>(key_out.size(1));
+  TORCH_CHECK(output_capacity >= input_capacity,
+              "FP16 output cache capacity must cover the input block table");
+  for (const at::Tensor* tensor : std::initializer_list<const at::Tensor*>{
+           &key_cache, &value_cache, &key_out, &value_out}) {
+    TORCH_CHECK(tensor->stride(3) == 1 &&
+                    reinterpret_cast<uintptr_t>(tensor->data_ptr()) % 16 == 0,
+                "INT8 PTH bridge requires 16-byte aligned pointers");
+    for (int axis = 0; axis < 3; ++axis) {
+      TORCH_CHECK(tensor->stride(axis) % 8 == 0,
+                  "INT8 PTH bridge requires 8-element aligned strides");
+    }
+  }
+
+  c10::cuda::CUDAGuard device_guard(key_cache.device());
+  const int64_t total_vecs = static_cast<int64_t>(output_capacity) *
+                             key_cache.size(2) * (key_cache.size(3) / 8);
+  const dim3 grid(
+      static_cast<unsigned int>((total_vecs + kThreads - 1) / kThreads),
+      batch_size);
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  int8_pth_paged_kv_to_fp16_kernel<<<grid, kThreads, 0, stream>>>(
+      key_cache.data_ptr<int8_t>(), value_cache.data_ptr<int8_t>(),
+      k_scales.data_ptr<float>(), v_scales.data_ptr<float>(),
+      block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
+      reinterpret_cast<__half*>(key_out.data_ptr()),
+      reinterpret_cast<__half*>(value_out.data_ptr()), batch_size,
+      static_cast<int>(block_table.size(1)),
+      static_cast<int>(key_cache.size(1)), output_blocks_per_seq,
+      static_cast<int>(key_out.size(1)), static_cast<int>(key_cache.size(2)),
+      static_cast<int>(key_cache.size(3)), key_cache.stride(0),
+      key_cache.stride(1), key_cache.stride(2), value_cache.stride(0),
+      value_cache.stride(1), value_cache.stride(2), k_scales.stride(0),
+      k_scales.stride(1), k_scales.stride(2), v_scales.stride(0),
+      v_scales.stride(1), v_scales.stride(2), key_out.stride(0),
+      key_out.stride(1), key_out.stride(2), value_out.stride(0),
+      value_out.stride(1), value_out.stride(2));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, m) {
   m.def(
       "sm70_v37_e4m3_bridge(Tensor key, Tensor value, Tensor table, Tensor "
       "lengths, Tensor(a!) key_out, Tensor(b!) value_out, float key_scale, "
       "float value_scale) -> ()");
+  m.def(
+      "sm70_v37_int8_pth_bridge(Tensor key, Tensor value, Tensor k_scales, "
+      "Tensor v_scales, Tensor table, Tensor lengths, Tensor(a!) key_out, "
+      "Tensor(b!) value_out) -> ()");
+  m.def(
+      "sm70_reshape_and_cache_int8_pth(Tensor key, Tensor value, "
+      "Tensor(a!) key_cache, Tensor(b!) value_cache, Tensor(c!) k_scales, "
+      "Tensor(d!) v_scales, Tensor slot_mapping) -> ()");
 }
 TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, m) {
   m.impl("sm70_v37_e4m3_bridge", &sm70_v37_e4m3_paged_kv_to_fp16);
+  m.impl("sm70_v37_int8_pth_bridge", &sm70_v37_int8_pth_paged_kv_to_fp16);
+  m.impl("sm70_reshape_and_cache_int8_pth", &sm70_reshape_and_cache_int8_pth);
 }

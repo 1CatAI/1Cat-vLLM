@@ -17,12 +17,30 @@ from vllm.v1.attention.backends.flash_v100 import config as _config
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-def initialize_scalar_tail(self: Any, use_e4m3_fp32: bool) -> None:
+def initialize_scalar_tail(
+    self: Any, use_e4m3_fp32: bool, use_int8_pth: bool = False
+) -> None:
     self._sm70_scalar_tail_attention = None
     from vllm.v1.attention.ops.sm70_grouped_scalar import (
         load_scalar_tail_attention,
         scalar_tail_attention_available,
     )
+
+    if (
+        use_int8_pth
+        and _config.options().value("tail_cudagraphs")
+        and not graph_policy().decode_partition_size
+    ):
+        from vllm.v1.attention.ops.sm70_int8_grouped import (
+            int8_scalar_tail_available,
+            load_int8_scalar_tail_attention,
+        )
+
+        if int8_scalar_tail_available():
+            self._sm70_scalar_tail_attention = load_int8_scalar_tail_attention(
+                torch.device("cuda", torch.accelerator.current_device_index()),
+            )
+        return
 
     if (
         use_e4m3_fp32

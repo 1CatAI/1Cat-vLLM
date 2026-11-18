@@ -46,6 +46,8 @@ def test_flash_launcher_uses_adjacent_cli_and_preserves_overrides(tmp_path):
     }
     kc = json.loads(args[args.index("--kernel-config") + 1])
     assert kc["qsa_host_kv"] is True
+    assert kc["qsa_host_kv_dtype"] == "int8_per_token_head"
+    assert kc["qsa_host_kv_hot_dtype"] == "int8_per_token_head"
     assert kc["hc_weight_storage"] == "sharded"
     assert kc["qsa_host_kv_hot_tokens"] == 131072
     assert kc["qsa_host_kv_trim_warmup_cache"] is True

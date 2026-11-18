@@ -27,6 +27,8 @@ from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
     FP8_E5M2,
     FP16,
+    INT8_PER_TOKEN_HEAD,
+    per_token_head_scales_for_kv_views,
 )
 from vllm.v1.attention.ops.sm70_grouped import (
     MAX_GROUPS_PER_CALL,
@@ -86,7 +88,7 @@ def _should_use_fp8_prefill_bridge(
 ) -> bool:
     # Eight-byte input loads and 16-byte output stores. Keep layouts
     # outside the native bridge contract on their existing fallback.
-    if self.kv_codec is FP8_E4M3 and not all(
+    if self.kv_codec in (FP8_E4M3, INT8_PER_TOKEN_HEAD) and not all(
         tensor.ndim == 4
         and tensor.stride(-1) == 1
         and tensor.data_ptr() % 16 == 0
@@ -98,12 +100,13 @@ def _should_use_fp8_prefill_bridge(
         self.use_fp8_prefill_bridge
         and getattr(self, "fp8_bridge_head_groups", 1) != 0
         and self.use_flash_v100_prefill_paged
-        and self.kv_codec in (FP8_E4M3, FP8_E5M2)
+        and self.kv_codec in (FP8_E4M3, FP8_E5M2, INT8_PER_TOKEN_HEAD)
         and self.kv_codec.stores(key_cache, value_cache)
         and key_cache.shape == value_cache.shape
         and head_dim == 256
         and (
             q_len >= 32
+            or (self.kv_codec is INT8_PER_TOKEN_HEAD and q_len >= 1)
             # Shorter chunks are padded to one query tile, which split-KV
             # spreads over a long prefix.
             or (
@@ -190,23 +193,39 @@ def _run_fp8_prefill_bridge(
     if workspace is None:
         return None
     key_out, value_out, output_block_table = workspace
-    bridge = (
-        self.fp8_e4m3_paged_kv_to_fp16
-        if self.kv_codec is FP8_E4M3
-        else self.fp8_e5m2_paged_kv_to_fp16
-    )
-    if bridge is None:
-        return None
-    bridge(
-        key_cache,
-        value_cache,
-        active_block_table,
-        seq_lens,
-        key_out,
-        value_out,
-        k_scale,
-        v_scale,
-    )
+    if self.kv_codec is INT8_PER_TOKEN_HEAD:
+        bridge = self.int8_pth_paged_kv_to_fp16
+        if bridge is None:
+            return None
+        ks, vs = per_token_head_scales_for_kv_views(key_cache, value_cache)
+        bridge(
+            key_cache,
+            value_cache,
+            ks,
+            vs,
+            active_block_table,
+            seq_lens,
+            key_out,
+            value_out,
+        )
+    else:
+        bridge = (
+            self.fp8_e4m3_paged_kv_to_fp16
+            if self.kv_codec is FP8_E4M3
+            else self.fp8_e5m2_paged_kv_to_fp16
+        )
+        if bridge is None:
+            return None
+        bridge(
+            key_cache,
+            value_cache,
+            active_block_table,
+            seq_lens,
+            key_out,
+            value_out,
+            k_scale,
+            v_scale,
+        )
     q_len = int(query.shape[1])
     exact_query, exact_out, tail_prefix, kv_pad = pad_fp8_bridge_query(
         query, out, key_out, value_out, seq_len=seq_len, plan=plan
@@ -739,7 +758,7 @@ def _run_prefill_prefix_decode_rows(
         is not None
     )
     if (
-        self.kv_codec is FP8_E4M3
+        self.kv_codec in (FP8_E4M3, INT8_PER_TOKEN_HEAD)
         and not use_xqa
         and self._run_mixed_rows_grouped_e4m3(
             layer,
@@ -1587,6 +1606,7 @@ class PrefillDriverOps:
     splitkv: Any = None
     bridge_e4: Any = None
     bridge_e5: Any = None
+    bridge_i8: Any = None
     xqa: Any = None
     grouped_e4m3: Any = None
     window: Any = None
@@ -1617,6 +1637,7 @@ OPERATOR_FIELDS = {
     "flash_attn_prefill_paged_splitkv": "splitkv",
     "fp8_e4m3_paged_kv_to_fp16": "bridge_e4",
     "fp8_e5m2_paged_kv_to_fp16": "bridge_e5",
+    "int8_pth_paged_kv_to_fp16": "bridge_i8",
     "flash_attn_decode_paged_xqa": "xqa",
     "flash_attn_grouped_e4m3_fp32_paged": "grouped_e4m3",
     "_flash_v100_window_size": "window",

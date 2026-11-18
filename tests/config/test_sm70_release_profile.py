@@ -59,7 +59,7 @@ def test_profile_schema():
             },
         },
     )
-    assert profile["args"]["kv_cache_dtype"] == "fp8_e4m3"
+    assert profile["args"]["kv_cache_dtype"] == "int8_per_token_head"
     assert profile["args"]["max_num_batched_tokens"] == 4096
     assert profile["args"]["block_size"] == 2048
     assert profile["args"]["mamba_block_size"] == 2048

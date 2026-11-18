@@ -92,7 +92,7 @@ def _configure_sm70_dflash2_graph_cache(
         or model_config.quantization != "compressed-tensors"
         or not model_config.is_nvfp4_quantized()
         or parallel_config.tensor_parallel_size != 4
-        or cache_config.cache_dtype != "fp8_e4m3"
+        or cache_config.cache_dtype not in ("fp8_e4m3", "int8", "int8_per_token_head")
     ):
         return False
     # The E4M3 release contract passes cold/warm quality with this cache path.

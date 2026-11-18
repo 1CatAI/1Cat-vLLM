@@ -25,6 +25,16 @@ def _e4m3_satfinite(value):
     return (code | sign).to(tl.uint8)
 
 
+@triton.jit
+def _int8_sat_rne(scaled):
+    rounded = tl.where(
+        scaled >= 0.0,
+        tl.floor(scaled + 0.5),
+        -tl.floor(-scaled + 0.5),
+    )
+    return tl.maximum(-127.0, tl.minimum(127.0, rounded)).to(tl.int8)
+
+
 # Prefill chunks can have any length. Keep length-dependent values out of the
 # specialization, or every new length compiles a kernel while a request waits.
 @triton.jit(do_not_specialize=["POS_ROW", "POS_COL", "NUM_SLOTS"])
@@ -44,10 +54,14 @@ def _qk_norm_rope(
     KScale,
     VScale,
     STORE_CACHE: tl.constexpr,
+    STORE_INT8_PTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     CACHE_BLOCK: tl.constexpr,
     CACHE_TOKEN: tl.constexpr,
     CACHE_HEAD: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
+    SCALE_TOKEN: tl.constexpr,
+    SCALE_HEAD: tl.constexpr,
     POS_ROW: tl.int64,
     POS_COL: tl.int64,
     CACHE_ROWS: tl.constexpr,
@@ -107,24 +121,46 @@ def _qk_norm_rope(
     if STORE_CACHE:
         slot = tl.load(Slots + token, mask=token < NUM_SLOTS, other=-1)
         if slot >= 0:
-            offset = (
-                (slot // BLOCK_SIZE) * CACHE_BLOCK
-                + (slot % BLOCK_SIZE) * CACHE_TOKEN
-                + col
-            )
-            if head >= Q_HEADS:
-                head_offset = (head - Q_HEADS) * CACHE_HEAD
-                scaled = tl.div_rn(processed.to(tl.float32), tl.load(KScale))
-                tl.store(KCache + offset + head_offset, _e4m3_satfinite(scaled))
-            elif head < KV_HEADS:
-                head_offset = head * CACHE_HEAD
-                value = tl.load(
-                    QKV + token * ROW + Q_HEADS * 512 + (KV_HEADS + head) * 256 + col
-                ).to(tl.float32)
-                tl.store(
-                    VCache + offset + head_offset,
-                    _e4m3_satfinite(tl.div_rn(value, tl.load(VScale))),
-                )
+            blk = slot // BLOCK_SIZE
+            tok_off = slot % BLOCK_SIZE
+            offset = blk * CACHE_BLOCK + tok_off * CACHE_TOKEN + col
+            if STORE_INT8_PTH:
+                sc_base = blk * SCALE_BLOCK + tok_off * SCALE_TOKEN
+                if head >= Q_HEADS:
+                    kh = head - Q_HEADS
+                    pf = processed.to(tl.float32)
+                    amax = tl.max(tl.abs(pf), 0)
+                    k_sc = tl.where(amax > 0.0, amax * (1.0 / 127.0), 1.0)
+                    inv_sc = tl.where(amax > 0.0, 127.0 / amax, 0.0)
+                    tl.store(
+                        KCache + offset + kh * CACHE_HEAD,
+                        _int8_sat_rne(pf * inv_sc),
+                    )
+                    tl.store(KScale + sc_base + kh * SCALE_HEAD, k_sc)
+                elif head < KV_HEADS:
+                    v_off = Q_HEADS * 512 + (KV_HEADS + head) * 256
+                    value = tl.load(QKV + token * ROW + v_off + col).to(tl.float32)
+                    amax = tl.max(tl.abs(value), 0)
+                    v_sc = tl.where(amax > 0.0, amax * (1.0 / 127.0), 1.0)
+                    inv_sc = tl.where(amax > 0.0, 127.0 / amax, 0.0)
+                    tl.store(
+                        VCache + offset + head * CACHE_HEAD,
+                        _int8_sat_rne(value * inv_sc),
+                    )
+                    tl.store(VScale + sc_base + head * SCALE_HEAD, v_sc)
+            else:
+                if head >= Q_HEADS:
+                    head_offset = (head - Q_HEADS) * CACHE_HEAD
+                    scaled = tl.div_rn(processed.to(tl.float32), tl.load(KScale))
+                    tl.store(KCache + offset + head_offset, _e4m3_satfinite(scaled))
+                elif head < KV_HEADS:
+                    head_offset = head * CACHE_HEAD
+                    v_off = Q_HEADS * 512 + (KV_HEADS + head) * 256
+                    value = tl.load(QKV + token * ROW + v_off + col).to(tl.float32)
+                    tl.store(
+                        VCache + offset + head_offset,
+                        _e4m3_satfinite(tl.div_rn(value, tl.load(VScale))),
+                    )
 
 
 def qk_norm_rope(
@@ -158,14 +194,20 @@ def qk_norm_rope(
     assert positions.shape in ((tokens,), (3, tokens))
     assert positions.dtype == torch.int64
     store_cache = key_cache is not None
+    store_int8_pth = store_cache and key_cache.dtype == torch.int8
     if store_cache:
         assert key_cache.shape == value_cache.shape and key_cache.ndim == 4
         assert key_cache.shape[2:] == (kv_heads, 256)
         assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
-        assert key_cache.dtype == value_cache.dtype == torch.uint8
         assert slots.ndim == 1 and slots.dtype == torch.int64
-        assert k_scale.numel() == v_scale.numel() == 1
         assert k_scale.dtype == v_scale.dtype == torch.float32
+        if store_int8_pth:
+            assert key_cache.dtype == value_cache.dtype == torch.int8
+            assert k_scale.shape == v_scale.shape == key_cache.shape[:3]
+            assert k_scale.stride() == v_scale.stride()
+        else:
+            assert key_cache.dtype == value_cache.dtype == torch.uint8
+            assert k_scale.numel() == v_scale.numel() == 1
     q = (
         q_out
         if q_out is not None
@@ -196,10 +238,14 @@ def qk_norm_rope(
         k_scale,
         v_scale,
         store_cache,
+        store_int8_pth,
         key_cache.shape[1] if store_cache else 0,
         key_cache.stride(0) if store_cache else 0,
         key_cache.stride(1) if store_cache else 0,
         key_cache.stride(2) if store_cache else 0,
+        k_scale.stride(0) if store_int8_pth else 0,
+        k_scale.stride(1) if store_int8_pth else 0,
+        k_scale.stride(2) if store_int8_pth else 0,
         positions.stride(0) if positions.ndim == 2 else 0,
         positions.stride(-1),
         cache.shape[0],
@@ -234,6 +280,7 @@ def _prepare_with_cache(
     from vllm.v1.attention.backends.flash_v100.kv_layout import (
         _split_paged_kv_cache,
     )
+    from vllm.v1.attention.kv_codecs import per_token_head_scales_for_kv_views
 
     _, layer, kv_cache, slots = get_attention_context(_resolve_layer_name(layer_name))
     kv_heads = k_out.shape[1] // 256
@@ -241,19 +288,21 @@ def _prepare_with_cache(
     cache_args = {}
     if slots is not None and kv_cache.numel() > 0:
         key_cache, value_cache = _split_paged_kv_cache(kv_cache)
-        eligible = (
-            layer.kv_cache_dtype in ("fp8", "fp8_e4m3")
-            and key_cache.dtype == value_cache.dtype == torch.uint8
-            and key_cache.ndim == value_cache.ndim == 4
+        common_eligible = (
+            key_cache.ndim == value_cache.ndim == 4
             and key_cache.shape == value_cache.shape
             and key_cache.shape[2:] == (kv_heads, 256)
             and key_cache.stride() == value_cache.stride()
             and key_cache.stride(3) == 1
             and slots.ndim == 1
             and slots.dtype == torch.int64
-            and layer._k_scale.numel() == layer._v_scale.numel() == 1
         )
-        if eligible:
+        if (
+            common_eligible
+            and layer.kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and key_cache.dtype == value_cache.dtype == torch.uint8
+            and layer._k_scale.numel() == layer._v_scale.numel() == 1
+        ):
             cache_args = dict(
                 key_cache=key_cache,
                 value_cache=value_cache,
@@ -261,6 +310,20 @@ def _prepare_with_cache(
                 k_scale=layer._k_scale,
                 v_scale=layer._v_scale,
             )
+        elif (
+            common_eligible
+            and layer.kv_cache_dtype in ("int8", "int8_per_token_head")
+            and key_cache.dtype == value_cache.dtype == torch.int8
+        ):
+            ks, vs = per_token_head_scales_for_kv_views(key_cache, value_cache)
+            if ks.stride() == vs.stride():
+                cache_args = dict(
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    slots=slots,
+                    k_scale=ks,
+                    v_scale=vs,
+                )
     qk_norm_rope(
         qkv,
         q_weight,

@@ -52,7 +52,8 @@ def _supports_sm70_long_batch_graphs(vllm_config: VllmConfig) -> bool:
     if (
         model is None
         or getattr(model, "dtype", None) != torch.float16
-        or getattr(cache, "cache_dtype", None) not in ("fp8", "fp8_e4m3")
+        or getattr(cache, "cache_dtype", None)
+        not in ("fp8", "fp8_e4m3", "int8", "int8_per_token_head")
     ):
         return False
     parallel = vllm_config.parallel_config

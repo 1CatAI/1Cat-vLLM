@@ -377,6 +377,18 @@ def get_sm70_v37_e4m3_bridge_op():
     return getattr(torch.ops._vllm_fa2_C, "sm70_v37_e4m3_bridge", None)
 
 
+def get_sm70_v37_int8_pth_bridge_op():
+    """Resolve the per-token-head INT8 bridge from the FA2 runtime."""
+    get_sm70_splitd_d256_ops()
+    return getattr(torch.ops._vllm_fa2_C, "sm70_v37_int8_pth_bridge", None)
+
+
+def get_sm70_reshape_and_cache_int8_pth_op():
+    """Resolve the native CUDA per-token-head INT8 paged cache writer."""
+    get_sm70_splitd_d256_ops()
+    return getattr(torch.ops._vllm_fa2_C, "sm70_reshape_and_cache_int8_pth", None)
+
+
 def get_fp8_e5m2_paged_kv_bridge_op():
     global _fp8_e5m2_paged_kv_to_fp16
     global _fp8_e5m2_paged_kv_to_fp16_checked

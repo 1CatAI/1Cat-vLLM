@@ -167,7 +167,7 @@ def read_codecs(root):
 def read_routes(root, codecs):
     tree = ast.parse((root / ROUTES).read_text())
     values = {row["symbol"]: row["symbol"] for row in codecs}
-    for name in ("_NATIVE_CODECS", "_ALL_CODECS"):
+    for name in ("_NATIVE_CODECS", "_PAGED_CODECS", "_ALL_CODECS"):
         values[name] = expression(assignment(tree, name), values)
     spec = fields(tree, "RouteSpec", values)
     node = assignment(tree, "ROUTE_SPECS")

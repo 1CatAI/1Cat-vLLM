@@ -9,6 +9,48 @@ namespace flash_v100 {
 constexpr int KV_CACHE_DTYPE_FP16 = 0;
 constexpr int KV_CACHE_DTYPE_FP8_E4M3 = 1;
 constexpr int KV_CACHE_DTYPE_FP8_E5M2 = 2;
+constexpr int KV_CACHE_DTYPE_INT8_PTH = 3;
+
+// Exact zero-LUT signed int8 -> half2 conversion on SM70+.
+// In IEEE-754 binary16, exponent 25 (0x6400 = 1024.0) has ULP = 1.0, so
+// (0x6400 | (uint8_t(b) ^ 0x80)) equals 1024.0 + (b + 128) = b + 1152.0
+// without rounding for all b in [-128, 127].
+__device__ __forceinline__ __half2 int8_pair_to_half2_unscaled(uint32_t word,
+                                                               uint32_t sel) {
+  const uint32_t biased = __byte_perm(word, 0x64646464u, sel) ^ 0x00800080u;
+  const uint32_t offset = 0x64806480u;  // half2(1152.0, 1152.0)
+  return __hsub2(*reinterpret_cast<const __half2*>(&biased),
+                 *reinterpret_cast<const __half2*>(&offset));
+}
+
+__device__ __forceinline__ uint4 int8_vector_to_half8_unscaled(uint64_t raw) {
+  const uint32_t lo = static_cast<uint32_t>(raw);
+  const uint32_t hi = static_cast<uint32_t>(raw >> 32);
+  union {
+    uint4 u;
+    __half2 h[4];
+  } out;
+  out.h[0] = int8_pair_to_half2_unscaled(lo, 0x5140u);
+  out.h[1] = int8_pair_to_half2_unscaled(lo, 0x5342u);
+  out.h[2] = int8_pair_to_half2_unscaled(hi, 0x5140u);
+  out.h[3] = int8_pair_to_half2_unscaled(hi, 0x5342u);
+  return out.u;
+}
+
+__device__ __forceinline__ uint4 int8_vector_to_half8_scaled(uint64_t raw,
+                                                             __half2 scale2) {
+  const uint32_t lo = static_cast<uint32_t>(raw);
+  const uint32_t hi = static_cast<uint32_t>(raw >> 32);
+  union {
+    uint4 u;
+    __half2 h[4];
+  } out;
+  out.h[0] = __hmul2(int8_pair_to_half2_unscaled(lo, 0x5140u), scale2);
+  out.h[1] = __hmul2(int8_pair_to_half2_unscaled(lo, 0x5342u), scale2);
+  out.h[2] = __hmul2(int8_pair_to_half2_unscaled(hi, 0x5140u), scale2);
+  out.h[3] = __hmul2(int8_pair_to_half2_unscaled(hi, 0x5342u), scale2);
+  return out.u;
+}
 
 __device__ __forceinline__ float quiet_nan_f() {
   return __int_as_float(0x7fffffff);

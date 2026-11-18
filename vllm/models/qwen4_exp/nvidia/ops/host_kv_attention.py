@@ -103,7 +103,8 @@ def host_qsa_attention(
         HOST_VALID_COUNTS=state.lengths,
         HOST_CACHE=True,
         HOT_SCALES=state.hot_scales,
-        HOST_CACHE_E4M3=state.hot_fp8,
+        HOST_CACHE_E4M3=state.hot_fp8 and not getattr(state, "int8", False),
+        HOST_CACHE_INT8=state.hot_fp8 and getattr(state, "int8", False),
         num_warps=warps,
         num_stages=2,
     )
