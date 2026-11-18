@@ -1902,6 +1902,19 @@ class EngineArgs:
         has_linear_attention = any(
             layer_type == "linear_attention" for layer_type in layer_types
         )
+        if is_server and self.max_num_seqs is None:
+            from vllm.model_executor.models.runtime_defaults import (
+                default_hybrid_server_max_num_seqs,
+            )
+
+            try:
+                dev_bytes = current_platform.get_device_total_memory()
+            except Exception:
+                dev_bytes = 0
+            bounded_seqs = default_hybrid_server_max_num_seqs(text_config, dev_bytes)
+            if bounded_seqs is not None:
+                self.max_num_seqs = bounded_seqs
+                profile_updates.append(f"max_num_seqs={self.max_num_seqs}")
         if is_server and self.enable_prefix_caching is None and has_linear_attention:
             self.enable_prefix_caching = True
             profile_updates.append(

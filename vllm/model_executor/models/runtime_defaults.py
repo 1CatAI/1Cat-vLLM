@@ -513,3 +513,16 @@ def prefer_native_mtp_runner(cfg) -> bool:
     except Exception:
         return False
     return capability is not None and (capability.major, capability.minor) == (7, 0)
+
+
+def default_hybrid_server_max_num_seqs(
+    text_config: Any,
+    dev_bytes: int,
+) -> int | None:
+    """Bound default max_num_seqs for 32 GiB Qwen4Exp hybrid serving."""
+    if getattr(text_config, "model_type", None) in (
+        "qwen4_exp",
+        "qwen4_exp_text",
+    ) and 0 < dev_bytes <= 34 * (1 << 30):
+        return 8
+    return None

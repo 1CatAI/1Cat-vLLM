@@ -225,3 +225,74 @@ def test_qwen3_reasoning_parser_implicit_tool_call_and_reasoning_effort() -> Non
     assert fcs_req is not None and len(fcs_req) == 1
     assert fcs_req[0].name == "get_weather"
     assert fcs_req[0].arguments == '{"city": "Shanghai"}'
+
+
+def test_greedy_temperature_zero_skips_default_penalties() -> None:
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+    from vllm.models.sampling_defaults import QWEN38_NON_THINKING_SAMPLING_DEFAULTS
+
+    chat_greedy = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=0.0,
+    ).to_sampling_params(64, dict(QWEN38_NON_THINKING_SAMPLING_DEFAULTS))
+    assert chat_greedy.temperature == 0.0
+    assert chat_greedy.presence_penalty == 0.0
+    assert chat_greedy.frequency_penalty == 0.0
+    assert chat_greedy.repetition_penalty == 1.0
+
+    # Explicit penalty alongside temperature=0 is still honored.
+    chat_explicit = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=0.0,
+        presence_penalty=1.25,
+    ).to_sampling_params(64, dict(QWEN38_NON_THINKING_SAMPLING_DEFAULTS))
+    assert chat_explicit.presence_penalty == 1.25
+
+    comp_greedy = CompletionRequest(
+        prompt="hi",
+        temperature=0.0,
+    ).to_sampling_params(64, dict(QWEN38_NON_THINKING_SAMPLING_DEFAULTS))
+    assert comp_greedy.presence_penalty == 0.0
+
+    resp_greedy = ResponsesRequest(
+        input="hi",
+        temperature=0.0,
+    ).to_sampling_params(64, dict(QWEN38_NON_THINKING_SAMPLING_DEFAULTS))
+    assert resp_greedy.presence_penalty == 0.0
+
+
+def test_sm70_qwen4exp_bare_serve_defaults_max_num_seqs(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from vllm.engine import arg_utils
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.usage.usage_lib import UsageContext
+
+    monkeypatch.setattr(arg_utils.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(
+        arg_utils.current_platform,
+        "get_device_capability",
+        lambda *a, **k: SimpleNamespace(major=7, minor=0),
+    )
+    monkeypatch.setattr(
+        arg_utils.current_platform,
+        "get_device_total_memory",
+        lambda *a, **k: 32 * (1 << 30),
+    )
+    model_cfg = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            model_type="qwen4_exp_text",
+            mtp_num_hidden_layers=1,
+            layer_types=["linear_attention", "full_attention"],
+        ),
+        is_moe=True,
+    )
+    args = EngineArgs(model=str(tmp_path))
+    assert args.max_num_seqs is None
+    args._maybe_apply_sm70_mtp_defaults(UsageContext.OPENAI_API_SERVER, model_cfg)
+    assert args.max_num_seqs == 8
+
+    explicit = EngineArgs(model=str(tmp_path), max_num_seqs=4)
+    explicit._maybe_apply_sm70_mtp_defaults(UsageContext.OPENAI_API_SERVER, model_cfg)
+    assert explicit.max_num_seqs == 4
