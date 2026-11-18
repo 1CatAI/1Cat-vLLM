@@ -168,9 +168,11 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         if tool_call_index != -1:
             reasoning = model_output[:tool_call_index]
             tool_choice = getattr(request, "tool_choice", None)
-            has_structured_json = getattr(
-                request, "response_format", None
-            ) is not None or tool_choice not in (None, "auto", "none")
+            has_tools = bool(getattr(request, "tools", None))
+            has_structured_json = (
+                getattr(request, "response_format", None) is not None
+                and (not has_tools or tool_choice == "none")
+            ) or tool_choice not in (None, "auto", "none")
             if has_structured_json:
                 content = model_output[
                     tool_call_index + len(self._tool_call_tag) :

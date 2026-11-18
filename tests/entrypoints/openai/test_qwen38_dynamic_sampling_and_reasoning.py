@@ -296,3 +296,38 @@ def test_sm70_qwen4exp_bare_serve_defaults_max_num_seqs(monkeypatch, tmp_path) -
     explicit = EngineArgs(model=str(tmp_path), max_num_seqs=4)
     explicit._maybe_apply_sm70_mtp_defaults(UsageContext.OPENAI_API_SERVER, model_cfg)
     assert explicit.max_num_seqs == 4
+
+
+def test_truncated_required_tool_message_and_auto_tools_response_format() -> None:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatMessage
+
+    # Empty tool_calls list must construct ChatMessage without ValidationError
+    # and omit empty tool_calls on serialization.
+    msg = ChatMessage(role="assistant", content='[{"name":"w"', tool_calls=[])
+    dumped = msg.model_dump()
+    assert "tool_calls" not in dumped
+    assert dumped["content"] == '[{"name":"w"'
+
+    # Auto tool_choice + response_format must preserve <tool_call> tags for XML parser.
+    tok = _DummyQwenTokenizer()
+    parser = Qwen3ReasoningParser(tok, chat_template_kwargs={"enable_thinking": True})
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "weather"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="auto",
+        response_format={"type": "json_object"},
+    )
+    r_txt, c_txt = parser.extract_reasoning(
+        "Thinking.\n<tool_call>\n<function=get_weather></function>\n</tool_call>",
+        req,
+    )
+    assert r_txt == "Thinking.\n"
+    assert c_txt is not None and c_txt.startswith("<tool_call>")
