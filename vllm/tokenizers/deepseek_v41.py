@@ -81,16 +81,23 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             effort = kwargs.get("reasoning_effort")
             if effort == "none":
                 thinking, effort = False, None
+            elif effort == "minimal":
+                # OpenAI clients send "minimal"; V4.1's lightest named level.
+                effort = "low"
             elif effort == "medium":
                 effort = 75
             elif effort == "xhigh":
                 effort = 100
-            prompt = encode_messages(
-                conversation,
-                thinking_mode="thinking" if thinking else "chat",
-                drop_thinking=kwargs.get("drop_thinking", True),
-                reasoning_effort=effort,
-            )
+            try:
+                prompt = encode_messages(
+                    conversation,
+                    thinking_mode="thinking" if thinking else "chat",
+                    drop_thinking=kwargs.get("drop_thinking", True),
+                    reasoning_effort=effort,
+                )
+            except AssertionError as e:
+                # The encoding validates with asserts: a bad request, not a 500.
+                raise ValueError(str(e)) from e
             if not kwargs.get("tokenize", True):
                 return prompt
             options = {
