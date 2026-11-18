@@ -832,10 +832,9 @@ class Scheduler(SchedulerInterface):
             _has_prefill = _has_running_prefill or _has_waiting
             if _has_decode and _has_prefill:
                 _split_mtp_both_active = True
-                _short_tail_cap = min(256, self._split_mtp_concurrent_prefill_cap // 4)
+                _short_tail_cap = min(512, self._split_mtp_concurrent_prefill_cap // 4)
                 _has_short_tail = any(
-                    bool(r.prefix_cache_boundaries)
-                    and 0 < prefill_remaining[r.request_id] <= _short_tail_cap
+                    0 < prefill_remaining[r.request_id] <= _short_tail_cap
                     for r in _schedulable_running
                 )
                 if _force_decode or (
@@ -1761,23 +1760,26 @@ class Scheduler(SchedulerInterface):
                     self._split_mtp_prefill_burst_tokens = 0
             elif phase is Phase.PREFILL:
                 self._split_mtp_prefill_burst_tokens += total_num_scheduled_tokens
-                _short_tail_cap = min(256, self._split_mtp_concurrent_prefill_cap // 4)
+                _short_tail_cap = min(512, self._split_mtp_concurrent_prefill_cap // 4)
+                _unfinished_rems = [
+                    rem
+                    for rid, n in num_scheduled_tokens.items()
+                    if (rem := prefill_remaining.get(rid, 0) - n) > 0
+                ]
                 _next_has_short_tail = any(
-                    (req_obj := self.requests.get(rid)) is not None
-                    and bool(req_obj.prefix_cache_boundaries)
-                    and 0 < prefill_remaining.get(rid, 0) - n <= _short_tail_cap
-                    for rid, n in num_scheduled_tokens.items()
-                )
-                _has_unfinished_prefill = any(
-                    prefill_remaining.get(rid, 0) - n > 0
-                    for rid, n in num_scheduled_tokens.items()
+                    rem <= _short_tail_cap for rem in _unfinished_rems
                 )
                 if _next_has_short_tail:
                     self._split_mtp_decode_steps_due = 0
                 elif self._split_mtp_prefill_burst_tokens >= 1024:
-                    self._split_mtp_decode_steps_due = (
-                        8 if _has_unfinished_prefill else 3
-                    )
+                    if not _unfinished_rems:
+                        self._split_mtp_decode_steps_due = 3
+                    elif (
+                        min(_unfinished_rems) <= self._split_mtp_concurrent_prefill_cap
+                    ):
+                        self._split_mtp_decode_steps_due = 2
+                    else:
+                        self._split_mtp_decode_steps_due = 8
                     self._split_mtp_prefill_burst_tokens = 0
                 else:
                     self._split_mtp_decode_steps_due = 2

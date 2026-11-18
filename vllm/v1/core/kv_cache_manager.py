@@ -405,7 +405,7 @@ class KVCacheManager:
             for b in request.prefix_cache_boundaries
             if start < b < end
             and b % self.partial_block_size
-            and not (coalesce_gen_tail and end - b <= 32 and b - start < 128)
+            and not (coalesce_gen_tail and end - b < 80)
             and b // self.partial_block_size * self.partial_block_size <= hashed
             and not self.partial_cache.contains(self._partial_key(request, b))
         )

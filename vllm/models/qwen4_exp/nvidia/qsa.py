@@ -1757,7 +1757,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             or (
                 not torch.compiler.is_compiling()
                 and num_tokens <= 64
-                and (not use_host_prep or self._text_only or positions.dim() == 1)
+                and (self._text_only or positions.dim() == 1)
             )
         ):
             # Raw rows go to the attention op, which normalizes, rotates and

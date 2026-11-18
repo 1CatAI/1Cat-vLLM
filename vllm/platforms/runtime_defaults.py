@@ -363,26 +363,12 @@ def apply_runtime_policy_defaults(self):
             and self.model_config.multimodal_config is not None
             and not self.model_config.multimodal_config.language_model_only
         ):
-            from vllm.config.multimodal import ImageDummyOptions, VideoDummyOptions
+            from vllm.config.multimodal import VideoDummyOptions
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-            limit_per_prompt = self.model_config.multimodal_config.limit_per_prompt
-            if not limit_per_prompt:
-                limit_per_prompt.update(
-                    {
-                        "image": ImageDummyOptions(count=1, width=None, height=None),
-                        "video": VideoDummyOptions(
-                            count=0,
-                            num_frames=None,
-                            width=None,
-                            height=None,
-                        ),
-                    }
-                )
-                logger.info_once(
-                    "Using SM70 Flash-V100 multimodal default: image=1, "
-                    "video=0. Set --limit-mm-per-prompt to override."
-                )
-            elif "video" not in limit_per_prompt:
+            mm_cfg = self.model_config.multimodal_config
+            limit_per_prompt = mm_cfg.limit_per_prompt
+            if "video" not in limit_per_prompt:
                 limit_per_prompt["video"] = VideoDummyOptions(
                     count=0,
                     num_frames=None,
@@ -390,9 +376,16 @@ def apply_runtime_policy_defaults(self):
                     height=None,
                 )
                 logger.info_once(
-                    "Using SM70 Flash-V100 multimodal default: video=0 "
-                    "for partial --limit-mm-per-prompt override."
+                    "Using SM70 Flash-V100 multimodal default: image=unlimited, "
+                    "video=0. Set --limit-mm-per-prompt to override."
                 )
+            if mm_cfg.mm_encoder_attn_backend is None:
+                mm_cfg.mm_encoder_attn_backend = AttentionBackendEnum.TRITON_ATTN
+            if (
+                mm_cfg.mm_encoder_batch_size == 0
+                and mm_cfg.get_limit_per_prompt("image") > 1
+            ):
+                mm_cfg.mm_encoder_batch_size = 1
         self.apply_model_runtime_defaults(defaults, "prefill", is_sm70=True)
         self.kernel_config.gdn.apply_platform_defaults()
         sm70_baseline_env_defaults = {

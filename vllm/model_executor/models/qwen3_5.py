@@ -1220,8 +1220,9 @@ class Qwen3_5ForConditionalGeneration(
         self.model_config = vllm_config.model_config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-        # Qwen3.5 does not support multimodal pruning (EVS).
+        # Qwen3.5 does not support multimodal pruning (EVS) or DeepStack.
         self.is_multimodal_pruning_enabled = False
+        self.use_deepstack = False
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.visual = Qwen3_VisionTransformer(
@@ -1432,8 +1433,9 @@ class Qwen3_5MoeForConditionalGeneration(
         self.model_config = vllm_config.model_config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-        # Qwen3.5 does not support multimodal pruning (EVS).
+        # Qwen3.5 does not support multimodal pruning (EVS) or DeepStack.
         self.is_multimodal_pruning_enabled = False
+        self.use_deepstack = False
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.visual = Qwen3_VisionTransformer(

@@ -572,7 +572,7 @@ def try_eager_grouped_fp32(
     ):
         return False
     meta_plan_holder: Any = attn_metadata
-    cached_plan: tuple[torch.Tensor, torch.Tensor] | None
+    cached_plan: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None
     if hasattr(meta_plan_holder, "_flash_v100_ragged_smallq_plan"):
         cached_plan = meta_plan_holder._flash_v100_ragged_smallq_plan
     else:
@@ -581,12 +581,14 @@ def try_eager_grouped_fp32(
             cached_plan = None
         else:
             q_lens = [qsl[i + 1] - qsl[i] for i in range(groups)]
-            if not q_lens or min(q_lens) < 1 or max(q_lens) > GROUP_ROWS:
+            if not q_lens or min(q_lens) < 1:
                 cached_plan = None
             else:
                 dst: list[int] = []
+                group_req: list[int] = []
                 for i, q_len in enumerate(q_lens):
-                    base = i * GROUP_ROWS
+                    base = len(group_req) * GROUP_ROWS
+                    group_req.extend([i] * -(-q_len // GROUP_ROWS))
                     dst.extend(range(base, base + q_len))
                 dst_idx = torch.tensor(
                     dst,
@@ -594,25 +596,41 @@ def try_eager_grouped_fp32(
                     device="cpu",
                     pin_memory=query.device.type == "cuda",
                 ).to(query.device, non_blocking=True)
+                group_req_idx = (
+                    torch.tensor(
+                        group_req,
+                        dtype=torch.int64,
+                        device="cpu",
+                        pin_memory=query.device.type == "cuda",
+                    ).to(query.device, non_blocking=True)
+                    if len(group_req) != groups
+                    else None
+                )
                 lengths_pad = torch.zeros(
-                    groups * GROUP_ROWS,
+                    len(group_req) * GROUP_ROWS,
                     dtype=torch.int32,
                     device=seq_lens.device,
                 )
                 lengths_pad.index_copy_(0, dst_idx, seq_lens)
-                cached_plan = (dst_idx, lengths_pad)
+                cached_plan = (dst_idx, lengths_pad, group_req_idx)
         with suppress(AttributeError):
             meta_plan_holder._flash_v100_ragged_smallq_plan = cached_plan
     if cached_plan is None:
         return False
-    dst_idx, lengths_pad = cached_plan
-    total_rows = groups * GROUP_ROWS
+    dst_idx, lengths_pad, group_req_idx = cached_plan
+    explicit_table = (
+        table_for_group[:groups]
+        if group_req_idx is None
+        else table_for_group.index_select(0, group_req_idx)
+    )
+    num_explicit_groups = int(explicit_table.shape[0])
+    total_rows = num_explicit_groups * GROUP_ROWS
     q_pad = query.new_zeros((total_rows, query.shape[1], query.shape[2]))
     out_pad = torch.empty_like(q_pad)
     causal = bool(getattr(attn_metadata, "causal", True))
     chunks = [
-        (g0, min(g0 + MAX_GROUPS_PER_CALL, groups))
-        for g0 in range(0, groups, MAX_GROUPS_PER_CALL)
+        (g0, min(g0 + MAX_GROUPS_PER_CALL, num_explicit_groups))
+        for g0 in range(0, num_explicit_groups, MAX_GROUPS_PER_CALL)
     ]
     with _eager_bucket_scope(total_rows):
         for g0, g1 in chunks:
@@ -622,7 +640,7 @@ def try_eager_grouped_fp32(
                 q_pad[r0:r1],
                 key_cache,
                 value_cache,
-                table_for_group[g0:g1],
+                explicit_table[g0:g1],
                 lengths_pad[r0:r1],
                 causal=causal,
                 out=out_pad[r0:r1],
@@ -637,7 +655,7 @@ def try_eager_grouped_fp32(
                 q_pad[r0:r1],
                 key_cache,
                 value_cache,
-                table_for_group[g0:g1],
+                explicit_table[g0:g1],
                 lengths_pad[r0:r1],
                 out=out_pad[r0:r1],
                 softmax_scale=scale,

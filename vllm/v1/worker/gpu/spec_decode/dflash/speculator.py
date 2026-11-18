@@ -354,13 +354,24 @@ class DFlashSpeculator(DraftModelSpeculator):
         # FlashAttention's AOT split schedule is wrong for a windowed drafter,
         # and the global window scan can leave it enabled depending on the
         # target backend. Resolve the drafter's own builders explicitly.
+        draft_windows: list[int | None] = []
+        draft_block_sizes: list[int] = []
         for groups in self.attn_groups:
             for group in groups:
                 builder = group.get_metadata_builder()
-                if getattr(builder, "aot_schedule", False) and getattr(
-                    builder.kv_cache_spec, "sliding_window", None
-                ):
+                sw = getattr(builder.kv_cache_spec, "sliding_window", None)
+                bs = int(getattr(builder.kv_cache_spec, "block_size", 0) or 0)
+                draft_windows.append(int(sw) if sw else None)
+                if bs > 0:
+                    draft_block_sizes.append(bs)
+                if getattr(builder, "aot_schedule", False) and sw:
                     cast(Any, builder).aot_schedule = False
+        self._draft_context_keep_tail: int | None = (
+            max(w for w in draft_windows if w is not None)
+            + (max(draft_block_sizes) if draft_block_sizes else 0)
+            if draft_windows and all(w is not None for w in draft_windows)
+            else None
+        )
 
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
@@ -584,6 +595,22 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
         self._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
         self._debug_real_proposal = not dummy_run and not is_profile
+        keep_tail = getattr(self, "_draft_context_keep_tail", None)
+        if (
+            not dummy_run
+            and not is_profile
+            and keep_tail is not None
+            and _is_context_only_prefill(input_batch)
+        ):
+            chunk_end = (
+                input_batch.num_computed_prefill_tokens_np[:num_reqs]
+                + input_batch.num_scheduled_tokens[:num_reqs]
+            )
+            if bool(
+                np.all(chunk_end <= input_batch.prefill_len_np[:num_reqs] - keep_tail)
+            ):
+                self.draft_tokens[:num_reqs].fill_(-1)
+                return self.draft_tokens[:num_reqs]
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
