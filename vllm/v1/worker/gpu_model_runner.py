@@ -418,11 +418,27 @@ def _v41_fused_clip_count(runner, output_token_ids, batch):
         params.max_tokens,
         request.num_prompt_tokens,
         sorted(stops),
+        runner.model_config.get_vocab_size(),
     )
 
 
-def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tensor:
-    valid_token_mask = output_token_ids != -1
+def _count_contiguous_spec_tokens(
+    output_token_ids: torch.Tensor, vocab_size: int | None = None
+) -> torch.Tensor:
+    """Leading valid sampled ids per row (the step's accepted count).
+
+    With ``vocab_size``, valid means ``0 <= id < vocab_size``: the rule of
+    ``RejectionSampler.parse_output``, which builds the scheduler's tokens. An
+    out-of-vocabulary id (a NaN logits row's argmax: ``fast_argmax`` returns
+    the row width, a fully NaN row ``2**31 - 1``) is dropped there, so every
+    count derived on device must stop at it as well. Counting it made the
+    stateful models' commit (DeepSeek-V4.1 Engram/C2) run one token ahead of
+    the scheduler's position.
+    """
+    if vocab_size is None:
+        valid_token_mask = output_token_ids != -1
+    else:
+        valid_token_mask = (output_token_ids >= 0) & (output_token_ids < vocab_size)
     token_offsets = torch.arange(
         output_token_ids.shape[1],
         device=output_token_ids.device,
@@ -2479,7 +2495,9 @@ class GPUModelRunner(
                 restore = getattr(self.get_model(), "restore_prefix", None)
                 if restore is not None:
                     restore(
-                        new_req_data.num_computed_tokens, new_req_data.prompt_token_ids
+                        new_req_data.num_computed_tokens,
+                        new_req_data.prompt_token_ids,
+                        req_id=req_id,
                     )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
@@ -2828,7 +2846,11 @@ class GPUModelRunner(
                     output_token_ids, batch.req_ids, self.requests, budget
                 )
             if fused is None:
-                commit_state(_count_contiguous_spec_tokens(output_token_ids))
+                commit_state(
+                    _count_contiguous_spec_tokens(
+                        output_token_ids, self.model_config.get_vocab_size()
+                    )
+                )
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
 
@@ -2870,7 +2892,9 @@ class GPUModelRunner(
             spec_state_slot_selectors = self.spec_state_slot_selectors.gpu[:num_reqs]
             profile_sidecar_cpu = True
         else:
-            num_accepted_tokens = _count_contiguous_spec_tokens(output_token_ids)
+            num_accepted_tokens = _count_contiguous_spec_tokens(
+                output_token_ids, self.model_config.get_vocab_size()
+            )
             spec_state_slot_selectors = num_accepted_tokens
             num_accepted_tokens_cpu = None
             spec_state_slot_selectors_cpu = None
@@ -3170,7 +3194,9 @@ class GPUModelRunner(
             dtype=torch.int32,
             device=sampled_token_ids.device,
         ).clamp(max=sampled_token_ids.shape[1])
-        valid_sampled_token_counts = _count_contiguous_spec_tokens(sampled_token_ids)
+        valid_sampled_token_counts = _count_contiguous_spec_tokens(
+            sampled_token_ids, self.model_config.get_vocab_size()
+        )
         clamped_counts = torch.minimum(valid_sampled_token_counts, max_generated)
         if torch.equal(clamped_counts, valid_sampled_token_counts):
             return sampler_output
@@ -8075,7 +8101,9 @@ class GPUModelRunner(
             )
         if self._diagnostics.channels["mtp_step"].policy.directory:
             sampled_token_ids = sampler_output.sampled_token_ids
-            valid_sampled_count = _count_contiguous_spec_tokens(sampled_token_ids)
+            valid_sampled_count = _count_contiguous_spec_tokens(
+                sampled_token_ids, self.model_config.get_vocab_size()
+            )
             payload: dict[str, object] = {
                 "req_ids": list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
                 "sampled_token_ids": sampled_token_ids,
@@ -10256,7 +10284,9 @@ class GPUModelRunner(
         torch.distributed.broadcast(sampled_cpu, src=pp.last_rank, group=pp.cpu_group)
         self._pp_check_token_ids("sampled", sampled_cpu, skip_discarded=True)
         sampled = sampled_cpu.to(self.device, non_blocking=True)
-        valid_counts = _count_contiguous_spec_tokens(sampled)
+        valid_counts = _count_contiguous_spec_tokens(
+            sampled, self.model_config.get_vocab_size()
+        )
         next_token_ids = (
             sampled.gather(
                 1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
@@ -10350,7 +10380,9 @@ class GPUModelRunner(
         )
         self._pp_token_comm().broadcast(payload, src=pp.world_size - 1)
         sampled = payload[:, : k + 1].contiguous()
-        valid_counts = _count_contiguous_spec_tokens(sampled)
+        valid_counts = _count_contiguous_spec_tokens(
+            sampled, self.model_config.get_vocab_size()
+        )
         next_token_ids = (
             sampled.gather(
                 1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)

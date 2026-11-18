@@ -334,6 +334,34 @@ def test_sliding_window_remove_skipped_blocks():
     assert_block_id(block_table, [null_block_id] * 4 + original_block_ids[4:])
 
 
+def test_sliding_window_hold_reply_window():
+    """hold_reply_window: expired pages are freed one alignment plus two pages
+    behind the live window, so the run a hit at the sequence's last aligned
+    boundary reads is still held (and cached) when the request ends."""
+    spec = SlidingWindowSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4,
+    )
+    block_pool = BlockPool(num_gpu_blocks=100, enable_caching=True, hash_block_size=2)
+    manager = get_sliding_window_manager(spec, block_pool)
+    manager.alignment_tokens = 4
+    manager.hold_reply_window = True
+    blocks = block_pool.get_new_blocks(8)
+    manager.req_to_blocks["test"] = list(blocks)
+    null = block_pool.null_block
+
+    # 11 computed: tokens 0-7 left the window, the lag (4 + 2 * 2) keeps them.
+    manager.remove_skipped_blocks("test", 11)
+    assert null not in manager.req_to_blocks["test"]
+    # 15 computed: 12 skipped, 4 past the lag: blocks 0 and 1 go.
+    manager.remove_skipped_blocks("test", 15)
+    table = manager.req_to_blocks["test"]
+    assert table[:2] == [null, null] and null not in table[2:]
+
+
 def test_get_num_blocks_to_allocate():
     block_size = 2
     sliding_window_spec = SlidingWindowSpec(

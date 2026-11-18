@@ -4,6 +4,12 @@
 
 Usage: repack_engram.py SRC_DIR LAYER OUT_DIR. Writes OUT_DIR/engram-L.rows and
 OUT_DIR/engram-L.json (rows, row_bytes, row_bias, exponent stats, crc).
+
+The rows file is fsynced, dropped from the page cache and read back from the
+device: its CRC must equal the one of the bytes written, and every row must
+hold finite codes and in-range scales. A C4140 node once stored three 4 KiB
+pages of a 101 GB table misplaced (SATA link CRC errors); those rows decoded to
+NaN Engram embeddings and took the server down hours later (2026-11-18).
 """
 
 import json
@@ -18,6 +24,31 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from st_inventory import headers
 
 ROWS = 1 << 21  # 2M rows per chunk: 512 MiB codes + 16 MiB scales
+
+
+def verify_rows(path, rows, crc, scale_min, scale_max):
+    """Re-read the rows file from the device; raise unless it is intact."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    got, bad = 0, 0
+    with open(path, "rb") as f:
+        for start in range(0, rows, ROWS):
+            count = min(ROWS, rows - start)
+            buf = f.read(count * 264)
+            got = zlib.crc32(buf, got)
+            a = np.frombuffer(buf, np.uint8).reshape(count, 264)
+            nan = ((a[:, :256] & 0x7F) == 0x7F).any(1)
+            scales = a[:, 256:]
+            out = ((scales < scale_min) | (scales > scale_max)).any(1)
+            bad += int(np.count_nonzero(nan | out))
+    if got != crc or bad:
+        raise OSError(
+            f"{path}: read-back CRC {got} != written {crc} or {bad} invalid rows; "
+            "the device stored different bytes (check dmesg / SMART)"
+        )
 
 
 def main():
@@ -58,9 +89,12 @@ def main():
                     f"layer {layer}: {done:.1%} {(start + rows) * 264 / 1e9 / (time.time() - t):.2f} GB/s",
                     flush=True,
                 )
-    os.replace(path + ".part", path)
+        out.flush()
+        os.fsync(out.fileno())
     used = np.nonzero(hist)[0]
     smin, smax = int(used.min()), int(used.max())
+    verify_rows(path + ".part", n, crc, smin, smax)
+    os.replace(path + ".part", path)
     # Largest |value| = 448 * 2^(smax-127); keep it at 448 * 2^6 in FP16.
     bias = 6 - (smax - 127)
     meta = dict(

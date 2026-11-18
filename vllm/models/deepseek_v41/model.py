@@ -1437,6 +1437,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             self._slot_of: dict[str, int] = {}
             self._free_slots = list(range(slots - 1, -1, -1))
             self._slot_done: dict[int, torch.cuda.Event | None] = {}
+            # Prefix hits of requests not yet in a batch: req id -> (cached
+            # tokens, the 3 prompt tokens before the hit), applied when the
+            # request takes its fresh state slot.
+            self._pending_restore: dict[str, tuple[int, list[int]]] = {}
             self.batch_lengths = torch.zeros(slots, dtype=torch.int64, device=device)
             self.batch_positions = torch.zeros(slots, dtype=torch.int64, device=device)
             self.batch_prefill = torch.zeros(slots, dtype=torch.bool, device=device)
@@ -1689,7 +1693,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     raise RuntimeError("V4.1 batch: more live requests than slots")
                 slot = self._free_slots.pop()
                 self._slot_of[req_id] = slot
-                fresh.append(slot)
+                fresh.append((slot, req_id))
         host = self._slot_hosts[self._slot_turn]
         event = self._slot_events[self._slot_turn]
         self._slot_turn = (self._slot_turn + 1) % len(self._slot_hosts)
@@ -1700,11 +1704,14 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         )
         self.req_slots.copy_(host, non_blocking=True)
         event.record()
-        for slot in fresh:
+        for slot, req_id in fresh:
             done = self._slot_done.pop(slot, None)
             if done is not None:
                 torch.cuda.current_stream().wait_event(done)
             self._reset_slot(slot)
+            pending = self._pending_restore.pop(req_id, None)
+            if pending is not None:
+                self._restore_slot(slot, *pending)
 
     def v41_release(self, req_ids, done=None):
         """Runner hook: finished requests give their state slots back. done:
@@ -1717,6 +1724,26 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             if slot is not None:
                 self._free_slots.insert(0, slot)  # reuse the oldest last
                 self._slot_done[slot] = done
+
+    def _restore_slot(self, slot, cached, tail):
+        """A fresh slot at a prefix hit: the C2 pair and the Engram hash
+        history continue at `cached` (an even position: no partial pair)."""
+        for i in range(self.start_layer, self.end_layer):
+            compressor = getattr(self.layers[i].attn, "compressor", None)
+            state = getattr(compressor, "state_batch", None)
+            if state is not None:
+                state.position[slot] = cached
+        hash_state = self.hash_state
+        if self.hash_batch is None or hash_state is None:
+            return
+        device = hash_state.history.device
+        ids = torch.tensor(
+            [-1] * (3 - len(tail)) + list(tail), dtype=torch.long, device=device
+        )
+        mapped = hash_state.token_map[ids.clamp_min(0)].long()
+        history = self.hash_batch.history[slot]
+        history[:3].copy_(torch.where(ids >= 0, mapped, -1))
+        history[3] = cached
 
     def _reset_slot(self, slot):
         if self.hash_batch is not None:
@@ -2023,13 +2050,21 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         if count is not None:
             self._commit(self.stage_commit_count.fill_(count))
 
-    def restore_prefix(self, cached, prompt_ids):
+    def restore_prefix(self, cached, prompt_ids, req_id=None):
         """Rewind per-sequence device state to a same-session prefix hit.
+
+        VLLM_V41_BATCH: any even hit (paged window caches hold the rows the
+        hit covers); the request's state slot continues at it once assigned.
 
         The scheduler only admits hits that continue the last executed
         sequence at an even position inside the window rings' reach, so the
         rings need no rewind. Later PP stages hold nothing else.
         """
+        if _BATCH and req_id is not None:
+            assert cached % 2 == 0
+            tail = list(prompt_ids[max(0, cached - 3) : cached])
+            self._pending_restore[req_id] = (cached, tail)
+            return
         assert cached % 2 == 0
         if self.stage_commit is not None:
             self.stage_commit.reset()
@@ -2316,8 +2351,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
     def pp_before_forward(self, req_ids, num_computed):
         self.model.pp_before_forward(req_ids, num_computed)
 
-    def restore_prefix(self, cached, prompt_ids):
-        self.model.restore_prefix(cached, prompt_ids)
+    def restore_prefix(self, cached, prompt_ids, req_id=None):
+        self.model.restore_prefix(cached, prompt_ids, req_id)
 
     def stateful_output_budget(self, max_tokens, prompt_tokens):
         return self.model.output_budget(max_tokens, prompt_tokens)

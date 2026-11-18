@@ -61,6 +61,10 @@ class KVPartialHitDriftError(Exception):
 
 
 _V41_SESSION_PREFIX = envs.VLLM_V41_SESSION_PREFIX == "1"
+# VLLM_V41_BATCH with paged window caches: every request's window rows sit in
+# its own (cached) blocks, so any even hit is valid, not only a continuation
+# of the last executed sequence (whose ring the single-request path keeps).
+_V41_PAGED_PREFIX = envs.VLLM_V41_BATCH == "1" and envs.VLLM_V41_WINDOW_RING == "0"
 # Available rewind behind the last committed token, before rejected drafts.
 _V41_RING_REACH = 128
 
@@ -205,6 +209,10 @@ class KVCacheManager:
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval
         )
+        if _V41_SESSION_PREFIX and _V41_PAGED_PREFIX:
+            # Multi-turn sessions resume after the reply, not only the prompt.
+            for manager in self.coordinator.single_type_managers:
+                manager.hold_reply_window = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
@@ -277,6 +285,8 @@ class KVCacheManager:
     _v41_last: tuple[list[int], int] | None = None
 
     def _v41_session_hit(self, request: Request, hit: int) -> bool:
+        if _V41_PAGED_PREFIX:
+            return hit % 2 == 0
         last = self._v41_last
         if last is None or hit % 2:
             return False

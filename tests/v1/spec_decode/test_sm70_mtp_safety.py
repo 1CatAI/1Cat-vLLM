@@ -449,3 +449,23 @@ def test_proposer_mtp_profile_reports_from_last_pp_stage(
 
     assert proposer._step_profiler.totals["total_gpu"] == 83.9
     assert bool(messages) is expected
+
+
+def test_count_contiguous_spec_tokens_stops_at_out_of_vocab_ids():
+    """A NaN logits row's argmax is out of the vocabulary (fast_argmax returns
+    the row width, a fully NaN row 2**31 - 1). RejectionSampler.parse_output
+    drops such ids, so the device-side accepted count must stop at them too:
+    counting one advanced DeepSeek-V4.1's Engram/C2 commit past the
+    scheduler's position (stage-0 "starts at N, committed N+1")."""
+    vocab = 129280
+    ids = torch.tensor(
+        [
+            [734, 9335, vocab, -1, -1, -1],
+            [5, 6, 7, 8, 9, 10],
+            [2**31 - 1, -1, -1, -1, -1, -1],
+            [11, -1, -1, -1, -1, -1],
+        ]
+    )
+    assert _count_contiguous_spec_tokens(ids, vocab).tolist() == [2, 6, 0, 1]
+    # Without a vocabulary the legacy rule (placeholder -1 only) is kept.
+    assert _count_contiguous_spec_tokens(ids).tolist() == [3, 6, 1, 1]

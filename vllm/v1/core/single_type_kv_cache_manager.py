@@ -105,6 +105,9 @@ class SingleTypeKVCacheManager(ABC):
         self.reuse_window: int | None = None
         # Cache-hit alignment, set by the coordinator (its ``lcm_block_size``).
         self.alignment_tokens: int | None = None
+        # Keep expired sliding-window pages until they trail by one alignment
+        # (see remove_skipped_blocks), so a follow-up turn hits after a reply.
+        self.hold_reply_window = False
         self.mamba_replay_lookbehind = False
         # The coordinator's ``prefix_cache_retention_interval``: a positive
         # value keeps a Mamba state every that many tokens, which a sliding
@@ -619,10 +622,22 @@ class SingleTypeKVCacheManager(ABC):
             # A typical case is full attention that we never free any token
             # before the request is finished.
             return
-        num_skipped_blocks = num_skipped_tokens // self.block_size
         if self.reuse_window is None:
-            self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
+            self._remove_blocks_in_range(
+                request_id, 0, num_skipped_tokens // self.block_size
+            )
             return
+        if self.enable_caching and self.hold_reply_window:
+            # The window a hit at the sequence's final aligned boundary reads
+            # (a later turn resumes after this reply) trails the live window
+            # by up to one alignment and EAGLE's extra page: free those pages
+            # only once they are that far behind, so free() caches them.
+            num_skipped_tokens -= (
+                self.alignment_tokens or self.block_size
+            ) + 2 * self.block_size
+            if num_skipped_tokens <= 0:
+                return
+        num_skipped_blocks = num_skipped_tokens // self.block_size
         # Sliding window: blocks the window has moved past can serve no future
         # hit, so they are reused first -- otherwise a long prefill walks the
         # whole free queue and evicts other requests' prefixes. The exceptions
