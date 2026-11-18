@@ -2997,7 +2997,7 @@ __global__ void __launch_bounds__(W * 32)
       for (int p = 0; p < parts; ++p) v += __ldcg(all + p * 256 + e);
       store(e, v);
     }
-    if (threadIdx.x == 0) tickets[tile] = 0;
+    if (threadIdx.x == 0) atomicExch(tickets + tile, 0);
   }
   if constexpr (ROUTE) {
     __threadfence();
@@ -3009,7 +3009,7 @@ __global__ void __launch_bounds__(W * 32)
     route_plan_body<EPL, true, true, MATCH_GROUPS>(
         workspace + (size_t)tiles * parts * 256, bias, probs, ids, perm,
         experts, offsets, m, topk, scale);
-    if (threadIdx.x == 0) tickets[tiles] = 0;
+    if (threadIdx.x == 0) atomicExch(tickets + tiles, 0);
   }
 }
 
@@ -3245,7 +3245,7 @@ __global__ void __launch_bounds__(W * 32) h16_gemv_mtile_kernel(
       for (int p = 0; p < parts; ++p) v += __ldcg(all + p * SLICE + e);
       store(e >> 5, e & 31, v);
     }
-    if (threadIdx.x == 0) tickets[tile] = 0;
+    if (threadIdx.x == 0) atomicExch(tickets + tile, 0);
   }
   if constexpr (ROUTE) {
     __threadfence();
@@ -3257,7 +3257,7 @@ __global__ void __launch_bounds__(W * 32) h16_gemv_mtile_kernel(
     route_plan_wide_body<EPL, true, true>(
         smu.rw, workspace + (size_t)tiles * parts * SLICE, bias, probs, ids,
         perm, experts, offsets, m, topk, scale);
-    if (threadIdx.x == 0) tickets[tiles] = 0;
+    if (threadIdx.x == 0) atomicExch(tickets + tiles, 0);
   }
 }
 

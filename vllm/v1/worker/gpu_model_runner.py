@@ -2434,6 +2434,24 @@ class GPUModelRunner(
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
         # sets of requests), this optimization becomes very inefficient.
+        ahead_set = scheduler_output.v41_ahead_req_ids
+        if _V41_AHEAD and ahead_set is not None and self.use_async_scheduling:
+            c_reqs = scheduler_output.scheduled_cached_reqs
+            all_toks = c_reqs.all_token_ids
+            still_in_batch = cached_req_ids - unscheduled_req_ids
+            resolved_in_batch = {
+                r
+                for i, r in enumerate(c_reqs.req_ids)
+                if r in still_in_batch
+                and r not in ahead_set
+                and c_reqs.num_output_tokens[i] > 0
+                and r in all_toks
+            }
+            if resolved_in_batch:
+                unscheduled_req_ids = unscheduled_req_ids | resolved_in_batch
+                if self.input_batch.prev_req_id_to_index:
+                    for r in resolved_in_batch:
+                        self.input_batch.prev_req_id_to_index.pop(r, None)
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
 
@@ -7642,7 +7660,9 @@ class GPUModelRunner(
             from vllm.models.deepseek_v41.greedy_head import verify_top_tokens
 
             top_tokens = self.model.get_v41_top_tokens(sample_hidden_states)
-            sampled = verify_top_tokens(top_tokens, spec_decode_metadata)
+            sampled = verify_top_tokens(
+                top_tokens, spec_decode_metadata, self.model_config.get_vocab_size()
+            )
             logger.info_once("V4.1 TP-local greedy verification enabled")
             return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
 
@@ -10306,15 +10326,15 @@ class GPUModelRunner(
         torch.distributed.broadcast(sampled_cpu, src=pp.last_rank, group=pp.cpu_group)
         self._pp_check_token_ids("sampled", sampled_cpu, skip_discarded=True)
         sampled = sampled_cpu.to(self.device, non_blocking=True)
-        valid_counts = _count_contiguous_spec_tokens(
-            sampled, self.model_config.get_vocab_size()
-        )
-        next_token_ids = (
-            sampled.gather(
-                1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
-            )
-            .squeeze(1)
-            .clamp_(min=0)  # an emptied (budget-clipped) row: never consumed
+        vocab_size = self.model_config.get_vocab_size()
+        valid_counts = _count_contiguous_spec_tokens(sampled, vocab_size)
+        next_token_ids = sampled.gather(
+            1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
+        ).squeeze(1)
+        next_token_ids = torch.where(
+            (next_token_ids >= 0) & (next_token_ids < vocab_size),
+            next_token_ids,
+            torch.zeros_like(next_token_ids),
         )
         assert self.valid_sampled_token_count_event is not None
         self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
@@ -10402,15 +10422,15 @@ class GPUModelRunner(
         )
         self._pp_token_comm().broadcast(payload, src=pp.world_size - 1)
         sampled = payload[:, : k + 1].contiguous()
-        valid_counts = _count_contiguous_spec_tokens(
-            sampled, self.model_config.get_vocab_size()
-        )
-        next_token_ids = (
-            sampled.gather(
-                1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
-            )
-            .squeeze(1)
-            .clamp_(min=0)  # an emptied (budget-clipped) row: never consumed
+        vocab_size = self.model_config.get_vocab_size()
+        valid_counts = _count_contiguous_spec_tokens(sampled, vocab_size)
+        next_token_ids = sampled.gather(
+            1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
+        ).squeeze(1)
+        next_token_ids = torch.where(
+            (next_token_ids >= 0) & (next_token_ids < vocab_size),
+            next_token_ids,
+            torch.zeros_like(next_token_ids),
         )
         assert self.valid_sampled_token_count_event is not None
         self._copy_valid_sampled_token_count(next_token_ids, valid_counts)

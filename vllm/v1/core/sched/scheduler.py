@@ -2183,7 +2183,13 @@ class Scheduler(SchedulerInterface):
             # request as a new one, so under PP (a request is scheduled every
             # pp_size-th step) the copy and its serialization would cost the whole
             # context length per decode step: about 4 ms at 287k tokens.
-            if not scheduled_in_prev_step and not self.use_v2_model_runner:
+            need_readd_history = not scheduled_in_prev_step or (
+                self.v41_ahead
+                and self.scheduler_config.async_scheduling
+                and req.num_output_placeholders == 0
+                and req.num_output_tokens > 0
+            )
+            if need_readd_history and not self.use_v2_model_runner:
                 if _V41_FAST_READD:
                     # The runner reads the tokens since its last update of
                     # this request (a few PP rounds back) and, on resume, the

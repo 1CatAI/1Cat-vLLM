@@ -219,7 +219,7 @@ __global__ void __launch_bounds__(W * 32)
     output[static_cast<size_t>(element >> 5) * n + tile * 32 + (element & 31)] =
         __float2half(value);
   }
-  if (threadIdx.x == 0) tickets[tile] = 0;
+  if (threadIdx.x == 0) atomicExch(tickets + tile, 0);
 }
 
 static void launch_ksplit(torch::Tensor out, torch::Tensor input,
@@ -440,7 +440,7 @@ __global__ void __launch_bounds__(W * 32)
     out_ptr[static_cast<size_t>(element >> 5) * out_ld + out_col +
             (element & 31)] = __float2half(value);
   }
-  if (threadIdx.x == 0) tickets[tile] = 0;
+  if (threadIdx.x == 0) atomicExch(tickets + tile, 0);
 }
 
 // out[M, N] = input @ W^T for M <= 64 (rows = 8 * RT); grouped like

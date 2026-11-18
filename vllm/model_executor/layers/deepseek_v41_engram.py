@@ -425,7 +425,18 @@ def _bhash_request(
             for i in range(0, n):
                 pos = tl.load(positions + first + i).to(tl.int64)
                 token = tl.load(ids + first + i).to(tl.int64)
-                _fail_if((pos != start + i) | (token < 0) | (token >= VOCAB))
+                bad_tok = (pos != start + i) | (token < 0) | (token >= VOCAB)
+                if RECORD:
+                    if bad_tok:  # noqa: SIM102
+                        if tl.atomic_cas(errors, 0, 6) == 0:
+                            tl.store(errors + 1, slot.to(tl.int32))
+                            tl.store(errors + 2, start.to(tl.int32))
+                            tl.store(errors + 3, pos.to(tl.int32))
+                            tl.store(errors + 4, token.to(tl.int32))
+                            tl.store(errors + 5, i)
+                            tl.store(errors + 6, r)
+                else:
+                    _fail_if(bad_tok)
             tl.store(metadata + slot * 3, start)
             tl.store(metadata + slot * 3 + 1, n)
             tl.store(metadata + slot * 3 + 2, 1)
@@ -446,7 +457,9 @@ def _bhash_rows(
     pad,
     history,
     hashes,
+    errors,
     VOCAB: tl.constexpr,
+    RECORD: tl.constexpr = False,
 ):
     t, layer = tl.program_id(0), tl.program_id(1)
     heads = tl.arange(0, 32)
@@ -461,7 +474,17 @@ def _bhash_rows(
         at = local - lag
         inside = live & (at >= 0)
         token = tl.load(ids + base + at, inside, 0).to(tl.int64)
-        _fail_if(inside & ((token < 0) | (token >= VOCAB)))
+        bad_tok = inside & ((token < 0) | (token >= VOCAB))
+        if RECORD:
+            if bad_tok:  # noqa: SIM102
+                if tl.atomic_cas(errors, 0, 7) == 0:
+                    tl.store(errors + 1, slot.to(tl.int32))
+                    tl.store(errors + 2, start.to(tl.int32))
+                    tl.store(errors + 4, token.to(tl.int32))
+                    tl.store(errors + 5, t)
+            token = tl.where((token >= 0) & (token < VOCAB), token, 0)
+        else:
+            _fail_if(bad_tok)
         current = tl.load(token_map + token, inside, 0).to(tl.int64)
         current = tl.where(tl.load(mask + base + at, inside, False), current, -1)
         old = tl.load(history + slot * 4 + at + 3, live & (at < 0) & (at >= -3), -1)
@@ -607,6 +630,12 @@ class V41EngramHashBatch(nn.Module):
         values = self._errors_host.tolist()
         self._errors_host.copy_(self.errors, non_blocking=True)
         self._errors_event.record()
+        if values[0] in (6, 7):
+            raise RuntimeError(
+                f"V4.1 batch debug (token/pos code={values[0]}): row {values[6]} "
+                f"slot {values[1]} start={values[2]} pos={values[3]} "
+                f"token={values[4]} idx={values[5]}"
+            )
         if values[0] == 2:
             raise RuntimeError(
                 f"V4.1 batch debug (commit): entry {values[6]} slot {values[1]} "
@@ -663,7 +692,9 @@ class V41EngramHashBatch(nn.Module):
             s.pad,
             self.history,
             result,
+            self.errors,
             VOCAB=vocab,
+            RECORD=_DEBUG,
         )
         _bhistory_candidates[(n,)](
             input_ids,
