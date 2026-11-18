@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Se
 from contextlib import AsyncExitStack
 from copy import copy
 from http import HTTPStatus
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from fastapi import Request
 from openai.types.responses import (
@@ -16,6 +16,7 @@ from openai.types.responses import (
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
+    ResponseReasoningItem,
     ResponseStatus,
     response_text_delta_event,
 )
@@ -34,6 +35,11 @@ from vllm.entrypoints.chat_utils import (
 )
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.mcp.tool_server import ToolServer
+from vllm.entrypoints.openai.chat_completion.serving import (
+    _AssistantReasoningCache,
+    _PrefixCacheBoundaries,
+    _token_list,
+)
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     ErrorResponse,
@@ -180,6 +186,8 @@ class OpenAIServingResponses(OpenAIServing):
 
         self.openai_serving_render = openai_serving_render
         self.chat_template = chat_template
+        self._prefix_cache_boundaries = _PrefixCacheBoundaries()
+        self._assistant_reasoning_cache = _AssistantReasoningCache()
         self.chat_template_content_format: Final = chat_template_content_format
         self.chat_template_kwargs = default_chat_template_kwargs or {}
         self.enable_log_outputs = enable_log_outputs
@@ -424,14 +432,24 @@ class OpenAIServingResponses(OpenAIServing):
             available_tools = []
         tokenizer = self.renderer.get_tokenizer()
 
+        chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        tool_dicts_for_bounds = (
+            construct_tool_dicts(request.tools, request.tool_choice)
+            if not self.use_harmony
+            else None
+        )
         for engine_input in engine_inputs:
             maybe_error = self._validate_generator_input(engine_input)
             if maybe_error is not None:
                 return maybe_error
 
             effort = request.reasoning.effort if request.reasoning else None
+            thinking_enabled = (
+                chat_template_kwargs.get("enable_thinking") is not False
+                and effort != "none"
+            )
             effective_sampling_params = self.model_config.get_effective_sampling_param(
-                thinking_enabled=(effort != "none"),
+                thinking_enabled=thinking_enabled,
                 base_defaults=self.default_sampling_params,
             )
 
@@ -449,6 +467,20 @@ class OpenAIServingResponses(OpenAIServing):
             sampling_params = request.to_sampling_params(
                 default_max_tokens, effective_sampling_params
             )
+            if not self.use_harmony:
+                boundaries = self._prefix_cache_boundaries(
+                    tokenizer,
+                    request,
+                    engine_input.get("prompt_token_ids"),
+                    self.chat_template,
+                    chat_template_kwargs,
+                    messages=messages,
+                    tools=tool_dicts_for_bounds,
+                )
+                if boundaries:
+                    extra = dict(sampling_params.extra_args or {})
+                    extra["prefix_cache_boundaries"] = boundaries
+                    sampling_params.extra_args = extra
 
             trace_headers = (
                 None
@@ -557,6 +589,7 @@ class OpenAIServingResponses(OpenAIServing):
                         tokenizer,
                         request_metadata,
                         created_time,
+                        prior_messages=messages,
                     ),
                     name=f"create_{request.request_id}",
                 )
@@ -571,6 +604,7 @@ class OpenAIServingResponses(OpenAIServing):
                         tokenizer,
                         request_metadata,
                         created_time,
+                        prior_messages=messages,
                     ),
                     name=f"create_{response.id}",
                 )
@@ -595,6 +629,7 @@ class OpenAIServingResponses(OpenAIServing):
                 model_name,
                 tokenizer,
                 request_metadata,
+                prior_messages=messages,
             )
 
         return await self.responses_full_generator(
@@ -605,7 +640,41 @@ class OpenAIServingResponses(OpenAIServing):
             model_name,
             tokenizer,
             request_metadata,
+            prior_messages=messages,
         )
+
+    def _restore_assistant_reasoning(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        *,
+        cache_salt: str | None = None,
+    ) -> list[ChatCompletionMessageParam]:
+        if len(messages) < 2:
+            return messages
+        restored = list(messages)
+        for idx in range(len(restored) - 1):
+            msg = restored[idx]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            existing = msg.get("reasoning") or msg.get("reasoning_content")
+            if isinstance(existing, str) and existing.strip():
+                if "reasoning_content" not in msg:
+                    patched = dict(msg)
+                    patched["reasoning_content"] = existing
+                    restored[idx] = patched  # type: ignore[call-overload]
+                continue
+            cached = self._assistant_reasoning_cache.lookup(
+                restored[:idx],
+                msg.get("content"),
+                msg.get("tool_calls"),
+                cache_salt=cache_salt,
+            )
+            if cached:
+                patched = dict(msg)
+                patched["reasoning"] = cached
+                patched["reasoning_content"] = cached
+                restored[idx] = patched  # type: ignore[call-overload]
+        return restored
 
     async def _make_request(
         self,
@@ -620,6 +689,9 @@ class OpenAIServingResponses(OpenAIServing):
             prev_msg=self.msg_store.get(prev_response.id) if prev_response else None,
             prev_response_output=prev_response.output if prev_response else None,
         )
+        messages = self._restore_assistant_reasoning(
+            messages, cache_salt=request.cache_salt
+        )
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
         _, engine_inputs = await self.openai_serving_render.preprocess_chat(
             request,
@@ -631,6 +703,20 @@ class OpenAIServingResponses(OpenAIServing):
             tool_parser=self.parser.tool_parser_cls if self.parser else None,
             reasoning_parser=self.parser.reasoning_parser_cls if self.parser else None,
         )
+        tokenizer = self.renderer.get_tokenizer()
+        for eng_in in engine_inputs:
+            eng_dict = cast(dict[str, Any], eng_in)
+            raw_ids = eng_dict.get("prompt_token_ids")
+            if isinstance(raw_ids, list) and raw_ids:
+                eng_dict["prompt_token_ids"] = (
+                    self._assistant_reasoning_cache.splice_prompt_tokens(
+                        messages,
+                        list(raw_ids),
+                        tokenizer,
+                        cache_salt=request.cache_salt,
+                        max_model_len=self.model_config.max_model_len,
+                    )
+                )
         return messages, engine_inputs
 
     async def _render_next_turn(
@@ -645,6 +731,9 @@ class OpenAIServingResponses(OpenAIServing):
         new_messages = construct_input_messages(
             request_input=messages,
         )
+        new_messages = self._restore_assistant_reasoning(
+            new_messages, cache_salt=request.cache_salt
+        )
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
         _, engine_inputs = await self.openai_serving_render.preprocess_chat(
             request,
@@ -656,6 +745,20 @@ class OpenAIServingResponses(OpenAIServing):
             tool_parser=tool_parser,
             reasoning_parser=self.parser.reasoning_parser_cls if self.parser else None,
         )
+        tokenizer = self.renderer.get_tokenizer()
+        for eng_in in engine_inputs:
+            eng_dict = cast(dict[str, Any], eng_in)
+            raw_ids = eng_dict.get("prompt_token_ids")
+            if isinstance(raw_ids, list) and raw_ids:
+                eng_dict["prompt_token_ids"] = (
+                    self._assistant_reasoning_cache.splice_prompt_tokens(
+                        new_messages,
+                        list(raw_ids),
+                        tokenizer,
+                        cache_salt=request.cache_salt,
+                        max_model_len=self.model_config.max_model_len,
+                    )
+                )
         return engine_inputs
 
     async def _generate_with_builtin_tools(
@@ -787,6 +890,8 @@ class OpenAIServingResponses(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
+        *,
+        prior_messages: Sequence[Any] | None = None,
     ) -> ErrorResponse | ResponsesResponse:
         if created_time is None:
             created_time = int(time.time())
@@ -919,6 +1024,66 @@ class OpenAIServingResponses(OpenAIServing):
             usage=usage,
             kv_transfer_params=context.kv_transfer_params,
         )
+
+        rcache = getattr(self, "_assistant_reasoning_cache", None)
+        pbounds = getattr(self, "_prefix_cache_boundaries", None)
+        if (
+            not self.use_harmony
+            and rcache is not None
+            and prior_messages is not None
+            and status == "completed"
+        ):
+            reasoning_parts: list[str] = []
+            content_parts: list[str] = []
+            tool_pairs: list[tuple[str, str]] = []
+            for out_item in output:
+                if isinstance(out_item, ResponseReasoningItem):
+                    if out_item.content:
+                        reasoning_parts.append(out_item.content[0].text)
+                    elif out_item.summary:
+                        reasoning_parts.append(out_item.summary[0].text)
+                elif isinstance(out_item, ResponseOutputMessage):
+                    for part in out_item.content:
+                        if isinstance(part, ResponseOutputText):
+                            content_parts.append(part.text)
+                elif isinstance(out_item, ResponseFunctionToolCall):
+                    tool_pairs.append((out_item.name, out_item.arguments))
+            prompt_ids = None
+            out_ids = None
+            gen_suffix = None
+            im_end_id = None
+            nl_ids = None
+            if isinstance(context, SimpleContext) and context.final_output is not None:
+                prompt_ids = context.final_output.prompt_token_ids
+                out_ids = context.final_output.outputs[0].token_ids
+                try:
+                    chat_kwargs = self._effective_chat_template_kwargs(request)
+                    if pbounds is not None:
+                        gen_suffix = pbounds._generation_prompt(
+                            tokenizer,
+                            getattr(self, "chat_template", None),
+                            chat_kwargs,
+                        )
+                    vocab = tokenizer.get_vocab()
+                    im_end_id = vocab.get("<|im_end|>")
+                    nl_ids = tuple(
+                        _token_list(tokenizer.encode("\n", add_special_tokens=False))
+                    )
+                except Exception:
+                    pass
+            rcache.record(
+                prior_messages,
+                "".join(content_parts),
+                tool_pairs,
+                "".join(reasoning_parts) or None,
+                cache_salt=request.cache_salt,
+                reasoning_ended=True,
+                prompt_token_ids=prompt_ids,
+                output_token_ids=out_ids,
+                gen_suffix=gen_suffix,
+                im_end_id=im_end_id,
+                nl_ids=nl_ids,
+            )
 
         if request.store:
             async with self.response_store_lock:
@@ -1498,6 +1663,8 @@ class OpenAIServingResponses(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
+        *,
+        prior_messages: Sequence[Any] | None = None,
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
         # TODO:
         # 1. Handle disconnect
@@ -1585,6 +1752,7 @@ class OpenAIServingResponses(OpenAIServing):
                 tokenizer,
                 request_metadata,
                 created_time=created_time,
+                prior_messages=prior_messages,
             )
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(

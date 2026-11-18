@@ -62,6 +62,7 @@ class StreamState:
     # only used for "required" and "named tool" choices,
     # tracks whether function name has been fully returned in the stream yet
     function_name_returned: bool = False
+    post_reasoning_newlines_remaining: int = 0
 
 
 class Parser:
@@ -689,6 +690,7 @@ class DelegatingParser(Parser):
         delta_message: DeltaMessage | None = None
 
         # Reasoning extraction
+        transitioned_from_reasoning = False
         if self._in_reasoning_phase(state):
             delta_message = self.extract_reasoning_streaming(
                 previous_text=state.previous_text,
@@ -700,6 +702,15 @@ class DelegatingParser(Parser):
             )
             if self.is_reasoning_end_streaming(current_token_ids, delta_token_ids):
                 state.reasoning_ended = True
+                transitioned_from_reasoning = True
+                state.post_reasoning_newlines_remaining = int(
+                    getattr(
+                        self._reasoning_parser,
+                        "_remaining_post_end_newlines",
+                        0,
+                    )
+                    or 0
+                )
                 current_token_ids = self.extract_content_ids(delta_token_ids)
                 current_text = (
                     delta_message.content
@@ -708,6 +719,21 @@ class DelegatingParser(Parser):
                 )
                 delta_text = current_text
                 delta_token_ids = current_token_ids
+        elif (
+            state.post_reasoning_newlines_remaining > 0
+            and not state.previous_text
+            and delta_text
+        ):
+            while state.post_reasoning_newlines_remaining > 0 and delta_text.startswith(
+                "\n"
+            ):
+                delta_text = delta_text[1:]
+                state.post_reasoning_newlines_remaining -= 1
+            if delta_text:
+                state.post_reasoning_newlines_remaining = 0
+                current_text = state.previous_text + delta_text
+            else:
+                return None
 
         # Tool call extraction
         if self._in_tool_call_phase(state):
@@ -739,6 +765,7 @@ class DelegatingParser(Parser):
                 if not delta_message:
                     delta_message = DeltaMessage()
                 delta_message.reasoning = reasoning
+                delta_message.reasoning_content = reasoning
 
             if (
                 delta_message
@@ -755,7 +782,10 @@ class DelegatingParser(Parser):
             and not self._in_reasoning_phase(state)
             and not self._in_tool_call_phase(state)
         ):
-            delta_message = DeltaMessage(content=delta_text)
+            if transitioned_from_reasoning and not delta_text:
+                delta_message = None
+            else:
+                delta_message = DeltaMessage(content=delta_text)
 
         state.previous_text = current_text
         state.previous_token_ids = current_token_ids

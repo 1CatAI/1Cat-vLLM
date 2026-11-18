@@ -286,6 +286,10 @@ def _should_use_prefill_dense_splitkv3(
         and max_seqlen_q == query.shape[1]
         and max_seqlen_k >= _config.options().value("prefill_dense_splitkv3_min_kv")
         and max_seqlen_k > max_seqlen_q
+        and (
+            max_seqlen_k <= 262144
+            or _ops.get_sm70_d256_gqa_architecture_q4096_op() is None
+        )
         and not _routing.is_cuda_graph_capturing(query)
     )
 

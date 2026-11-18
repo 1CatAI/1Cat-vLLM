@@ -78,21 +78,28 @@ class PartialEntry:
     ready_step: int
     # Referenced full-block parents kept resident while this entry is cached.
     pinned_blocks: list[KVCacheBlock] = field(default_factory=list)
+    # Number of prefix-cache lookups served by this entry.
+    hit_count: int = 0
+
+    @property
+    def owned_blocks(self) -> int:
+        return sum(len(blocks) for blocks in self.blocks)
 
     @property
     def num_blocks(self) -> int:
-        return sum(len(blocks) for blocks in self.blocks) + len(self.pinned_blocks)
+        return self.owned_blocks + len(self.pinned_blocks)
 
 
 @dataclass
 class PartialPrefixCache:
     block_pool: BlockPool
-    # Upper bound on the blocks held by entries.
+    # Upper bound on the physical blocks held by entries.
     max_blocks: int
     entries: "OrderedDict[PartialKey, PartialEntry]" = field(
         default_factory=OrderedDict
     )
     by_parent: dict[BlockHash | None, set[PartialKey]] = field(default_factory=dict)
+    pinned_ref_counts: dict[int, int] = field(default_factory=dict)
     num_blocks: int = 0
 
     def contains(self, key: PartialKey) -> bool:
@@ -103,9 +110,15 @@ class PartialPrefixCache:
             self._remove(entry.key)
         self.entries[entry.key] = entry
         self.by_parent.setdefault(entry.key[0], set()).add(entry.key)
-        self.num_blocks += entry.num_blocks
+        self.num_blocks += entry.owned_blocks
+        for blk in entry.pinned_blocks:
+            prev = self.pinned_ref_counts.get(blk.block_id, 0)
+            if prev == 0:
+                self.num_blocks += 1
+            self.pinned_ref_counts[blk.block_id] = prev + 1
         while self.num_blocks > self.max_blocks and len(self.entries) > 1:
-            self.evict_one()
+            if not self.evict_one(protected=entry):
+                break
 
     def _remove(self, key: PartialKey) -> None:
         entry = self.entries.pop(key)
@@ -114,9 +127,16 @@ class PartialPrefixCache:
             siblings.discard(key)
             if not siblings:
                 del self.by_parent[key[0]]
-        self.num_blocks -= entry.num_blocks
+        self.num_blocks -= entry.owned_blocks
+        for blk in entry.pinned_blocks:
+            rem = self.pinned_ref_counts.get(blk.block_id, 1) - 1
+            if rem <= 0:
+                self.pinned_ref_counts.pop(blk.block_id, None)
+                self.num_blocks -= 1
+            else:
+                self.pinned_ref_counts[blk.block_id] = rem
         self.block_pool.free_blocks(
-            [b for blocks in entry.blocks for b in blocks] + entry.pinned_blocks
+            [b for blocks in entry.blocks for b in blocks] + list(entry.pinned_blocks)
         )
 
     def remove(self, key: PartialKey) -> bool:
@@ -126,12 +146,29 @@ class PartialPrefixCache:
         self._remove(key)
         return True
 
-    def evict_one(self) -> bool:
-        """Release the least recently used entry. Returns False if empty."""
+    def has_cold_evictable(self, protected: PartialEntry | None = None) -> bool:
+        """True if at least one non-protected unhit entry can be evicted."""
+        return any(
+            e is not protected and e.hit_count == 0 for e in self.entries.values()
+        )
+
+    def evict_one(self, protected: PartialEntry | None = None) -> bool:
+        """Release the least wanted entry (unhit LRU first, then hit LRU).
+
+        Never evicts ``protected`` (e.g. an entry already matched for the
+        in-progress ``allocate_slots`` call).
+        """
         if not self.entries:
             return False
-        self._remove(next(iter(self.entries)))
-        return True
+        for key, entry in self.entries.items():
+            if entry is not protected and entry.hit_count == 0:
+                self._remove(key)
+                return True
+        for key, entry in self.entries.items():
+            if entry is not protected:
+                self._remove(key)
+                return True
+        return False
 
     def lookup(
         self,
@@ -167,6 +204,7 @@ class PartialPrefixCache:
             ):
                 best = entry
         if best is not None:
+            best.hit_count += 1
             self.entries.move_to_end(best.key)
         return best
 

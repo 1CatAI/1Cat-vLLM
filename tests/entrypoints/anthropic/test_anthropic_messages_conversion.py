@@ -775,3 +775,55 @@ class TestInlineSystemMessageInMessagesArray:
         assert result.messages[0]["role"] == "system"
         assert result.messages[0]["content"] == "Top-level prompt.Inline hint."
         assert result.messages[1]["role"] == "user"
+
+
+class TestThinkingCacheControlAndAuth:
+    def test_thinking_disabled_maps_to_enable_thinking_false(self):
+        req = _make_request(
+            [{"role": "user", "content": "Hello"}],
+            thinking={"type": "disabled"},
+        )
+        converted = _convert(req)
+        assert converted.chat_template_kwargs == {"enable_thinking": False}
+        assert converted.include_reasoning is False
+
+    def test_thinking_enabled_maps_to_enable_thinking_true(self):
+        req = _make_request(
+            [{"role": "user", "content": "Solve"}],
+            thinking={"type": "enabled", "budget_tokens": 4096},
+        )
+        converted = _convert(req)
+        assert converted.chat_template_kwargs == {"enable_thinking": True}
+        assert converted.include_reasoning is True
+
+    def test_system_cache_control_preserves_structured_sub_blocks(self):
+        req = _make_request(
+            [{"role": "user", "content": "Run task"}],
+            system=[
+                {
+                    "type": "text",
+                    "text": "Static tools preamble",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "text", "text": "Dynamic repo context"},
+            ],
+        )
+        converted = _convert(req)
+        assert converted.messages[0]["role"] == "system"
+        assert (
+            converted.messages[0]["content"]
+            == "Static tools preambleDynamic repo context"
+        )
+        assert getattr(converted, "_system_cache_prefixes", None) == [
+            "Static tools preamble"
+        ]
+
+    def test_auth_middleware_accepts_x_api_key(self):
+        from starlette.datastructures import Headers
+
+        from vllm.entrypoints.openai.server_utils import AuthenticationMiddleware
+
+        mw = AuthenticationMiddleware(app=lambda *a: None, tokens=["sk-secret"])
+        assert mw.verify_token(Headers({"x-api-key": "sk-secret"})) is True
+        assert mw.verify_token(Headers({"x-api-key": "wrong"})) is False
+        assert mw.verify_token(Headers({"authorization": "Bearer sk-secret"})) is True

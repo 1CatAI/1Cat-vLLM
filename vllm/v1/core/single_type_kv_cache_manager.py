@@ -1643,6 +1643,22 @@ class MambaManager(SingleTypeKVCacheManager):
         boundaries = list(replay_boundaries)
         if boundary := getattr(request, "shared_prefix_boundary", 0):
             boundaries.append(boundary)
+        if req_boundaries := getattr(request, "prefix_cache_boundaries", None):
+            align = alignment_tokens or self.block_size
+            for b in req_boundaries:
+                if b > 0 and b % align == 0:
+                    boundaries.append(b)
+        if (
+            num_tokens > request.num_prompt_tokens
+            and not getattr(self.block_pool, "_device_state_blocks", 0)
+            and self.block_size >= 2048
+        ):
+            decode_start_blk = max(
+                num_cached_blocks_before,
+                request.num_prompt_tokens // self.block_size,
+            )
+            for blk_idx in range(decode_start_blk, num_full_blocks):
+                boundaries.append((blk_idx + 1) * self.block_size)
         mask = self.reachable_block_mask(
             num_cached_blocks_before,
             num_full_blocks,

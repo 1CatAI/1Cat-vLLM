@@ -168,6 +168,43 @@ class KVCacheCoordinator(ABC):
         else:
             manager.cache_blocks(request, num_tokens, alignment_tokens=alignment)
 
+    def get_group_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> tuple[int, dict[int, int]]:
+        num_blocks_to_allocate = 0
+        group_demand: dict[int, int] = {}
+        for i, manager in enumerate(self.single_type_managers):
+            before = num_blocks_to_allocate
+            if isinstance(manager, CrossAttentionManager):
+                # For cross-attention, we issue a single static allocation
+                # of blocks based on the number of encoder input tokens.
+                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_encoder_tokens,
+                    [],
+                    0,
+                    num_encoder_tokens,
+                    apply_admission_cap=apply_admission_cap,
+                )
+            else:
+                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    new_computed_blocks[i],
+                    total_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                )
+            group_demand[i] = num_blocks_to_allocate - before
+        return num_blocks_to_allocate, group_demand
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -201,31 +238,15 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
-        group_demand = {}
-        for i, manager in enumerate(self.single_type_managers):
-            before = num_blocks_to_allocate
-            if isinstance(manager, CrossAttentionManager):
-                # For cross-attention, we issue a single static allocation
-                # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_encoder_tokens,
-                    [],
-                    0,
-                    num_encoder_tokens,
-                    apply_admission_cap=apply_admission_cap,
-                )
-            else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_tokens,
-                    new_computed_blocks[i],
-                    total_computed_tokens,
-                    num_tokens_main_model,
-                    apply_admission_cap=apply_admission_cap,
-                )
-            group_demand[i] = num_blocks_to_allocate - before
+        num_blocks_to_allocate, group_demand = self.get_group_blocks_to_allocate(
+            request_id=request_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=total_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+        )
         if not self.block_pool.can_allocate_group_blocks(group_demand):
             # Preserve the caller's existing admission/preemption contract.
             return self.block_pool.get_num_free_blocks() + 1
@@ -779,13 +800,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         if longest_hit_length > hit_length:
             self.shared_prefix_boundary = longest_hit_length
 
-        # Truncate full attention blocks to final hit_length (if present)
-        first_group = self.attention_groups[0]
-        if isinstance(first_group.spec, FullAttentionSpec):
-            num_blocks = hit_length // first_group.spec.block_size
-            for group_id in first_group.group_ids:
-                if (blks := hit_blocks_by_group[group_id]) is not None:
-                    del blks[num_blocks:]
+        # Truncate all full-attention groups to final hit_length (including
+        # secondary FullAttentionSpec/MLAAttentionSpec groups such as QSA
+        # compressed key caches that skipped re-lookup on iteration 2+).
+        for attn_group in self.attention_groups:
+            if isinstance(attn_group.spec, FullAttentionSpec):
+                num_blocks = hit_length // attn_group.spec.block_size
+                for group_id in attn_group.group_ids:
+                    if (blks := hit_blocks_by_group[group_id]) is not None:
+                        del blks[num_blocks:]
 
         return tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group

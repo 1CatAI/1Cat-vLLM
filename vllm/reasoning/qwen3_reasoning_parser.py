@@ -115,6 +115,16 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             return input_ids[tool_call_index:]
         return []
 
+    strip_post_reasoning_newlines: int = 2
+
+    @staticmethod
+    def _strip_post_end_newlines(text: str, limit: int = 2) -> tuple[str, int]:
+        removed = 0
+        while removed < limit and text.startswith("\n"):
+            text = text[1:]
+            removed += 1
+        return text, removed
+
     def extract_reasoning(
         self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> tuple[str | None, str | None]:
@@ -144,6 +154,9 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
 
         if self.end_token in model_output:
             reasoning, _, content = model_output.partition(self.end_token)
+            content, _ = self._strip_post_end_newlines(
+                content, self.strip_post_reasoning_newlines
+            )
             return reasoning, content or None
 
         if not self.thinking_enabled:
@@ -205,6 +218,12 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             if end_index >= 0:
                 reasoning = delta_text[:end_index]
                 content = delta_text[end_index + len(self.end_token) :]
+                content, removed = self._strip_post_end_newlines(
+                    content, self.strip_post_reasoning_newlines
+                )
+                self._remaining_post_end_newlines = (
+                    0 if content else self.strip_post_reasoning_newlines - removed
+                )
                 if not reasoning and not content:
                     return None
                 return DeltaMessage(

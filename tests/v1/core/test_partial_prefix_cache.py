@@ -1025,3 +1025,303 @@ def test_decode_ckpt_duplicate_snapshot_defers_chosen_release():
 
     cm.reset_prefix_cache()
     assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_spec_decode_crosses_2048_mamba_block_and_hits_full_and_partial_on_turn2():
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import RequestStatus
+
+    full = FullAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    mamba = MambaSpec(
+        block_size=2048,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        64,
+        [],
+        [
+            KVCacheGroupSpec(["qsa"], full),
+            KVCacheGroupSpec(["gdn"], mamba),
+        ],
+    )
+    cm = KVCacheManager(
+        config,
+        8192,
+        256,
+        prefix_cache_retention_interval=8192,
+        partial_prefix_cache=True,
+        enable_decode_ckpt=True,
+    )
+    free_initial = cm.block_pool.get_num_free_blocks()
+
+    def _hasher(req):
+        start = len(req.block_hashes) * 256
+        return [
+            BlockHash(
+                bytes(((x * 131 + i) % 256) for x in req.all_token_ids[i : i + 256])
+            )
+            for i in range(start, len(req.all_token_ids) // 256 * 256, 256)
+        ]
+
+    # Turn 1: prompt=1980 (< 2048), speculative decode steps cross 2048 up to 2120.
+    prompt_ids = list(range(1000, 2980))
+    t1 = Request(
+        request_id="spec-t1",
+        prompt_token_ids=prompt_ids,
+        sampling_params=SamplingParams(
+            max_tokens=256,
+            extra_args={"prefix_cache_boundaries": [1975]},
+        ),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+    cm.new_step_starts()
+    assert cm.allocate_slots(t1, 1980) is not None
+    t1.num_computed_tokens = 1980
+    t1.append_output_token_ids([5000])
+
+    cur = 1980
+    next_tok = 5001
+    while cur < 2120:
+        cm.new_step_starts()
+        draft = list(range(next_tok, next_tok + 7))
+        assert cm.allocate_slots(t1, 1 + len(draft), num_lookahead_tokens=len(draft))
+        cm.take_decode_ckpt_mounts()
+        t1.num_computed_tokens = cur + 8
+        t1.append_output_token_ids(list(range(next_tok, next_tok + 8)))
+        cur += 8
+        next_tok += 8
+
+    t1.status = RequestStatus.FINISHED_STOPPED
+    cm.free(t1)
+
+    cm.new_step_starts()
+    t2_tokens = list(t1.all_token_ids[:2120]) + list(range(9000, 9160))
+    t2 = Request(
+        request_id="spec-t2",
+        prompt_token_ids=t2_tokens,
+        sampling_params=SamplingParams(
+            max_tokens=64,
+            extra_args={"prefix_cache_boundaries": [len(t2_tokens) - 5]},
+        ),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+    comp_blocks, hit = cm.get_computed_blocks(t2)
+    assert hit == 2112
+    assert cm.partial_prefix_stops(t2, hit, len(t2_tokens)) == (
+        (len(t2_tokens) - 5) // 64 * 64,
+    )
+    assert cm.allocate_slots(t2, len(t2_tokens) - hit, hit, comp_blocks) is not None
+    t2.status = RequestStatus.FINISHED_ABORTED
+    cm.free(t2)
+
+    for _ in range(4):
+        cm.new_step_starts()
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_partial_cache_dedups_pinned_blocks_and_protects_active_hit_on_eviction():
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.partial_prefix_cache import PartialEntry, PartialPrefixCache
+
+    pool = BlockPool(num_gpu_blocks=32, enable_caching=True, hash_block_size=256)
+    cache = PartialPrefixCache(block_pool=pool, max_blocks=20)
+    parent_a, parent_b, sys_blk, t0, t1_blk, t2_blk = pool.get_new_blocks(6)
+
+    sys_entry = PartialEntry(
+        key=(None, (1, 2, 3), None, 0, ()),
+        length=3,
+        blocks=((sys_blk,),),
+        copy_last=(True,),
+        ready_step=0,
+        pinned_blocks=(),
+    )
+    cache.insert(sys_entry)
+    sys_entry.hit_count = 1
+
+    turn_entries = []
+    for i, tail in enumerate((t0, t1_blk, t2_blk)):
+        for p in (parent_a, parent_b):
+            p.ref_cnt += 1
+        ent = PartialEntry(
+            key=(None, tuple(range(100 + i)), None, 0, ()),
+            length=100 + i,
+            blocks=((tail,),),
+            copy_last=(True,),
+            ready_step=0,
+            pinned_blocks=(parent_a, parent_b),
+        )
+        cache.insert(ent)
+        turn_entries.append(ent)
+    # 1 (sys_blk) + 3 (tails) + 2 (deduped parent_a, parent_b) == 6 blocks!
+    assert cache.num_blocks == 6
+
+    assert cache.evict_one(protected=turn_entries[0]) is True
+    assert sys_entry.key in cache.entries
+    assert turn_entries[0].key in cache.entries
+    assert turn_entries[1].key not in cache.entries
+    assert parent_a.ref_cnt == 3 and parent_b.ref_cnt == 3
+
+
+def test_agent_prefix_boundaries_and_decoded_span_splicing():
+    from vllm.entrypoints.openai.chat_completion.serving import (
+        _AssistantReasoningCache,
+        _PrefixCacheBoundaries,
+    )
+
+    class _MockChatTokenizer:
+        chat_template = "Supported types are xhigh, high, medium, low"
+
+        def get_vocab(self):
+            return {
+                "<|im_start|>": 1,
+                "<|im_end|>": 2,
+                "<think>": 3,
+                "</think>": 4,
+            }
+
+        def encode(self, text: str, add_special_tokens: bool = False):
+            if text == "\n":
+                return [10]
+            return [100 + (ord(ch) % 90) for ch in text]
+
+        def apply_chat_template(
+            self,
+            messages,
+            tools=None,
+            chat_template=None,
+            add_generation_prompt=False,
+            tokenize=True,
+            **kwargs,
+        ):
+            if kwargs.get("reasoning_effort") in ("max", "minimal", "none"):
+                raise ValueError(f"Unsupported effort: {kwargs['reasoning_effort']}")
+            ids: list[int] = []
+            if tools:
+                ids.extend([50] * 140)
+            for msg in messages:
+                ids.append(1)
+                role = msg.get("role", "")
+                ids.extend(self.encode(role))
+                ids.append(10)
+                if role == "assistant":
+                    ids.append(3)
+                    ids.append(10)
+                    rc = (
+                        msg.get("reasoning_content") or msg.get("reasoning") or ""
+                    ).strip()
+                    if rc:
+                        ids.extend(self.encode(rc))
+                    ids.append(10)
+                    ids.append(4)
+                    ids.append(10)
+                    ids.append(10)
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            ids.extend(self.encode(part.get("text", "")))
+                elif isinstance(content, str):
+                    ids.extend(
+                        self.encode(content.strip() if role == "assistant" else content)
+                    )
+                if role == "tool":
+                    ids.extend(self.encode(msg.get("tool_call_id", "")))
+                ids.append(2)
+                ids.append(10)
+            if add_generation_prompt:
+                ids.extend([1, 101, 10, 3, 10])
+            return ids
+
+    tok = _MockChatTokenizer()
+    bounds = _PrefixCacheBoundaries()
+    rcache = _AssistantReasoningCache()
+
+    sys_msg = {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "S" * 80, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "D" * 40},
+        ],
+    }
+    user_1 = {"role": "user", "content": [{"type": "text", "text": "Inspect repo"}]}
+    tools = [{"type": "function", "function": {"name": "read_file"}}]
+    kwargs = {"reasoning_effort": "max"}
+    t1_msgs = [sys_msg, user_1]
+    t1_prompt = tok.apply_chat_template(
+        t1_msgs, tools=tools, add_generation_prompt=True, reasoning_effort="xhigh"
+    )
+    gen_suffix = bounds._generation_prompt(tok, tok.chat_template, kwargs)
+    assert gen_suffix == (1, 101, 10, 3, 10)
+    b1 = bounds(
+        tok,
+        None,
+        t1_prompt,
+        tok.chat_template,
+        kwargs,
+        messages=t1_msgs,
+        tools=tools,
+    )
+    assert 141 in b1
+    assert 228 in b1
+    assert len(t1_prompt) - len(gen_suffix) in b1
+
+    decoded_out = [10] + tok.encode("plan") + [10, 4, 10, 10] + tok.encode("OK") + [2]
+    rcache.record(
+        t1_msgs,
+        "OK",
+        [],
+        "\nplan",
+        prompt_token_ids=t1_prompt,
+        output_token_ids=decoded_out,
+        gen_suffix=gen_suffix,
+        im_end_id=2,
+        nl_ids=(10,),
+    )
+
+    t2_msgs = [
+        sys_msg,
+        user_1,
+        {"role": "assistant", "content": "OK"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+    ]
+    rerendered_t2 = tok.apply_chat_template(
+        [
+            sys_msg,
+            user_1,
+            {"role": "assistant", "content": "OK", "reasoning_content": "\nplan"},
+            t2_msgs[3],
+        ],
+        tools=tools,
+        add_generation_prompt=True,
+        reasoning_effort="xhigh",
+    )
+    expected_decode_prefix = list(t1_prompt) + decoded_out + [10]
+    assert rerendered_t2[: len(expected_decode_prefix)] != expected_decode_prefix
+
+    spliced_t2 = rcache.splice_prompt_tokens(t2_msgs, rerendered_t2, tok)
+    assert spliced_t2[: len(expected_decode_prefix)] == expected_decode_prefix
+    b2 = bounds(
+        tok,
+        None,
+        spliced_t2,
+        tok.chat_template,
+        kwargs,
+        messages=t2_msgs,
+        tools=tools,
+    )
+    assert len(expected_decode_prefix) in b2
