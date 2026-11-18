@@ -1964,20 +1964,42 @@ def _sharded_index_core(
     q = q_all
     local_columns = triton.cdiv(columns, kt * world) * kt
     head = torch.empty(tokens, local_columns, dtype=torch.float16, device=q.device)
-    torch.ops.v41sk.index_scores_shard(
-        head,
-        q_all,
-        w_all,
-        cache,
-        block_table,
-        positions if positions.dtype == torch.int64 else positions.long(),
-        layout.query_start_loc,
-        layout.num_reqs,
-        ratio,
-        min(triton.cdiv(local_columns, kt), max(32, 320 // max(1, layout.num_reqs))),
-        rank,
-        world,
-    )
+    if (
+        layout.num_reqs == 1
+        and tokens > 6
+        and q_all.shape[1] == 32
+        and hasattr(torch.ops.v41sk, "index_scores_prefill_shard")
+    ):
+        torch.ops.v41sk.index_scores_prefill_shard(
+            head,
+            q_all,
+            w_all,
+            cache,
+            block_table,
+            (
+                positions if positions.dtype == torch.int64 else positions.long()
+            ).contiguous(),
+            ratio,
+            rank,
+            world,
+        )
+    else:
+        torch.ops.v41sk.index_scores_shard(
+            head,
+            q_all,
+            w_all,
+            cache,
+            block_table,
+            positions if positions.dtype == torch.int64 else positions.long(),
+            layout.query_start_loc,
+            layout.num_reqs,
+            ratio,
+            min(
+                triton.cdiv(local_columns, kt), max(32, 320 // max(1, layout.num_reqs))
+            ),
+            rank,
+            world,
+        )
     # This rank's keys below each row's length (whole tiles t % world == rank,
     # plus the partial last tile when it is ours), as the select kernels'
     # positions: p = mine * ratio - 1 makes their (p + 1) // ratio == mine.
@@ -2126,28 +2148,62 @@ def _sharded_index_prefill(
             continue
         columns = max(-(-(int(last_positions[r]) + 1) // ratio), top_k)
         local_columns = triton.cdiv(columns, kt * world) * kt
-        tile = max(group, min(1536, (64 << 20) // (2 * local_columns) // group * group))
+        from vllm.models.deepseek_v41.native import load_v41sk
+
+        load_v41sk()
+        use_pf_shard = (
+            q_all.shape[1] == 32
+            and b - a > group
+            and hasattr(torch.ops.v41sk, "index_scores_prefill_shard")
+        )
+        tile = max(
+            group,
+            min(
+                4096 if use_pf_shard else 1536,
+                (128 << 20 if use_pf_shard else 64 << 20)
+                // (2 * local_columns)
+                // group
+                * group,
+            ),
+        )
         for first in range(a, b, tile):
             last = min(first + tile, b)
-            groups = triton.cdiv(last - first, group)
-            qsl = (
-                torch.arange(groups + 1, device=q.device, dtype=torch.int32) * group
-            ).clamp_(max=last - first)
-            result[first:last] = _sharded_index_core(
-                q_all[first:last],
-                w_all[first:last],
-                cache,
-                block_table[r : r + 1].expand(groups, -1),
-                positions[first:last],
-                valid_tokens[first:last],
-                SimpleNamespace(query_start_loc=qsl, num_reqs=groups),
-                ratio,
-                columns,
-                top_k,
-                all_gather,
-                rank,
-                world,
-            )
+            if use_pf_shard:
+                result[first:last] = _sharded_index_core(
+                    q_all[first:last],
+                    w_all[first:last],
+                    cache,
+                    block_table[r : r + 1],
+                    positions[first:last],
+                    valid_tokens[first:last],
+                    SimpleNamespace(query_start_loc=None, num_reqs=1),
+                    ratio,
+                    columns,
+                    top_k,
+                    all_gather,
+                    rank,
+                    world,
+                )
+            else:
+                groups = triton.cdiv(last - first, group)
+                qsl = (
+                    torch.arange(groups + 1, device=q.device, dtype=torch.int32) * group
+                ).clamp_(max=last - first)
+                result[first:last] = _sharded_index_core(
+                    q_all[first:last],
+                    w_all[first:last],
+                    cache,
+                    block_table[r : r + 1].expand(groups, -1),
+                    positions[first:last],
+                    valid_tokens[first:last],
+                    SimpleNamespace(query_start_loc=qsl, num_reqs=groups),
+                    ratio,
+                    columns,
+                    top_k,
+                    all_gather,
+                    rank,
+                    world,
+                )
 
 
 def _bindex_scores_launch(

@@ -503,7 +503,9 @@ if TYPE_CHECKING:
     VLLM_V41_EM7: str = "1"
     VLLM_V41_EM8: str | None = None
     VLLM_V41_EMPTY_CACHE_TOKENS: str = "2048"
+    VLLM_V41_ENGRAM_PEER: str | None = None
     VLLM_V41_ENGRAM_READERS: str | None = None
+    VLLM_V41_ENGRAM_SPLIT_ROW: str = "0"
     VLLM_V41_EXACT_GEMM: str = "0"
     VLLM_V41_EXPERT_DIET: str = "0"
     VLLM_V41_EXPERT_FAST: str = "0"
@@ -1575,8 +1577,10 @@ def _get_weight_load_max_split_scope() -> bool:
 
 environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_PHASE_SEPARATION": env_var(
-        lambda: os.getenv("VLLM_SM70_PHASE_SEPARATION", "0").strip().lower()
-        not in ("", "0", "false", "no", "off"),
+        lambda: (
+            os.getenv("VLLM_SM70_PHASE_SEPARATION", "0").strip().lower()
+            not in ("", "0", "false", "no", "off")
+        ),
         description=(
             "Separate resident decode and prefill phases in synchronous PP1 "
             "chunked text generation. Cache recovery keeps its normal path. "
@@ -1647,8 +1651,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=True,
     ),
     "VLLM_KV_RETENTION_ENABLED": env_var(
-        lambda: os.getenv("VLLM_KV_RETENTION_ENABLED", "0").strip().lower()
-        not in ("", "0", "false", "no", "off"),
+        lambda: (
+            os.getenv("VLLM_KV_RETENTION_ENABLED", "0").strip().lower()
+            not in ("", "0", "false", "no", "off")
+        ),
         description=(
             "Opt into warm KV history-block retention using cache_config.retention. "
             "The default free queue already preserves valid prefix hashes until "
@@ -7859,6 +7865,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
+    "VLLM_V41_ENGRAM_PEER": env_var(
+        lambda: os.getenv("VLLM_V41_ENGRAM_PEER"),
+        description=(
+            "DS-V4.1 optional host:port of remote IB RAM peer serving Engram rows "
+            ">= VLLM_V41_ENGRAM_SPLIT_ROW."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ENGRAM_SPLIT_ROW": env_var(
+        lambda: os.getenv("VLLM_V41_ENGRAM_SPLIT_ROW", "0"),
+        description=(
+            "DS-V4.1 row index above which Engram rows are served from "
+            "VLLM_V41_ENGRAM_PEER over InfiniBand."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_V41_ENGRAM_READERS": env_var(
         lambda: os.getenv("VLLM_V41_ENGRAM_READERS"),
         description=("DS-V4.1 Engram reader tuning."),
@@ -9446,8 +9478,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_INPLACE_AR_MIN": env_var(
-        lambda: os.getenv("VLLM_INPLACE_AR_MIN")
-        or ("4194304" if os.getenv("VLLM_V41_PACKED_KV") == "1" else "0"),
+        lambda: (
+            os.getenv("VLLM_INPLACE_AR_MIN")
+            or ("4194304" if os.getenv("VLLM_V41_PACKED_KV") == "1" else "0")
+        ),
         description=(
             "All-reduce large (prefill) temporaries in place at or above this many "
             "elements; 0 disables. The all_reduce op is declared out-of-place, so "
@@ -21831,7 +21865,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_EM7",
         "VLLM_V41_EM8",
         "VLLM_V41_EMPTY_CACHE_TOKENS",
+        "VLLM_V41_ENGRAM_PEER",
         "VLLM_V41_ENGRAM_READERS",
+        "VLLM_V41_ENGRAM_SPLIT_ROW",
         "VLLM_V41_EXACT_GEMM",
         "VLLM_V41_EXPERT_FAST_HIT",
         "VLLM_V41_FP8_GEMV",

@@ -671,8 +671,6 @@ class EngineCore:
         live_qdepth = v41_live.get("qdepth", 0)
         if live_qdepth > 0:
             depth = min(self.batch_queue_size, live_qdepth)
-        elif self._v41_micro and getattr(self.scheduler, "v41_ahead", False):
-            depth = min(self.batch_queue_size, 2 * self._v41_depth)
         else:
             depth = self._v41_depth
 
