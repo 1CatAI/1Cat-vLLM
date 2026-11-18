@@ -530,7 +530,15 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             return None
         if anchor.numel() > 1 and self._markov_shard is None:
             return None  # batched drafts need the sharded Markov head
-        return self.greedy_graph(hidden_states, anchor)
+        return self._valid_drafts(self.greedy_graph(hidden_states, anchor))
+
+    def _valid_drafts(self, ids):
+        """An all-NaN draft step yields 2**31 - 1 (as upstream); the target
+        must never read it (embedding, Engram hash). Out-of-vocabulary drafts
+        become token 0: verification rejects them unless the target itself
+        picks 0, so the output is the target's either way."""
+        vocab = self.model.markov_embed.num_embeddings
+        return torch.where((ids >= 0) & (ids < vocab), ids, torch.zeros_like(ids))
 
     def coupled_draft_tokens(
         self, base_logits, prev, temperature, keys, positions, scale
@@ -564,7 +572,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         ).squeeze(-1)
 
     def map_draft_to_target(self, ids):
-        return ids
+        return self._valid_drafts(ids)
 
     def skip_checkpoint_weight(self, name):
         return draft_weight_name(name) is None
