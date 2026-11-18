@@ -325,8 +325,9 @@ def warmup_kernels(
             # admits a prefill beside decoding requests takes its own route.
             # Without this, the first batch at each concurrency compiles them
             # while serving it (about 1 s of TTFT per new shape).
-            for count in range(num_reqs - 1, 0, -1):
-                for mixed in (False, True):
+            for count in range(num_reqs, 0, -1):
+                mixed_modes = (True,) if count == num_reqs else (False, True)
+                for mixed in mixed_modes:
                     _warmup_cycle(
                         model_runner,
                         worker_execute_model,
@@ -344,3 +345,5 @@ def warmup_kernels(
     finally:
         model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
+    if torch.accelerator.is_available():
+        torch.accelerator.empty_cache()

@@ -566,14 +566,25 @@ def try_dflash2_sparse_target_rejection(
     if not hasattr(model, "get_topk_tokens_and_logits"):
         return None
     if not _supports_sparse_sampling_contract(
-        rejection_sampler, input_batch, allow_penalties=True
+        rejection_sampler,
+        input_batch,
+        allow_penalties=True,
+        max_top_k=_TARGET_PROBE_K - 1,
     ):
         return None
 
     sparse_draft_logits = speculator.get_sparse_draft_logits()
     if sparse_draft_logits is None:
         return None
-    if allow_graph and not speculator._trace.value("alignment"):
+    idx = input_batch.idx_mapping_np
+    states = rejection_sampler.sampler.sampling_states
+    raw_top_k = int(states.top_k.np[idx[0]])
+    req_top_k = raw_top_k if 1 <= raw_top_k < _TARGET_PROBE_K else _TARGET_TOP_K
+    if (
+        allow_graph
+        and req_top_k == _TARGET_TOP_K
+        and not speculator._trace.value("alignment")
+    ):
         from .sampler_graph import try_graph_rejection
 
         result = try_graph_rejection(
@@ -587,8 +598,6 @@ def try_dflash2_sparse_target_rejection(
         if result is not None:
             return result
     draft_topk_ids, draft_topk_logits = sparse_draft_logits
-    idx = input_batch.idx_mapping_np
-    states = rejection_sampler.sampler.sampling_states
     # The reference sampler dispatches on logit rows, not request count.
     # A single q8 verifier has eight rows and uses the same large-vocabulary
     # radix tie order as a batch. Retain every cutoff tie in that case too.
@@ -596,7 +605,7 @@ def try_dflash2_sparse_target_rejection(
         int(input_batch.cu_num_logits_np[-1]) >= 2
         and getattr(states, "vocab_size", 0) >= 32768
     )
-    probe_k = _TARGET_PROBE_K if retain_ties else _TARGET_TOP_K + 1
+    probe_k = _TARGET_PROBE_K if retain_ties else req_top_k + 1
     fallback = None
     if retain_ties and hasattr(model, "get_compact_target_probe_with_fallback"):
         target_topk_ids, target_topk_logits, fallback = (
@@ -640,6 +649,7 @@ def try_dflash2_sparse_target_rejection(
             states.top_p.gpu,
             input_batch.expanded_idx_mapping,
             floors,
+            target_top_k=req_top_k,
         )
     else:
         num_logits = np.diff(input_batch.cu_num_logits_np)
@@ -647,6 +657,7 @@ def try_dflash2_sparse_target_rejection(
             target_topk_logits,
             np.repeat(states.temperature.np[idx], num_logits),
             np.repeat(states.top_p.np[idx], num_logits),
+            target_top_k=req_top_k,
         )
     reference_reqs = np.flatnonzero(
         np.logical_or.reduceat(reference_rows, input_batch.cu_num_logits_np[:-1])
@@ -662,8 +673,8 @@ def try_dflash2_sparse_target_rejection(
         if reference_reqs.size == idx.size or reference_logits is None:
             return DFlash2LogitsFallback(reference_logits)
     if not retain_ties:
-        target_topk_ids = target_topk_ids[:, :_TARGET_TOP_K]
-        target_topk_logits = target_topk_logits[:, :_TARGET_TOP_K]
+        target_topk_ids = target_topk_ids[:, :req_top_k]
+        target_topk_logits = target_topk_logits[:, :req_top_k]
     num_rows = target_topk_ids.shape[0]
     if input_batch.num_tokens == num_rows:
         # Uniform decode logits_indices spans the entire real query.
@@ -687,7 +698,7 @@ def try_dflash2_sparse_target_rejection(
         rejection_sampler.sampler.sampling_states.seeds.gpu,
         rejection_sampler.num_speculative_steps,
         use_fp64=rejection_sampler.sampler.use_fp64_gumbel,
-        target_top_k=_TARGET_TOP_K,
+        target_top_k=req_top_k,
     )
     if reference_logits is not None:
         reqs, dense_sampled, dense_num_sampled = _sample_reference_requests(

@@ -67,6 +67,7 @@ class AnthropicContentBlock(BaseModel):
     signature: str | None = None
     # For redacted thinking content (safety-filtered by the API)
     data: str | None = None
+    cache_control: dict[str, Any] | None = None
 
 
 class AnthropicMessage(BaseModel):
@@ -74,6 +75,7 @@ class AnthropicMessage(BaseModel):
 
     role: Literal["user", "assistant", "system"]
     content: str | list[AnthropicContentBlock]
+    cache_control: dict[str, Any] | None = None
 
 
 class AnthropicTool(BaseModel):
@@ -83,6 +85,7 @@ class AnthropicTool(BaseModel):
     description: str | None = None
     input_schema: dict[str, Any]
     defer_loading: bool | None = None
+    cache_control: dict[str, Any] | None = None
 
     @field_validator("input_schema")
     @classmethod
@@ -114,6 +117,13 @@ class AnthropicJsonOutputFormat(BaseModel):
     type: Literal["json_schema"] = "json_schema"
 
 
+class AnthropicThinkingConfig(BaseModel):
+    """Configuration for extended thinking on Anthropic Messages API."""
+
+    type: Literal["enabled", "disabled", "adaptive"]
+    budget_tokens: int | None = None
+
+
 class AnthropicOutputConfig(BaseModel):
     """Configuration options for the model's output, such as the output format."""
 
@@ -129,6 +139,7 @@ class AnthropicMessagesRequest(BaseModel):
     max_tokens: int
     metadata: dict[str, Any] | None = None
     output_config: AnthropicOutputConfig | None = None
+    thinking: AnthropicThinkingConfig | None = None
     stop_sequences: list[str] | None = None
     stream: bool | None = False
     system: str | list[AnthropicContentBlock] | None = None
@@ -311,6 +322,7 @@ class AnthropicCountTokensRequest(BaseModel):
     model: str
     messages: list[AnthropicMessage]
     system: str | list[AnthropicContentBlock] | None = None
+    thinking: AnthropicThinkingConfig | None = None
     tool_choice: AnthropicToolChoice | None = None
     tools: list[AnthropicTool] | None = None
 

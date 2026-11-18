@@ -214,12 +214,18 @@ def _construct_message_from_response_item(
         if prev_assistant_msg:
             previous_reasoning = prev_assistant_msg.get("reasoning")
             if previous_reasoning is None:
-                prev_assistant_msg["reasoning"] = reasoning
+                msg_dict = cast(dict[str, Any], prev_assistant_msg)
+                msg_dict["reasoning"] = reasoning
+                msg_dict["reasoning_content"] = reasoning
                 return None
-        return {
-            "role": "assistant",
-            "reasoning": reasoning,
-        }
+        return cast(
+            ChatCompletionMessageParam,
+            {
+                "role": "assistant",
+                "reasoning": reasoning,
+                "reasoning_content": reasoning,
+            },
+        )
     elif isinstance(item, ResponseOutputMessage):
         output_text = item.content[0].text
         if prev_assistant_msg:

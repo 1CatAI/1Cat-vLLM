@@ -26,7 +26,7 @@ ROWS_PER_REQUEST = 8
 # Up to 4 requests share one (prefix, reference, compact) CUDA graph memory
 # pool triple (~170 MiB total when captured from max_reqs down to 1).
 MAX_GRAPH_REQUESTS = 4
-MAX_GRAPHS = 16
+MAX_GRAPHS = 32
 # Capture allocates outside the budget. Serving still needs room after it: the
 # host-decision path at c8 reserves about 1.3 GiB on top of the idle footprint.
 CAPTURE_HEADROOM_BYTES = 5 << 29
@@ -560,6 +560,8 @@ def pre_capture_dflash2_sampler_graphs(
         for use_pen, temp, top_p, pres in (
             (False, 1.0, 0.95, 0.0),
             (True, 0.7, 0.80, 1.5),
+            (False, 1.0, 1.0, 0.0),
+            (True, 0.7, 1.0, 1.5),
         ):
             states.temperature.np[:max_reqs] = temp
             states.top_k.np[:max_reqs] = 20

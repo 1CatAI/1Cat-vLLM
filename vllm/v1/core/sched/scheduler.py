@@ -687,6 +687,10 @@ class Scheduler(SchedulerInterface):
                 retained_boundaries.append(
                     (start // retention_interval + 1) * retention_interval
                 )
+            if req_boundaries := getattr(request, "prefix_cache_boundaries", None):
+                for b in req_boundaries:
+                    if b > 0 and b % block_size == 0:
+                        retained_boundaries.append(b)
         end = min(
             (
                 stop

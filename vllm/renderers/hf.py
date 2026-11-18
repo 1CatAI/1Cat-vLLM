@@ -739,7 +739,18 @@ def resolve_chat_template_kwargs(
     hf_base_params = _get_hf_base_chat_template_params()
 
     accept_vars = (fn_kw | template_vars | hf_base_params) - unexpected_vars
-    return {k: v for k, v in chat_template_kwargs.items() if k in accept_vars}
+    resolved = {k: v for k, v in chat_template_kwargs.items() if k in accept_vars}
+    if "reasoning_effort" in resolved and "Supported types are xhigh" in chat_template:
+        effort = resolved.get("reasoning_effort")
+        if effort == "max":
+            resolved["reasoning_effort"] = "xhigh"
+        elif effort == "minimal":
+            resolved["reasoning_effort"] = "low"
+        elif effort == "none":
+            resolved.pop("reasoning_effort", None)
+            if "enable_thinking" in accept_vars and "enable_thinking" not in resolved:
+                resolved["enable_thinking"] = False
+    return resolved
 
 
 @overload

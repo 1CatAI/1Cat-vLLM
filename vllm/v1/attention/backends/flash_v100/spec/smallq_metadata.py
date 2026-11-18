@@ -66,20 +66,21 @@ def _sm70_prepare_smallq_decode_metadata_kernel(
         tl.where(is_padding, 0, decode_seq_len),
     )
 
-    cols = tl.arange(0, BLOCK_COLS)
-    col_mask = cols < block_cols
-    block_ids = tl.load(
-        block_table_ptr + req_idx * block_table_stride + cols,
-        mask=col_mask,
-        other=0,
-    )
-    block_ids = tl.maximum(block_ids, 0)
-    block_ids = tl.where(is_padding, 0, block_ids)
-    tl.store(
-        out_block_table_ptr + token_idx * out_block_table_stride + cols,
-        block_ids,
-        mask=col_mask,
-    )
+    for col_base in range(0, block_cols, BLOCK_COLS):
+        cols = col_base + tl.arange(0, BLOCK_COLS)
+        col_mask = cols < block_cols
+        block_ids = tl.load(
+            block_table_ptr + req_idx * block_table_stride + cols,
+            mask=col_mask,
+            other=0,
+        )
+        block_ids = tl.maximum(block_ids, 0)
+        block_ids = tl.where(is_padding, 0, block_ids)
+        tl.store(
+            out_block_table_ptr + token_idx * out_block_table_stride + cols,
+            block_ids,
+            mask=col_mask,
+        )
 
     # The same launch also refreshes the graph-stable query boundaries.
     if token_idx == 0:
@@ -135,8 +136,8 @@ def sm70_prepare_smallq_decode_metadata(
         num_query_tokens,
         real_num_query_tokens,
         block_cols,
-        REQ_BLOCK=triton.next_power_of_2(num_reqs + 1),
-        BLOCK_COLS=triton.next_power_of_2(block_cols),
+        REQ_BLOCK=max(16, triton.next_power_of_2(num_reqs + 1)),
+        BLOCK_COLS=128,
         num_warps=1,
     )
 
@@ -196,20 +197,21 @@ def _sm70_prepare_grouped_smallq_decode_metadata_kernel(
         tl.where(is_padding, 0, decode_seq_len),
     )
 
-    cols = tl.arange(0, BLOCK_COLS)
-    col_mask = cols < block_cols
-    block_ids = tl.load(
-        block_table + req_idx * block_table_stride + cols,
-        mask=col_mask,
-        other=0,
-    )
-    block_ids = tl.maximum(block_ids, 0)
-    block_ids = tl.where(is_padding, 0, block_ids)
-    tl.store(
-        out_block_table + token_idx * out_block_table_stride + cols,
-        block_ids,
-        mask=col_mask,
-    )
+    for col_base in range(0, block_cols, BLOCK_COLS):
+        cols = col_base + tl.arange(0, BLOCK_COLS)
+        col_mask = cols < block_cols
+        block_ids = tl.load(
+            block_table + req_idx * block_table_stride + cols,
+            mask=col_mask,
+            other=0,
+        )
+        block_ids = tl.maximum(block_ids, 0)
+        block_ids = tl.where(is_padding, 0, block_ids)
+        tl.store(
+            out_block_table + token_idx * out_block_table_stride + cols,
+            block_ids,
+            mask=col_mask,
+        )
 
     if token_idx == 0:
         boundary_offsets = tl.arange(0, REQ_BLOCK)
@@ -284,7 +286,6 @@ def _sm70_prepare_grouped_smallq_decode_metadata(
     block_col_counts = [int(table.shape[1]) for table in block_tables]
     if any(cols <= 0 for cols in block_col_counts):
         raise ValueError("grouped small-query block tables cannot be empty")
-    max_block_cols = max(block_col_counts)
     device = block_tables[0].device
     if (
         seq_lens.device != device
@@ -399,8 +400,8 @@ def _sm70_prepare_grouped_smallq_decode_metadata(
         query_start_loc,
         num_reqs,
         real_num_query_tokens,
-        REQ_BLOCK=triton.next_power_of_2(num_reqs + 1),
-        BLOCK_COLS=triton.next_power_of_2(max_block_cols),
+        REQ_BLOCK=max(16, triton.next_power_of_2(num_reqs + 1)),
+        BLOCK_COLS=128,
         num_warps=1,
     )
     return descriptor

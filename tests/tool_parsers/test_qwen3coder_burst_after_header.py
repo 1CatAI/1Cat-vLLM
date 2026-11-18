@@ -168,6 +168,11 @@ CASES = {
         "\n<tool_call>\n<function=list_files>",
         "\n</function>\n</tool_call>",
     ],
+    "two_in_one_burst": [NOARG + "\n" + SHORT],
+    "close_first_and_complete_second": [
+        NOARG[:30],
+        NOARG[30:] + "\n" + SHORT,
+    ],
 }
 
 
@@ -309,3 +314,95 @@ def test_token_by_token_stream_is_unchanged(tok):
     assert _streamed_calls(choices) == _non_streaming_calls(tok, text)
     # "{" is still sent on its own before the parameters arrive.
     assert arguments.count("{") == 2
+
+
+def test_length_truncated_unclosed_tool_call_keeps_length_finish_reason(tok):
+    truncated = "<tool_call>\n<function=f>\n<parameter=x>\nunfinished_value"
+    ids = tok.encode(truncated, add_special_tokens=False)
+    prompt = tok.encode("<think>\n\n</think>\n\n", add_special_tokens=False)
+    out = _output(truncated, ids, "length")
+    out.prompt_token_ids = prompt
+
+    chunks = _stream(
+        _serving(_WrappedParser),
+        _request(stream=True),
+        [out],
+        tokenizer=tok,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    choices = _choices(chunks)[0]
+    assert choices[-1]["finish_reason"] == "length"
+
+    full = asyncio.run(
+        _serving(_WrappedParser).chat_completion_full_generator(
+            _request(stream=False),
+            _generate([out]),
+            "test",
+            "test",
+            [],
+            tok,
+            RequestResponseMetadata(request_id="test"),
+            reasoning_parser=Qwen3ReasoningParser(
+                tok, chat_template_kwargs={"enable_thinking": False}
+            ),
+        )
+    )
+    assert full.choices[0].finish_reason == "length"
+    assert not full.choices[0].message.tool_calls
+
+
+def test_reasoning_content_alias_and_post_think_newline_strip(tok):
+    raw = "<think>\nplan step\n</think>\n\nHello world"
+    ids = tok.encode(raw, add_special_tokens=False)
+    prompt = tok.encode("<think>\n", add_special_tokens=False)
+    out = _output(raw[len("<think>\n") :], ids[len(prompt) :], "stop")
+    out.prompt_token_ids = prompt
+
+    req_on = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+    )
+    full_on = asyncio.run(
+        _serving(_WrappedParser).chat_completion_full_generator(
+            req_on,
+            _generate([out]),
+            "test",
+            "test",
+            [],
+            tok,
+            RequestResponseMetadata(request_id="test"),
+            reasoning_parser=Qwen3ReasoningParser(
+                tok, chat_template_kwargs={"enable_thinking": True}
+            ),
+        )
+    )
+    dumped_msg = full_on.choices[0].message.model_dump(exclude_none=True)
+    assert dumped_msg["content"] == "Hello world"
+    assert dumped_msg["reasoning"] == "plan step\n"
+    assert dumped_msg["reasoning_content"] == "plan step\n"
+
+    req_off = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        include_reasoning=False,
+    )
+    full_off = asyncio.run(
+        _serving(_WrappedParser).chat_completion_full_generator(
+            req_off,
+            _generate([out]),
+            "test",
+            "test",
+            [],
+            tok,
+            RequestResponseMetadata(request_id="test"),
+            reasoning_parser=Qwen3ReasoningParser(
+                tok, chat_template_kwargs={"enable_thinking": True}
+            ),
+        )
+    )
+    dumped_off = full_off.choices[0].message.model_dump(exclude_none=True)
+    assert dumped_off["content"] == "Hello world"
+    assert "reasoning" not in dumped_off
+    assert "reasoning_content" not in dumped_off

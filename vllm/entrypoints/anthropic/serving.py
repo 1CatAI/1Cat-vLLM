@@ -156,9 +156,11 @@ class AnthropicServingMessages(OpenAIServingChat):
         """Convert Anthropic message format to OpenAI format"""
         openai_messages: list[dict[str, Any]] = []
 
-        cls._convert_system_message(anthropic_request, openai_messages)
+        cache_prefixes = cls._convert_system_message(anthropic_request, openai_messages)
         cls._convert_messages(anthropic_request.messages, openai_messages)
         req = cls._build_base_request(anthropic_request, openai_messages)
+        if cache_prefixes:
+            object.__setattr__(req, "_system_cache_prefixes", cache_prefixes)
         cls._handle_streaming_options(req, anthropic_request)
         cls._handle_output_config(req, anthropic_request)
         cls._convert_tool_choice(anthropic_request, req)
@@ -170,38 +172,54 @@ class AnthropicServingMessages(OpenAIServingChat):
         cls,
         anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
         openai_messages: list[dict[str, Any]],
-    ) -> None:
+    ) -> list[str]:
         """Convert Anthropic system message to OpenAI format"""
-        system_parts: list[str] = []
+        system_blocks: list[dict[str, Any]] = []
+        cache_prefixes: list[str] = []
+
+        def _append_system_text(text: str, cache_control: dict[str, Any] | None = None):
+            if text.startswith("x-anthropic-billing-header"):
+                return
+            entry: dict[str, Any] = {"type": "text", "text": text}
+            if cache_control:
+                entry["cache_control"] = cache_control
+            system_blocks.append(entry)
 
         # Top-level system field
         if anthropic_request.system:
             if isinstance(anthropic_request.system, str):
-                system_parts.append(anthropic_request.system)
+                _append_system_text(anthropic_request.system)
             else:
                 for block in anthropic_request.system:
                     if block.type == "text" and block.text:
-                        # Strip Claude Code's attribution header which contains
-                        # a per-request hash that defeats prefix caching.
-                        if block.text.startswith("x-anthropic-billing-header"):
-                            continue
-                        system_parts.append(block.text)
+                        _append_system_text(
+                            block.text, getattr(block, "cache_control", None)
+                        )
 
         # System messages embedded inside the messages array
         for msg in anthropic_request.messages:
             if msg.role != "system":
                 continue
             if isinstance(msg.content, str):
-                system_parts.append(msg.content)
+                _append_system_text(msg.content, getattr(msg, "cache_control", None))
             else:
                 for block in msg.content:
                     if block.type == "text" and block.text:
-                        if block.text.startswith("x-anthropic-billing-header"):
-                            continue
-                        system_parts.append(block.text)
+                        _append_system_text(
+                            block.text,
+                            getattr(block, "cache_control", None)
+                            or getattr(msg, "cache_control", None),
+                        )
 
-        if system_parts:
-            openai_messages.append({"role": "system", "content": "".join(system_parts)})
+        if system_blocks:
+            full_text = "".join(b["text"] for b in system_blocks)
+            openai_messages.append({"role": "system", "content": full_text})
+            acc = ""
+            for b in system_blocks[:-1]:
+                acc += b["text"]
+                if b.get("cache_control") and acc and acc != full_text:
+                    cache_prefixes.append(acc)
+        return cache_prefixes
 
     @classmethod
     def _convert_messages(
@@ -414,11 +432,27 @@ class AnthropicServingMessages(OpenAIServingChat):
         openai_messages: list[dict[str, Any]],
     ) -> ChatCompletionRequest:
         """Build base ChatCompletionRequest"""
+        chat_kwargs = (
+            dict(anthropic_request.chat_template_kwargs)
+            if anthropic_request.chat_template_kwargs
+            else {}
+        )
+        include_reasoning = True
+        thinking_cfg = getattr(anthropic_request, "thinking", None)
+        if thinking_cfg is not None:
+            if thinking_cfg.type == "disabled":
+                chat_kwargs.setdefault("enable_thinking", False)
+                include_reasoning = False
+            elif thinking_cfg.type in ("enabled", "adaptive"):
+                chat_kwargs.setdefault("enable_thinking", True)
+
+        resolved_chat_kwargs = chat_kwargs if chat_kwargs else None
+
         if isinstance(anthropic_request, AnthropicCountTokensRequest):
             return ChatCompletionRequest(
                 model=anthropic_request.model,
                 messages=openai_messages,
-                chat_template_kwargs=anthropic_request.chat_template_kwargs,
+                chat_template_kwargs=resolved_chat_kwargs,
             )
 
         return ChatCompletionRequest(
@@ -431,7 +465,8 @@ class AnthropicServingMessages(OpenAIServingChat):
             top_p=anthropic_request.top_p,
             top_k=anthropic_request.top_k,
             kv_transfer_params=anthropic_request.kv_transfer_params,
-            chat_template_kwargs=anthropic_request.chat_template_kwargs,
+            chat_template_kwargs=resolved_chat_kwargs,
+            include_reasoning=include_reasoning,
             # off by default, matching vLLM's OpenAI
             # protocol (`return_token_ids` defaults to None/off).
             # `create_messages` turns it on only when the caller asked — the
@@ -607,12 +642,14 @@ class AnthropicServingMessages(OpenAIServingChat):
             ),
         )
         choice = generator.choices[0]
-        if choice.finish_reason == "stop":
+        if choice.finish_reason == "tool_calls" or (
+            choice.finish_reason == "stop" and bool(choice.message.tool_calls)
+        ):
+            result.stop_reason = "tool_use"
+        elif choice.finish_reason == "stop":
             result.stop_reason = "end_turn"
         elif choice.finish_reason == "length":
             result.stop_reason = "max_tokens"
-        elif choice.finish_reason == "tool_calls":
-            result.stop_reason = "tool_use"
 
         content: list[AnthropicContentBlock] = []
         if choice.message.reasoning:
@@ -686,6 +723,7 @@ class AnthropicServingMessages(OpenAIServingChat):
 
             first_item = True
             finish_reason = None
+            saw_tool_use = False
             state = _ActiveBlockState()
             # Map from tool call index to tool_use_id
             tool_index_to_id: dict[int, str] = {}
@@ -854,8 +892,11 @@ class AnthropicServingMessages(OpenAIServingChat):
                         if len(origin_chunk.choices) == 0:
                             for event in stop_active_block():
                                 yield event
-                            stop_reason = self.stop_reason_map.get(
-                                finish_reason or "stop"
+                            effective_finish = finish_reason or "stop"
+                            stop_reason = (
+                                "tool_use"
+                                if (saw_tool_use and effective_finish == "stop")
+                                else self.stop_reason_map.get(effective_finish)
                             )
                             chunk = AnthropicStreamEvent(
                                 type="message_delta",
@@ -948,6 +989,7 @@ class AnthropicServingMessages(OpenAIServingChat):
 
                         # tool calls - process all tool calls in the delta
                         if len(origin_chunk.choices[0].delta.tool_calls) > 0:
+                            saw_tool_use = True
                             for tool_call in origin_chunk.choices[0].delta.tool_calls:
                                 if tool_call.id is not None:
                                     # Update mapping for incremental updates
