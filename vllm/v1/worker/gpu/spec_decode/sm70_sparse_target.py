@@ -59,7 +59,7 @@ _WARMED_SPARSE_TARGET_KEYS: set[tuple[int, int, int]] = set()
 # pool triple (~170 MiB total). Larger batches are compute-bound and use the
 # per-request host-decision route so a single flagged row never sorts all rows.
 _MAX_GRAPH_REQUESTS = 4
-_MAX_GRAPHS = 12
+_MAX_GRAPHS = 16
 _CAPTURE_HEADROOM_BYTES = 1 << 30
 
 
@@ -579,8 +579,9 @@ def maybe_capture_sparse_target_graphs(
     device = speculator.device
     width = int(rejection_sampler.num_speculative_steps) + 1
     states = rejection_sampler.sampler.sampling_states
+    penalties = rejection_sampler.sampler.penalties_state
     vocab_size = int(getattr(states, "vocab_size", 0))
-    precapture_limit = min(3, _MAX_GRAPH_REQUESTS)
+    precapture_limit = _MAX_GRAPH_REQUESTS
     max_reqs = min(
         precapture_limit,
         int(getattr(speculator, "max_num_reqs", 0)),
@@ -601,55 +602,66 @@ def maybe_capture_sparse_target_graphs(
     saved_top_p = states.top_p.np[:max_reqs].copy()
     saved_min_p = states.min_p.np[:max_reqs].copy()
     saved_seeds = states.seeds.np[:max_reqs].copy()
+    saved_pres = penalties.presence_penalty.np[:max_reqs].copy()
+    saved_use_pen = penalties.use_penalty[:max_reqs].copy()
     try:
-        states.temperature.np[:max_reqs] = 0.6
-        states.top_k.np[:max_reqs] = 20
-        states.top_p.np[:max_reqs] = 0.95
-        states.min_p.np[:max_reqs] = 0.0
-        states.seeds.np[:max_reqs] = 2026
-        states.apply_staged_writes()
+        for use_pen, temp, top_p, pres in (
+            (False, 1.0, 0.95, 0.0),
+            (True, 0.7, 0.80, 1.5),
+        ):
+            states.temperature.np[:max_reqs] = temp
+            states.top_k.np[:max_reqs] = 20
+            states.top_p.np[:max_reqs] = top_p
+            states.min_p.np[:max_reqs] = 0.0
+            states.seeds.np[:max_reqs] = 2026
+            states.apply_staged_writes()
+            penalties.presence_penalty.np[:max_reqs] = pres
+            penalties.presence_penalty.copy_to_uva()
+            penalties.use_penalty[:max_reqs] = use_pen
 
-        # Capture from largest batch down to 1 so the shared pools allocate the
-        # high-water mark once and smaller request counts reuse the same blocks.
-        for requests in range(max_reqs, 0, -1):
-            rows = requests * width
-            if (
-                input_buffers is not None
-                and input_buffers.input_ids.shape[0] >= rows
-                and input_buffers.positions.shape[0] >= rows
-            ):
-                input_ids = input_buffers.input_ids[:rows]
-                positions = input_buffers.positions[:rows]
-            else:
-                input_ids = torch.zeros(rows, dtype=torch.int32, device=device)
-                positions = torch.zeros(rows, dtype=torch.int64, device=device)
-            mapping_np = np.arange(requests, dtype=np.int32)
-            mapping = torch.arange(requests, dtype=torch.int32, device=device)
-            cu_np = np.arange(requests + 1, dtype=np.int32) * width
-            dummy_batch = SimpleNamespace(
-                num_reqs=requests,
-                num_tokens=rows,
-                req_ids=[f"_sm70_sparse_warmup_{r}" for r in range(requests)],
-                idx_mapping_np=mapping_np,
-                idx_mapping=mapping,
-                expanded_idx_mapping=mapping.repeat_interleave(width),
-                expanded_local_pos=torch.arange(
-                    width, dtype=torch.int32, device=device
-                ).repeat(requests),
-                input_ids=input_ids,
-                positions=positions,
-                cu_num_logits_np=cu_np,
-                cu_num_logits=torch.tensor(cu_np, dtype=torch.int32, device=device),
-            )
-            dummy_hidden = torch.zeros((rows, hidden_size), dtype=dtype, device=device)
-            try_graph_greedy_draft_rejection(
-                model,
-                rejection_sampler,
-                dummy_hidden,
-                dummy_batch,
-                batch_top_k=20,
-                pre_capture_only=True,
-            )
+            # Capture from largest batch down to 1 so the shared pools allocate the
+            # high-water mark once and smaller request counts reuse the same blocks.
+            for requests in range(max_reqs, 0, -1):
+                rows = requests * width
+                if (
+                    input_buffers is not None
+                    and input_buffers.input_ids.shape[0] >= rows
+                    and input_buffers.positions.shape[0] >= rows
+                ):
+                    input_ids = input_buffers.input_ids[:rows]
+                    positions = input_buffers.positions[:rows]
+                else:
+                    input_ids = torch.zeros(rows, dtype=torch.int32, device=device)
+                    positions = torch.zeros(rows, dtype=torch.int64, device=device)
+                mapping_np = np.arange(requests, dtype=np.int32)
+                mapping = torch.arange(requests, dtype=torch.int32, device=device)
+                cu_np = np.arange(requests + 1, dtype=np.int32) * width
+                dummy_batch = SimpleNamespace(
+                    num_reqs=requests,
+                    num_tokens=rows,
+                    req_ids=[f"_sm70_sparse_warmup_{r}" for r in range(requests)],
+                    idx_mapping_np=mapping_np,
+                    idx_mapping=mapping,
+                    expanded_idx_mapping=mapping.repeat_interleave(width),
+                    expanded_local_pos=torch.arange(
+                        width, dtype=torch.int32, device=device
+                    ).repeat(requests),
+                    input_ids=input_ids,
+                    positions=positions,
+                    cu_num_logits_np=cu_np,
+                    cu_num_logits=torch.tensor(cu_np, dtype=torch.int32, device=device),
+                )
+                dummy_hidden = torch.zeros(
+                    (rows, hidden_size), dtype=dtype, device=device
+                )
+                try_graph_greedy_draft_rejection(
+                    model,
+                    rejection_sampler,
+                    dummy_hidden,
+                    dummy_batch,
+                    batch_top_k=20,
+                    pre_capture_only=True,
+                )
     finally:
         states.temperature.np[:max_reqs] = saved_temp
         states.top_k.np[:max_reqs] = saved_top_k
@@ -657,6 +669,9 @@ def maybe_capture_sparse_target_graphs(
         states.min_p.np[:max_reqs] = saved_min_p
         states.seeds.np[:max_reqs] = saved_seeds
         states.apply_staged_writes()
+        penalties.presence_penalty.np[:max_reqs] = saved_pres
+        penalties.presence_penalty.copy_to_uva()
+        penalties.use_penalty[:max_reqs] = saved_use_pen
         torch.accelerator.synchronize(device)
         torch.accelerator.empty_cache()
 

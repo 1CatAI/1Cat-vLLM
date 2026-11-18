@@ -6,9 +6,9 @@ import sys
 import threading
 import time
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 from pickle import PickleBuffer
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
@@ -232,6 +232,20 @@ class SpinCondition:
         self.local_notify_socket.send(b"\x00")
 
 
+def _close_shm(shm: shared_memory.SharedMemory, is_creator: bool) -> None:
+    with suppress(BufferError, FileNotFoundError, OSError):
+        shm.close()
+    shm_name = getattr(shm, "_name", None)
+    if is_creator and isinstance(shm_name, str) and shm_name:
+        try:
+            shm.unlink()
+        except FileNotFoundError:
+            with suppress(Exception):
+                resource_tracker.unregister(shm_name, "shared_memory")
+        except OSError:
+            pass
+
+
 class ShmRingBuffer:
     def __init__(
         self,
@@ -309,6 +323,9 @@ class ShmRingBuffer:
             # initialize the metadata section to 0
             with self.shared_memory.buf[self.metadata_offset :] as metadata_buffer:
                 torch.frombuffer(metadata_buffer, dtype=torch.uint8).fill_(0)
+            self._shm_finalizer = weakref.finalize(
+                self, _close_shm, self.shared_memory, True
+            )
         else:
             # we are opening an existing buffer
             self.is_creator = False
@@ -327,6 +344,9 @@ class ShmRingBuffer:
                     # to the requested size. The size parameter is ignored
                     # when attaching to an existing block.
                     assert self.shared_memory.size >= self.total_bytes_of_buffer
+                    self._shm_finalizer = weakref.finalize(
+                        self, _close_shm, self.shared_memory, False
+                    )
                 except FileNotFoundError:
                     # we might deserialize the object in a different node
                     # in this case, this object is not used,
@@ -347,11 +367,15 @@ class ShmRingBuffer:
             self.handle(),
         )
 
+    def close(self) -> None:
+        finalizer = getattr(self, "_shm_finalizer", None)
+        if finalizer is not None:
+            finalizer()
+        elif hasattr(self, "shared_memory"):
+            _close_shm(self.shared_memory, getattr(self, "is_creator", False))
+
     def __del__(self):
-        if hasattr(self, "shared_memory"):
-            self.shared_memory.close()
-            if self.is_creator:
-                self.shared_memory.unlink()
+        self.close()
 
     @contextmanager
     def get_data(self, current_idx: int):

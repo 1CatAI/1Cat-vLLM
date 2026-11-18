@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pickle
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from itertools import chain
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 from multiprocessing.synchronize import Lock as LockType
 from typing import Any
 from unittest.mock import patch
@@ -17,6 +18,20 @@ import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _close_single_writer_shm(shm: shared_memory.SharedMemory, is_writer: bool) -> None:
+    with suppress(BufferError, FileNotFoundError, OSError):
+        shm.close()
+    shm_name = getattr(shm, "_name", None)
+    if is_writer and isinstance(shm_name, str) and shm_name:
+        try:
+            shm.unlink()
+        except FileNotFoundError:
+            with suppress(Exception):
+                resource_tracker.unregister(shm_name, "shared_memory")
+        except OSError:
+            pass
 
 
 class SingleWriterShmRingBuffer:
@@ -132,6 +147,9 @@ class SingleWriterShmRingBuffer:
             self.shared_memory = shared_memory.SharedMemory(
                 create=True, size=self.data_buffer_size, name=name
             )
+            self._shm_finalizer = weakref.finalize(
+                self, _close_single_writer_shm, self.shared_memory, True
+            )
         else:
             # we are opening an existing buffer
             # fix to https://stackoverflow.com/q/62748654/9191338
@@ -148,6 +166,9 @@ class SingleWriterShmRingBuffer:
                 # to the requested size. The size parameter is ignored
                 # when attaching to an existing block.
                 assert self.shared_memory.size >= self.data_buffer_size
+                self._shm_finalizer = weakref.finalize(
+                    self, _close_single_writer_shm, self.shared_memory, False
+                )
 
         logger.debug(
             "Shared memory created/opened with name: %s, size: %d",
@@ -172,11 +193,11 @@ class SingleWriterShmRingBuffer:
 
     def close(self) -> None:
         """Close the shared memory."""
-        if hasattr(self, "shared_memory"):
-            self.shared_memory.close()
-            if self.is_writer:
-                with suppress(FileNotFoundError):
-                    self.shared_memory.unlink()
+        finalizer = getattr(self, "_shm_finalizer", None)
+        if finalizer is not None:
+            finalizer()
+        elif hasattr(self, "shared_memory"):
+            _close_single_writer_shm(self.shared_memory, self.is_writer)
 
     def __del__(self):
         self.close()

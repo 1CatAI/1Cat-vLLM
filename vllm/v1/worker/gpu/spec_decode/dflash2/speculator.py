@@ -794,6 +794,12 @@ class DFlash2Speculator(DFlashSpeculator):
         reason = "strong-copy" if self._lookup_long_active else "adaptive-default"
         return self._record_lookup_width(width, reason)
 
+    def capture_target_sampler(self, model: torch.nn.Module, rejection_sampler) -> None:
+        if rejection_sampler is not None:
+            from .sampler_graph import pre_capture_dflash2_sampler_graphs
+
+            pre_capture_dflash2_sampler_graphs(model, self, rejection_sampler)
+
     def capture(self) -> None:
         super().capture()
         if (

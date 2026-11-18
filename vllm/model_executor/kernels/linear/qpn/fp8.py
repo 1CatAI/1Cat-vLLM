@@ -379,14 +379,24 @@ def _engine_fp8_prefill_ceiling_elements() -> int:
 def _get_sm70_fp8_prefill_exact_dense_workspace(
     weight: torch.Tensor,
     min_elements: int = 0,
+    *,
+    cap_to_bounded_ceiling: bool = False,
 ) -> torch.Tensor | None:
     device_index = weight.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    elements = max(
+    bounded_ceiling = max(
         _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS,
         _engine_fp8_prefill_ceiling_elements(),
-        weight.numel(),
+    )
+    weight_elems = (
+        min(weight.numel(), bounded_ceiling)
+        if cap_to_bounded_ceiling
+        else weight.numel()
+    )
+    elements = max(
+        bounded_ceiling,
+        weight_elems,
         min_elements,
     )
     # Never replace a live allocation: prepared layers retain its raw pointer.
@@ -1381,7 +1391,10 @@ def dispatch_channel_rows(
     # Resolve scratch storage inside the opaque op. Passing its data_ptr as an
     # integer from apply_weights embeds a process-local address in AOT artifacts.
     # Weight preparation already reserves this shared, bounded workspace.
-    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(
+        codes,
+        cap_to_bounded_ceiling=True,
+    )
     if workspace is None:
         raise RuntimeError("SM70 channel-FP8 QPN8 prefill workspace is unavailable")
     rows = x.shape[0]
@@ -1407,7 +1420,9 @@ def dispatch_channel_rows(
         )
     )
     single_launch_max = _QPN8_NATIVE_ROWS_MAX if native_m40 else _QPN8_ROW_BLOCK
-    if single_launch_max < rows <= _QPN8_ROW_BLOCKS_MAX:
+    if (single_launch_max < rows <= _QPN8_ROW_BLOCKS_MAX) or (
+        rows > single_launch_max and codes.numel() > workspace.numel()
+    ):
         # Without the batch TurboMind copy, 41..128 rows would take the dense
         # prefill route (FP16 dequantization plus cuBLAS, about five bytes of
         # traffic per weight). Up to four 32-row QPN8 launches read the FP8

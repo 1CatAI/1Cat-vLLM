@@ -91,14 +91,15 @@ def canonical_kv_cache_dtype(kv_cache_dtype: str) -> str:
     return kv_cache_dtype if codec is None else codec.name
 
 
-_PTH_BASE_OFFSETS: dict[tuple[int, int, int], int] = {}
+_PTH_BASE_OFFSETS: dict[tuple[int, int], set[int]] = {}
 
 
 def _record_pth_base(storage_ptr: int, block_stride: int, base_offset: int, nkv: int):
-    key = (storage_ptr, block_stride, base_offset)
-    if key not in _PTH_BASE_OFFSETS and len(_PTH_BASE_OFFSETS) >= 512:
+    del nkv
+    key = (storage_ptr, block_stride)
+    if key not in _PTH_BASE_OFFSETS and len(_PTH_BASE_OFFSETS) >= 4096:
         _PTH_BASE_OFFSETS.pop(next(iter(_PTH_BASE_OFFSETS)))
-    _PTH_BASE_OFFSETS[key] = nkv
+    _PTH_BASE_OFFSETS.setdefault(key, set()).add(base_offset)
 
 
 def split_per_token_head_kv_cache(
@@ -220,14 +221,14 @@ def per_token_head_scales_for_kv_views(
     kv_lo = 0
     if kv_heads_slice < total_kv_heads:
         k_off = key_cache.storage_offset()
+        recorded = _PTH_BASE_OFFSETS.get((storage_ptr, block_stride_elems), ())
         for cand in range(total_kv_heads - kv_heads_slice + 1):
-            if (storage_ptr, block_stride_elems, k_off - cand * head_size) in (
-                _PTH_BASE_OFFSETS
-            ):
+            if (k_off - cand * head_size) in recorded:
                 kv_lo = cand
                 break
         else:
-            kv_lo = (k_off % (total_kv_heads * head_size)) // head_size
+            k_in_block = k_off % block_stride_elems if block_stride_elems > 0 else k_off
+            kv_lo = (k_in_block % (total_kv_heads * head_size)) // head_size
 
     k_base_bytes = (key_cache.storage_offset() - kv_lo * head_size) * elem_bytes
     v_base_bytes = (value_cache.storage_offset() - kv_lo * head_size) * elem_bytes

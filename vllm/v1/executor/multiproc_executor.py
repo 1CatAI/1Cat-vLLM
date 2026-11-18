@@ -483,6 +483,9 @@ class MultiprocExecutor(Executor):
 
     def shutdown(self):
         """Properly shut down the executor and its workers"""
+        finalizer = getattr(self, "_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()
         if not getattr(self, "shutting_down", False):
             logger.debug("Triggering shutdown of workers")
             self.shutting_down = True
@@ -500,14 +503,20 @@ class MultiprocExecutor(Executor):
                     # Shutdown response queues
                     if w.worker_response_mq is not None:
                         w.worker_response_mq.shutdown()
+                        if w.worker_response_mq.buffer is not None:
+                            w.worker_response_mq.buffer.close()
                         w.worker_response_mq = None
 
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()
+            if rpc_broadcast_mq.buffer is not None:
+                rpc_broadcast_mq.buffer.close()
             self.rpc_broadcast_mq = None
         if response_mqs := getattr(self, "response_mqs", None):
             for mq in response_mqs:
                 mq.shutdown()
+                if mq.buffer is not None:
+                    mq.buffer.close()
             self.response_mqs = []
 
     def check_health(self) -> None:
@@ -593,6 +602,7 @@ class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
     READY_STR = "READY"
+    _ASYNC_OUTPUT_STOP = object()
     rpc_broadcast_mq: MessageQueue | None
     worker_response_mq: MessageQueue | None
 
@@ -819,13 +829,38 @@ class WorkerProc:
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
     def shutdown(self):
-        if self.rpc_broadcast_mq is not None:
-            self.rpc_broadcast_mq.shutdown()
-        if self.worker_response_mq is not None:
-            self.worker_response_mq.shutdown()
-        self.worker.shutdown()
+        rpc_mq = self.rpc_broadcast_mq
+        resp_mq = self.worker_response_mq
+        if rpc_mq is not None:
+            rpc_mq.shutdown()
+        if resp_mq is not None:
+            resp_mq.shutdown()
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
+        if getattr(self, "use_async_scheduling", False) and hasattr(
+            self, "async_output_queue"
+        ):
+            self.async_output_queue.put(self._ASYNC_OUTPUT_STOP)
+            if hasattr(self, "async_output_copy_thread"):
+                self.async_output_copy_thread.join(timeout=0.5)
+        if rpc_mq is not None and rpc_mq.buffer is not None:
+            rpc_mq.buffer.close()
+        if resp_mq is not None and resp_mq.buffer is not None:
+            resp_mq.buffer.close()
+        from vllm.distributed import parallel_state
+
+        for group in (
+            parallel_state._TP,
+            parallel_state._DCP,
+            parallel_state._INNER_DP_WORLD,
+            parallel_state._WORLD,
+        ):
+            if group is not None and group.mq_broadcaster is not None:
+                group.mq_broadcaster.shutdown()
+                if group.mq_broadcaster.buffer is not None:
+                    group.mq_broadcaster.buffer.close()
+                group.mq_broadcaster = None
+        self.worker.shutdown()
         destroy_model_parallel()
         destroy_distributed_environment()
 
@@ -961,6 +996,8 @@ class WorkerProc:
             raise e
 
         finally:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
             if ready_writer is not None:
                 ready_writer.close()
             if death_pipe is not None:
@@ -968,6 +1005,8 @@ class WorkerProc:
             # Clean up once worker exits busy loop
             if worker is not None:
                 worker.shutdown()
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
 
     class ResponseStatus(Enum):
         SUCCESS = auto()
@@ -1014,6 +1053,8 @@ class WorkerProc:
 
         while True:
             output = self.async_output_queue.get()
+            if output is self._ASYNC_OUTPUT_STOP:
+                break
             self.enqueue_output(output)
 
     def worker_busy_loop(self):
@@ -1061,15 +1102,19 @@ class WorkerProc:
             except OSError:
                 node_cpus = set(range(ncpu))
             pin_others = (node_cpus - reserved) or (node_cpus - mine)
-            os.sched_setaffinity(0, mine)
+            setaffinity = getattr(os, "sched_setaffinity", None)
+            if setaffinity is not None:
+                setaffinity(0, mine)
+        else:
+            setaffinity = None
         main_tid = threading.get_native_id()
         loops = 0
         while True:
-            if pin_others is not None and loops % 512 == 0:
+            if setaffinity is not None and pin_others is not None and loops % 512 == 0:
                 for tid in os.listdir("/proc/self/task"):
                     if int(tid) != main_tid:
                         with suppress(OSError):
-                            os.sched_setaffinity(int(tid), pin_others)
+                            setaffinity(int(tid), pin_others)
             loops += 1
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 indefinite=True

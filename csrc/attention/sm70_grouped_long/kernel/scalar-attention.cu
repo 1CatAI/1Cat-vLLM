@@ -1274,7 +1274,8 @@ __global__ void flash_attention_decode_partition_int8_pth_kernel(
     float* __restrict__ max_logits, float* __restrict__ exp_sums,
     const int* __restrict__ block_table, const int* __restrict__ seq_lens,
     const int* __restrict__ active_num_partitions, const int max_num_partitions,
-    const int block_size, const int64_t q_stride1,
+    const int max_num_blocks_per_seq, const int block_size,
+    const int64_t q_stride1,
     const int64_t tmp_out_stride1, const int64_t tmp_out_stride2,
     const int64_t stats_stride1, const int64_t k_block_stride,
     const int64_t k_token_stride, const int64_t v_block_stride,
@@ -1283,7 +1284,7 @@ __global__ void flash_attention_decode_partition_int8_pth_kernel(
     const int64_t vs_token_stride, const float softmax_scale) {
   static_assert(D == 256 && PARTITION_SIZE == 1024);
   const int partition_idx = blockIdx.x;
-  const int seq_len = seq_lens[0];
+  const int seq_len = min(seq_lens[0], max_num_blocks_per_seq * block_size);
   const int start_token_idx = partition_idx * PARTITION_SIZE;
   if (seq_len <= 0 || start_token_idx >= seq_len ||
       partition_idx >= max_num_partitions)
@@ -1489,6 +1490,14 @@ at::Tensor scalar_attention_int8_pth_candidate(
   TORCH_CHECK(out.sizes() == q.sizes() && out.scalar_type() == at::kHalf &&
                   out.is_contiguous(),
               "Output shape/dtype mismatch");
+  TORCH_CHECK(table.dim() == 2 && table.size(0) == 1 && table.size(1) > 0 &&
+                  table.scalar_type() == at::kInt && table.is_contiguous() &&
+                  table.size(1) <= (INT_MAX - 4096) / k.size(1) &&
+                  lengths.sizes() == at::IntArrayRef({1}) &&
+                  lengths.scalar_type() == at::kInt && lengths.is_contiguous() &&
+                  active.sizes() == at::IntArrayRef({1}) &&
+                  active.scalar_type() == at::kInt && active.is_contiguous(),
+              "Invalid scalar INT8 PTH q1 page/length metadata");
   const int64_t partitions = partial.dim() == 4 ? partial.size(2) : 0;
   TORCH_CHECK(
       partitions > 0 &&
@@ -1501,6 +1510,14 @@ at::Tensor scalar_attention_int8_pth_candidate(
           sums.scalar_type() == at::kFloat && maximum.is_contiguous() &&
           sums.is_contiguous(),
       "Scalar INT8 PTH q1 requires matching FP32 partition workspaces");
+  TORCH_CHECK(table.size(1) <= (partitions * 1024 + k.size(1) - 1) / k.size(1),
+              "Scalar INT8 PTH q1 workspace does not cover the page table");
+  for (const auto* t :
+       {&k, &v, &k_scales, &v_scales, static_cast<const at::Tensor*>(&out),
+        &table, &lengths, static_cast<const at::Tensor*>(&partial),
+        static_cast<const at::Tensor*>(&maximum),
+        static_cast<const at::Tensor*>(&sums), &active})
+    TORCH_CHECK(t->device() == q.device(), "Device mismatch");
   TORCH_CHECK(std::isfinite(scale), "Finite scale required");
   c10::cuda::CUDAGuard guard(q.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
@@ -1513,7 +1530,8 @@ at::Tensor scalar_attention_int8_pth_candidate(
           v_scales.data_ptr<float>(), partial.data_ptr<float>(),
           maximum.data_ptr<float>(), sums.data_ptr<float>(),
           table.data_ptr<int>(), lengths.data_ptr<int>(), active.data_ptr<int>(),
-          static_cast<int>(partitions), static_cast<int>(k.size(1)),
+          static_cast<int>(partitions), static_cast<int>(table.size(1)),
+          static_cast<int>(k.size(1)),
           q.stride(1), partial.stride(1), partial.stride(2), maximum.stride(1),
           k.stride(0), k.stride(1), v.stride(0), v.stride(1),
           k_scales.stride(0), k_scales.stride(1), v_scales.stride(0),

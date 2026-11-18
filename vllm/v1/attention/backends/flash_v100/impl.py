@@ -558,9 +558,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
-        supported_kv_dtype = not _routing.uses_fp8_kv_cache(
-            self.kv_cache_dtype
-        ) or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
+        supported_kv_dtype = (
+            self.kv_codec is INT8_PER_TOKEN_HEAD
+            or not _routing.uses_fp8_kv_cache(self.kv_cache_dtype)
+            or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
+        )
         return (
             self.use_flash_v100
             and self.attn_type == AttentionType.DECODER
@@ -940,8 +942,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         int8_fallback = (
             self.kv_codec is INT8_PER_TOKEN_HEAD and not self._supports_int8_pth_path()
         )
-        if int8_fallback or not self._supports_flash_v100_path():
-            if not int8_fallback:
+        supports_flash = self._supports_flash_v100_path()
+        if int8_fallback or not supports_flash:
+            if not supports_flash:
                 layer_info = self._layer_debug_info(layer)
                 feature_fallback = _feature.fallback_kind(layer_info)
                 message = self._unsupported_layer_message(

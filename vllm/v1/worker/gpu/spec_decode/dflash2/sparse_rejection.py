@@ -336,13 +336,12 @@ def _sample_reference_requests(
     row_indices = np.concatenate([np.arange(cu[i], cu[i + 1]) for i in reference_reqs])
     sub_cu = np.zeros(len(reference_reqs) + 1, dtype=np.int32)
     np.cumsum(np.diff(cu)[reference_reqs], out=sub_cu[1:])
-    # Pack metadata into a single CPU-to-GPU transfer.
-    # The rejection kernels accept either int32 or int64 cumulative offsets.
-    packed = np.concatenate((row_indices, reference_reqs, sub_cu)).astype(np.int64)
+    # Pack row/request indices as int64 and keep cu_num_logits as contiguous int32
+    # so the rejection kernels never recompile on int64/unaligned split views.
+    packed = np.concatenate((row_indices, reference_reqs)).astype(np.int64)
     metadata = torch.from_numpy(packed).to(device=logits.device, non_blocking=True)
-    rows, reqs, cu_num_logits = metadata.split(
-        [row_indices.size, reference_reqs.size, sub_cu.size]
-    )
+    rows, reqs = metadata.split([row_indices.size, reference_reqs.size])
+    cu_num_logits = torch.from_numpy(sub_cu).to(device=logits.device, non_blocking=True)
     indices = input_batch.logits_indices[rows]
     draft_sampled = input_batch.input_ids[indices]
     pos = input_batch.positions[indices]

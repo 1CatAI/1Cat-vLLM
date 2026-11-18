@@ -902,6 +902,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             else vllm_config.kernel_config.qsa_host_kv_dtype
         )
         hot_dtype = vllm_config.kernel_config.qsa_host_kv_hot_dtype
+        if hot_dtype == "auto":
+            hot_dtype = self.host_kv_dtype
         if (
             not self.host_kv_is_draft
             and self.host_kv_enabled

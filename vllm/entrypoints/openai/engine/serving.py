@@ -499,6 +499,14 @@ class OpenAIServing(BeamSearchOnlineMixin):
             and request._grammar_from_tool_parser
         )
 
+        def _strip_implicit_tool_tags(raw: str) -> str:
+            cleaned = raw.strip()
+            if cleaned.startswith("<tool_call>"):
+                cleaned = cleaned[len("<tool_call>") :].lstrip()
+                if cleaned.endswith("</tool_call>"):
+                    cleaned = cleaned[: -len("</tool_call>")].rstrip()
+            return cleaned
+
         function_calls = list[FunctionCall]()
         if (
             not use_mistral_tool_parser
@@ -509,7 +517,10 @@ class OpenAIServing(BeamSearchOnlineMixin):
             if content is None:
                 return [], None
             function_calls.append(
-                FunctionCall(name=request.tool_choice.name, arguments=content)
+                FunctionCall(
+                    name=request.tool_choice.name,
+                    arguments=_strip_implicit_tool_tags(content),
+                )
             )
             content = None  # Clear content since tool is called.
         elif (
@@ -522,7 +533,10 @@ class OpenAIServing(BeamSearchOnlineMixin):
             if content is None:
                 return [], None
             function_calls.append(
-                FunctionCall(name=request.tool_choice.function.name, arguments=content)
+                FunctionCall(
+                    name=request.tool_choice.function.name,
+                    arguments=_strip_implicit_tool_tags(content),
+                )
             )
             content = None  # Clear content since tool is called.
         elif (
@@ -533,7 +547,7 @@ class OpenAIServing(BeamSearchOnlineMixin):
             # "required" with standard JSON-based parsing
             tool_calls = []
             with contextlib.suppress(ValidationError):
-                content = content or ""
+                content = _strip_implicit_tool_tags(content or "")
                 tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
                     content
                 )
