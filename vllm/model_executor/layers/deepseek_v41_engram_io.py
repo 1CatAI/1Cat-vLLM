@@ -163,30 +163,42 @@ class SharedEngramOwner:
         self.control.send(connection)
 
     def start_page_cache_warm(self) -> None:
-        """Drop loaded .safetensors from OS page cache and pre-warm Engram rows
-        sequentially while keeping >= 5 GiB free on every NUMA node."""
+        """Drop loaded .safetensors (and remote peer Engram tail when split_row > 0)
+        from OS page cache, and pre-warm local Engram rows interleaved across
+        NUMA 0 (even CPUs) and NUMA 1 (odd CPUs)."""
         import glob
         import threading
 
         paths = sorted({s.path for s in self.specs if os.path.exists(s.path)})
         if not paths:
             return
+        row_bytes = _row_bytes(self.specs)
+        split_row = int(envs.VLLM_V41_ENGRAM_SPLIT_ROW or "0")
 
-        def _numa_mem_ok() -> bool:
+        def _mem_ok() -> bool:
             try:
+                if split_row > 0:
+                    with open("/proc/meminfo") as mf:
+                        for line in mf:
+                            if (
+                                line.startswith("MemFree:")
+                                and int(line.split()[1]) < 6_000_000
+                            ):
+                                return False
+                    return True
                 with open("/proc/meminfo") as mf:
                     lines = mf.readlines()
                 for line in lines:
                     if (
                         line.startswith("MemFree:")
-                        and int(line.split()[1]) < 12_000_000
+                        and int(line.split()[1]) < 22_000_000
                     ):
                         return False
                 for p in glob.glob("/sys/devices/system/node/node*/meminfo"):
                     with open(p) as nf:
                         nlines = nf.readlines()
                     for line in nlines:
-                        if "MemFree:" in line and int(line.split()[-2]) < 5_000_000:
+                        if "MemFree:" in line and int(line.split()[-2]) < 9_500_000:
                             return False
             except OSError:
                 return False
@@ -194,16 +206,18 @@ class SharedEngramOwner:
 
         def _worker() -> None:
             model_dir = os.path.dirname(os.path.dirname(paths[0]))
-            for sp in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
-                try:
-                    fd = os.open(sp, os.O_RDONLY)
-                    if hasattr(os, "posix_fadvise") and hasattr(
-                        os, "POSIX_FADV_DONTNEED"
-                    ):
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                    os.close(fd)
-                except OSError:
-                    pass
+            drop_dirs = [model_dir, model_dir + "-dspark"]
+            for d in drop_dirs:
+                for sp in sorted(glob.glob(os.path.join(d, "*.safetensors"))):
+                    try:
+                        fd = os.open(sp, os.O_RDONLY)
+                        if hasattr(os, "posix_fadvise") and hasattr(
+                            os, "POSIX_FADV_DONTNEED"
+                        ):
+                            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                        os.close(fd)
+                    except OSError:
+                        pass
             chunk = 16 * 1024 * 1024
             for ep in paths:
                 if self._warm_stopped:
@@ -214,22 +228,61 @@ class SharedEngramOwner:
                 except OSError:
                     continue
                 try:
+                    keep = min(sz, split_row * row_bytes) if split_row > 0 else sz
+                    if (
+                        sz > keep
+                        and hasattr(os, "posix_fadvise")
+                        and hasattr(os, "POSIX_FADV_DONTNEED")
+                    ):
+                        os.posix_fadvise(fd, keep, 0, os.POSIX_FADV_DONTNEED)
                     if hasattr(os, "posix_fadvise") and hasattr(
                         os, "POSIX_FADV_SEQUENTIAL"
                     ):
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
-                    for off in range(0, sz, chunk):
-                        if (
-                            self._warm_stopped
-                            or (off // chunk) % 8 == 0
-                            and not _numa_mem_ok()
-                        ):
-                            break
-                        os.pread(fd, min(chunk, sz - off), off)
+                        os.posix_fadvise(fd, 0, keep, os.POSIX_FADV_SEQUENTIAL)
+
+                    nchunks = (keep + chunk - 1) // chunk
+
+                    def _numa_reader(
+                        parity: int, cpu: int, r_fd: int, r_keep: int, r_nchunks: int
+                    ) -> None:
+                        try:
+                            if hasattr(os, "sched_setaffinity"):
+                                os.sched_setaffinity(0, {cpu})
+                        except OSError:
+                            pass
+                        for ci in range(parity, r_nchunks, 2):
+                            if self._warm_stopped or (
+                                ci % 16 == parity and not _mem_ok()
+                            ):
+                                break
+                            off = ci * chunk
+                            os.pread(r_fd, min(chunk, r_keep - off), off)
+
+                    t0 = threading.Thread(
+                        target=_numa_reader,
+                        args=(0, 24, fd, keep, nchunks),
+                        daemon=True,
+                    )
+                    t1 = threading.Thread(
+                        target=_numa_reader,
+                        args=(1, 25, fd, keep, nchunks),
+                        daemon=True,
+                    )
+                    t0.start()
+                    t1.start()
+                    t0.join()
+                    t1.join()
+
                     if hasattr(os, "posix_fadvise") and hasattr(
                         os, "POSIX_FADV_NORMAL"
                     ):
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_NORMAL)
+                        os.posix_fadvise(fd, 0, keep, os.POSIX_FADV_NORMAL)
+                    if (
+                        sz > keep
+                        and hasattr(os, "posix_fadvise")
+                        and hasattr(os, "POSIX_FADV_DONTNEED")
+                    ):
+                        os.posix_fadvise(fd, keep, 0, os.POSIX_FADV_DONTNEED)
                 except OSError:
                     pass
                 finally:

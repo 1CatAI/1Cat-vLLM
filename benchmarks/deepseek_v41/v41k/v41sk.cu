@@ -4087,6 +4087,189 @@ void index_scores_shard(torch::Tensor out, torch::Tensor q, torch::Tensor w,
                            ratio, ctas, shard, nshard);
 }
 
+// Key-stationary WMMA prefill indexer for key-sharded TP4:
+// Each CTA (256 threads = 8 warps) owns up to 2 local 32-key tiles (64 keys),
+// loads those 64 keys into shared memory ONCE from the paged FP16 index cache
+// (eliminating the 342x HBM key re-reads of running 6-row decode groups), skips
+// causal future query rows, and streams BT=4 query tokens (128 query-head rows)
+// at a time across SM70 Tensor Cores with identical FP16 rounding points.
+__global__ void __launch_bounds__(256) index_scores_prefill_shard_kernel(
+    __half* __restrict__ out, const __half* __restrict__ q,
+    const __half* __restrict__ w, const __half* __restrict__ cache,
+    const int* __restrict__ table, const int64_t* __restrict__ positions, int T,
+    int n_out, int64_t page_stride, int keys_per_page, int ratio, int shard,
+    int nshard) {
+  using namespace nvcuda;
+  constexpr int D = 128, H = 32, BT = 4, ROWS = BT * H;  // 128 rows
+  constexpr int QLD = D + 8, KLD = D + 8, SLD = 64 + 4;
+  extern __shared__ __align__(16) unsigned char smem_pf[];
+  __half* ks = reinterpret_cast<__half*>(smem_pf);  // [64][136]  = 17408 B
+  __half* qs = ks + 64 * KLD;                       // [128][136] = 34816 B
+  float* sc =
+      reinterpret_cast<float*>(qs + ROWS * QLD);  // [128][68]  = 34816 B
+  float* ws = sc + ROWS * SLD;                    // [128]      =   512 B
+  int64_t* sh_meta =
+      reinterpret_cast<int64_t*>(ws + ROWS);  // [2]        =    16 B
+
+  const int local0 = 2 * int(blockIdx.x);
+  const int column0 = local0 * 32;
+  if (column0 >= n_out || T <= 0) return;
+  const bool has_half1 = (column0 + 32) < n_out;
+  const int64_t n_base0 = (int64_t(local0) * nshard + shard) * 32;
+  const int64_t n_base1 = (int64_t(local0 + 1) * nshard + shard) * 32;
+
+  // Scan positions[0..T-1] across 256 threads to find max_end and first causal
+  // t
+  int64_t local_max_end = 0;
+  int local_first_t = T;
+  for (int t = threadIdx.x; t < T; t += 256) {
+    const int64_t end_t = (positions[t] + 1) / ratio;
+    if (end_t > local_max_end) local_max_end = end_t;
+    if (end_t > n_base0 && t < local_first_t) local_first_t = t;
+  }
+  if (threadIdx.x == 0) {
+    sh_meta[0] = 0;
+    sh_meta[1] = T;
+  }
+  __syncthreads();
+  atomicMax(reinterpret_cast<unsigned long long*>(&sh_meta[0]),
+            (unsigned long long)local_max_end);
+  atomicMin(reinterpret_cast<int*>(&sh_meta[1]), local_first_t);
+  __syncthreads();
+
+  const int64_t max_end = sh_meta[0];
+  const int first_t = int(reinterpret_cast<int*>(&sh_meta[1])[0]);
+  if (n_base0 >= max_end || first_t >= T) return;
+
+  // Load up to 64 keys into ks[64][136] ONCE for the entire query loop!
+  for (int i = threadIdx.x; i < 64 * (D / 8); i += 256) {
+    const int j = i / (D / 8), c = (i % (D / 8)) * 8;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (j < 32 || has_half1) {
+      const int64_t n = (j < 32) ? (n_base0 + j) : (n_base1 + (j - 32));
+      if (n < max_end) {
+        const int page = table[n / keys_per_page];
+        if (page >= 0) {
+          v = __ldg(reinterpret_cast<const uint4*>(
+              cache + int64_t(page) * page_stride + (n % keys_per_page) * D +
+              c));
+        }
+      }
+    }
+    *reinterpret_cast<uint4*>(ks + j * KLD + c) = v;
+  }
+  __syncthreads();
+
+  const int warp =
+      threadIdx.x >> 5;  // 0..7, each warp owns mt = warp (16 rows)
+  const int ntiles = has_half1 ? 4 : 2;
+
+  for (int t0 = first_t; t0 < T; t0 += BT) {
+    const int count = (t0 + BT <= T) ? BT : (T - t0);
+    const int rows = count * H;
+
+    // Stage 4 tokens x 32 heads = 128 query rows (32 KB, L2 cache hit across
+    // SMs)
+    for (int i = threadIdx.x; i < ROWS * (D / 8); i += 256) {
+      const int row = i / (D / 8), c = (i % (D / 8)) * 8;
+      uint4 v = make_uint4(0, 0, 0, 0);
+      if (row < rows) {
+        v = __ldg(
+            reinterpret_cast<const uint4*>(q + (size_t(t0) * H + row) * D + c));
+      }
+      *reinterpret_cast<uint4*>(qs + row * QLD + c) = v;
+    }
+    if (threadIdx.x < ROWS) {
+      ws[threadIdx.x] = (threadIdx.x < rows)
+                            ? __half2float(w[size_t(t0) * H + threadIdx.x])
+                            : 0.f;
+    }
+    __syncthreads();
+
+    if (warp * 16 < rows) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>
+          a_frag[8];
+#pragma unroll
+      for (int kd = 0; kd < 8; ++kd) {
+        wmma::load_matrix_sync(a_frag[kd], qs + warp * 16 * QLD + kd * 16, QLD);
+      }
+      for (int nt = 0; nt < ntiles; ++nt) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.f);
+#pragma unroll
+        for (int kd = 0; kd < 8; ++kd) {
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major>
+              b_frag;
+          wmma::load_matrix_sync(b_frag, ks + nt * 16 * KLD + kd * 16, KLD);
+          wmma::mma_sync(acc, a_frag[kd], b_frag, acc);
+        }
+        wmma::store_matrix_sync(sc + warp * 16 * SLD + nt * 16, acc, SLD,
+                                wmma::mem_row_major);
+      }
+    }
+    __syncthreads();
+
+    // 256 threads map 1-to-1 onto (t in 0..3, j in 0..63)!
+    const int t = threadIdx.x >> 6;
+    const int j = threadIdx.x & 63;
+    if (t < count && (j < 32 || has_half1)) {
+      const int64_t end_t = (positions[t0 + t] + 1) / ratio;
+      const int64_t n = (j < 32) ? (n_base0 + j) : (n_base1 + (j - 32));
+      if (n < end_t) {
+        float total = 0.f;
+#pragma unroll 8
+        for (int h = 0; h < H; ++h) {
+          float v = __half2float(__float2half(sc[(t * H + h) * SLD + j]));
+          v = fmaxf(v, 0.f);
+          total += __half2float(__float2half(v * ws[t * H + h]));
+        }
+        out[size_t(t0 + t) * n_out + column0 + j] = __float2half(total);
+      }
+    }
+    __syncthreads();
+  }
+}
+
+void index_scores_prefill_shard(torch::Tensor out, torch::Tensor q,
+                                torch::Tensor w, torch::Tensor cache,
+                                torch::Tensor table, torch::Tensor positions,
+                                int64_t ratio, int64_t shard, int64_t nshard) {
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kFloat16 &&
+              q.is_contiguous() && q.dim() == 3 && q.size(1) == 32 &&
+              q.size(2) == 128);
+  TORCH_CHECK(w.scalar_type() == torch::kFloat16 && w.is_contiguous() &&
+              w.size(0) == q.size(0) && w.size(1) == 32);
+  TORCH_CHECK(cache.scalar_type() == torch::kFloat16 && cache.dim() == 3 &&
+              cache.size(2) == 128 && cache.stride(1) == 128 &&
+              cache.stride(2) == 1);
+  TORCH_CHECK(table.scalar_type() == torch::kInt32 && table.stride(-1) == 1);
+  TORCH_CHECK(positions.scalar_type() == torch::kInt64 &&
+              positions.is_contiguous() && positions.numel() == q.size(0));
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 && out.is_contiguous() &&
+              out.size(0) == q.size(0) && out.size(1) % 32 == 0);
+  TORCH_CHECK(0 <= shard && shard < nshard);
+  const int T = int(q.size(0)), n_out = int(out.size(1));
+  if (T <= 0 || n_out <= 0) return;
+  const at::cuda::OptionalCUDAGuard guard(device_of(q));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  constexpr int SMEM = 17408 + 34816 + 34816 + 512 + 32;  // 87584 B <= 96 KB
+  static bool smem_set = false;
+  if (!smem_set) {
+    cudaFuncSetAttribute(index_scores_prefill_shard_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    smem_set = true;
+  }
+  const int blocks = (n_out / 32 + 1) / 2;
+  index_scores_prefill_shard_kernel<<<blocks, 256, SMEM, stream>>>(
+      reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(w.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(cache.data_ptr<at::Half>()),
+      table.data_ptr<int>(), positions.data_ptr<int64_t>(), T, n_out,
+      cache.stride(0), int(cache.size(1)), int(ratio), int(shard), int(nshard));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // ---- Router top-k + slot plan for many tokens (VLLM_V41_BATCH) --------------
 // route_plan_body's per-token selection, warps looping over T tokens, then a
 // stable counting sort of the T*K slots by expert (groups in expert order,
@@ -4358,6 +4541,10 @@ TORCH_LIBRARY(v41sk, m) {
       "Tensor positions, Tensor qsl, int num_reqs, int ratio, int ctas, int "
       "shard, "
       "int nshard) -> ()");
+  m.def(
+      "index_scores_prefill_shard(Tensor(a!) out, Tensor q, Tensor w, "
+      "Tensor cache, Tensor table, Tensor positions, int ratio, int shard, "
+      "int nshard) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(v41sk, CUDA, m) {
@@ -4382,6 +4569,7 @@ TORCH_LIBRARY_IMPL(v41sk, CUDA, m) {
   m.impl("hc_mix", &v41sk::hc_mix);
   m.impl("index_scores", &v41sk::index_scores);
   m.impl("index_scores_shard", &v41sk::index_scores_shard);
+  m.impl("index_scores_prefill_shard", &v41sk::index_scores_prefill_shard);
   m.impl("route_plan_wide", &v41sk::route_plan_wide);
 }
 
