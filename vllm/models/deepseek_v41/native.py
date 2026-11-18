@@ -1029,12 +1029,15 @@ def _clip_count_kernel(
     max_tokens,
     L,
     NS,
+    VOCAB,
     LB: tl.constexpr,
     SB: tl.constexpr,
 ):
     j = tl.arange(0, LB)
     live = j < L
     v = tl.load(ids + j, live, -1).to(tl.int64)
+    # Out-of-vocabulary ids (NaN logits) are invalid, as in parse_output.
+    v = tl.where((v < 0) | (v >= VOCAB), -1, v)
     pre = tl.load(prefill).to(tl.int1)
     pos = tl.load(position)
     before = tl.where(pre, pos + tl.load(length), pos + 1)
@@ -1052,7 +1055,7 @@ def _clip_count_kernel(
     tl.store(count, first.to(tl.int32))
 
 
-def fused_clip_count(model, ids, max_tokens, prompt_tokens, stop_ids):
+def fused_clip_count(model, ids, max_tokens, prompt_tokens, stop_ids, vocab_size):
     """In-place clip of row 0 of ids [1, L]; returns the contiguous count [1]."""
     prefill, position, length = model.v41_pending()
     key = (ids.device, tuple(stop_ids))
@@ -1075,6 +1078,7 @@ def fused_clip_count(model, ids, max_tokens, prompt_tokens, stop_ids):
         max_tokens,
         L,
         len(stop_ids),
+        vocab_size,
         LB=max(16, triton.next_power_of_2(L)),
         SB=max(16, triton.next_power_of_2(max(1, len(stop_ids)))),
     )
