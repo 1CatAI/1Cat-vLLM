@@ -60,26 +60,36 @@ class SharedExpertPlanner {
           max_routes > unsigned(config.resident))
         throw std::invalid_argument("invalid shared expert layer capacity");
       const auto cold = uint64_t(config.experts - config.resident);
-      if (config.expert_bytes > (arena_bytes - offset) / cold)
+      // VLLM_V41_KEEP_HOST=1: every expert has a permanent host home (resident
+      // ones too), so evictions never write back.
+      const auto homes = keep_ ? uint64_t(config.experts) : cold;
+      if (config.expert_bytes > (arena_bytes - offset) / homes)
         throw std::invalid_argument("cold experts exceed the shared arena");
       Layer layer{config, offset, {}, {}, {}};
       layer.slot.assign(config.experts, -1);
       layer.cold.assign(config.experts, -1);  // absolute arena offsets
       layer.use.assign(config.experts, 0);
+      layer.home.assign(config.experts, -1);
       for (int32_t expert = 0; expert < config.experts; ++expert) {
+        if (keep_)
+          layer.home[expert] =
+              int64_t(offset + uint64_t(expert) * config.expert_bytes);
         if (expert < config.resident)
           layer.slot[expert] = expert;
         else
           layer.cold[expert] =
-              int64_t(offset +
-                      uint64_t(expert - config.resident) * config.expert_bytes);
+              keep_ ? layer.home[expert]
+                    : int64_t(offset + uint64_t(expert - config.resident) *
+                                           config.expert_bytes);
       }
       layers_.push_back(std::move(layer));
-      offset += cold * config.expert_bytes;
+      offset += homes * config.expert_bytes;
       if (max_routes > exchange_bytes / config.expert_bytes)
         throw std::invalid_argument(
             "shared exchange cannot hold maximum routes");
     }
+    if (keep_ && !free_mode_)
+      throw std::invalid_argument("VLLM_V41_KEEP_HOST needs VLLM_V41_SWAP_FREE=1");
     if (offset > arena_bytes - exchange_bytes)
       throw std::invalid_argument("cold experts overlap the exchange reserve");
     exchange_offset_ = offset;
@@ -170,7 +180,9 @@ class SharedExpertPlanner {
     }
     std::unordered_set<int32_t> skipped;
     std::vector<uint64_t> saves_by_order;
-    auto* pool = free_mode_ ? &free_.at(layer.config.expert_bytes) : nullptr;
+    // Keep-host mode needs no host allocation for a victim: no pool.
+    auto* pool = free_mode_ && !keep_ ? &free_.at(layer.config.expert_bytes)
+                                      : nullptr;
     size_t available = pool ? pool->size() : 0;
     size_t free_slots = layer.free_slots.size();
     for (const auto& [e, s] : layer.ghost)
@@ -285,7 +297,9 @@ class SharedExpertPlanner {
       // into the incoming expert's own cold allocation after every rank has
       // read it (device-side barrier), so finish() needs no host compaction.
       uint64_t save;
-      if (pool) {
+      if (keep_) {
+        save = kSharedNoOffset;  // the victim's home copy stays canonical
+      } else if (pool) {
         save = pool->back();
         pool->pop_back();
       } else {
@@ -293,7 +307,7 @@ class SharedExpertPlanner {
       }
       copies.push_back({layer.slot[victim], incoming, victim, load, save});
       inputs.push_back({load, bytes});
-      outputs.push_back({save, bytes});
+      if (!keep_) outputs.push_back({save, bytes});
       evicting.insert(victim);
     }
     // Refill this layer's empty slots in the background: LRU victims leave
@@ -301,9 +315,10 @@ class SharedExpertPlanner {
     // its exclusive bytes with copy-engine DMA (no SM interference) and the
     // slot becomes free once all ranks report completion.
     evicts_.clear();
-    if (async_free_ > 0 && pool) {
+    if (async_free_ > 0 && (pool || keep_)) {
       size_t have = layer.free_slots.size() + layer.evicting.size();
-      while (have < size_t(async_free_) && pool->size() > kEvictReserve &&
+      while (have < size_t(async_free_) &&
+             (keep_ || pool->size() > kEvictReserve) &&
              jobs_[0].size() + jobs_[1].size() + evicts_.size() <
                  kMaxPendingJobs &&
              copies.size() + evicts_.size() < kMaxPlanOps) {
@@ -316,10 +331,10 @@ class SharedExpertPlanner {
             victim = expert;
         }
         if (victim < 0) break;
-        evicts_.push_back(
-            {layer.slot[victim], -1, victim, kSharedNoOffset, pool->back()});
+        evicts_.push_back({layer.slot[victim], -1, victim, kSharedNoOffset,
+                           keep_ ? kSharedNoOffset : pool->back()});
         ++stat_evict_;
-        pool->pop_back();
+        if (!keep_) pool->pop_back();
         evicting.insert(victim);
         ++have;
       }
@@ -548,12 +563,13 @@ class SharedExpertPlanner {
       // the old canonical input, including overlapping TP boundary readers.
       if (free_mode_) {
         if (copy.victim >= 0) {
-          layer.cold[copy.victim] = int64_t(copy.save_offset);
+          layer.cold[copy.victim] =
+              keep_ ? layer.home[copy.victim] : int64_t(copy.save_offset);
           layer.slot[copy.victim] = -1;
         }
-        if (copy.load_offset != kSharedNoOffset)
-          free_.at(bytes).push_back(copy.load_offset);
-        else
+        if (copy.load_offset != kSharedNoOffset) {
+          if (!keep_) free_.at(bytes).push_back(copy.load_offset);
+        } else
           layer.evicting.erase(copy.incoming);  // rescued (or a ghost)
         layer.cold[copy.incoming] = -1;
         layer.slot[copy.incoming] = copy.slot;
@@ -569,9 +585,18 @@ class SharedExpertPlanner {
     }
     // A rescued ghost's saved host copy is no longer canonical.
     for (const auto& [expert, at] : ghost_rescues_)
-      if (at >= 0) free_.at(bytes).push_back(uint64_t(at));
+      if (at >= 0 && !keep_) free_.at(bytes).push_back(uint64_t(at));
     ghost_rescues_.clear();
     for (const auto& ev : evicts_) {
+      if (keep_) {
+        // No save: the home copy is canonical. The slot is free at once and
+        // still holds the expert (a ghost), as after a completed save job.
+        layer.slot[ev.victim] = -1;
+        layer.cold[ev.victim] = layer.home[ev.victim];
+        layer.free_slots.push_back(ev.slot);
+        layer.ghost[ev.victim] = ev.slot;
+        continue;
+      }
       const SharedExpertJob job{
           next_job_++,       0,         int32_t(pending_layer_),
           ev.slot,           ev.victim, ev.save_offset,
@@ -645,7 +670,13 @@ class SharedExpertPlanner {
     std::unordered_map<int32_t, int32_t> ghost;  // saved, still in a free slot
     std::unordered_map<int32_t, uint64_t>
         prefetching;  // load ordinal in flight
+    std::vector<int64_t> home;  // keep-host mode: permanent host offset
   };
+  // VLLM_V41_KEEP_HOST=1: a full host copy of every expert; no writebacks.
+  const bool keep_ = [] {
+    const char* v = std::getenv("VLLM_V41_KEEP_HOST");
+    return v != nullptr && v[0] == '1';
+  }();
   uint8_t* const arena_;
   const bool inplace_ = [] {
     const char* v = std::getenv("VLLM_V41_SWAP_INPLACE");

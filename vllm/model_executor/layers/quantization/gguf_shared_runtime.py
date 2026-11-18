@@ -125,8 +125,13 @@ class SharedExpertOwner:
                 per_class * sum({s.expert_bytes for s in specs})
                 + empty * sum(s.expert_bytes for s in specs),
             )
+        # VLLM_V41_KEEP_HOST=1: a permanent host home for every expert.
+        keep = envs.VLLM_V41_KEEP_HOST == "1"
         self.data = SharedHostArena.create(
-            sum((s.experts - s.resident) * s.expert_bytes for s in specs)
+            sum(
+                (s.experts if keep else s.experts - s.resident) * s.expert_bytes
+                for s in specs
+            )
             + exchange_bytes
         )
         self.control = None
@@ -471,16 +476,28 @@ class SharedExpertRank:
             )
             table = torch.full((len(specs), self.experts), -1, dtype=torch.int32)
             cold = torch.full((len(specs), self.experts), -1, dtype=torch.int64)
-            cold_base = 0
+            self.keep_host = envs.VLLM_V41_KEEP_HOST == "1"
+            homes = torch.full((len(specs), self.experts), -1, dtype=torch.int64)
+            cold_base = home_base = 0
             for i, spec in enumerate(specs):
                 table[i, : spec.resident] = torch.arange(
                     spec.resident, dtype=torch.int32
                 )
-                cold[i, spec.resident : spec.experts] = (
-                    cold_base
-                    + torch.arange(spec.experts - spec.resident, dtype=torch.int64)
-                    * spec.expert_bytes
+                homes[i, : spec.experts] = (
+                    home_base
+                    + torch.arange(spec.experts, dtype=torch.int64) * spec.expert_bytes
                 )
+                home_base += spec.experts * spec.expert_bytes
+                if self.keep_host:
+                    cold[i, spec.resident : spec.experts] = homes[
+                        i, spec.resident : spec.experts
+                    ]
+                else:
+                    cold[i, spec.resident : spec.experts] = (
+                        cold_base
+                        + torch.arange(spec.experts - spec.resident, dtype=torch.int64)
+                        * spec.expert_bytes
+                    )
                 cold_base += (spec.experts - spec.resident) * spec.expert_bytes
                 for shard, geometry in zip(SHARDS, self.geometries[i]):
                     bank = banks[i, shard]
@@ -495,6 +512,7 @@ class SharedExpertRank:
                         raise ValueError("GPU bank does not match the shared layer")
             self.table = table.to(self.device)
             self.cold_offsets = cold.to(self.device)
+            self.homes = homes.to(self.device)
             self.counter = torch.ones(1, dtype=torch.int64, device=self.device)
             # Per-layer decode requests and unique misses. Each rank observes
             # the same plan; group reports use one copy of these counters.
@@ -1009,6 +1027,8 @@ class SharedExpertRank:
                 EVICT=self.async_evict,
                 skip_mask=self.skip_mask,
                 SKIP=skip,
+                homes=self.homes,
+                KEEP=self.keep_host,
             )
             if (
                 skip
