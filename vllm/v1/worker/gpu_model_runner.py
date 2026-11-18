@@ -9025,6 +9025,12 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            # VLLM_V41_VISION: whether this step holds image-span tokens.
+            set_vision = getattr(self.get_model(), "v41_set_vision", None)
+            if set_vision is not None:
+                set_vision(
+                    self.input_ids.np[: scheduler_output.total_num_scheduled_tokens]
+                )
             if trace_log:
                 trace_prepare_inputs_ms = (
                     time.perf_counter() - trace_prepare_inputs_t0

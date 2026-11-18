@@ -11,17 +11,51 @@ from vllm.third_party.deepseek_v41.encoding import encode_messages
 from .hf import HfTokenizer, get_cached_tokenizer
 from .protocol import TokenizerLike
 
+_IMAGE = "<｜deepseek_image｜>"
 
-def _text_only(value):
+
+def _vision() -> bool:
+    import vllm.envs as envs
+
+    return envs.VLLM_V41_VISION == "1"
+
+
+def _text_only(value, images=False):
+    """Text and tool results; image blocks too when `images` (VLLM_V41_VISION).
+    Placeholder tokens typed into text are always refused."""
     if isinstance(value, list):
         for block in value:
-            if block.get("type") not in ("text", "tool_result"):
-                raise ValueError("V4.1 first profile admits text and tool results only")
-            _text_only(block.get("content", block.get("text")))
-    elif isinstance(value, str) and (
-        "<｜deepseek_image｜>" in value or "<image>" in value
-    ):
-        raise ValueError("V4.1 first profile does not admit image inputs")
+            kind = block.get("type")
+            if images and kind in ("image", "image_url"):
+                continue
+            if kind not in ("text", "tool_result"):
+                raise ValueError(
+                    "V4.1 admits text, tool results"
+                    + (" and images" if images else "")
+                    + " only"
+                )
+            _text_only(block.get("content", block.get("text")), images)
+    elif isinstance(value, str) and (_IMAGE in value or "<image>" in value):
+        raise ValueError("V4.1 does not admit image placeholders in text")
+
+
+def _image_blocks(text):
+    """vLLM's interleaved string (parts joined by newlines, one placeholder
+    per image) -> the content blocks the V4.1 encoding expects."""
+    parts = text.split(_IMAGE)
+    blocks = []
+    for i, part in enumerate(parts):
+        if i > 0 and part.startswith("\n"):
+            part = part[1:]
+        if i < len(parts) - 1 and part.endswith("\n"):
+            part = part[:-1]
+        if part:
+            blocks.append({"type": "text", "text": part})
+        if i < len(parts) - 1:
+            # The pixels travel as multi-modal data; the encoding only needs
+            # the block (its source is not read).
+            blocks.append({"type": "image", "url": "vllm-multimodal"})
+    return blocks
 
 
 def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
@@ -32,7 +66,12 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
         def apply_chat_template(self, messages, tools=None, **kwargs):
             conversation = copy.deepcopy(kwargs.get("conversation", messages))
             for message in conversation:
-                _text_only(message.get("content"))
+                content = message.get("content")
+                if _vision() and isinstance(content, str) and _IMAGE in content:
+                    # Placeholders inserted by vLLM for the request's images.
+                    message["content"] = _image_blocks(content)
+                    continue
+                _text_only(content)
                 _text_only(message.get("content_blocks"))
             if tools:
                 conversation.insert(0, {"role": "system", "tools": tools})

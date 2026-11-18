@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Reuse chat transport while dispatching to the independent V4.1 encoding."""
 
-from vllm.tokenizers.deepseek_v41 import _text_only
+from vllm.tokenizers.deepseek_v41 import _text_only, _vision
 
 from .deepseek_v4 import DeepseekV4Renderer
 
@@ -10,9 +10,10 @@ from .deepseek_v4 import DeepseekV4Renderer
 class DeepseekV41Renderer(DeepseekV4Renderer):
     @staticmethod
     def _validate_messages(messages):
+        images = _vision()
         for message in messages:
-            _text_only(message.get("content"))
-            _text_only(message.get("content_blocks"))
+            _text_only(message.get("content"), images)
+            _text_only(message.get("content_blocks"), images)
 
     def render_messages(self, messages, params):
         self._validate_messages(messages)
