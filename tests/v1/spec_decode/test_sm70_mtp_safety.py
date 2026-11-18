@@ -469,3 +469,23 @@ def test_count_contiguous_spec_tokens_stops_at_out_of_vocab_ids():
     assert _count_contiguous_spec_tokens(ids, vocab).tolist() == [2, 6, 0, 1]
     # Without a vocabulary the legacy rule (placeholder -1 only) is kept.
     assert _count_contiguous_spec_tokens(ids).tolist() == [3, 6, 1, 1]
+
+
+def test_v41_ahead_empty_set_retains_ahead_mode_dict():
+    """An empty v41_ahead_req_ids set keeps _v41_ahead_map as {} (not None) so
+    _v41_comp_table continues updating while _v41_prev_map returns {}."""
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(prev_req_id_to_index={"req-1": 0})
+    runner._v41_draft_slot = {"req-1": 3}
+    ahead: set[str] | None = set()
+    runner._v41_ahead_map = (
+        None
+        if ahead is None
+        else {
+            r: runner._v41_draft_slot[r] for r in ahead if r in runner._v41_draft_slot
+        }
+    )
+    assert runner._v41_ahead_map == {}
+    assert runner._v41_prev_map() == {}

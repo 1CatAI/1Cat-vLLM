@@ -1574,6 +1574,8 @@ class Worker(WorkerBase):
             raise RuntimeError("VLLM_V41_PP_RANK0 needs persistent PP input buffers")
         tp = get_tp_group()
         views = {key: value[:num_tokens] for key, value in buffers.tensors.items()}
+        max_cg = self.vllm_config.compilation_config.max_cudagraph_capture_size or 0
+        early_side: torch.cuda.Stream | None = None
         if _PP_RECV_SIDE and num_tokens <= 256:
             # Slot j is reused 4 receiving steps later. The side stream first
             # waits for the main stream to pass the start of the step two
@@ -1608,21 +1610,23 @@ class Worker(WorkerBase):
                 handles = []
                 for value in views.values():
                     value.zero_()
-        elif _PP_RECV_EARLY and num_tokens > 8:
-            # Prefill: receive into fresh tensors from an idle side stream, so
-            # the transfer overlaps the previous step's forward (the graph
-            # input buffers are still being read by it).
-            views = {key: torch.empty_like(value) for key, value in views.items()}
+        elif _PP_RECV_EARLY and num_tokens > max(8, max_cg):
+            # Prefill (> max_cudagraph_capture_size): receive into fresh tensors
+            # allocated on an idle side stream so 40G IB transfers overlap the
+            # previous step's forward without touching CUDA graph buffers.
             if tp.rank_in_group == 0:
                 side = self._pp_recv_stream
                 if side is None:
                     side = self._pp_recv_stream = torch.cuda.Stream()
+                early_side = side
                 with torch.cuda.stream(side):
+                    views = {
+                        key: torch.empty_like(value) for key, value in views.items()
+                    }
                     handles = get_pp_group().irecv_tensor_dict_static(views)
             else:
+                views = {key: torch.zeros_like(value) for key, value in views.items()}
                 handles = []
-                for value in views.values():
-                    value.zero_()
         elif tp.rank_in_group == 0:
             handles = get_pp_group().irecv_tensor_dict_static(views)
         else:
@@ -1632,6 +1636,11 @@ class Worker(WorkerBase):
         tensor_dict = dict(views)
 
         def _broadcast() -> None:
+            if early_side is not None:
+                cur = torch.cuda.current_stream()
+                cur.wait_stream(early_side)
+                for v in views.values():
+                    v.record_stream(cur)
             for key, value in views.items():
                 if tp.world_size == 1:
                     continue

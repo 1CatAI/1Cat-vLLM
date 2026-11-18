@@ -1966,7 +1966,7 @@ def _sharded_index_core(
     head = torch.empty(tokens, local_columns, dtype=torch.float16, device=q.device)
     if (
         layout.num_reqs == 1
-        and tokens > 6
+        and (tokens > 6 or layout.query_start_loc is None)
         and q_all.shape[1] == 32
         and hasattr(torch.ops.v41sk, "index_scores_prefill_shard")
     ):

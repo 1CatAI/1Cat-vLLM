@@ -15,11 +15,12 @@ def _local_pair(
     row = tl.program_id(0)
     part = tl.arange(0, PARTS)
     value = tl.load(values + row * PARTS + part, part < parts, float("-inf"))
-    index = tl.load(indices + row * PARTS + part, part < parts, 2147483647)
+    index = tl.load(indices + row * PARTS + part, part < parts, 16777215)
     maximum = tl.max(value, 0)
-    winner = tl.min(tl.where(value == maximum, index, 2147483647), 0)
+    winner = tl.min(tl.where(value == maximum, index, 16777215), 0)
+    global_idx = tl.where(winner < 16777215, winner + START, 16777215)
     column = tl.arange(0, 4)
-    pair = tl.where(column == 0, maximum, tl.where(column == 1, winner + START, 0))
+    pair = tl.where(column == 0, maximum, tl.where(column == 1, global_idx, 0))
     tl.store(output + row * 4 + column, pair)
 
 
@@ -30,7 +31,7 @@ def _global_top1(pairs, output, RANKS: tl.constexpr):
     value = tl.load(pairs + row * RANKS * 4 + rank * 4)
     index = tl.load(pairs + row * RANKS * 4 + rank * 4 + 1).to(tl.int64)
     maximum = tl.max(value, 0)
-    winner = tl.min(tl.where(value == maximum, index, 2147483647), 0)
+    winner = tl.min(tl.where(value == maximum, index, 16777215), 0)
     tl.store(output + row, winner)
 
 
@@ -42,6 +43,7 @@ def _verify(
     drafts,
     cu_drafts,
     output,
+    VOCAB: tl.constexpr,
     STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -53,18 +55,21 @@ def _verify(
     in_drafts = position < num_drafts
     row = tl.load(target_indices + start + position, in_drafts, 0)
     target = tl.load(top_tokens + row, in_drafts, 0).to(tl.int32)
+    valid_t = (target >= 0) & (target < VOCAB)
     proposed = tl.load(drafts + start + position, in_drafts, -1)
     first_rejected = tl.min(
-        tl.where(in_drafts & (target != proposed), position, num_drafts), 0
+        tl.where(in_drafts & (~valid_t | (target != proposed)), position, num_drafts),
+        0,
     )
     bonus_row = tl.load(bonus_indices + req)
     bonus = tl.load(top_tokens + bonus_row).to(tl.int32)
     token = tl.where(position < num_drafts, target, bonus)
+    token = tl.where((token >= 0) & (token < VOCAB), token, -1)
     token = tl.where(position <= first_rejected, token, -1)
     tl.store(output + req * STRIDE + position, token, position < STRIDE)
 
 
-def verify_top_tokens(top_tokens, metadata):
+def verify_top_tokens(top_tokens, metadata, vocab_size: int = 129280):
     """Match the ordinary greedy rejection sampler, including its -1 padding."""
     num_reqs = len(metadata.num_draft_tokens)
     stride = metadata.max_spec_len + 1
@@ -78,6 +83,7 @@ def verify_top_tokens(top_tokens, metadata):
         metadata.draft_token_ids,
         metadata.cu_num_draft_tokens,
         output,
+        VOCAB=int(vocab_size),
         STRIDE=stride,
         BLOCK=triton.next_power_of_2(stride),
         num_warps=1,
