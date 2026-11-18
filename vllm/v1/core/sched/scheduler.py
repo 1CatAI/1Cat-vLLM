@@ -995,7 +995,7 @@ class Scheduler(SchedulerInterface):
         # only while the decoders do not fill the stages (a second step of a
         # full pipeline only waits for its round: 8 x 1K 41 vs 34 ms/round).
         # VLLM_V41_LIVE_FILE "dec_ahead" (diagnostic): 2 always two, 0 one.
-        dec_mode = v41_live.get("dec_ahead", 1) if self.v41_ahead else 2
+        dec_mode = v41_live.get("dec_ahead", 2) if self.v41_ahead else 2
         decoder_limit = 2
         if dec_mode == 0 or (
             dec_mode == 1

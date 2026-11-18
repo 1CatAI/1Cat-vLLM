@@ -15,6 +15,14 @@ class DeepSeekV41ToolParser(DeepSeekV32ToolParser):
     # The existing JSON-based required/named constraint is not V4.1 DSML.
     supports_required_and_named = False
 
+    def extract_tool_calls(self, model_output, request):
+        res = super().extract_tool_calls(model_output, request)
+        if res.tools_called and res.content and res.content.endswith("\n\n"):
+            # V4.1 encoding prepends '\n\n' before the DSML tool_calls block;
+            # strip that separator so multi-turn re-encoding is token-exact.
+            res.content = res.content[:-2] or None
+        return res
+
     def _convert_params_with_schema(self, function_name, param_dict):
         del function_name
         converted = {}

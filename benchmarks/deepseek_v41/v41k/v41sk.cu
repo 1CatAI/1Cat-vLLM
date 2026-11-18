@@ -1601,7 +1601,7 @@ void moe_w13_swiglu(torch::Tensor x, torch::Tensor qcodes,
                     torch::Tensor activated, int64_t xch) {
   TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous() &&
               x.dim() == 2 && x.size(1) == 5120 && x.size(0) >= 1 &&
-              x.size(0) <= 8);
+              x.size(0) <= 8192);
   const c10::cuda::CUDAGuard guard(x.device());
   for (const auto& tensor :
        {qcodes, qscales, gscales, probabilities, perm, gids, goff, activated})
@@ -3013,6 +3013,254 @@ __global__ void __launch_bounds__(W * 32)
   }
 }
 
+constexpr int RPW_MAX_SLOTS = 640;
+
+template <int EPL>
+struct RouteWideSmem {
+  int slot_ids[RPW_MAX_SLOTS];
+  float sh_score[8][EPL * 32];
+  unsigned sh_key[8][EPL * 32];
+  int cnt[EPL * 32];
+  int start[EPL * 32];
+  int gid[EPL * 32];
+  int groups_total;
+};
+
+template <int EPL, bool COHERENT, bool PREPARED>
+__device__ __forceinline__ void route_plan_wide_body(
+    RouteWideSmem<EPL>& sm, const float* __restrict__ logits,
+    const float* __restrict__ bias, float* __restrict__ probs,
+    int* __restrict__ ids, int* __restrict__ perm, int* __restrict__ experts,
+    int* __restrict__ offsets, int T, int K, float scale) {
+  constexpr int E = EPL * 32;
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const unsigned full = 0xffffffffu;
+  for (int e = threadIdx.x; e < E; e += blockDim.x) sm.cnt[e] = 0;
+  for (int t = warp; t < T; t += 8) {
+    float* sc = sm.sh_score[warp];
+    unsigned* ky = sm.sh_key[warp];
+#pragma unroll
+    for (int i = 0; i < EPL; ++i) {
+      const int e = lane + 32 * i;
+      sc[e] = COHERENT ? __ldcg(logits + (size_t)t * E + e)
+                       : logits[(size_t)t * E + e];
+      ky[e] = __float_as_uint(bias[e]);
+    }
+#pragma unroll 1
+    for (int i = 0; i < EPL; ++i) {
+      const int e = lane + 32 * i;
+      const float score = PREPARED ? sc[e] : route_score(sc[e]);
+      sc[e] = score;
+      unsigned key = __float_as_uint(score + __uint_as_float(ky[e]));
+      ky[e] = (key & 0x80000000u) ? ~key : (key | 0x80000000u);
+    }
+    __syncwarp();
+    float my_v = 0.0f;
+    int my_e = 0;
+#pragma unroll 1
+    for (int j = 0; j < K; ++j) {
+      unsigned long long best = 0ull;
+#pragma unroll 4
+      for (int i = 0; i < EPL; ++i) {
+        const unsigned u = ky[lane + 32 * i];
+        const unsigned long long packed =
+            ((unsigned long long)u << 32) | (0xffffffffu - (lane + 32 * i));
+        best = packed > best ? packed : best;
+      }
+#pragma unroll
+      for (int o = 16; o; o >>= 1) {
+        const unsigned long long other = __shfl_xor_sync(full, best, o);
+        best = other > best ? other : best;
+      }
+      const int best_e =
+          (int)(0xffffffffu - (unsigned int)(best & 0xffffffffu));
+      if (lane == j) {
+        my_v = sc[best_e];
+        my_e = best_e;
+      }
+      if (lane == (best_e & 31)) ky[best_e] = 0x007fffffu;
+      __syncwarp();
+    }
+    float total = my_v + __shfl_xor_sync(full, my_v, 4);
+    total += __shfl_xor_sync(full, total, 2);
+    total += __shfl_xor_sync(full, total, 1);
+    const float denom = __shfl_sync(full, total, 0) + 1e-20f;
+    if (lane < K) {
+      probs[t * K + lane] = rp_div(my_v, denom) * scale;
+      ids[t * K + lane] = my_e;
+      sm.slot_ids[t * K + lane] = my_e;
+    }
+    __syncwarp();
+  }
+  __syncthreads();
+  const int S = T * K;
+  for (int s = threadIdx.x; s < S; s += blockDim.x)
+    atomicAdd(&sm.cnt[sm.slot_ids[s]], 1);
+  __syncthreads();
+  if (warp == 0) {
+    int run = 0, grun = 0;
+    for (int base = 0; base < E; base += 32) {
+      const int c = sm.cnt[base + lane];
+      int inc = c, ginc = c > 0;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int a = __shfl_up_sync(full, inc, o),
+                  b = __shfl_up_sync(full, ginc, o);
+        if (lane >= o) {
+          inc += a;
+          ginc += b;
+        }
+      }
+      sm.start[base + lane] = run + inc - c;
+      sm.gid[base + lane] = grun + ginc - (c > 0);
+      run += __shfl_sync(full, inc, 31);
+      grun += __shfl_sync(full, ginc, 31);
+    }
+    if (lane == 0) sm.groups_total = grun;
+  }
+  __syncthreads();
+  for (int s = threadIdx.x; s < S; s += blockDim.x) {
+    const int e = sm.slot_ids[s];
+    int rank = 0;
+    for (int j = 0; j < s; ++j) rank += sm.slot_ids[j] == e;
+    perm[sm.start[e] + rank] = s;
+  }
+  for (int e = threadIdx.x; e < E; e += blockDim.x) {
+    if (sm.cnt[e] > 0) {
+      experts[sm.gid[e]] = e;
+      offsets[sm.gid[e]] = sm.start[e];
+    }
+  }
+  const int groups = sm.groups_total;
+  for (int j = threadIdx.x; j <= S; j += blockDim.x) {
+    if (j >= groups && j < S) experts[j] = 0;
+    if (j >= groups) offsets[j] = S;
+  }
+}
+
+template <int W, int MTILES, bool OUT_F32, bool ROUTE = false, int EPL = 12>
+__global__ void __launch_bounds__(W * 32) h16_gemv_mtile_kernel(
+    const uint4* __restrict__ packed, const half* __restrict__ x,
+    void* __restrict__ out, float* __restrict__ workspace,
+    int* __restrict__ tickets, int n, int k, int m, float oscale,
+    const float* __restrict__ bias = nullptr,
+    float* __restrict__ probs = nullptr, int* __restrict__ ids = nullptr,
+    int* __restrict__ perm = nullptr, int* __restrict__ experts = nullptr,
+    int* __restrict__ offsets = nullptr, int topk = 0, float scale = 0.f) {
+  struct PlainPartials {
+    float partials[W][256];
+  };
+  union RouteUnion {
+    float partials[W][256];
+    RouteWideSmem<EPL> rw;
+  };
+  using SmemT =
+      typename std::conditional<ROUTE, RouteUnion, PlainPartials>::type;
+  __shared__ SmemT smu;
+  __shared__ bool last;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x, part = blockIdx.y, parts = gridDim.y;
+  const int tiles = gridDim.x;
+  const int quadpair = (lane >> 2) & 3;
+  const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = k >> 4;
+  const int gpw = G / (W * parts);
+  const int g0 = (part * W + warp) * gpw;
+  const uint4* wp = packed + ((size_t)tile * G * 32 + lane) * 2;
+  float acc[MTILES][8];
+#pragma unroll
+  for (int t = 0; t < MTILES; ++t)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[t][i] = 0.f;
+#pragma unroll 2
+  for (int g = g0; g < g0 + gpw; ++g) {
+    const uint4 w0 = __ldcs(wp + (size_t)g * 64);
+    const uint4 w1 = __ldcs(wp + (size_t)g * 64 + 1);
+    const unsigned* B0 = reinterpret_cast<const unsigned*>(&w0);
+    const unsigned* B1 = reinterpret_cast<const unsigned*>(&w1);
+#pragma unroll
+    for (int t = 0; t < MTILES; ++t) {
+      const int r = t * 8 + row;
+      uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+      if (r < m) {
+        const half* xr = x + (size_t)r * k + g * 16;
+        a01 = *reinterpret_cast<const uint4*>(xr);
+        a23 = *reinterpret_cast<const uint4*>(xr + 8);
+      }
+      const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
+      const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+      H16_MMA(acc[t], A0[0], A0[1], B0[0], B0[1]);
+      H16_MMA(acc[t], A0[2], A0[3], B0[2], B0[3]);
+      H16_MMA(acc[t], A1[0], A1[1], B1[0], B1[1]);
+      H16_MMA(acc[t], A1[2], A1[3], B1[2], B1[3]);
+    }
+  }
+  constexpr int SLICE = MTILES * 256;
+  auto store = [&](int r, int c, float v) {
+    const size_t o = (size_t)r * n + tile * 32 + c;
+    if constexpr (OUT_F32) {
+      const float value = v * oscale;
+      reinterpret_cast<float*>(out)[o] = value;
+      if constexpr (ROUTE)
+        workspace[(size_t)tiles * parts * SLICE + o] = route_score(value);
+    } else {
+      reinterpret_cast<half*>(out)[o] = __float2half(v * oscale);
+    }
+  };
+  float* mine = workspace + ((size_t)tile * parts + part) * SLICE;
+#pragma unroll
+  for (int t = 0; t < MTILES; ++t) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int orow = (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+      const int ocol = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      smu.partials[warp][orow * 32 + quadpair * 8 + ocol] = acc[t][i];
+    }
+    __syncthreads();
+    const int rem = m - t * 8;
+    const int live_n = (rem >= 8 ? 8 : (rem > 0 ? rem : 0)) * 32;
+    for (int e = threadIdx.x; e < live_n; e += blockDim.x) {
+      float v = 0.f;
+#pragma unroll
+      for (int w = 0; w < W; ++w) v += smu.partials[w][e];
+      if (parts == 1) {
+        store(t * 8 + (e >> 5), e & 31, v);
+      } else {
+        mine[t * 256 + e] = v;
+      }
+    }
+    if (t + 1 < MTILES) __syncthreads();
+  }
+  if (parts > 1) {
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(tickets + tile, 1) == parts - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const float* all = workspace + (size_t)tile * parts * SLICE;
+    const int total_n = m * 32;
+    for (int e = threadIdx.x; e < total_n; e += blockDim.x) {
+      float v = 0.f;
+      for (int p = 0; p < parts; ++p) v += __ldcg(all + p * SLICE + e);
+      store(e >> 5, e & 31, v);
+    }
+    if (threadIdx.x == 0) tickets[tile] = 0;
+  }
+  if constexpr (ROUTE) {
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(tickets + tiles, 1) == tiles - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    route_plan_wide_body<EPL, true, true>(
+        smu.rw, workspace + (size_t)tiles * parts * SLICE, bias, probs, ids,
+        perm, experts, offsets, m, topk, scale);
+    if (threadIdx.x == 0) tickets[tiles] = 0;
+  }
+}
+
 // out[M, N] (FP32 or FP16) = x[M, K] @ W^T, W prepacked by h16 order.
 // tickets: zeroed int32 [N/32 + 1], re-armed by every launch.
 void h16_gemv(torch::Tensor out, torch::Tensor x, torch::Tensor packed,
@@ -3021,7 +3269,7 @@ void h16_gemv(torch::Tensor out, torch::Tensor x, torch::Tensor packed,
   const int m = x.size(0), k = x.size(1), n = out.size(1);
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
               x.is_contiguous());
-  TORCH_CHECK(m >= 1 && m <= 8 && out.size(0) == m && out.is_contiguous());
+  TORCH_CHECK(m >= 1 && m <= 32 && out.size(0) == m && out.is_contiguous());
   TORCH_CHECK(n % 32 == 0 && k % 16 == 0 && packed.numel() == (int64_t)n * k &&
               packed.scalar_type() == torch::kFloat16);
   TORCH_CHECK((k / 16) % (warps * parts) == 0,
@@ -3029,35 +3277,53 @@ void h16_gemv(torch::Tensor out, torch::Tensor x, torch::Tensor packed,
   TORCH_CHECK(tickets.numel() >= n / 32 + 1);
   const at::cuda::OptionalCUDAGuard guard(device_of(x));
   auto stream = at::cuda::getCurrentCUDAStream();
-  auto ws = torch::empty({parts > 1 ? (int64_t)(n / 32) * parts * 256 : 1},
-                         x.options().dtype(torch::kFloat32));
+  const int mtiles = (m + 7) / 8;
+  auto ws =
+      torch::empty({parts > 1 ? (int64_t)(n / 32) * parts * 256 * mtiles : 1},
+                   x.options().dtype(torch::kFloat32));
   const dim3 grid(n / 32, parts);
   const bool f32 = out.scalar_type() == torch::kFloat32;
   const auto* pk = reinterpret_cast<const uint4*>(packed.data_ptr<at::Half>());
   const auto* xp = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
-#define H16(Wv, F32v)                                                        \
-  h16_gemv_kernel<Wv, 2, F32v, false, 12><<<grid, Wv * 32, 0, stream>>>(     \
-      pk, xp, out.data_ptr(), ws.data_ptr<float>(), tickets.data_ptr<int>(), \
-      n, k, m, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0.f, \
-      (float)oscale)
+#define H16_DISPATCH(Wv, F32v)                                               \
+  do {                                                                       \
+    if (mtiles == 1) {                                                       \
+      h16_gemv_kernel<Wv, 2, F32v, false, 12><<<grid, Wv * 32, 0, stream>>>( \
+          pk, xp, out.data_ptr(), ws.data_ptr<float>(),                      \
+          tickets.data_ptr<int>(), n, k, m, nullptr, nullptr, nullptr,       \
+          nullptr, nullptr, nullptr, 0, 0.f, (float)oscale);                 \
+    } else if (mtiles == 2) {                                                \
+      h16_gemv_mtile_kernel<Wv, 2, F32v><<<grid, Wv * 32, 0, stream>>>(      \
+          pk, xp, out.data_ptr(), ws.data_ptr<float>(),                      \
+          tickets.data_ptr<int>(), n, k, m, (float)oscale);                  \
+    } else if (mtiles == 3) {                                                \
+      h16_gemv_mtile_kernel<Wv, 3, F32v><<<grid, Wv * 32, 0, stream>>>(      \
+          pk, xp, out.data_ptr(), ws.data_ptr<float>(),                      \
+          tickets.data_ptr<int>(), n, k, m, (float)oscale);                  \
+    } else {                                                                 \
+      h16_gemv_mtile_kernel<Wv, 4, F32v><<<grid, Wv * 32, 0, stream>>>(      \
+          pk, xp, out.data_ptr(), ws.data_ptr<float>(),                      \
+          tickets.data_ptr<int>(), n, k, m, (float)oscale);                  \
+    }                                                                        \
+  } while (0)
   if (warps == 4) {
     if (f32)
-      H16(4, true);
+      H16_DISPATCH(4, true);
     else
-      H16(4, false);
+      H16_DISPATCH(4, false);
   } else if (warps == 8) {
     if (f32)
-      H16(8, true);
+      H16_DISPATCH(8, true);
     else
-      H16(8, false);
+      H16_DISPATCH(8, false);
   } else if (warps == 16) {
     if (f32)
-      H16(16, true);
+      H16_DISPATCH(16, true);
     else
-      H16(16, false);
+      H16_DISPATCH(16, false);
   } else
     TORCH_CHECK(false, "h16_gemv: warps in {4, 8, 16}");
-#undef H16
+#undef H16_DISPATCH
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -3071,16 +3337,19 @@ void gate_route(torch::Tensor logits, torch::Tensor x, torch::Tensor packed,
   const int m = x.size(0), k = x.size(1), n = logits.size(1), K = ids.size(1);
   TORCH_CHECK(x.scalar_type() == torch::kFloat16 && x.is_contiguous());
   TORCH_CHECK(logits.scalar_type() == torch::kFloat32 && logits.size(0) == m);
-  TORCH_CHECK(m >= 1 && m <= 8 && K <= 8 && m * K < 64 &&
+  TORCH_CHECK(m >= 1 && m <= 32 && K <= 8 && m * K <= RPW_MAX_SLOTS &&
               (n == 384 || n == 128));
   TORCH_CHECK((k / 16) % (8 * parts) == 0, "gate_route: K/16 % (8*parts)");
   const at::cuda::OptionalCUDAGuard guard(device_of(x));
   auto stream = at::cuda::getCurrentCUDAStream();
-  auto ws = torch::empty({(int64_t)(n / 32) * parts * 256 + (int64_t)m * n},
-                         x.options().dtype(torch::kFloat32));
+  const int mtiles = (m + 7) / 8;
+  auto ws =
+      torch::empty({(int64_t)(n / 32) * parts * 256 * mtiles + (int64_t)m * n},
+                   x.options().dtype(torch::kFloat32));
   const dim3 grid(n / 32, parts);
   const auto* pk = reinterpret_cast<const uint4*>(packed.data_ptr<at::Half>());
   const auto* xp = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
+  if (m <= 8 && m * K < 64) {
 #define GR(EPLv, MATCH)                                                     \
   h16_gemv_kernel<8, 2, true, true, EPLv, MATCH><<<grid, 256, 0, stream>>>( \
       pk, xp, logits.data_ptr(), ws.data_ptr<float>(),                      \
@@ -3088,20 +3357,44 @@ void gate_route(torch::Tensor logits, torch::Tensor x, torch::Tensor packed,
       probs.data_ptr<float>(), ids.data_ptr<int>(), perm.data_ptr<int>(),   \
       experts.data_ptr<int>(), offsets.data_ptr<int>(), K, (float)scale,    \
       (float)oscale)
-  if (n == 384) {
-    if (match_groups) {
-      GR(12, true);
+    if (n == 384) {
+      if (match_groups) {
+        GR(12, true);
+      } else {
+        GR(12, false);
+      }
     } else {
-      GR(12, false);
+      if (match_groups) {
+        GR(4, true);
+      } else {
+        GR(4, false);
+      }
     }
-  } else {
-    if (match_groups) {
-      GR(4, true);
-    } else {
-      GR(4, false);
-    }
-  }
 #undef GR
+  } else {
+#define GR_WIDE(MTv, EPLv)                                                     \
+  h16_gemv_mtile_kernel<8, MTv, true, true, EPLv><<<grid, 256, 0, stream>>>(   \
+      pk, xp, logits.data_ptr(), ws.data_ptr<float>(),                         \
+      tickets.data_ptr<int>(), n, k, m, (float)oscale, bias.data_ptr<float>(), \
+      probs.data_ptr<float>(), ids.data_ptr<int>(), perm.data_ptr<int>(),      \
+      experts.data_ptr<int>(), offsets.data_ptr<int>(), K, (float)scale)
+#define GR_WIDE_MT(EPLv) \
+  if (mtiles == 1)       \
+    GR_WIDE(1, EPLv);    \
+  else if (mtiles == 2)  \
+    GR_WIDE(2, EPLv);    \
+  else if (mtiles == 3)  \
+    GR_WIDE(3, EPLv);    \
+  else                   \
+    GR_WIDE(4, EPLv)
+    if (n == 384) {
+      GR_WIDE_MT(12);
+    } else {
+      GR_WIDE_MT(4);
+    }
+#undef GR_WIDE_MT
+#undef GR_WIDE
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

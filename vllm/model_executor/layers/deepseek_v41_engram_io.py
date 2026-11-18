@@ -118,6 +118,8 @@ class SharedEngramOwner:
         row_bytes = _row_bytes(specs)
         native = _native()
         words, channel_words, _ = native.shared_engram_control_layout(maximum)
+        self.specs = specs
+        self._warm_stopped = False
         self.data = self.control = self.reader = None
         try:
             self.data = SharedHostArena.create(
@@ -160,7 +162,83 @@ class SharedEngramOwner:
         self.data.send(connection)
         self.control.send(connection)
 
+    def start_page_cache_warm(self) -> None:
+        """Drop loaded .safetensors from OS page cache and pre-warm Engram rows
+        sequentially while keeping >= 5 GiB free on every NUMA node."""
+        import glob
+        import threading
+
+        paths = sorted({s.path for s in self.specs if os.path.exists(s.path)})
+        if not paths:
+            return
+
+        def _numa_mem_ok() -> bool:
+            try:
+                with open("/proc/meminfo") as mf:
+                    lines = mf.readlines()
+                for line in lines:
+                    if (
+                        line.startswith("MemFree:")
+                        and int(line.split()[1]) < 12_000_000
+                    ):
+                        return False
+                for p in glob.glob("/sys/devices/system/node/node*/meminfo"):
+                    with open(p) as nf:
+                        nlines = nf.readlines()
+                    for line in nlines:
+                        if "MemFree:" in line and int(line.split()[-2]) < 5_000_000:
+                            return False
+            except OSError:
+                return False
+            return True
+
+        def _worker() -> None:
+            model_dir = os.path.dirname(os.path.dirname(paths[0]))
+            for sp in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+                try:
+                    fd = os.open(sp, os.O_RDONLY)
+                    if hasattr(os, "posix_fadvise") and hasattr(
+                        os, "POSIX_FADV_DONTNEED"
+                    ):
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    os.close(fd)
+                except OSError:
+                    pass
+            chunk = 16 * 1024 * 1024
+            for ep in paths:
+                if self._warm_stopped:
+                    return
+                try:
+                    sz = os.path.getsize(ep)
+                    fd = os.open(ep, os.O_RDONLY)
+                except OSError:
+                    continue
+                try:
+                    if hasattr(os, "posix_fadvise") and hasattr(
+                        os, "POSIX_FADV_SEQUENTIAL"
+                    ):
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+                    for off in range(0, sz, chunk):
+                        if (
+                            self._warm_stopped
+                            or (off // chunk) % 8 == 0
+                            and not _numa_mem_ok()
+                        ):
+                            break
+                        os.pread(fd, min(chunk, sz - off), off)
+                    if hasattr(os, "posix_fadvise") and hasattr(
+                        os, "POSIX_FADV_NORMAL"
+                    ):
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_NORMAL)
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+
+        threading.Thread(target=_worker, name="v41-engram-warm", daemon=True).start()
+
     def close(self):
+        self._warm_stopped = True
         if self.reader is not None:
             self.reader.stop()
             self.reader = None

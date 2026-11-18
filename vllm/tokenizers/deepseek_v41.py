@@ -67,6 +67,14 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             conversation = copy.deepcopy(kwargs.get("conversation", messages))
             for message in conversation:
                 content = message.get("content")
+                if (
+                    message.get("role") == "assistant"
+                    and message.get("tool_calls")
+                    and isinstance(content, str)
+                    and content.endswith("\n\n")
+                ):
+                    content = content[:-2]
+                    message["content"] = content
                 if _vision() and isinstance(content, str) and _IMAGE in content:
                     # Placeholders inserted by vLLM for the request's images.
                     message["content"] = _image_blocks(content)

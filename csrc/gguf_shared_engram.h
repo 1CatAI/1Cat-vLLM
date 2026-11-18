@@ -5,6 +5,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__x86_64__) || defined(_M_X64)
+  #include <immintrin.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -12,16 +15,15 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
-#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <cstdlib>
-#include <algorithm>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace vllm::gguf {
@@ -31,11 +33,6 @@ struct SharedEngramTable {
   uint64_t offset, rows;
 };
 
-// Two independently prefetched table channels, one raw row buffer per table.
-// Each GPU writes its own request record and consumption sequence. The CPU
-// lane never calls CUDA; it publishes readiness only after all preads and
-// duplicate-row scatters complete. A buffer is reused only after all ranks
-// consume its previous sequence.
 class SharedEngramReader {
  public:
   static constexpr uint64_t kChannels = 2, kRanks = 4, kHeader = 8;
@@ -75,14 +72,9 @@ class SharedEngramReader {
         fds_.push_back(fd);
       }
       std::fill_n(control_, control_words(maximum), 0);
-      // Rows are 144-byte IQ4_NL (GGUF sidecar) or 264-byte E4M3+E8M0
-      // (native checkpoint tables). A short decode reads at most 144 rows per
-      // channel. Creating and
-      // joining eight threads for each batch can outlast the cached reads.
-      // Keep the same bounded I/O parallelism for both hot and cold rows.
-      // Cold rows are random 144-byte NVMe reads: queue depth (threads)
-      // bounds IOPS. VLLM_V41_ENGRAM_READERS overrides the default.
-      size_t readers = 64;
+      // Default 32 reader threads matches SATA AHCI NCQ queue_depth (32) while
+      // halving cross-socket futex wakeups; VLLM_V41_ENGRAM_READERS overrides.
+      size_t readers = 32;
       if (const char* v = std::getenv("VLLM_V41_ENGRAM_READERS"))
         readers = std::max(1, std::atoi(v));
       for (size_t i = 0; i < readers; ++i)
@@ -154,13 +146,23 @@ class SharedEngramReader {
       });
       if (readers_stopped_) return;
       completed = read_generation_;
-      // The coordinator cannot replace this task until all workers have
-      // acknowledged it. Its captures remain alive in read_rows below.
       guard.unlock();
       read_task_();
       guard.lock();
       if (!--read_remaining_) read_done_.notify_one();
     }
+  }
+
+  bool pread_row(int fd, uint64_t offset, uint8_t* target) const {
+    uint64_t left = row_bytes_;
+    while (left) {
+      const auto got = pread(fd, target, left, off_t(offset));
+      if (got <= 0) return false;
+      left -= uint64_t(got);
+      offset += uint64_t(got);
+      target += got;
+    }
+    return true;
   }
 
   void read_rows(size_t channel, uint64_t count, uint64_t begin) {
@@ -180,42 +182,45 @@ class SharedEngramReader {
         duplicate.emplace_back(i, inserted.first->second);
     }
     std::sort(unique.begin(), unique.end());
-    std::atomic<size_t> next{0};
-    std::atomic<bool> failed{false};
-    {
-      std::lock_guard<std::mutex> guard(read_mutex_);
-      read_task_ = [&] {
-        for (;;) {
-          const size_t i = next.fetch_add(1, std::memory_order_relaxed);
-          if (i >= unique.size() || failed.load(std::memory_order_acquire))
-            break;
-          const auto [row, output] = unique[i];
-          auto* target = raw + output * row_bytes_;
-          uint64_t offset = tables_[channel].offset + row * row_bytes_;
-          uint64_t left = row_bytes_;
-          while (left) {
-            const auto got = pread(fds_[channel], target, left, off_t(offset));
-            if (got <= 0) {
+    if (unique.size() <= 4) {
+      for (const auto& [row, output] : unique) {
+        if (!pread_row(fds_[channel],
+                       tables_[channel].offset + row * row_bytes_,
+                       raw + output * row_bytes_))
+          throw std::runtime_error(
+              "shared Engram source returned a short read");
+      }
+    } else {
+      std::atomic<size_t> next{0};
+      std::atomic<bool> failed{false};
+      {
+        std::lock_guard<std::mutex> guard(read_mutex_);
+        read_task_ = [&] {
+          for (;;) {
+            const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= unique.size() || failed.load(std::memory_order_acquire))
+              break;
+            const auto [row, output] = unique[i];
+            if (!pread_row(fds_[channel],
+                           tables_[channel].offset + row * row_bytes_,
+                           raw + output * row_bytes_)) {
               failed.store(true, std::memory_order_release);
               break;
             }
-            left -= uint64_t(got);
-            offset += uint64_t(got);
-            target += got;
           }
-        }
-      };
-      read_remaining_ = readers_.size();
-      ++read_generation_;
+        };
+        read_remaining_ = readers_.size();
+        ++read_generation_;
+      }
+      read_ready_.notify_all();
+      {
+        std::unique_lock<std::mutex> guard(read_mutex_);
+        read_done_.wait(guard, [&] { return !read_remaining_; });
+        read_task_ = {};
+      }
+      if (failed.load(std::memory_order_acquire))
+        throw std::runtime_error("shared Engram source returned a short read");
     }
-    read_ready_.notify_all();
-    {
-      std::unique_lock<std::mutex> guard(read_mutex_);
-      read_done_.wait(guard, [&] { return !read_remaining_; });
-      read_task_ = {};
-    }
-    if (failed.load(std::memory_order_acquire))
-      throw std::runtime_error("shared Engram source returned a short read");
     check(begin);
     for (const auto& [to, from] : duplicate)
       std::memcpy(raw + to * row_bytes_, raw + from * row_bytes_, row_bytes_);
@@ -228,6 +233,7 @@ class SharedEngramReader {
 
   void run() {
     std::array<uint64_t, kChannels> sequence{1, 1}, started{0, 0};
+    int idle_spins = 0;
     try {
       while (!stopped_.load(std::memory_order_acquire)) {
         bool work = false;
@@ -261,7 +267,16 @@ class SharedEngramReader {
           started[c] = 0;
           work = true;
         }
-        if (!work) std::this_thread::sleep_for(std::chrono::microseconds(10));
+        if (work) {
+          idle_spins = 0;
+        } else if (idle_spins < 4000) {
+          ++idle_spins;
+#if defined(__x86_64__) || defined(_M_X64)
+          _mm_pause();
+#endif
+        } else {
+          std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
       }
     } catch (const std::exception& e) {
       {

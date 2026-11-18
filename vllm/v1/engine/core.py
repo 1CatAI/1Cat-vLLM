@@ -668,7 +668,13 @@ class EngineCore:
         # are kept in flight; more queued decode steps only wait for rounds
         # not back yet (8 x 8K: 38 vs 80 ms/round). VLLM_V41_LIVE_FILE
         # "qdepth N" overrides it (diagnostic).
-        depth = v41_live.get("qdepth", self._v41_depth)
+        live_qdepth = v41_live.get("qdepth", 0)
+        if live_qdepth > 0:
+            depth = min(self.batch_queue_size, live_qdepth)
+        elif self._v41_micro and getattr(self.scheduler, "v41_ahead", False):
+            depth = min(self.batch_queue_size, 2 * self._v41_depth)
+        else:
+            depth = self._v41_depth
 
         model_executed = False
         deferred_scheduler_output = None
