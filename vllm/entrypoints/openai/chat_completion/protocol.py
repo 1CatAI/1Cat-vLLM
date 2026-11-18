@@ -572,24 +572,37 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default_sampling_params: dict,
     ) -> SamplingParams:
         # Default parameters
-        if (presence_penalty := self.presence_penalty) is None:
-            presence_penalty = default_sampling_params.get(
-                "presence_penalty",
-                self._DEFAULT_SAMPLING_PARAMS["presence_penalty"],
-            )
-        if (frequency_penalty := self.frequency_penalty) is None:
-            frequency_penalty = default_sampling_params.get(
-                "frequency_penalty",
-                self._DEFAULT_SAMPLING_PARAMS["frequency_penalty"],
-            )
-        if (repetition_penalty := self.repetition_penalty) is None:
-            repetition_penalty = default_sampling_params.get(
-                "repetition_penalty",
-                self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"],
-            )
         if (temperature := self.temperature) is None:
             temperature = default_sampling_params.get(
                 "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
+            )
+        greedy = temperature < 1e-5
+        if (presence_penalty := self.presence_penalty) is None:
+            presence_penalty = (
+                self._DEFAULT_SAMPLING_PARAMS["presence_penalty"]
+                if greedy
+                else default_sampling_params.get(
+                    "presence_penalty",
+                    self._DEFAULT_SAMPLING_PARAMS["presence_penalty"],
+                )
+            )
+        if (frequency_penalty := self.frequency_penalty) is None:
+            frequency_penalty = (
+                self._DEFAULT_SAMPLING_PARAMS["frequency_penalty"]
+                if greedy
+                else default_sampling_params.get(
+                    "frequency_penalty",
+                    self._DEFAULT_SAMPLING_PARAMS["frequency_penalty"],
+                )
+            )
+        if (repetition_penalty := self.repetition_penalty) is None:
+            repetition_penalty = (
+                self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"]
+                if greedy
+                else default_sampling_params.get(
+                    "repetition_penalty",
+                    self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"],
+                )
             )
         if (top_p := self.top_p) is None:
             top_p = default_sampling_params.get(

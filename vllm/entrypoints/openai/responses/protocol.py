@@ -354,6 +354,7 @@ class ResponsesRequest(OpenAIBaseModel):
             temperature = default_sampling_params.get(
                 "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
             )
+        greedy = temperature < 1e-5
         if (top_p := self.top_p) is None:
             top_p = default_sampling_params.get(
                 "top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"]
@@ -364,13 +365,21 @@ class ResponsesRequest(OpenAIBaseModel):
             )
 
         if (repetition_penalty := self.repetition_penalty) is None:
-            repetition_penalty = default_sampling_params.get("repetition_penalty", 1.0)
+            repetition_penalty = (
+                1.0
+                if greedy
+                else default_sampling_params.get("repetition_penalty", 1.0)
+            )
 
         if (presence_penalty := self.presence_penalty) is None:
-            presence_penalty = default_sampling_params.get("presence_penalty", 0.0)
+            presence_penalty = (
+                0.0 if greedy else default_sampling_params.get("presence_penalty", 0.0)
+            )
 
         if (frequency_penalty := self.frequency_penalty) is None:
-            frequency_penalty = default_sampling_params.get("frequency_penalty", 0.0)
+            frequency_penalty = (
+                0.0 if greedy else default_sampling_params.get("frequency_penalty", 0.0)
+            )
 
         stop_token_ids = default_sampling_params.get("stop_token_ids")
 
