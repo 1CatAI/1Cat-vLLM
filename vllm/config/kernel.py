@@ -1059,10 +1059,10 @@ class KernelConfig:
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
     qsa_host_kv_hot_dtype: Literal[
-        "float16", "fp8_e4m3", "int8_per_token_head", "int8"
-    ] = "float16"
-    """Target hot storage; encoded E4M3/INT8 requires matching 8-bit history.
-    Encoded hot reads round to the same FP16 operands as the decoded cache."""
+        "auto", "float16", "fp8_e4m3", "int8_per_token_head", "int8"
+    ] = "auto"
+    """Target hot storage; 'auto' follows qsa_host_kv_dtype so encoded 8-bit
+    history keeps matching 8-bit hot pages and 3 CTAs/SM native occupancy."""
     qsa_host_kv_draft_hot_tokens: int | None = Field(default=None, gt=0, multiple_of=16)
     """Optional independent draft hot capacity; None preserves target capacity."""
     qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)

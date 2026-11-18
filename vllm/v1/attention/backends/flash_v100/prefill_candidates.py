@@ -524,6 +524,8 @@ class Fp8BridgePrefill(SequenceCandidate):
                 if self.executor.config.kv_codec in (FP8_E4M3, INT8_PER_TOKEN_HEAD)
                 else "prefill_prefix_fp8_e5m2_bridge"
             )
+        elif self.executor.config.kv_codec is INT8_PER_TOKEN_HEAD:
+            return _run_int8_pth_paged_prefill_fallback(self.executor, request)
         else:
             out_seq = self.executor.ops.paged(
                 request.q_seq,
@@ -541,9 +543,49 @@ class Fp8BridgePrefill(SequenceCandidate):
         return PrefillResult(out_seq, out_is_destination, False)
 
 
+def _run_int8_pth_paged_prefill_fallback(
+    executor: PrefillExecutor, request: PrefillRequest
+) -> PrefillResult:
+    from vllm.v1.attention.kv_codecs import per_token_head_scales_for_kv_views
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    k_scales, v_scales = per_token_head_scales_for_kv_views(
+        request.key_cache, request.value_cache
+    )
+    q_flat = request.q_seq.squeeze(0)
+    out_slice = request.out_view[request.start : request.end]
+    cu_q = torch.tensor([0, request.q_len], dtype=torch.int32, device=q_flat.device)
+    unified_attention(
+        q=q_flat,
+        k=request.key_cache,
+        v=request.value_cache,
+        out=out_slice,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=request.q_len,
+        seqused_k=request.attn_metadata.seq_lens[request.i : request.i + 1],
+        max_seqlen_k=request.seq_len,
+        softmax_scale=executor.config.scale,
+        causal=request.causal,
+        window_size=request.window_size,
+        block_table=request.attn_metadata.block_table[request.i : request.i + 1],
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+        k_scale_cache=k_scales,
+        v_scale_cache=v_scales,
+    )
+    return PrefillResult(out_slice.unsqueeze(0), True, False)
+
+
 class SplitKvPrefill(SequenceCandidate):
     def admit(self, request: PrefillRequest) -> bool:
-        return request.use_splitkv
+        return (
+            request.use_splitkv
+            and self.executor.config.kv_codec is not INT8_PER_TOKEN_HEAD
+        )
 
     def run(
         self, request: PrefillRequest, record: _plan.RecordRoute
@@ -587,6 +629,8 @@ class PagedPrefill(SequenceCandidate):
     def run(
         self, request: PrefillRequest, record: _plan.RecordRoute
     ) -> PrefillResult | None:
+        if self.executor.config.kv_codec is INT8_PER_TOKEN_HEAD:
+            return _run_int8_pth_paged_prefill_fallback(self.executor, request)
         out_is_destination = False
         out_seq = self.executor.ops.run_paged(
             route="prefill_prefix_paged",

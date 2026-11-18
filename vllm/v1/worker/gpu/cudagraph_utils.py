@@ -411,10 +411,15 @@ class CudaGraphManager:
                 with sm70_decode_graph_compilation(mode == CUDAGraphMode.FULL):
                     for desc in descs:
                         # Prepare inputs and get forward function
-                        forward_fn, attn_state = create_forward_fn(desc)
-
-                        # Warmup
-                        forward_fn(CUDAGraphMode.NONE)
+                        compile_full_graph = (
+                            desc.cg_mode != CUDAGraphMode.PIECEWISE
+                            and graph_policy().compile_graph
+                            and _worker_device_is_pre_ampere()
+                        )
+                        if not compile_full_graph:
+                            forward_fn, attn_state = create_forward_fn(desc)
+                            # Warmup
+                            forward_fn(CUDAGraphMode.NONE)
 
                         # Capture
                         logger.debug(
@@ -435,10 +440,7 @@ class CudaGraphManager:
                             assert desc not in self.graphs, (
                                 f"Graph already captured for {desc}"
                             )
-                            if (
-                                graph_policy().compile_graph
-                                and _worker_device_is_pre_ampere()
-                            ):
+                            if compile_full_graph:
                                 logger.info_once(
                                     "Running SM70 Flash-V100 compile full-graph "
                                     "pre-capture warmup for stable replay."

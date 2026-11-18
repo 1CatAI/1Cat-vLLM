@@ -1571,6 +1571,9 @@ class GroupCoordinator:
         if self.device_communicator is not None:
             self.device_communicator.destroy()
         if self.mq_broadcaster is not None:
+            self.mq_broadcaster.shutdown()
+            if self.mq_broadcaster.buffer is not None:
+                self.mq_broadcaster.buffer.close()
             self.mq_broadcaster = None
 
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
@@ -2423,7 +2426,10 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
-    global _WORLD, _NODE_COUNT
+    global _WORLD, _INNER_DP_WORLD, _NODE_COUNT
+    if _INNER_DP_WORLD is not None and _INNER_DP_WORLD is not _WORLD:
+        _INNER_DP_WORLD.destroy()
+    _INNER_DP_WORLD = None
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None

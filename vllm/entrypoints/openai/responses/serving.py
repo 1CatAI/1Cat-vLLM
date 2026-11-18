@@ -429,11 +429,17 @@ class OpenAIServingResponses(OpenAIServing):
             if maybe_error is not None:
                 return maybe_error
 
+            effort = request.reasoning.effort if request.reasoning else None
+            effective_sampling_params = self.model_config.get_effective_sampling_param(
+                thinking_enabled=(effort != "none"),
+                base_defaults=self.default_sampling_params,
+            )
+
             default_max_tokens = get_max_tokens(
                 max_model_len,
                 request.max_output_tokens,
                 self._extract_prompt_len(engine_input),
-                self.default_sampling_params,
+                effective_sampling_params,
                 self.override_max_tokens,
                 truncate_prompt_tokens=(
                     -1 if request.truncation != "disabled" else None
@@ -441,7 +447,7 @@ class OpenAIServingResponses(OpenAIServing):
             )
 
             sampling_params = request.to_sampling_params(
-                default_max_tokens, self.default_sampling_params
+                default_max_tokens, effective_sampling_params
             )
 
             trace_headers = (

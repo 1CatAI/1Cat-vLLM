@@ -28,6 +28,7 @@ from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
     FP8_E5M2,
     FP16,
+    INT8_PER_TOKEN_HEAD,
     KVCodec,
     resolve_kv_codec,
 )
@@ -190,6 +191,25 @@ class DecodeExecutor:
             anchored_window=anchored_window,
         ):
             record(_routing.ROUTE_SPECS["decode_e4m3_compact_scalar_tail"].name)
+            return
+        if resolve_kv_codec(kv_cache_dtype) is INT8_PER_TOKEN_HEAD and not getattr(
+            self.ops.paged, "_handles_int8_pth", False
+        ):
+            from vllm.v1.attention.ops.sm70_e4m3_decode import (
+                triton_int8_pth_decode_fallback,
+            )
+
+            triton_int8_pth_decode_fallback(
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens,
+                softmax_scale=softmax_scale,
+                out=out,
+                window_size=window_size,
+                max_seq_len_hint=max_seq_len_hint,
+            )
             return
         kwargs: dict[str, object] = {
             "softmax_scale": softmax_scale,

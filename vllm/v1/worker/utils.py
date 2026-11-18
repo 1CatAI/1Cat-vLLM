@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import math
 from collections import defaultdict
 from collections.abc import Iterable
@@ -103,26 +104,33 @@ def _shared_replica_host_pool(pool_size: int, device: torch.device):
     tokens = [uuid.uuid4().hex if rank == 0 else None]
     dist.broadcast_object_list(tokens, src=group.ranks[0], group=group.cpu_group)
     path = f"/dev/shm/vllm-host-kv-{tokens[0]}-{rank // replicas}"
+    created = False
     try:
         if leader:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-            os.ftruncate(fd, pool_size)
-            os.close(fd)
+            created = True
+            try:
+                os.ftruncate(fd, pool_size)
+            finally:
+                os.close(fd)
         ok = True
     except OSError:
         ok = False
-    flags = [None] * group.world_size
-    dist.all_gather_object(flags, ok, group=group.cpu_group)
-    if not all(flags):
-        if leader and ok:
-            os.unlink(path)
-        return None
-    fd = os.open(path, os.O_RDWR)
-    shared = mmap.mmap(fd, pool_size, mmap.MAP_SHARED)
-    os.close(fd)
-    dist.barrier(group=group.cpu_group)
-    if leader:
-        os.unlink(path)
+    try:
+        flags = [None] * group.world_size
+        dist.all_gather_object(flags, ok, group=group.cpu_group)
+        if not all(flags):
+            return None
+        fd = os.open(path, os.O_RDWR)
+        try:
+            shared = mmap.mmap(fd, pool_size, mmap.MAP_SHARED)
+        finally:
+            os.close(fd)
+        dist.barrier(group=group.cpu_group)
+    finally:
+        if leader and created:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
     from vllm.model_executor.layers.quantization.gguf_expert_cache import _native
 
     host = torch.frombuffer(shared, dtype=torch.int8)

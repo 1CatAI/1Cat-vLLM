@@ -43,7 +43,10 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
         # Qwen3 defaults to thinking enabled; only treat output as
         # pure content when the user explicitly disables it.
-        self.thinking_enabled = chat_kwargs.get("enable_thinking", True)
+        effort = chat_kwargs.get("reasoning_effort")
+        self.thinking_enabled = (
+            chat_kwargs.get("enable_thinking", True) is not False and effort != "none"
+        )
 
         self._tool_call_tag = "<tool_call>"
         self._tool_call_token_id = self.vocab.get(self._tool_call_tag)
@@ -151,7 +154,18 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         tool_call_index = model_output.find(self._tool_call_tag)
         if tool_call_index != -1:
             reasoning = model_output[:tool_call_index]
-            content = model_output[tool_call_index:]
+            tool_choice = getattr(request, "tool_choice", None)
+            has_structured_json = getattr(
+                request, "response_format", None
+            ) is not None or tool_choice not in (None, "auto", "none")
+            if has_structured_json:
+                content = model_output[
+                    tool_call_index + len(self._tool_call_tag) :
+                ].lstrip()
+                if content.endswith(self._tool_call_end_tag):
+                    content = content[: -len(self._tool_call_end_tag)].rstrip()
+            else:
+                content = model_output[tool_call_index:]
             return reasoning or None, content or None
         # Thinking enabled but no </think>: output was truncated.
         # Everything generated so far is reasoning.

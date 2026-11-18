@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import importlib.machinery
 import importlib.util
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -24,6 +27,53 @@ _SM70_GENCODE_FLAGS = [
     "-gencode=arch=compute_70,code=sm_70",
     "-gencode=arch=compute_75,code=sm_75",
 ]
+
+
+def _find_matching_site_extension(src: Path):
+    """Reuse an ABI-compatible wheel .so when a source overlay shares identical .cu."""
+    if getattr(importlib.import_module, "__module__", "") != "importlib":
+        return None
+    if not src.is_file():
+        return None
+    try:
+        src_digest = hashlib.sha256(src.read_bytes()).digest()
+        cur_dir = src.parent.parent.resolve()
+    except OSError:
+        return None
+    rel = Path("flash_qla") / "ops" / "gated_delta_rule" / "chunk" / "sm70"
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            cand_dir = (Path(entry) / rel).resolve()
+        except OSError:
+            continue
+        if cand_dir == cur_dir or not cand_dir.is_dir():
+            continue
+        cand_src = cand_dir / "csrc" / "gdn_forward.cu"
+        try:
+            if (
+                not cand_src.is_file()
+                or hashlib.sha256(cand_src.read_bytes()).digest() != src_digest
+            ):
+                continue
+        except OSError:
+            continue
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            so_path = cand_dir / f"flash_qla_sm70_gdn_strided{suffix}"
+            if not so_path.is_file():
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    _PREBUILT_EXTENSION, so_path
+                )
+                if spec is not None and spec.loader is not None:
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    return module
+            except Exception:
+                continue
+    return None
 
 
 def _load_ext():
@@ -74,6 +124,10 @@ def _load_ext():
         ) from exc
 
     src = Path(__file__).with_name("csrc") / "gdn_forward.cu"
+    prebuilt_overlay = _find_matching_site_extension(src)
+    if prebuilt_overlay is not None:
+        _EXT = prebuilt_overlay
+        return _EXT
     try:
         _EXT = load(
             name="flash_qla_sm70_gdn_strided",

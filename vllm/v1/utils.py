@@ -617,10 +617,12 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
         procs: List of processes to shutdown
         timeout: Maximum time in seconds to wait for graceful shutdown
     """
-    if timeout is None:
-        # Keep a small grace period for best-effort cleanup paths that do not
-        # have a user-configured shutdown timeout.
-        timeout = 5.0
+    if timeout is None or timeout <= 0:
+        # Keep a grace period >= MultiprocExecutor._ensure_worker_termination
+        # (4s + 4s) for best-effort cleanup paths when shutdown_timeout defaults
+        # to 0 (immediate request-drain abort), so EngineCore and WorkerProcs
+        # can finish unlinking shared memory and tearing down CUDA graphs.
+        timeout = 15.0
 
     # Shutdown the process.
     for proc in procs:

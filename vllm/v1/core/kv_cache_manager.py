@@ -530,7 +530,26 @@ class KVCacheManager:
                     break
                 if first > 0 and isinstance(manager, FullAttentionManager):
                     parents = req_blocks[:first]
-                    if any(block.is_null for block in parents):
+                    group_hashes = (
+                        request.block_hashes
+                        if manager.block_size == self.hash_block_size
+                        else BlockHashListWithBlockSize(
+                            request.block_hashes,
+                            self.hash_block_size,
+                            manager.block_size,
+                        )
+                    )
+                    if (
+                        len(group_hashes) < first
+                        or any(block.is_null for block in parents)
+                        or any(
+                            self.block_pool.get_cached_block(
+                                group_hashes[i], [group_id]
+                            )
+                            is None
+                            for i in range(first)
+                        )
+                    ):
                         break
                     pinned_parents.extend(parents)
                 sources.append(group_sources)

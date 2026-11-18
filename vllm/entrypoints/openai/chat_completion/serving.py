@@ -568,6 +568,21 @@ class OpenAIServingChat(OpenAIServing):
             .chat_template_kwargs
         )
 
+    def _effective_sampling_params(
+        self,
+        request: ChatCompletionRequest,
+        chat_template_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        effort = request.reasoning_effort or chat_template_kwargs.get(
+            "reasoning_effort"
+        )
+        enable_thinking = chat_template_kwargs.get("enable_thinking")
+        thinking_enabled = (enable_thinking is not False) and (effort != "none")
+        return self.model_config.get_effective_sampling_param(
+            thinking_enabled=thinking_enabled,
+            base_defaults=self.default_sampling_params,
+        )
+
     def _restore_historical_assistant_reasoning(
         self, request: ChatCompletionRequest
     ) -> ChatCompletionRequest:
@@ -658,11 +673,20 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        parser_chat_kwargs = (
+            {**chat_template_kwargs, "reasoning_effort": request.reasoning_effort}
+            if request.reasoning_effort
+            and "reasoning_effort" not in chat_template_kwargs
+            else chat_template_kwargs
+        )
+        effective_sampling_params = self._effective_sampling_params(
+            request, chat_template_kwargs
+        )
         reasoning_parser: ReasoningParser | None = None
         if self.reasoning_parser_cls:
             reasoning_parser = self.reasoning_parser_cls(
                 tokenizer,
-                chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                chat_template_kwargs=parser_chat_kwargs,  # type: ignore[call-arg]
             )
             request = self._restore_historical_assistant_reasoning(request)
         result = await self.render_chat_request(request)
@@ -704,7 +728,7 @@ class OpenAIServingChat(OpenAIServing):
                 if request.max_completion_tokens is not None
                 else request.max_tokens,
                 self._extract_prompt_len(engine_input),
-                self.default_sampling_params,
+                effective_sampling_params,
                 self.override_max_tokens,
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
             )
@@ -712,12 +736,12 @@ class OpenAIServingChat(OpenAIServing):
             sampling_params: SamplingParams | BeamSearchParams
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(
-                    max_tokens, self.default_sampling_params
+                    max_tokens, effective_sampling_params
                 )
             else:
                 sampling_params = request.to_sampling_params(
                     max_tokens,
-                    self.default_sampling_params,
+                    effective_sampling_params,
                 )
                 boundaries = self._prefix_cache_boundaries(
                     tokenizer,
@@ -756,9 +780,7 @@ class OpenAIServingChat(OpenAIServing):
                     trace_headers=trace_headers,
                 )
             else:
-                if not request.include_reasoning:
-                    reasoning_ended = True
-                elif request._grammar_from_tool_parser:
+                if request._grammar_from_tool_parser:
                     # The Mistral grammar already includes an optional
                     # `think?` rule that handles both reasoning and
                     # non-reasoning outputs.
@@ -781,7 +803,7 @@ class OpenAIServingChat(OpenAIServing):
                     data_parallel_rank=data_parallel_rank,
                     reasoning_ended=reasoning_ended,
                     reasoning_parser_kwargs={
-                        "chat_template_kwargs": chat_template_kwargs,
+                        "chat_template_kwargs": parser_chat_kwargs,
                     }
                     if reasoning_parser
                     else None,
@@ -802,7 +824,7 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 request_metadata,
                 reasoning_parser,
-                chat_template_kwargs=chat_template_kwargs,
+                chat_template_kwargs=parser_chat_kwargs,
             )
 
         return await self.chat_completion_full_generator(
@@ -1194,6 +1216,19 @@ class OpenAIServingChat(OpenAIServing):
                     if generated_ids_per_choice is not None:
                         generated_ids_per_choice[i].extend(output.token_ids)
 
+                    if (
+                        delta_message is not None
+                        and not request.include_reasoning
+                        and delta_message.reasoning is not None
+                    ):
+                        delta_message.reasoning = None
+                        if (
+                            delta_message.content is None
+                            and not delta_message.tool_calls
+                            and delta_message.role is None
+                        ):
+                            delta_message = None
+
                     # if the message delta is None (e.g. because it was a
                     # "control token" for tool calls or the parser otherwise
                     # wasn't ready to send a token, then
@@ -1393,7 +1428,7 @@ class OpenAIServingChat(OpenAIServing):
                         # "tool_calls" for "auto" or "required" tool calls,
                         # and "stop" for named tool calls.
                         if output.finish_reason == "stop" and (
-                            auto_tools_called
+                            (auto_tools_called and not tool_choice_function_name)
                             or (tools_streamed[i] and not tool_choice_function_name)
                             or (self.use_harmony and harmony_tools_streamed[i])
                         ):
@@ -1470,7 +1505,11 @@ class OpenAIServingChat(OpenAIServing):
                     choice_tool_parser = (
                         choice_parser.tool_parser if choice_parser is not None else None
                     )
-                    if (
+                    if streamed_tcs and (
+                        tool_choice_function_name or request.tool_choice == "required"
+                    ):
+                        visible_content = ""
+                    elif (
                         streamed_tcs
                         and visible_content
                         and choice_tool_parser is not None
@@ -1780,8 +1819,8 @@ class OpenAIServingChat(OpenAIServing):
                 message = ChatMessage(
                     role=role,
                     reasoning=reasoning,
-                    content="",
-                    tool_calls=tool_call_class_items,
+                    content="" if tool_call_class_items else content,
+                    tool_calls=tool_call_class_items or None,
                 )
 
             elif request.tool_choice and request.tool_choice == "required":
@@ -1814,8 +1853,8 @@ class OpenAIServingChat(OpenAIServing):
                     history_tool_call_cnt += 1
                 message = ChatMessage(
                     role=role,
-                    content="",
-                    tool_calls=tool_call_class_items,
+                    content="" if tool_call_class_items else content,
+                    tool_calls=tool_call_class_items or None,
                     reasoning=reasoning,
                 )
 

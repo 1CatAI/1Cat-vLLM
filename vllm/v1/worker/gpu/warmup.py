@@ -334,7 +334,7 @@ def warmup_kernels(
                         f"c{count}{'m' if mixed else 'd'}",
                         count,
                         default_prompt_len,
-                        sampling_params,
+                        profile_sampling_params,
                         pooling_params,
                         block_count,
                         kv_cache_specs,

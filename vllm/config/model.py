@@ -1502,6 +1502,42 @@ class ModelConfig:
 
         return config.to_diff_dict()
 
+    def supports_dynamic_thinking_sampling(self) -> bool:
+        """Return whether model uses dynamic thinking/non-thinking presets."""
+        from vllm.models.sampling_defaults import supports_dynamic_thinking_sampling
+
+        return supports_dynamic_thinking_sampling(self)
+
+    def get_effective_sampling_param(
+        self,
+        *,
+        thinking_enabled: bool | None = None,
+        base_defaults: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve per-request default sampling params with dynamic thinking."""
+        from vllm.models.sampling_defaults import get_dynamic_thinking_sampling_preset
+
+        params = (
+            dict(base_defaults)
+            if base_defaults is not None
+            else self.get_diff_sampling_param()
+        )
+        if thinking_enabled is None or self.generation_config == "vllm":
+            return params
+        profile = get_dynamic_thinking_sampling_preset(
+            self, thinking_enabled=thinking_enabled
+        )
+        if profile is None:
+            return params
+        params.update(profile)
+        for key, val in self.override_generation_config.items():
+            if val is not None:
+                if key == "max_new_tokens":
+                    params["max_tokens"] = val
+                else:
+                    params[key] = val
+        return params
+
     def get_diff_sampling_param(self) -> dict[str, Any]:
         """
         This method returns a dictionary containing the non-default sampling
@@ -1517,15 +1553,23 @@ class ModelConfig:
         Returns:
             A dictionary containing the non-default sampling parameters.
         """
+        from vllm.models.sampling_defaults import get_dynamic_thinking_sampling_preset
+
         src = self.generation_config
 
         config = {} if src == "vllm" else self.try_get_generation_config()
+        if src != "vllm":
+            preset = get_dynamic_thinking_sampling_preset(self, thinking_enabled=True)
+            if preset is not None:
+                config = {**preset, **config}
 
         # Overriding with given generation config
         config.update(self.override_generation_config)
 
         available_params = [
             "repetition_penalty",
+            "presence_penalty",
+            "frequency_penalty",
             "temperature",
             "top_k",
             "top_p",

@@ -211,6 +211,8 @@ def load_int8_scalar_tail_attention(device: torch.device):
             else None
         )
         bucket = getattr(descriptor, "attention_context_bucket", None)
+        if bucket is None and table.ndim == 2 and k.ndim == 4:
+            bucket = model_capacity or int(table.shape[1]) * int(k.shape[1])
         if not (
             bucket is not None
             and 0 < bucket <= capability

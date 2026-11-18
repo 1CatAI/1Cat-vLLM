@@ -55,7 +55,7 @@ def packed_topk_reason(
         return "unmeasured_tp_size"
     if values.ndim != 2 or not 1 <= values.shape[0] <= 64:
         return "unmeasured_row_count"
-    if values.shape[1] not in (20, 64):
+    if not 1 <= values.shape[1] <= 128:
         return "unmeasured_candidate_count"
     if values.dtype not in (torch.float16, torch.float32):
         return "value_dtype"

@@ -81,7 +81,7 @@ class PartialEntry:
 
     @property
     def num_blocks(self) -> int:
-        return sum(len(blocks) for blocks in self.blocks)
+        return sum(len(blocks) for blocks in self.blocks) + len(self.pinned_blocks)
 
 
 @dataclass

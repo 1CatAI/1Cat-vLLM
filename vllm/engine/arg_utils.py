@@ -174,9 +174,11 @@ def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
         return "fp8_e4m3", False
     if (
         requested_dtype == "auto"
+        and resolved_dtype == "auto"
         and model_config is not None
         and not model_config.is_attention_free
         and not getattr(model_config, "use_mla", False)
+        and getattr(model_config.hf_text_config, "indexer_n_heads", None) is None
         and getattr(model_config, "runner_type", "generate") == "generate"
         and not getattr(kernel_config, "qsa_host_kv", False)
     ):
@@ -1854,6 +1856,7 @@ class EngineArgs:
         if self.block_size is None and self.mamba_block_size is None:
             self.block_size = _HYBRID_PREFIX_BLOCK_SIZE
             self.mamba_block_size = _HYBRID_PREFIX_BLOCK_SIZE
+            self._auto_hybrid_mamba_block_size = True
             updates.append(f"block_size={self.block_size}")
             updates.append(f"mamba_block_size={self.mamba_block_size}")
         if self.partial_prefix_cache is None:
@@ -2176,6 +2179,8 @@ class EngineArgs:
         )
 
         cache_config.cache_dtype_from_checkpoint = cache_dtype_from_checkpoint
+        if getattr(self, "_auto_hybrid_mamba_block_size", False):
+            cache_config.user_specified_mamba_block_size = False
 
         if resolved_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
