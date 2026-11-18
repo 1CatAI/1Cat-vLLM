@@ -574,6 +574,7 @@ if TYPE_CHECKING:
     VLLM_V41_PP_SERIAL: str = "0"
     VLLM_V41_PP_TOKEN_NCCL: str = "0"
     VLLM_V41_PREFILL_PIPELINE: str = "0"
+    VLLM_V41_VISION: str = "0"
     VLLM_V41_PROPOSE_GRAPH: str = "0"
     VLLM_V41_PROPOSE_GRAPH_MODE: str = "relaxed"
     VLLM_V41_Q8: str = "1"
@@ -8609,6 +8610,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: os.getenv("VLLM_V41_PREFILL_PIPELINE", "0"),
         description=(
             "DS-V4.1 PP: keep several prefill chunks in flight across stages."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_VISION": env_var(
+        lambda: os.getenv("VLLM_V41_VISION", "0"),
+        description=(
+            "DS-V4.1 native: image inputs (ViT + aligner on the first stage, "
+            "VL routing bias, no Engram n-grams over image spans)."
         ),
         category="experimental",
         declared_default="'0'",
@@ -21880,6 +21894,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_PP_SERIAL",
         "VLLM_V41_PP_TOKEN_NCCL",
         "VLLM_V41_PREFILL_PIPELINE",
+        "VLLM_V41_VISION",
         "VLLM_V41_PROPOSE_GRAPH",
         "VLLM_V41_PROPOSE_GRAPH_MODE",
         "VLLM_V41_Q8",

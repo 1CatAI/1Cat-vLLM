@@ -892,10 +892,18 @@ class V41NativeMoEMethod(Mxfp4SM70MoEMethod):
 
 # ---------------------------------------------------------------- loading
 
+_VISION = envs.VLLM_V41_VISION == "1"
 _SKIP = re.compile(
-    r"(mtp\..*|vision.*|aligner\..*|image_.*|layers\.\d+\.engram\.embed\..*"
-    r"|layers\.\d+\.ffn\.gate\.bias_vl)"
+    r"(mtp\..*|layers\.\d+\.engram\.embed\..*"
+    + (
+        ""
+        if _VISION
+        else r"|vision.*|aligner\..*|image_.*|layers\.\d+\.ffn\.gate\.bias_vl"
+    )
+    + ")"
 )
+# VLLM_V41_VISION: the vision tower's checkpoint tensors (first stage only).
+_VISION_TENSOR = re.compile(r"(vision\.|aligner\.|image_(start|end|newline)$)")
 
 
 def native_weight_name(name: str) -> str | None:
@@ -904,6 +912,8 @@ def native_weight_name(name: str) -> str | None:
         return name  # sidecar tensors already carry parameter names
     if _SKIP.fullmatch(name):
         return None
+    if _VISION and _VISION_TENSOR.match(name):
+        return "vision_tower." + name
     if name == "embed.weight":
         return "model.embed_tokens.weight"
     if name == "head.weight":
@@ -944,7 +954,9 @@ def _converted(value, parameter, name):
     if not value.is_floating_point() or parameter.dtype == value.dtype:
         return value
     converted = value.to(parameter.dtype)
-    if name.endswith(_ROUNDED) and parameter.dtype == torch.float16:
+    if (
+        name.endswith(_ROUNDED) or name.startswith("vision_tower.")
+    ) and parameter.dtype == torch.float16:
         if not torch.isfinite(converted).all():
             raise ValueError(f"V4.1 native: {name} overflows {parameter.dtype}")
         changed = int((converted.to(value.dtype) != value).sum())
@@ -990,8 +1002,8 @@ def load_native_weights(model, weights: Iterable[tuple[str, torch.Tensor]]) -> s
             loaded.add(mapped)
             continue
         if name not in parameters:
-            if name.startswith(("lm_head.", "model.norm.")):
-                continue  # owned by the last stage
+            if name.startswith(("lm_head.", "model.norm.", "vision_tower.")):
+                continue  # owned by the last (vision: first) stage
             raise ValueError(f"V4.1 native: no parameter for {source} ({name})")
         parameter = parameters[name]
         value = _converted(value, parameter, name)

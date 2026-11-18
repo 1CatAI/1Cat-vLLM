@@ -137,6 +137,12 @@ class V41DraftAttention(V41Attention):
 
 
 class V41DraftMoE(V41MoE):
+    def __init__(self, vllm_config, prefix):
+        super().__init__(vllm_config, prefix)
+        # The drafter never routes image rows (the reference MTP takes no
+        # image mask): its checkpoint VL bias is not loaded.
+        self.gate.bias_vl = None
+
     def forward(self, x):
         routed, shared = self.experts.forward_partials(
             hidden_states=x, router_logits=self._draft_gate(x)
