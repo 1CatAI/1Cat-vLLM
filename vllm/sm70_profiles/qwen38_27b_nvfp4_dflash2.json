@@ -21,7 +21,7 @@
     "dtype": "half",
     "tensor_parallel_size": 4,
     "attention_backend": "FLASH_ATTN_V100",
-    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_dtype": "int8_per_token_head",
     "max_model_len": 262144,
     "gpu_memory_utilization": 0.83,
     "max_num_batched_tokens": 4096,

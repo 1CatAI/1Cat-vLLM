@@ -9,7 +9,7 @@ usage() {
 Usage: serve_flash_next_nvfp4_v100.sh MODEL [--draft LOCAL_PATH] [vllm serve options...]
 
 MODEL is a local checkpoint directory or a Hugging Face model ID.
-Defaults: TP4, FP16 compute/KV, MTP4, 256K context with FP8 KV history in
+Defaults: TP4, FP16 compute, MTP4, 256K context with INT8 KV history in
 pinned host memory, 4096-token prefill, up to 8 sequences, prefix caching and
 GPU memory utilization 0.89. Without --draft the MTP layers inside MODEL are
 used; pass --draft for a separate MTP checkpoint directory.
@@ -49,7 +49,7 @@ if [[ -n $draft ]]; then
   draft_json=$(printf '%s' "$draft" | sed 's/\\/\\\\/g; s/"/\\"/g')
   speculative="{\"method\": \"mtp\", \"model\": \"$draft_json\", \"num_speculative_tokens\": 4, \"draft_sample_method\": \"greedy\"}"
 fi
-kernel_config='{"sm70_hcx": true, "sm70_qsa_prep": true, "sm70_hcx_local_schedule": true, "hc_weight_storage": "sharded", "qsa_host_kv": true, "qsa_host_kv_dtype": "fp8_e4m3", "qsa_host_kv_hot_dtype": "fp8_e4m3", "qsa_host_kv_hot_tokens": 131072, "qsa_host_kv_prefill_stage_tokens": 262144, "qsa_host_kv_trim_warmup_cache": true}'
+kernel_config='{"sm70_hcx": true, "sm70_qsa_prep": true, "sm70_hcx_local_schedule": true, "hc_weight_storage": "sharded", "qsa_host_kv": true, "qsa_host_kv_dtype": "int8_per_token_head", "qsa_host_kv_hot_dtype": "int8_per_token_head", "qsa_host_kv_hot_tokens": 131072, "qsa_host_kv_prefill_stage_tokens": 262144, "qsa_host_kv_trim_warmup_cache": true}'
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 vllm_cli=vllm

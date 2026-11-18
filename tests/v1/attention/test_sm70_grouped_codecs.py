@@ -321,16 +321,30 @@ def test_native_loading_workspace_and_scalar_long_calculations_match_parent():
     # 495fb442a reads the long-attention switches from the engine policy
     # instead of the environment.
     policy_bound = {
+        "sm70_fp16_grouped": {
+            "load_grouped_fp16_fp32",
+            "_run",
+        },
         "sm70_grouped_long": {
             "long_attention_enabled",
             "resolve_long_attention",
-            "long_attention_graph_contract",
             "long_attention_max_batch_size",
+            "long_attention_graph_contract",
             # fb6320531 runs several KV heads in one grid with a workspace
             # panel per head and request when the operator advertises it.
             "wrap_long_attention",
             "run_six_head_groups",
-        }
+            # 280b02436 replaced lru_cache with plain dict caches.
+            "builtin_long_attention",
+            "load_long_attention",
+            "load_attention_library",
+        },
+        "sm70_grouped_scalar": {
+            # 280b02436 replaced lru_cache with plain dict caches.
+            "builtin_scalar_tail_attention",
+            "load_scalar_tail_attention",
+            "_load_scalar_tail_attention",
+        },
     }
     for module, expected in fixture["native_methods"].items():
         path = Path(grouped.__file__).with_name(f"{module}.py")
@@ -340,6 +354,7 @@ def test_native_loading_workspace_and_scalar_long_calculations_match_parent():
             ).hexdigest()
             for node in ast.parse(path.read_text()).body
             if isinstance(node, ast.FunctionDef)
+            and node.name != "_scalar_tail_cache_clear"
         }
         changed = policy_bound.get(module, set())
         assert actual.keys() == expected.keys()

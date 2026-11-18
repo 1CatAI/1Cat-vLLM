@@ -35,12 +35,15 @@ from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
 from vllm.utils.torch_utils import (
+    STR_DTYPE_TO_TORCH_DTYPE,
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
     canonicalize_singleton_dim_strides,
     direct_register_custom_op,
+    get_dtype_size,
     kv_cache_dtype_str_to_dtype,
+    kv_cache_uses_per_token_head_scales,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -60,6 +63,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
+    KVQuantMode,
     get_kv_quant_mode,
 )
 
@@ -318,7 +322,31 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "int8",
+        "int8_per_token_head",
     ]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if block_size % 16 != 0:
+            raise ValueError("Block size must be a multiple of 16.")
+        padded_head_size = head_size
+        if kv_cache_uses_per_token_head_scales(cache_dtype_str):
+            cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
+            padded_head_size += torch.float32.itemsize // get_dtype_size(cache_dtype)
+        return (num_blocks, 2, block_size, num_kv_heads, padded_head_size)
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        if kv_cache_dtype is None:
+            return True
+        return kv_cache_dtype in cls.supported_kv_cache_dtypes
 
     @staticmethod
     def get_name() -> str:
@@ -365,11 +393,57 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             "bfloat16",
             "fp8",
             "fp8_e4m3",
+            "int8",
+            "int8_per_token_head",
         ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
+                "Qwen4Exp QSA requires FP16/BF16, E4M3, or INT8 main KV cache"
             )
         self.supports_quant_query_input = False
+        self._pth_cache_key: tuple[int, int] | None = None
+        self._pth_views: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
+
+    def _get_pth_views(
+        self, kv_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from vllm.v1.attention.kv_codecs import split_per_token_head_kv_cache
+
+        key = (kv_cache.untyped_storage().data_ptr(), kv_cache.storage_offset())
+        if self._pth_cache_key != key or self._pth_views is None:
+            self._pth_views = split_per_token_head_kv_cache(kv_cache, self.head_size)
+            self._pth_cache_key = key
+        return self._pth_views
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if self.kv_cache_dtype in ("int8", "int8_per_token_head"):
+            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                triton_reshape_and_cache_flash_per_token_head_quant,
+            )
+
+            kc, vc, ks, vs = self._get_pth_views(kv_cache)
+            fa2_ns = getattr(torch.ops, "_vllm_fa2_C", None)
+            native_writer = (
+                getattr(fa2_ns, "sm70_reshape_and_cache_int8_pth", None)
+                if fa2_ns is not None
+                else None
+            )
+            if native_writer is not None and key.dtype == torch.float16:
+                native_writer(key, value, kc, vc, ks, vs, slot_mapping)
+            else:
+                triton_reshape_and_cache_flash_per_token_head_quant(
+                    key, value, kc, vc, ks, vs, slot_mapping
+                )
+            return
+        super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
 
     def forward_qsa(
         self,
@@ -428,16 +502,27 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 attn_metadata,
             )
             return output
-        # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
-        # [num_blocks, 2, block_size, num_kv_heads, head_size].
-        key_cache, value_cache = kv_cache.unbind(1)
-        key_cache = canonicalize_singleton_dim_strides(key_cache)
-        value_cache = canonicalize_singleton_dim_strides(value_cache)
+        k_scale_cache = v_scale_cache = None
+        if self.kv_cache_dtype in ("int8", "int8_per_token_head"):
+            key_cache, value_cache, k_scale_cache, v_scale_cache = self._get_pth_views(
+                kv_cache
+            )
+            key_cache = canonicalize_singleton_dim_strides(key_cache)
+            value_cache = canonicalize_singleton_dim_strides(value_cache)
+        else:
+            # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
+            # [num_blocks, 2, block_size, num_kv_heads, head_size].
+            key_cache, value_cache = kv_cache.unbind(1)
+            key_cache = canonicalize_singleton_dim_strides(key_cache)
+            value_cache = canonicalize_singleton_dim_strides(value_cache)
         if query.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 queries")
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
             if key_cache.dtype != torch.uint8 or value_cache.dtype != torch.uint8:
                 raise RuntimeError("Qwen4Exp QSA E4M3 cache must use uint8 storage")
+        elif self.kv_cache_dtype in ("int8", "int8_per_token_head"):
+            if key_cache.dtype != torch.int8 or value_cache.dtype != torch.int8:
+                raise RuntimeError("Qwen4Exp QSA INT8 cache must use int8 storage")
         elif key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
             raise RuntimeError("Qwen4Exp QSA FP16/BF16 cache must match query dtype")
 
@@ -478,6 +563,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 token_to_req,
                 output[:num_tokens],
                 output_gate[:num_tokens],
+                k_scale_cache=k_scale_cache,
+                v_scale_cache=v_scale_cache,
             )
             return output
 
@@ -499,6 +586,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             kv_cache_dtype=self.kv_cache_dtype,
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
             **qsa_metadata,
         )
         return output
@@ -514,6 +603,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         token_to_req: torch.Tensor,
         output: torch.Tensor,
         output_gate: torch.Tensor,
+        k_scale_cache: torch.Tensor | None = None,
+        v_scale_cache: torch.Tensor | None = None,
     ) -> None:
         from vllm.distributed import get_dcp_group
 
@@ -591,6 +682,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
                 lse=partial_lse[grouped_rows:],
+                k_scale_cache=k_scale_cache,
+                v_scale_cache=v_scale_cache,
             )
         merged = cast(
             torch.Tensor,
@@ -658,9 +751,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "bfloat16",
             "fp8",
             "fp8_e4m3",
+            "int8",
+            "int8_per_token_head",
         ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
+                "Qwen4Exp QSA requires FP16/BF16, E4M3, or INT8 main KV cache"
             )
         _verify_e4m3_kv_requirements(vllm_config, model_config, cache_config)
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
@@ -801,26 +896,46 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 vllm_config.kernel_config.qsa_host_kv_draft_hot_tokens
                 or self.host_kv_hot_tokens
             )
-        self.host_kv_hot_fp8 = (
-            not self.host_kv_is_draft
-            and vllm_config.kernel_config.qsa_host_kv_hot_dtype == "fp8_e4m3"
-        )
-        self.host_kv_direct_device = vllm_config.kernel_config.sm70_qsa_device_history
         self.host_kv_dtype = (
             vllm_config.kernel_config.qsa_host_kv_draft_dtype
             if self.host_kv_is_draft
             else vllm_config.kernel_config.qsa_host_kv_dtype
         )
-        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3") and (
-            self.kv_cache_torch_dtype != model_config.dtype
+        hot_dtype = vllm_config.kernel_config.qsa_host_kv_hot_dtype
+        if (
+            not self.host_kv_is_draft
+            and self.host_kv_enabled
+            and hot_dtype in ("fp8_e4m3", "int8", "int8_per_token_head")
         ):
+            host_is_int8 = self.host_kv_dtype in ("int8", "int8_per_token_head")
+            hot_is_int8 = hot_dtype in ("int8", "int8_per_token_head")
+            if self.host_kv_dtype == "float16" or host_is_int8 != hot_is_int8:
+                raise ValueError(
+                    f"Incompatible qsa_host_kv_hot_dtype={hot_dtype!r} for "
+                    f"qsa_host_kv_dtype={self.host_kv_dtype!r}"
+                )
+        self.host_kv_hot_fp8 = not self.host_kv_is_draft and hot_dtype in (
+            "fp8_e4m3",
+            "int8",
+            "int8_per_token_head",
+        )
+        self.host_kv_direct_device = vllm_config.kernel_config.sm70_qsa_device_history
+        if self.kv_cache_dtype not in (
+            "fp8",
+            "fp8_e4m3",
+            "int8",
+            "int8_per_token_head",
+        ) and (self.kv_cache_torch_dtype != model_config.dtype):
             raise NotImplementedError(
                 "Qwen4Exp QSA main cache dtype must match the model dtype"
             )
         if self.host_kv_enabled:
-            self.kv_cache_torch_dtype = (
-                torch.uint8 if self.host_kv_dtype == "fp8_e4m3" else torch.float16
-            )
+            if self.host_kv_dtype == "fp8_e4m3":
+                self.kv_cache_torch_dtype = torch.uint8
+            elif self.host_kv_dtype in ("int8", "int8_per_token_head"):
+                self.kv_cache_torch_dtype = torch.int8
+            else:
+                self.kv_cache_torch_dtype = torch.float16
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
@@ -1081,7 +1196,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 table, lengths, self.host_kv_prefill_stage_tokens, plan
             )
             first = number == 0
-            if history.dtype == torch.uint8:
+            if history.dtype in (torch.uint8, torch.int8):
                 torch.ops.vllm_sm70_qsa_device.run_rows_window(
                     query,
                     history,
@@ -1249,7 +1364,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 if state.device_history_hot:
                     state.warm_hot_staged(table, staged_table, history, scales, lengths)
                 gate_rows = gate.view_as(query) if gate is not None else None
-                if history.dtype == torch.uint8:
+                if history.dtype in (torch.uint8, torch.int8):
                     # One CTA per row over all its keys (tensor-core QK/PV,
                     # 2 CTAs per SM): no partial workspace, no merge pass.
                     torch.ops.vllm_sm70_qsa_device.run_rows(
@@ -1391,7 +1506,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             head_size=self.head_dim,
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
-            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            kv_quant_mode=(
+                KVQuantMode.NONE
+                if self.host_kv_enabled
+                else get_kv_quant_mode(self.kv_cache_dtype)
+            ),
             dcp_sharded=dcp_sharded,
         )
 

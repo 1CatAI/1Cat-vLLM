@@ -142,6 +142,7 @@ def _write(
     HOT: tl.constexpr = True,
     HOT_FP8: tl.constexpr = False,
     HotScales=None,
+    INT8: tl.constexpr = False,
 ):
     # HOT=False: a plain history copy (a prefill stage buffer): no epoch,
     # no hot-cache update.
@@ -157,7 +158,16 @@ def _write(
             tl.load(K + row * Ks + dims[None, :]),
             tl.load(V + row * Vs + dims[None, :]),
         ).to(tl.float32)
-        if FP8:
+        if INT8:
+            scales = tl.maximum(tl.max(tl.abs(values), 1) * (1.0 / 127.0), 1.0e-8)
+            scaled = tl.clamp(
+                tl.extra.cuda.libdevice.rint(values / scales[:, None]),
+                -127.0,
+                127.0,
+            )
+            codes = scaled.to(tl.int8)
+            tl.store(Scales + slot * 2 + kv, scales)
+        elif FP8:
             scales = tl.maximum(tl.div_rn(tl.max(tl.abs(values), 1), 448.0), 2.0**-126)
             codes = fp32_to_fp8_e4m3fn_bits(tl.div_rn(values, scales[:, None]))
             tl.store(Scales + slot * 2 + kv, scales)
@@ -175,7 +185,9 @@ def _write(
             resident = tl.load(PageSlots + page)
             tag = tl.load(Tags + tl.maximum(resident, 0), resident >= 0, other=-1)
             decoded = codes.to(tl.float16)
-            if FP8:
+            if INT8:
+                decoded = (codes.to(tl.float32) * scales[:, None]).to(tl.float16)
+            elif FP8:
                 decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, None]).to(
                     tl.float16
                 )
@@ -295,6 +307,7 @@ def _gather(
     HOT_FP8: tl.constexpr = False,
     HotScales=None,
     HANDS: tl.constexpr = 1,
+    INT8: tl.constexpr = False,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
     lanes = tl.arange(0, 16)
@@ -343,9 +356,14 @@ def _gather(
                     initial_hit[:, None],
                     other=0,
                 )
-                values = (
-                    fp8_e4m3fn_bits_to_fp32_bitcast(values) * scales[:, :, None]
-                ).to(tl.float16)
+                if INT8:
+                    values = (
+                        values.to(tl.int8).to(tl.float32) * scales[:, :, None]
+                    ).to(tl.float16)
+                else:
+                    values = (
+                        fp8_e4m3fn_bits_to_fp32_bitcast(values) * scales[:, :, None]
+                    ).to(tl.float16)
             tl.store(
                 Out
                 + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None])
@@ -476,9 +494,14 @@ def _gather(
                 need_cached[:, None],
                 other=0,
             )
-            cached = (
-                fp8_e4m3fn_bits_to_fp32_bitcast(cached) * cached_scales[:, :, None]
-            ).to(tl.float16)
+            if INT8:
+                cached = (
+                    cached.to(tl.int8).to(tl.float32) * cached_scales[:, :, None]
+                ).to(tl.float16)
+            else:
+                cached = (
+                    fp8_e4m3fn_bits_to_fp32_bitcast(cached) * cached_scales[:, :, None]
+                ).to(tl.float16)
         codes = tl.load(
             History
             + (
@@ -496,9 +519,14 @@ def _gather(
                 need_history[:, None],
                 other=0,
             )
-            decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
-                tl.float16
-            )
+            if INT8:
+                decoded = (codes.to(tl.int8).to(tl.float32) * scales[:, :, None]).to(
+                    tl.float16
+                )
+            else:
+                decoded = (
+                    fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]
+                ).to(tl.float16)
         else:
             decoded = codes.to(tl.float16)
         values = tl.where(token_hits[:, None, None], cached, decoded)
@@ -584,11 +612,15 @@ class HostQSAKV:
         self.padded = triton.cdiv(width, 4) * 4
         self.sets = hot_tokens // 16
         dtype = history.dtype if history is not None else dtype
-        if dtype not in (torch.uint8, torch.float16):
-            raise ValueError("Host history requires E4M3 bytes or FP16 values")
-        self.fp8 = dtype == torch.uint8
+        if dtype not in (torch.uint8, torch.int8, torch.float16):
+            raise ValueError("Host history requires E4M3/INT8 bytes or FP16 values")
+        self.int8 = dtype == torch.int8
+        self.e4m3 = dtype == torch.uint8
+        self.fp8 = self.e4m3 or self.int8
         if hot_fp8 and not self.fp8:
-            raise ValueError("Encoded hot cache requires E4M3 authoritative history")
+            raise ValueError(
+                "Encoded hot cache requires E4M3 or INT8 authoritative history"
+            )
         self.hot_fp8 = hot_fp8
         self.device_reference = device_reference
         self.is_speculative_draft = is_speculative_draft
@@ -600,7 +632,7 @@ class HostQSAKV:
         elif history.shape != (blocks, 2, page_size, 1, dim) or (
             not history.is_contiguous()
         ):
-            raise ValueError("Host history must use contiguous page-major E4M3 bytes")
+            raise ValueError("Host history must use contiguous page-major bytes")
         scale_shape = (blocks * page_size if self.fp8 else 1, 2)
         if device_reference:
             # Preserve the host allocator geometry and byte layout for the
@@ -625,7 +657,7 @@ class HostQSAKV:
                 self.scales = get_accelerator_view_from_cpu_tensor(self.host_scales)
         self.hot_values = torch.empty(
             (hot_tokens, 2, dim),
-            dtype=torch.uint8 if hot_fp8 else torch.float16,
+            dtype=dtype if hot_fp8 else torch.float16,
             device=device,
         )
         self.hot_scales = torch.empty(
@@ -729,6 +761,7 @@ class HostQSAKV:
                 self.fp8,
                 HOT_FP8=self.hot_fp8,
                 HotScales=self.hot_scales,
+                INT8=self.int8,
                 num_warps=4,
             )
 
@@ -773,6 +806,7 @@ class HostQSAKV:
             HOT=False,
             HOT_FP8=self.hot_fp8,
             HotScales=self.hot_scales,
+            INT8=self.int8,
             num_warps=4,
         )
 
@@ -1249,6 +1283,7 @@ class HostQSAKV:
                 HOT_FP8=self.hot_fp8,
                 HotScales=self.hot_scales,
                 HANDS=self.num_hands,
+                INT8=self.int8,
                 num_warps=4,
             )
 

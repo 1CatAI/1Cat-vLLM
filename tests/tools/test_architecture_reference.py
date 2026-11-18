@@ -49,6 +49,7 @@ def test_reference_is_deterministic_and_links_actual_owners(source_tree):
         "BF16",
         "FP8_E4M3",
         "FP8_E5M2",
+        "INT8_PER_TOKEN_HEAD",
     }
     assert first["routes"] == sorted(first["routes"], key=lambda r: r["name"])
     (source_tree / reference.OUTPUT).write_text(reference.render(first))

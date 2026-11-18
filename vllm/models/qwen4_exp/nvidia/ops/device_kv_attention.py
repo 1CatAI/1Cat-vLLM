@@ -217,7 +217,9 @@ def device_history_attention(
         logger.info_once(
             "Using SM70 native QSA attention over host history with a device "
             "hot cache (%s storage, FP32 PV)",
-            "E4M3" if getattr(state, "hot_fp8", False) else "FP16",
+            ("INT8" if getattr(state, "int8", False) else "E4M3")
+            if getattr(state, "hot_fp8", False)
+            else "FP16",
         )
         return True
     torch.ops.vllm_sm70_qsa_device.run(
@@ -319,7 +321,10 @@ def _direct_history_triton(
         HISTORY_POSITIONS=positions,
         HISTORY_LENGTHS=lengths,
         DEVICE_HISTORY=True,
-        HISTORY_E4M3=state.fp8,
+        HISTORY_E4M3=getattr(
+            state, "e4m3", state.fp8 and not getattr(state, "int8", False)
+        ),
+        HISTORY_INT8=getattr(state, "int8", False),
         num_warps=warps,
         num_stages=2,
     )

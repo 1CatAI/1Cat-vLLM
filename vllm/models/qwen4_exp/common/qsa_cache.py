@@ -832,6 +832,10 @@ class QSAStateBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "int8",
+        "int8_per_token_head",
     ]
 
     @staticmethod

@@ -18,7 +18,9 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
 from vllm.v1.attention.kv_codecs import (
+    per_token_head_scales_for_kv_views,
     resolve_kv_codec,
+    split_per_token_head_kv_cache,
 )
 from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
 
@@ -45,6 +47,10 @@ def split_paged_kv_cache(
             f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
             "expected dimension 2 at axis 0 or 1"
         )
+
+    if kv_cache.dtype == torch.int8 and kv_cache.ndim == 5 and kv_cache.shape[-1] > 4:
+        kc, vc, _, _ = split_per_token_head_kv_cache(kv_cache, kv_cache.shape[-1] - 4)
+        return kc, vc
 
     # Standard vLLM paged KV layout is [num_blocks, 2, block_size, heads, dim].
     # Prefer axis 1 so num_blocks == 2 does not get mistaken for K/V.
@@ -162,7 +168,10 @@ def extract_contiguous_kv_from_paged_cache(
 
     key_cache, value_cache = split_paged_kv_cache(kv_cache)
 
-    if paged_kv_utils is not None and key_cache.dtype != torch.uint8:
+    if paged_kv_utils is not None and key_cache.dtype not in (
+        torch.uint8,
+        torch.int8,
+    ):
         if hasattr(paged_kv_utils, "paged_kv_to_contiguous"):
             k_cont, v_cont = paged_kv_utils.paged_kv_to_contiguous(
                 key_cache, value_cache, block_table, seq_lens
@@ -183,14 +192,23 @@ def extract_contiguous_kv_from_paged_cache(
     if total_tokens is None:
         total_tokens = int(seq_lens.sum().item())
 
+    is_int8_pth = key_cache.dtype == torch.int8
+    ks_cache, vs_cache = (
+        per_token_head_scales_for_kv_views(key_cache, value_cache)
+        if is_int8_pth
+        else (None, None)
+    )
+    out_k_dtype = torch.float16 if is_int8_pth else key_cache.dtype
+    out_v_dtype = torch.float16 if is_int8_pth else value_cache.dtype
+
     k_cont = torch.empty(
         (total_tokens, num_kv_heads, head_dim),
-        dtype=key_cache.dtype,
+        dtype=out_k_dtype,
         device=key_cache.device,
     )
     v_cont = torch.empty(
         (total_tokens, num_kv_heads, head_dim),
-        dtype=value_cache.dtype,
+        dtype=out_v_dtype,
         device=value_cache.device,
     )
 
@@ -207,10 +225,23 @@ def extract_contiguous_kv_from_paged_cache(
             end_token = min(start_token + block_size, seq_len)
             n = end_token - start_token
 
-            k_cont[token_offset : token_offset + n] = key_cache[physical_block_idx, :n]
-            v_cont[token_offset : token_offset + n] = value_cache[
-                physical_block_idx, :n
-            ]
+            if is_int8_pth:
+                assert ks_cache is not None and vs_cache is not None
+                k_cont[token_offset : token_offset + n] = (
+                    key_cache[physical_block_idx, :n].float()
+                    * ks_cache[physical_block_idx, :n].unsqueeze(-1)
+                ).to(torch.float16)
+                v_cont[token_offset : token_offset + n] = (
+                    value_cache[physical_block_idx, :n].float()
+                    * vs_cache[physical_block_idx, :n].unsqueeze(-1)
+                ).to(torch.float16)
+            else:
+                k_cont[token_offset : token_offset + n] = key_cache[
+                    physical_block_idx, :n
+                ]
+                v_cont[token_offset : token_offset + n] = value_cache[
+                    physical_block_idx, :n
+                ]
             token_offset += n
 
     return k_cont, v_cont

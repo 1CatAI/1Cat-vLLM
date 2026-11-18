@@ -356,6 +356,7 @@ def test_runner_does_not_dispatch_short_prefill_as_tail(
     for method in ("finish_requests", "free_states", "add_requests", "update_requests"):
         setattr(runner, method, lambda _: None)
     runner.block_tables = SimpleNamespace(apply_staged_writes=lambda: None)
+    runner.model_state = SimpleNamespace(flush_decode_ckpt_blocks=lambda: None)
     runner.kv_connector = SimpleNamespace(handle_preemptions=lambda _: None)
     runner.cudagraph_manager = SimpleNamespace(_sm70_dflash2_tail_graphs=True)
     runner.req_states = SimpleNamespace(
@@ -371,6 +372,7 @@ def test_runner_does_not_dispatch_short_prefill_as_tail(
     scheduler = SimpleNamespace(
         new_block_ids_to_zero=[],
         kv_block_copies=[],
+        decode_ckpt_mounts=[],
         total_num_scheduled_tokens=query_len,
         num_scheduled_tokens={"r": query_len},
     )

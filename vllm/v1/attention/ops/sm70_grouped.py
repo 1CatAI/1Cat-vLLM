@@ -12,7 +12,13 @@ import torch
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.execution_policy import graph_policy
-from vllm.v1.attention.kv_codecs import FP8_E4M3, FP16, KVCodec, resolve_kv_codec
+from vllm.v1.attention.kv_codecs import (
+    FP8_E4M3,
+    FP16,
+    INT8_PER_TOKEN_HEAD,
+    KVCodec,
+    resolve_kv_codec,
+)
 
 GROUP_ROWS = 8
 MAX_CONTEXT = 266240
@@ -86,6 +92,25 @@ GROUPED_CONTRACTS = {
         page_alignment=16,
         query_heads=None,
         require_cuda=False,
+        query_alignment=0,
+        raw_partition_policy=True,
+        early_query_layout=True,
+        early_cache_dtype=True,
+        metadata_before_cache_layout=True,
+    ),
+    INT8_PER_TOKEN_HEAD: GroupedContract(
+        codec=INT8_PER_TOKEN_HEAD,
+        operator_attr="flash_attn_grouped_e4m3_fp32_paged",
+        operator_name="sm70_grouped_int8_pth_fwd",
+        loader_module="vllm.v1.attention.ops.sm70_int8_grouped",
+        loader_name="load_grouped_int8_pth_fp32",
+        batch_revision=None,
+        max_groups=16,
+        explicit_groups=True,
+        page_sizes=None,
+        page_alignment=16,
+        query_heads=None,
+        require_cuda=True,
         query_alignment=0,
         raw_partition_policy=True,
         early_query_layout=True,
@@ -334,9 +359,15 @@ def grouped_fp16_fp32_reason(
 def grouped_e4m3_fp32_allowed(
     instance, query, k, v, table, lengths, metadata, *, out, partition_size_hint
 ):
+    target_codec = (
+        INT8_PER_TOKEN_HEAD
+        if resolve_kv_codec(getattr(instance, "kv_cache_dtype", None))
+        is INT8_PER_TOKEN_HEAD
+        else FP8_E4M3
+    )
     return (
         grouped_fp32_reason(
-            FP8_E4M3,
+            target_codec,
             instance,
             query,
             k,
@@ -354,9 +385,15 @@ def grouped_e4m3_fp32_allowed(
 def grouped_e4m3_fp32_groups_allowed(
     instance, query, k, v, group_table, row_lengths, *, causal, out
 ):
+    target_codec = (
+        INT8_PER_TOKEN_HEAD
+        if resolve_kv_codec(getattr(instance, "kv_cache_dtype", None))
+        is INT8_PER_TOKEN_HEAD
+        else FP8_E4M3
+    )
     return (
         grouped_fp32_reason(
-            FP8_E4M3,
+            target_codec,
             instance,
             query,
             k,
@@ -391,7 +428,221 @@ def load_grouped_e4m3_fp32():
     return load_grouped_fp32(FP8_E4M3)
 
 
+def load_grouped_int8_pth_fp32():
+    return load_grouped_fp32(INT8_PER_TOKEN_HEAD)
+
+
 def clear_grouped_fp16_workspaces():
     from vllm.v1.attention.ops import sm70_fp16_grouped
 
     sm70_fp16_grouped.clear_grouped_fp16_workspaces()
+
+
+def try_eager_grouped_fp32(
+    grouped_admission: Any,
+    grouped_op: Any,
+    scale: float,
+    layer: torch.nn.Module,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    attn_metadata: Any,
+    *,
+    out: torch.Tensor,
+    max_seq_len_hint: int | None,
+    partition_size_hint: int | None,
+) -> bool:
+    from contextlib import contextmanager, suppress
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from vllm.forward_context import (
+        BatchDescriptor,
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    parent_bt = getattr(attn_metadata, "block_table", None)
+    parent_seq = getattr(attn_metadata, "seq_lens", None)
+    if (
+        not query.is_cuda
+        or not getattr(grouped_admission, "use_smallq_decode_xqa", False)
+        or not bool(getattr(attn_metadata, "causal", True))
+        or grouped_admission._flash_v100_window_size(causal=True) != (-1, -1)
+        or parent_bt is None
+        or parent_bt.ndim != 2
+        or key_cache.ndim != 4
+        or key_cache.shape[1] <= 0
+        or query.ndim != 3
+        or query.shape[2] != 256
+        or key_cache.shape[2] * 6 != query.shape[1]
+    ):
+        return False
+    page = int(key_cache.shape[1])
+    eff_max_seq = int(max_seq_len_hint or getattr(attn_metadata, "max_seq_len", 0) or 0)
+    table_for_group = parent_bt
+    row_bt = block_table
+    eager_bucket: int | None = None
+    if eff_max_seq > 0:
+        cols = min(parent_bt.shape[1], max(1, (eff_max_seq + page - 1) // page))
+        if cols * page > MAX_CONTEXT:
+            eager_bucket = cols * page
+        if cols < parent_bt.shape[1]:
+            meta_any: Any = attn_metadata
+            cached_bt = getattr(meta_any, "_flash_v100_trimmed_bt", None)
+            if cached_bt is None or cached_bt[0] != cols:
+                trimmed_parent = parent_bt[:, :cols].contiguous()
+                trimmed_rows = (
+                    block_table[:, :cols].contiguous()
+                    if block_table is not None and block_table.ndim == 2
+                    else block_table
+                )
+                cached_bt = (cols, trimmed_parent, trimmed_rows)
+                with suppress(AttributeError):
+                    meta_any._flash_v100_trimmed_bt = cached_bt
+            _, table_for_group, row_bt = cached_bt
+
+    @contextmanager
+    def _eager_bucket_scope(tokens: int):
+        if eager_bucket is None or not is_forward_context_available():
+            yield
+            return
+        ctx = get_forward_context()
+        prev = ctx.batch_descriptor
+        if prev is not None and prev.attention_context_bucket is not None:
+            yield
+            return
+        ctx.batch_descriptor = (
+            replace(prev, attention_context_bucket=eager_bucket)
+            if prev is not None
+            else BatchDescriptor(
+                num_tokens=tokens, attention_context_bucket=eager_bucket
+            )
+        )
+        try:
+            yield
+        finally:
+            ctx.batch_descriptor = prev
+
+    if table_for_group is not parent_bt or eager_bucket is not None:
+        meta_proxy = SimpleNamespace(
+            block_table=table_for_group,
+            seq_lens=parent_seq,
+            causal=getattr(attn_metadata, "causal", True),
+            query_start_loc_cpu=getattr(attn_metadata, "query_start_loc_cpu", None),
+        )
+        with _eager_bucket_scope(int(query.shape[0])):
+            if grouped_e4m3_fp32_allowed(
+                grouped_admission,
+                query,
+                key_cache,
+                value_cache,
+                row_bt,
+                seq_lens,
+                meta_proxy,
+                out=out,
+                partition_size_hint=partition_size_hint,
+            ):
+                grouped_op(
+                    query,
+                    key_cache,
+                    value_cache,
+                    table_for_group,
+                    seq_lens,
+                    out=out,
+                    softmax_scale=scale,
+                    k_scale=float(layer._k_scale_float),
+                    v_scale=float(layer._v_scale_float),
+                )
+                return True
+
+    if partition_size_hint is not None:
+        return False
+    groups = int(table_for_group.shape[0])
+    rows = int(query.shape[0])
+    qsl_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+    if (
+        groups < 1
+        or qsl_cpu is None
+        or qsl_cpu.device.type != "cpu"
+        or qsl_cpu.numel() < groups + 1
+        or seq_lens.shape != (rows,)
+    ):
+        return False
+    meta_plan_holder: Any = attn_metadata
+    cached_plan: tuple[torch.Tensor, torch.Tensor] | None
+    if hasattr(meta_plan_holder, "_flash_v100_ragged_smallq_plan"):
+        cached_plan = meta_plan_holder._flash_v100_ragged_smallq_plan
+    else:
+        qsl = qsl_cpu[: groups + 1].tolist()
+        if qsl[0] != 0 or qsl[groups] != rows:
+            cached_plan = None
+        else:
+            q_lens = [qsl[i + 1] - qsl[i] for i in range(groups)]
+            if not q_lens or min(q_lens) < 1 or max(q_lens) > GROUP_ROWS:
+                cached_plan = None
+            else:
+                dst: list[int] = []
+                for i, q_len in enumerate(q_lens):
+                    base = i * GROUP_ROWS
+                    dst.extend(range(base, base + q_len))
+                dst_idx = torch.tensor(
+                    dst,
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=query.device.type == "cuda",
+                ).to(query.device, non_blocking=True)
+                lengths_pad = torch.zeros(
+                    groups * GROUP_ROWS,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+                lengths_pad.index_copy_(0, dst_idx, seq_lens)
+                cached_plan = (dst_idx, lengths_pad)
+        with suppress(AttributeError):
+            meta_plan_holder._flash_v100_ragged_smallq_plan = cached_plan
+    if cached_plan is None:
+        return False
+    dst_idx, lengths_pad = cached_plan
+    total_rows = groups * GROUP_ROWS
+    q_pad = query.new_zeros((total_rows, query.shape[1], query.shape[2]))
+    out_pad = torch.empty_like(q_pad)
+    causal = bool(getattr(attn_metadata, "causal", True))
+    chunks = [
+        (g0, min(g0 + MAX_GROUPS_PER_CALL, groups))
+        for g0 in range(0, groups, MAX_GROUPS_PER_CALL)
+    ]
+    with _eager_bucket_scope(total_rows):
+        for g0, g1 in chunks:
+            r0, r1 = g0 * GROUP_ROWS, g1 * GROUP_ROWS
+            if not grouped_e4m3_fp32_groups_allowed(
+                grouped_admission,
+                q_pad[r0:r1],
+                key_cache,
+                value_cache,
+                table_for_group[g0:g1],
+                lengths_pad[r0:r1],
+                causal=causal,
+                out=out_pad[r0:r1],
+            ):
+                return False
+        q_pad.index_copy_(0, dst_idx, query)
+        k_scale = float(layer._k_scale_float)
+        v_scale = float(layer._v_scale_float)
+        for g0, g1 in chunks:
+            r0, r1 = g0 * GROUP_ROWS, g1 * GROUP_ROWS
+            grouped_op(
+                q_pad[r0:r1],
+                key_cache,
+                value_cache,
+                table_for_group[g0:g1],
+                lengths_pad[r0:r1],
+                out=out_pad[r0:r1],
+                softmax_scale=scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+    out.copy_(out_pad.index_select(0, dst_idx))
+    return True

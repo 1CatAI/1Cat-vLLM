@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -60,7 +61,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         base = super()._create_draft_vllm_config()
         if (
             self.speculative_config.kv_cache_dtype is None
-            and str(base.cache_config.cache_dtype).startswith("fp8")
+            and is_quantized_kv_cache(str(base.cache_config.cache_dtype))
             and current_platform.is_cuda()
             and current_platform.is_device_capability(70)
         ):

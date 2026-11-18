@@ -15,7 +15,12 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.config.execution_policy import graph_policy
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.platforms import current_platform
-from vllm.v1.attention.kv_codecs import FP8_E4M3, resolve_kv_codec
+from vllm.v1.attention.kv_codecs import (
+    FP8_E4M3,
+    INT8_PER_TOKEN_HEAD,
+    per_token_head_scales_for_kv_views,
+    resolve_kv_codec,
+)
 from vllm.v1.attention.ops.sm70_grouped_long import (
     _WORKSPACES,
     context_table_supported,
@@ -25,12 +30,15 @@ from vllm.v1.attention.ops.sm70_grouped_long import (
     resolve_long_attention,
     run_six_head_groups,
 )
+from vllm.v1.attention.ops.sm70_int8_grouped import builtin_int8_pth_attention
 
 
-def _kv_layout_supported(k: torch.Tensor, v: torch.Tensor) -> bool:
+def _kv_layout_supported(
+    k: torch.Tensor, v: torch.Tensor, expected_dtype: torch.dtype = torch.uint8
+) -> bool:
     if (
-        k.dtype != torch.uint8
-        or v.dtype != torch.uint8
+        k.dtype != expected_dtype
+        or v.dtype != expected_dtype
         or k.stride(3) != 1
         or v.stride(3) != 1
         or k.data_ptr() % 16 != 0
@@ -49,7 +57,10 @@ def wrap_e4m3_decode_attention(fallback):
     if not current_platform.is_cuda() or not current_platform.is_device_capability(70):
         return fallback
     operator, manifest = resolve_long_attention()
-    if operator is None or manifest is None:
+    int8_operator = builtin_int8_pth_attention()
+    if (operator is None or manifest is None) and int8_operator is None:
+        return fallback
+    if manifest is None:
         return fallback
 
     capability = long_attention_capability(manifest)
@@ -96,11 +107,16 @@ def wrap_e4m3_decode_attention(fallback):
         if bucket is None and table.ndim == 2 and k.ndim == 4:
             bucket = model_capacity or int(table.shape[1]) * int(k.shape[1])
 
+        codec = resolve_kv_codec(kv_cache_dtype)
+        is_int8_pth = codec is INT8_PER_TOKEN_HEAD and int8_operator is not None
+        is_e4m3 = codec is FP8_E4M3 and operator is not None
+        expected_storage = torch.int8 if is_int8_pth else torch.uint8
+
         if not (
             not extra_args
             and not explicit_partition_size
             and out is not None
-            and resolve_kv_codec(kv_cache_dtype) is FP8_E4M3
+            and (is_e4m3 or is_int8_pth)
             and tuple(window_size) == (-1, -1)
             and anchor_lens is None
             and anchored_window == 0
@@ -133,13 +149,18 @@ def wrap_e4m3_decode_attention(fallback):
             and k.device == q.device
             and v.device == q.device
             and math.isfinite(scale)
-            and math.isfinite(k_scale)
-            and math.isfinite(v_scale)
-            and k_scale > 0
-            and v_scale > 0
+            and (
+                is_int8_pth
+                or (
+                    math.isfinite(k_scale)
+                    and math.isfinite(v_scale)
+                    and k_scale > 0
+                    and v_scale > 0
+                )
+            )
             and long_attention_page_supported(int(k.shape[1]), manifest)
             and context_table_supported(table, int(k.shape[1]), capability)
-            and _kv_layout_supported(k, v)
+            and _kv_layout_supported(k, v, expected_storage)
         ):
             return fallback(
                 q,
@@ -158,9 +179,12 @@ def wrap_e4m3_decode_attention(fallback):
             )
 
         stream = torch.cuda.current_stream(q.device).cuda_stream
-        key = (manifest["source_sha256"], bucket, 80, q.device, stream)
+        ws_tag = "int8_pth_v1" if is_int8_pth else manifest["source_sha256"]
+        key = (ws_tag, bucket, 80, q.device, stream)
         bank = _WORKSPACES.setdefault(key, [])
-        panels = batch_size * (int(k.shape[2]) if parallel_kv_heads else 1)
+        panels = batch_size * (
+            int(k.shape[2]) if (is_int8_pth or parallel_kv_heads) else 1
+        )
         for partial_buf, lse_buf in bank:
             if partial_buf.shape[0] >= panels:
                 break
@@ -176,6 +200,21 @@ def wrap_e4m3_decode_attention(fallback):
             partial_view, lse_view = partial_buf[0], lse_buf[0]
         else:
             partial_view, lse_view = partial_buf[:panels], lse_buf[:panels]
+        if is_int8_pth:
+            k_scales, v_scales = per_token_head_scales_for_kv_views(k, v)
+            return int8_operator(
+                q,
+                k,
+                v,
+                k_scales,
+                v_scales,
+                out,
+                table,
+                seq_lens,
+                partial_view,
+                lse_view,
+                scale,
+            )
         return run_six_head_groups(
             operator,
             q,

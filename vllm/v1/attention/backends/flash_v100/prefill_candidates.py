@@ -17,7 +17,12 @@ from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100.plan import routing as _plan
 from vllm.v1.attention.backends.flash_v100.workspace import V100Workspace
-from vllm.v1.attention.kv_codecs import FP8_E4M3, KVCodec, resolve_kv_codec
+from vllm.v1.attention.kv_codecs import (
+    FP8_E4M3,
+    INT8_PER_TOKEN_HEAD,
+    KVCodec,
+    resolve_kv_codec,
+)
 
 
 @dataclass(frozen=True)
@@ -516,7 +521,7 @@ class Fp8BridgePrefill(SequenceCandidate):
             self.executor.ops.log_fp8_bridge(self.executor.config)
             record(
                 "prefill_prefix_fp8_e4m3_bridge"
-                if self.executor.config.kv_codec is FP8_E4M3
+                if self.executor.config.kv_codec in (FP8_E4M3, INT8_PER_TOKEN_HEAD)
                 else "prefill_prefix_fp8_e5m2_bridge"
             )
         else:

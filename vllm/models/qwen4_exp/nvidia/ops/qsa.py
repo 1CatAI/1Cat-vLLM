@@ -678,8 +678,19 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     HISTORY_LENGTHS=None,
     DEVICE_HISTORY: tl.constexpr = False,
     HISTORY_E4M3: tl.constexpr = False,
+    HISTORY_INT8: tl.constexpr = False,
     HOT_SCALES=None,
     HOST_CACHE_E4M3: tl.constexpr = False,
+    HOST_CACHE_INT8: tl.constexpr = False,
+    KV_INT8_PTH: tl.constexpr = False,
+    K_SCALES=None,
+    V_SCALES=None,
+    stride_ks_block: tl.int64 = 0,
+    stride_ks_token: tl.int64 = 0,
+    stride_ks_head: tl.int64 = 0,
+    stride_vs_block: tl.int64 = 0,
+    stride_vs_token: tl.int64 = 0,
+    stride_vs_head: tl.int64 = 0,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -779,7 +790,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 tl.cdiv(TOPK, 4) * 4,
                 HEAD_DIM,
                 HotScales=HOT_SCALES,
-                HOT_FP8=HOST_CACHE_E4M3,
+                HOT_FP8=HOST_CACHE_E4M3 or HOST_CACHE_INT8,
+                HOT_INT8=HOST_CACHE_INT8,
             )
         else:
             keys = tl.load(
@@ -800,12 +812,45 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 mask=valid[:, None],
                 other=0.0,
             )
-        if DEVICE_HISTORY and HISTORY_E4M3:
+        if DEVICE_HISTORY and (HISTORY_E4M3 or HISTORY_INT8):
             slot = safe_page * PAGE_SIZE + page_offset
             key_scales = tl.load(HISTORY_SCALES + slot * 2, valid, other=1.0)
             value_scales = tl.load(HISTORY_SCALES + slot * 2 + 1, valid, other=1.0)
-            keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(query.dtype)
-            values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
+            if HISTORY_INT8:
+                keys = (keys.to(tl.int8).to(tl.float32) * key_scales[None, :]).to(
+                    query.dtype
+                )
+                values = (values.to(tl.int8).to(tl.float32) * value_scales[:, None]).to(
+                    query.dtype
+                )
+            else:
+                keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(
+                    query.dtype
+                )
+                values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
+                    query.dtype
+                )
+        if KV_INT8_PTH:
+            key_scales = tl.load(
+                K_SCALES
+                + safe_page * stride_ks_block
+                + page_offset * stride_ks_token
+                + kv_head * stride_ks_head,
+                mask=valid,
+                other=1.0,
+            )
+            value_scales = tl.load(
+                V_SCALES
+                + safe_page * stride_vs_block
+                + page_offset * stride_vs_token
+                + kv_head * stride_vs_head,
+                mask=valid,
+                other=1.0,
+            )
+            keys = (keys.to(tl.int8).to(tl.float32) * key_scales[None, :]).to(
+                query.dtype
+            )
+            values = (values.to(tl.int8).to(tl.float32) * value_scales[:, None]).to(
                 query.dtype
             )
         if KV_E4M3:
@@ -2824,6 +2869,8 @@ def qsa_sparse_paged_attention(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     lse: torch.Tensor | None = None,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
@@ -2850,6 +2897,7 @@ def qsa_sparse_paged_attention(
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("QSA sparse attention requires FP16 or BF16 queries")
     kv_e4m3 = kv_cache_dtype in ("fp8", "fp8_e4m3")
+    kv_int8_pth = kv_cache_dtype in ("int8", "int8_per_token_head")
     if kv_e4m3:
         if k_cache.dtype != torch.uint8 or v_cache.dtype != torch.uint8:
             raise ValueError("QSA E4M3 K/V caches must use uint8 storage")
@@ -2857,6 +2905,11 @@ def qsa_sparse_paged_attention(
             raise ValueError("QSA E4M3 K/V scales must be finite")
         if k_scale <= 0.0 or v_scale <= 0.0:
             raise ValueError("QSA E4M3 K/V scales must be positive")
+    elif kv_int8_pth:
+        if k_cache.dtype != torch.int8 or v_cache.dtype != torch.int8:
+            raise ValueError("QSA INT8 K/V caches must use int8 storage")
+        if k_scale_cache is None or v_scale_cache is None:
+            raise ValueError("QSA INT8 per-token-head K/V caches require scale views")
     else:
         if kv_cache_dtype not in ("auto", "float16", "bfloat16"):
             raise ValueError(f"Unsupported QSA K/V cache dtype: {kv_cache_dtype}")
@@ -3029,6 +3082,15 @@ def qsa_sparse_paged_attention(
         BLOCK_N=block_n,
         KV_E4M3=kv_e4m3,
         RESOLVED_INDICES=resolved_indices,
+        KV_INT8_PTH=kv_int8_pth,
+        K_SCALES=k_scale_cache,
+        V_SCALES=v_scale_cache,
+        stride_ks_block=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
+        stride_ks_token=k_scale_cache.stride(1) if k_scale_cache is not None else 0,
+        stride_ks_head=k_scale_cache.stride(2) if k_scale_cache is not None else 0,
+        stride_vs_block=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
+        stride_vs_token=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
+        stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
         num_warps=partial_warps,
         num_stages=2,
     )

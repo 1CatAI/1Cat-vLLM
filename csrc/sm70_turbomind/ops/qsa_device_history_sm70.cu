@@ -195,6 +195,50 @@ __device__ __forceinline__ uint4 decode8_hot_fast(const uint2 packed,
                     *reinterpret_cast<const uint32_t*>(&r3));
 }
 
+// Two signed INT8 codes (bytes `lo`, `hi` of `word`, selected by __byte_perm)
+// as an exact FP16 pair: (0x6400 | (b ^ 0x80)) - 1152.0 == b for all int8 b.
+__device__ __forceinline__ uint32_t int8x2_half(uint32_t word,
+                                                uint32_t selector) {
+  const uint32_t biased =
+      __byte_perm(word, 0x64646464u, selector) ^ 0x00800080u;
+  const uint32_t bias_bits = 0x64806480u;  // half2(1152.0f, 1152.0f)
+  const half2 h2 = __hsub2(*reinterpret_cast<const half2*>(&biased),
+                           *reinterpret_cast<const half2*>(&bias_bits));
+  return *reinterpret_cast<const uint32_t*>(&h2);
+}
+
+// Eight signed INT8 codes as four exact unscaled FP16 pairs.
+__device__ __forceinline__ uint4 decode8_int8_unscaled(const uint2 packed) {
+  return make_uint4(
+      int8x2_half(packed.x, 0x4140u), int8x2_half(packed.x, 0x4342u),
+      int8x2_half(packed.y, 0x4140u), int8x2_half(packed.y, 0x4342u));
+}
+
+// Eight signed INT8 codes scaled to FP16 without lookup tables.
+__device__ __forceinline__ uint4 decode8_int8_scaled(const uint2 packed,
+                                                     float scale) {
+  const uint32_t h0 = int8x2_half(packed.x, 0x4140u);
+  const uint32_t h1 = int8x2_half(packed.x, 0x4342u);
+  const uint32_t h2 = int8x2_half(packed.y, 0x4140u);
+  const uint32_t h3 = int8x2_half(packed.y, 0x4342u);
+  const float2 f0 = __half22float2(*reinterpret_cast<const half2*>(&h0));
+  const float2 f1 = __half22float2(*reinterpret_cast<const half2*>(&h1));
+  const float2 f2 = __half22float2(*reinterpret_cast<const half2*>(&h2));
+  const float2 f3 = __half22float2(*reinterpret_cast<const half2*>(&h3));
+  const half2 r0 =
+      __floats2half2_rn(__fmul_rn(f0.x, scale), __fmul_rn(f0.y, scale));
+  const half2 r1 =
+      __floats2half2_rn(__fmul_rn(f1.x, scale), __fmul_rn(f1.y, scale));
+  const half2 r2 =
+      __floats2half2_rn(__fmul_rn(f2.x, scale), __fmul_rn(f2.y, scale));
+  const half2 r3 =
+      __floats2half2_rn(__fmul_rn(f3.x, scale), __fmul_rn(f3.y, scale));
+  return make_uint4(*reinterpret_cast<const uint32_t*>(&r0),
+                    *reinterpret_cast<const uint32_t*>(&r1),
+                    *reinterpret_cast<const uint32_t*>(&r2),
+                    *reinterpret_cast<const uint32_t*>(&r3));
+}
+
 __device__ __forceinline__ uint4 decode8(const unsigned char* source,
                                          float scale, const float* lut) {
   return decode8_raw(__ldg(reinterpret_cast<const uint2*>(source)), scale, lut);
@@ -203,7 +247,7 @@ __device__ __forceinline__ uint4 decode8(const unsigned char* source,
 // Read one 8-value chunk of token K (kv=0) or V (kv=1): from the protected
 // hot cache when resolved there, else from the authoritative history, which
 // may be pinned host memory mapped into the device address space (UVA).
-template <bool FP8, bool HOT, bool HOT_FP8 = false>
+template <bool FP8, bool HOT, bool HOT_FP8 = false, bool IS_INT8 = false>
 __device__ __forceinline__ uint4 load_kv(const Args& a, int64_t slot, int hot,
                                          int kv, int dim, const float* lut) {
   if (slot < 0) return make_uint4(0, 0, 0, 0);
@@ -212,10 +256,13 @@ __device__ __forceinline__ uint4 load_kv(const Args& a, int64_t slot, int hot,
       if constexpr (HOT_FP8) {
         const auto* source = reinterpret_cast<const unsigned char*>(a.hot) +
                              (int64_t(hot) * 2 + kv) * D + dim;
-        // Match the software bit decoder used to materialize FP16 hot values,
-        // including the FP16 rounding before QK/PV arithmetic.
-        return decode8_bits(__ldg(reinterpret_cast<const uint2*>(source)),
-                            __ldg(a.hot_scales + int64_t(hot) * 2 + kv));
+        const uint2 raw = __ldg(reinterpret_cast<const uint2*>(source));
+        const float sc = __ldg(a.hot_scales + int64_t(hot) * 2 + kv);
+        if constexpr (IS_INT8) {
+          return decode8_int8_scaled(raw, sc);
+        } else {
+          return decode8_bits(raw, sc);
+        }
       } else {
         return __ldg(reinterpret_cast<const uint4*>(
             a.hot + (int64_t(hot) * 2 + kv) * D + dim));
@@ -224,14 +271,21 @@ __device__ __forceinline__ uint4 load_kv(const Args& a, int64_t slot, int hot,
   }
   const int block = slot / a.page, off = slot % a.page;
   const int64_t element = ((int64_t(block) * 2 + kv) * a.page + off) * D + dim;
-  if constexpr (FP8)
-    return decode8(a.history + element, __ldg(a.scales + slot * 2 + kv), lut);
-  else
+  if constexpr (FP8) {
+    const float sc = __ldg(a.scales + slot * 2 + kv);
+    if constexpr (IS_INT8) {
+      return decode8_int8_scaled(
+          __ldg(reinterpret_cast<const uint2*>(a.history + element)), sc);
+    } else {
+      return decode8(a.history + element, sc, lut);
+    }
+  } else {
     return __ldg(reinterpret_cast<const uint4*>(
         reinterpret_cast<const half*>(a.history) + element));
+  }
 }
 
-template <bool FP8, bool HOT, bool HOT_FP8 = false>
+template <bool FP8, bool HOT, bool HOT_FP8 = false, bool IS_INT8 = false>
 __global__ __launch_bounds__(256) void partial(Args a) {
   const int row = blockIdx.y, split = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -241,7 +295,7 @@ __global__ __launch_bounds__(256) void partial(Args a) {
   __shared__ int64_t slots[C];
   __shared__ int hots[C];
   __shared__ float lut[256];
-  if constexpr (FP8) lut[threadIdx.x] = e4m3(threadIdx.x);
+  if constexpr (FP8 && !IS_INT8) lut[threadIdx.x] = e4m3(threadIdx.x);
   __shared__ float alpha[8];
   const int req = a.requests[row];
   const int64_t position = a.positions[row];
@@ -296,7 +350,8 @@ __global__ __launch_bounds__(256) void partial(Args a) {
     for (int v = t; v < C * 32; v += 256) {
       const int token = v / 32, dim = (v % 32) * 8;
       *reinterpret_cast<uint4*>(&kv[token][dim]) =
-          load_kv<FP8, HOT, HOT_FP8>(a, slots[token], hots[token], 0, dim, lut);
+          load_kv<FP8, HOT, HOT_FP8, IS_INT8>(a, slots[token], hots[token], 0,
+                                              dim, lut);
     }
     __syncthreads();
     // Issue V loads ahead of QK and softmax so global/PCIe latency overlaps
@@ -395,8 +450,9 @@ __global__ __launch_bounds__(256) void partial(Args a) {
     if constexpr (HOT && FP8) {
       for (int v = t; v < C * 32; v += 256) {
         const int token = v / 32, dim = (v % 32) * 8;
-        *reinterpret_cast<uint4*>(&kv[token][dim]) = load_kv<FP8, HOT, HOT_FP8>(
-            a, slots[token], hots[token], 1, dim, lut);
+        *reinterpret_cast<uint4*>(&kv[token][dim]) =
+            load_kv<FP8, HOT, HOT_FP8, IS_INT8>(a, slots[token], hots[token], 1,
+                                                dim, lut);
       }
     } else {
 #pragma unroll
@@ -404,10 +460,15 @@ __global__ __launch_bounds__(256) void partial(Args a) {
         const int v = t + i * 256, token = v / 32, dim = (v % 32) * 8;
         uint4 value = make_uint4(0, 0, 0, 0);
         if (slots[token] >= 0) {
-          if constexpr (FP8)
-            value = decode8_raw(raw[i], raw_scale[i], lut);
-          else
+          if constexpr (FP8) {
+            if constexpr (IS_INT8) {
+              value = decode8_int8_scaled(raw[i], raw_scale[i]);
+            } else {
+              value = decode8_raw(raw[i], raw_scale[i], lut);
+            }
+          } else {
             value = raw[i];
+          }
         }
         *reinterpret_cast<uint4*>(&kv[token][dim]) = value;
       }
@@ -497,7 +558,8 @@ __device__ __forceinline__ void merge_head(const Args& a, int row, int head,
 // the K and V tiles stay E4M3 in shared memory and are decoded where they are
 // used, with the same arithmetic as `partial` (half(e4m3 * scale), FP32
 // QK/PV). Half the tile footprint fits three CTAs per SM.
-constexpr int KP = 272;  // E4M3 tile row stride (bytes)
+constexpr int KP = 272;  // 8-bit tile row stride (bytes)
+template <bool IS_INT8 = false>
 __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
   const int row = blockIdx.y, split = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -507,7 +569,7 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
   __shared__ int64_t slots[C];
   __shared__ float kscale[C], vscale[C];
   __shared__ float lut[256];
-  lut[t] = e4m3(t);
+  if constexpr (!IS_INT8) lut[t] = e4m3(t);
   const int req = a.requests[row];
   const int64_t position = a.positions[row];
   const int length = req >= 0 && req < a.num_requests ? a.lengths[req] : 0;
@@ -562,9 +624,15 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
     const uint4 q0 = *reinterpret_cast<const uint4*>(&query[r8][k]);
     const uint4 q1 = *reinterpret_cast<const uint4*>(&query[r8][k + 8]);
     const uint4 k0 =
-        decode8_raw(*reinterpret_cast<const uint2*>(&tile[nr][k]), ks, lut);
+        IS_INT8 ? decode8_int8_scaled(
+                      *reinterpret_cast<const uint2*>(&tile[nr][k]), ks)
+                : decode8_raw(*reinterpret_cast<const uint2*>(&tile[nr][k]), ks,
+                              lut);
     const uint4 k1 =
-        decode8_raw(*reinterpret_cast<const uint2*>(&tile[nr][k + 8]), ks, lut);
+        IS_INT8 ? decode8_int8_scaled(
+                      *reinterpret_cast<const uint2*>(&tile[nr][k + 8]), ks)
+                : decode8_raw(*reinterpret_cast<const uint2*>(&tile[nr][k + 8]),
+                              ks, lut);
     mma(acc, q0.x, q0.y, k0.x, k0.y);
     mma(acc, q0.z, q0.w, k0.z, k0.w);
     mma(acc, q1.x, q1.y, k1.x, k1.y);
@@ -614,8 +682,11 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
   float result[H] = {};
 #pragma unroll 4
   for (int k = 0; k < C; ++k) {
+    const float raw_v =
+        IS_INT8 ? static_cast<float>(static_cast<int8_t>(tile[k][t]))
+                : lut[tile[k][t]];
     const float value =
-        __half2float(__float2half_rn(__fmul_rn(lut[tile[k][t]], vscale[k])));
+        __half2float(__float2half_rn(__fmul_rn(raw_v, vscale[k])));
 #pragma unroll
     for (int h = 0; h < H; ++h)
       result[h] = __fmaf_rn(scores[0][h][k], value, result[h]);
@@ -625,11 +696,13 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
     a.partial[((row * H + h) * a.splits + split) * D + t] = result[h];
 }
 
-// Decode/verify over encoded E4M3 hot cache + mapped host history: keep K/V
-// tiles as raw E4M3 bytes in shared memory (half the footprint -> up to 3 CTAs
-// per SM instead of 1), preload per-token K/V scales once in `t < C`, prefetch
-// V bytes in registers before QK MMA + softmax, and decode with conflict-free
-// bit arithmetic matching `partial<true, true, true>` bit-for-bit.
+// Decode/verify over encoded E4M3/INT8 hot cache + mapped host history: keep
+// K/V tiles as raw 8-bit bytes in shared memory (half the footprint -> up to 3
+// CTAs per SM instead of 1), preload per-token K/V scales once in `t < C`,
+// prefetch V bytes in registers before QK MMA + softmax, and decode with
+// conflict-free bit arithmetic matching `partial<true, true, true>`
+// bit-for-bit.
+template <bool IS_INT8 = false>
 __global__ __launch_bounds__(256, 3) void partial_hot_fp8_lite(Args a) {
   const int row = blockIdx.y, split = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -743,7 +816,23 @@ __global__ __launch_bounds__(256, 3) void partial_hot_fp8_lite(Args a) {
     }
     __syncthreads();
     float acc[8] = {};
-    if (all_hot) {
+    if constexpr (IS_INT8) {
+      const float ks = kscale[nr];
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        const int k = kw * 64 + s * 16;
+        const uint4 q0 = *reinterpret_cast<const uint4*>(&query[r8][k]);
+        const uint4 q1 = *reinterpret_cast<const uint4*>(&query[r8][k + 8]);
+        const uint4 k0 = decode8_int8_scaled(
+            *reinterpret_cast<const uint2*>(&tile[nr][k]), ks);
+        const uint4 k1 = decode8_int8_scaled(
+            *reinterpret_cast<const uint2*>(&tile[nr][k + 8]), ks);
+        mma(acc, q0.x, q0.y, k0.x, k0.y);
+        mma(acc, q0.z, q0.w, k0.z, k0.w);
+        mma(acc, q1.x, q1.y, k1.x, k1.y);
+        mma(acc, q1.z, q1.w, k1.z, k1.w);
+      }
+    } else if (all_hot) {
       const float ks256 = kscale[nr] * 256.f;
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
@@ -825,7 +914,25 @@ __global__ __launch_bounds__(256, 3) void partial_hot_fp8_lite(Args a) {
     __syncthreads();
 #pragma unroll
     for (int h = 0; h < H; ++h) result[h] *= alpha[h];
-    if (all_hot) {
+    if constexpr (IS_INT8) {
+#pragma unroll 4
+      for (int k = 0; k < C; k += 2) {
+        const float2 vs = *reinterpret_cast<const float2*>(&vscale[k]);
+        const uint32_t c01 =
+            unsigned(tile[k][t]) | (unsigned(tile[k + 1][t]) << 8);
+        const uint32_t h01 = int8x2_half(c01, 0x4140u);
+        const float2 d01 =
+            __half22float2(*reinterpret_cast<const half2*>(&h01));
+        const float v0 = __half2float(__float2half_rn(__fmul_rn(d01.x, vs.x)));
+        const float v1 = __half2float(__float2half_rn(__fmul_rn(d01.y, vs.y)));
+#pragma unroll
+        for (int h = 0; h < H; ++h) {
+          const float2 sc = *reinterpret_cast<const float2*>(&scores[0][h][k]);
+          result[h] = __fmaf_rn(sc.x, v0, result[h]);
+          result[h] = __fmaf_rn(sc.y, v1, result[h]);
+        }
+      }
+    } else if (all_hot) {
 #pragma unroll 4
       for (int k = 0; k < C; k += 2) {
         const float2 vs = *reinterpret_cast<const float2*>(&vscale[k]);
@@ -877,7 +984,7 @@ __global__ __launch_bounds__(256, 3) void partial_hot_fp8_lite(Args a) {
 // per-key K scale multiplies the FP32 score and the per-key V scale the PV
 // weight. QK on tensor cores with FP32 accumulation and softmax; PV in FP32
 // FMAs, or with MMA_PV on tensor cores (FP16 weights, FP32 accumulation).
-template <int MIN_BLOCKS, bool MMA_PV>
+template <int MIN_BLOCKS, bool MMA_PV, bool IS_INT8 = false>
 __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
   const int row = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -914,10 +1021,13 @@ __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
         found = int64_t(physical) * a.page + logical % a.page;
     }
   };
-  // Scales times 2^8: the tiles decode to value * 2^-8.
+  // Scales: for E4M3, times 2^8 because tiles decode to value * 2^-8;
+  // for INT8, tiles decode to exact integer values (factor 1).
   auto stage_scales = [&]() {
-    found_k = found >= 0 ? __ldg(a.scales + found * 2) * 256.f : 0.f;
-    found_v = found >= 0 ? __ldg(a.scales + found * 2 + 1) * 256.f : 0.f;
+    constexpr float kDecodeFactor = IS_INT8 ? 1.f : 256.f;
+    found_k = found >= 0 ? __ldg(a.scales + found * 2) * kDecodeFactor : 0.f;
+    found_v =
+        found >= 0 ? __ldg(a.scales + found * 2 + 1) * kDecodeFactor : 0.f;
   };
   auto stage_store = [&](int b) {
     if (t < C) {
@@ -1001,9 +1111,15 @@ __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
         const uint4 q0 = *reinterpret_cast<const uint4*>(&query[r8][k]);
         const uint4 q1 = *reinterpret_cast<const uint4*>(&query[r8][k + 8]);
         const uint4 k0 =
-            decode8_unscaled(*reinterpret_cast<const uint2*>(&tile[nr][k]));
+            IS_INT8 ? decode8_int8_unscaled(
+                          *reinterpret_cast<const uint2*>(&tile[nr][k]))
+                    : decode8_unscaled(
+                          *reinterpret_cast<const uint2*>(&tile[nr][k]));
         const uint4 k1 =
-            decode8_unscaled(*reinterpret_cast<const uint2*>(&tile[nr][k + 8]));
+            IS_INT8 ? decode8_int8_unscaled(
+                          *reinterpret_cast<const uint2*>(&tile[nr][k + 8]))
+                    : decode8_unscaled(
+                          *reinterpret_cast<const uint2*>(&tile[nr][k + 8]));
         mma(acc, q0.x, q0.y, k0.x, k0.y);
         mma(acc, q0.z, q0.w, k0.z, k0.w);
         mma(acc, q1.x, q1.y, k1.x, k1.y);
@@ -1069,16 +1185,21 @@ __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
           const half2 p23 = __floats2half2_rn(p.z, p.w);
           const uint32_t codes =
               *reinterpret_cast<const uint32_t*>(&tile[k + vk][vn]);
+          const uint32_t v01 = IS_INT8 ? int8x2_half(codes, 0x4140u)
+                                       : e4m3x2_half(codes, 0x4140u);
+          const uint32_t v23 = IS_INT8 ? int8x2_half(codes, 0x4342u)
+                                       : e4m3x2_half(codes, 0x4342u);
           mma_rr(pv, *reinterpret_cast<const uint32_t*>(&p01),
-                 *reinterpret_cast<const uint32_t*>(&p23),
-                 e4m3x2_half(codes, 0x4140u), e4m3x2_half(codes, 0x4342u));
+                 *reinterpret_cast<const uint32_t*>(&p23), v01, v23);
         }
       } else {
 #pragma unroll
         for (int h = 0; h < H; ++h) result[h] *= alpha[h];
 #pragma unroll 4
         for (int k = 0; k < C; ++k) {
-          const float value = e4m3_bits(tile[k][t]) * (1.f / 256.f);
+          const float value =
+              IS_INT8 ? static_cast<float>(static_cast<int8_t>(tile[k][t]))
+                      : e4m3_bits(tile[k][t]) * (1.f / 256.f);
 #pragma unroll
           for (int h = 0; h < H; ++h)
             result[h] = __fmaf_rn(scores[0][h][k], value, result[h]);
@@ -1143,15 +1264,16 @@ void device_qsa_out(
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf && q.dim() == 3 &&
               q.size(0) > 0 && (whole_rows || q.size(0) <= 64) &&
               q.size(1) == 6 && q.size(2) == 256 && q.stride(2) == 1);
-  TORCH_CHECK((history.scalar_type() == at::kByte ||
-               history.scalar_type() == at::kHalf) &&
+  const bool is_e4m3 = history.scalar_type() == at::kByte;
+  const bool is_int8 = history.scalar_type() == at::kChar;
+  const bool byte_quant = is_e4m3 || is_int8;
+  TORCH_CHECK((byte_quant || history.scalar_type() == at::kHalf) &&
               history.dim() == 5 && history.size(1) == 2 &&
               history.size(3) == 1 && history.size(4) == 256 &&
               history.is_contiguous());
   TORCH_CHECK(scales.scalar_type() == at::kFloat && scales.is_contiguous() &&
-              scales.numel() == (history.scalar_type() == at::kByte
-                                     ? history.size(0) * history.size(2) * 2
-                                     : 2));
+              scales.numel() ==
+                  (byte_quant ? history.size(0) * history.size(2) * 2 : 2));
   TORCH_CHECK(indices.scalar_type() == at::kInt && indices.dim() == 2 &&
               indices.size(0) == q.size(0) && indices.stride(1) == 1 &&
               indices.size(1) > 0 && indices.size(1) <= 4096);
@@ -1172,11 +1294,13 @@ void device_qsa_out(
     TORCH_CHECK(tensor.device() == q.device());
   if (gate) TORCH_CHECK(gate->device() == q.device());
   TORCH_CHECK(hot.has_value() == resolved.has_value());
-  TORCH_CHECK(!hot_scales || (hot && history.scalar_type() == at::kByte),
-              "Encoded hot storage requires E4M3 authoritative history");
+  TORCH_CHECK(
+      !hot_scales || (hot && byte_quant),
+      "Encoded hot storage requires E4M3 or INT8 authoritative history");
   if (hot) {
     TORCH_CHECK(hot->is_cuda() && hot->device() == q.device() &&
-                hot->scalar_type() == (hot_scales ? at::kByte : at::kHalf) &&
+                hot->scalar_type() ==
+                    (hot_scales ? history.scalar_type() : at::kHalf) &&
                 hot->dim() == 3 && hot->size(1) == 2 && hot->size(2) == 256 &&
                 hot->is_contiguous());
     TORCH_CHECK(
@@ -1274,45 +1398,79 @@ void device_qsa_out(
   a.gs1 = gate ? gate->stride(1) : 0;
   const auto stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(a.splits, a.M);
-  const bool fp8 = history.scalar_type() == at::kByte;
   if (whole_rows) {
     // One CTA per row, no workspace.
     // whole_rows: CTAs per SM (2 or 3), +10 for tensor-core PV.
-    TORCH_CHECK(fp8 && !hot);
-    switch (whole_rows) {
-      case 2:
-        device_qsa::rows_fp8<2, false><<<a.M, 256, 0, stream>>>(a);
-        break;
-      case 3:
-        device_qsa::rows_fp8<3, false><<<a.M, 256, 0, stream>>>(a);
-        break;
-      case 12:
-        device_qsa::rows_fp8<2, true><<<a.M, 256, 0, stream>>>(a);
-        break;
-      case 13:
-        device_qsa::rows_fp8<3, true><<<a.M, 256, 0, stream>>>(a);
-        break;
-      default:
-        TORCH_CHECK(false, "invalid whole_rows ", whole_rows);
+    TORCH_CHECK(byte_quant && !hot);
+    auto launch_rows = [&](auto int8_tag) {
+      constexpr bool kInt8 = decltype(int8_tag)::value;
+      switch (whole_rows) {
+        case 2:
+          device_qsa::rows_fp8<2, false, kInt8><<<a.M, 256, 0, stream>>>(a);
+          break;
+        case 3:
+          device_qsa::rows_fp8<3, false, kInt8><<<a.M, 256, 0, stream>>>(a);
+          break;
+        case 12:
+          device_qsa::rows_fp8<2, true, kInt8><<<a.M, 256, 0, stream>>>(a);
+          break;
+        case 13:
+          device_qsa::rows_fp8<3, true, kInt8><<<a.M, 256, 0, stream>>>(a);
+          break;
+        default:
+          TORCH_CHECK(false, "invalid whole_rows ", whole_rows);
+      }
+    };
+    if (is_int8) {
+      launch_rows(std::true_type{});
+    } else {
+      launch_rows(std::false_type{});
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
-  if (prefill && fp8 && !hot && a.tiles == 1) {
-    device_qsa::partial_fp8_lite<<<grid, 256, 0, stream>>>(a);
-  } else if (fp8 && hot_scales) {
-    static int configured_dev = -1;
-    const int cur_dev = q.device().index();
-    if (configured_dev != cur_dev) {
-      cudaFuncSetAttribute(device_qsa::partial_hot_fp8_lite,
-                           cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-      configured_dev = cur_dev;
+  if (prefill && byte_quant && !hot && a.tiles == 1) {
+    if (is_int8) {
+      device_qsa::partial_fp8_lite<true><<<grid, 256, 0, stream>>>(a);
+    } else {
+      device_qsa::partial_fp8_lite<false><<<grid, 256, 0, stream>>>(a);
     }
-    device_qsa::partial_hot_fp8_lite<<<grid, 256, 0, stream>>>(a);
-  } else if (fp8 && hot) {
-    device_qsa::partial<true, true><<<grid, 256, 0, stream>>>(a);
-  } else if (fp8) {
-    device_qsa::partial<true, false><<<grid, 256, 0, stream>>>(a);
+  } else if (byte_quant && hot_scales) {
+    const int cur_dev = q.device().index();
+    if (is_int8) {
+      static int configured_int8_dev = -1;
+      if (configured_int8_dev != cur_dev) {
+        cudaFuncSetAttribute(device_qsa::partial_hot_fp8_lite<true>,
+                             cudaFuncAttributePreferredSharedMemoryCarveout,
+                             100);
+        configured_int8_dev = cur_dev;
+      }
+      device_qsa::partial_hot_fp8_lite<true><<<grid, 256, 0, stream>>>(a);
+    } else {
+      static int configured_dev = -1;
+      if (configured_dev != cur_dev) {
+        cudaFuncSetAttribute(device_qsa::partial_hot_fp8_lite<false>,
+                             cudaFuncAttributePreferredSharedMemoryCarveout,
+                             100);
+        configured_dev = cur_dev;
+      }
+      device_qsa::partial_hot_fp8_lite<false><<<grid, 256, 0, stream>>>(a);
+    }
+  } else if (byte_quant && hot) {
+    if (is_int8) {
+      device_qsa::partial<true, true, false, true><<<grid, 256, 0, stream>>>(a);
+    } else {
+      device_qsa::partial<true, true, false, false>
+          <<<grid, 256, 0, stream>>>(a);
+    }
+  } else if (byte_quant) {
+    if (is_int8) {
+      device_qsa::partial<true, false, false, true>
+          <<<grid, 256, 0, stream>>>(a);
+    } else {
+      device_qsa::partial<true, false, false, false>
+          <<<grid, 256, 0, stream>>>(a);
+    }
   } else if (hot) {
     device_qsa::partial<false, true><<<grid, 256, 0, stream>>>(a);
   } else {
@@ -1332,20 +1490,23 @@ bool stage_host_run(torch::Tensor history, torch::Tensor scales,
                   history.device() == out.device() && history.is_contiguous() &&
                   out.is_contiguous(),
               "QSA stage history must have contiguous same-device views");
-  TORCH_CHECK(history.dim() == 5 && out.dim() == 5 && history.size(1) == 2 &&
-                  history.size(2) > 0 && history.size(2) % 4 == 0 &&
-                  history.size(3) == 1 && history.size(4) == 256 &&
-                  history.sizes().slice(1) == out.sizes().slice(1) &&
-                  history.scalar_type() == out.scalar_type() &&
-                  (history.scalar_type() == at::kByte ||
-                   history.scalar_type() == at::kHalf),
-              "QSA stage history requires matching page-major E4M3/FP16 views");
+  TORCH_CHECK(
+      history.dim() == 5 && out.dim() == 5 && history.size(1) == 2 &&
+          history.size(2) > 0 && history.size(2) % 4 == 0 &&
+          history.size(3) == 1 && history.size(4) == 256 &&
+          history.sizes().slice(1) == out.sizes().slice(1) &&
+          history.scalar_type() == out.scalar_type() &&
+          (history.scalar_type() == at::kByte ||
+           history.scalar_type() == at::kChar ||
+           history.scalar_type() == at::kHalf),
+      "QSA stage history requires matching page-major 8-bit/FP16 views");
   TORCH_CHECK(source_page >= 0 && source_page <= history.size(0) &&
                   target_page >= 0 && target_page <= out.size(0) &&
                   pages >= 0 && pages <= history.size(0) - source_page &&
                   pages <= out.size(0) - target_page,
               "QSA stage page range is outside its source or destination");
-  const bool fp8 = history.scalar_type() == at::kByte;
+  const bool fp8 =
+      history.scalar_type() == at::kByte || history.scalar_type() == at::kChar;
   const int64_t scale_stride = 2 * history.size(2);
   if (fp8) {
     TORCH_CHECK(scales.is_cuda() && out_scales.is_cuda() &&
@@ -1416,7 +1577,7 @@ __device__ __forceinline__ uint8_t fp32_to_e4m3fn_rne(float x) {
   return static_cast<uint8_t>(sign | static_cast<uint32_t>(normal));
 }
 
-template <bool FP8, bool HOT_FP8>
+template <bool FP8, bool HOT_FP8, bool IS_INT8 = false>
 __device__ __forceinline__ void write_host_hot_kv(
     const uint4& val_u4, int64_t slot, int kv, int lane, int blocks,
     int page_size, int hot_pages, int64_t page_slots_len, void* history_raw,
@@ -1447,14 +1608,27 @@ __device__ __forceinline__ void write_host_hot_kv(
 #pragma unroll
     for (int s = 16; s > 0; s >>= 1)
       m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, s));
-    const float scale = fmaxf(__fdiv_rn(m, 448.0f), 0x1p-126f);
-    if (lane == 0) scales[slot * 2 + kv] = scale;
-
+    float scale;
     uint2 packed;
     uint8_t* bytes = reinterpret_cast<uint8_t*>(&packed);
+    if constexpr (IS_INT8) {
+      scale = fmaxf(m * (1.0f / 127.0f), 1.0e-8f);
+      const float inv_scale = 1.0f / scale;
 #pragma unroll
-    for (int j = 0; j < 8; ++j)
-      bytes[j] = fp32_to_e4m3fn_rne(__fdiv_rn(vf[j], scale));
+      for (int j = 0; j < 8; ++j) {
+        int q;
+        asm("cvt.rni.s32.f32 %0, %1;" : "=r"(q) : "f"(vf[j] * inv_scale));
+        bytes[j] =
+            static_cast<uint8_t>(static_cast<int8_t>(min(max(q, -127), 127)));
+      }
+    } else {
+      scale = fmaxf(__fdiv_rn(m, 448.0f), 0x1p-126f);
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        bytes[j] = fp32_to_e4m3fn_rne(__fdiv_rn(vf[j], scale));
+    }
+    if (lane == 0) scales[slot * 2 + kv] = scale;
+
     *reinterpret_cast<uint2*>(static_cast<uint8_t*>(history_raw) + hist_elem) =
         packed;
     if (update_hot) {
@@ -1464,7 +1638,8 @@ __device__ __forceinline__ void write_host_hot_kv(
         if (lane == 0) hot_scales[resident * 8 + (slot & 3) * 2 + kv] = scale;
       } else {
         *reinterpret_cast<uint4*>(static_cast<half*>(hot_raw) + hot_elem) =
-            device_qsa::decode8_bits(packed, scale);
+            IS_INT8 ? device_qsa::decode8_int8_scaled(packed, scale)
+                    : device_qsa::decode8_bits(packed, scale);
       }
     }
   } else {
@@ -1477,7 +1652,8 @@ __device__ __forceinline__ void write_host_hot_kv(
   }
 }
 
-template <typename CS, typename PosT, typename SlotT, bool FP8, bool HOT_FP8>
+template <typename CS, typename PosT, typename SlotT, bool FP8, bool HOT_FP8,
+          bool IS_INT8 = false>
 __global__ void prep_write_kernel(
     const half* __restrict__ qkv, int64_t ld_qkv, const PosT* __restrict__ pos,
     const CS* __restrict__ cos_sin, int rot, const half* __restrict__ qw,
@@ -1497,7 +1673,7 @@ __global__ void prep_write_kernel(
     const int64_t sl = static_cast<int64_t>(slots[t]);
     const uint4 v = *reinterpret_cast<const uint4*>(
         qkv + static_cast<int64_t>(t) * ld_qkv + HQ * 512 + 256 + lane * 8);
-    write_host_hot_kv<FP8, HOT_FP8>(
+    write_host_hot_kv<FP8, HOT_FP8, IS_INT8>(
         v, sl, 1, lane, blocks, page_size, hot_pages, page_slots_len,
         history_raw, scales, tags, page_slots, hot_raw, hot_scales);
     return;
@@ -1559,7 +1735,7 @@ __global__ void prep_write_kernel(
                               lane * 8) = outv;
     if (t == 0 && lane == 0) atomicAdd(epoch, 1);
     const int64_t sl = static_cast<int64_t>(slots[t]);
-    write_host_hot_kv<FP8, HOT_FP8>(
+    write_host_hot_kv<FP8, HOT_FP8, IS_INT8>(
         outv, sl, 0, lane, blocks, page_size, hot_pages, page_slots_len,
         history_raw, scales, tags, page_slots, hot_raw, hot_scales);
   }
@@ -1603,7 +1779,9 @@ void prep_write_out(torch::Tensor qkv, torch::Tensor pos, torch::Tensor cos_sin,
   TORCH_CHECK(
       slots.is_contiguous() && slots.numel() >= M &&
       (slots.scalar_type() == at::kLong || slots.scalar_type() == at::kInt));
-  const bool fp8 = history.scalar_type() == at::kByte;
+  const bool is_e4m3 = history.scalar_type() == at::kByte;
+  const bool is_int8 = history.scalar_type() == at::kChar;
+  const bool fp8 = is_e4m3 || is_int8;
   const bool hot_fp8 = hot_scales.has_value() && hot_scales->defined() &&
                        hot_scales->numel() > 0;
   TORCH_CHECK((fp8 || history.scalar_type() == at::kHalf) &&
@@ -1613,7 +1791,8 @@ void prep_write_out(torch::Tensor qkv, torch::Tensor pos, torch::Tensor cos_sin,
               scales.is_contiguous());
   TORCH_CHECK(!hot_fp8 || fp8);
   TORCH_CHECK(hot.is_cuda() &&
-              hot.scalar_type() == (hot_fp8 ? at::kByte : at::kHalf) &&
+              hot.scalar_type() ==
+                  (hot_fp8 ? history.scalar_type() : at::kHalf) &&
               hot.dim() == 3 && hot.size(1) == 2 && hot.size(2) == 256 &&
               hot.is_contiguous());
   TORCH_CHECK(tags.scalar_type() == at::kInt && tags.is_contiguous() &&
@@ -1627,8 +1806,10 @@ void prep_write_out(torch::Tensor qkv, torch::Tensor pos, torch::Tensor cos_sin,
   const int64_t page_slots_len = page_slots.numel();
   float* hs_ptr = hot_fp8 ? hot_scales->data_ptr<float>() : nullptr;
 
-#define LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, IS_FP8, IS_HOT_FP8) \
-  host_prep::prep_write_kernel<CS_T, POS_T, SLOT_T, IS_FP8, IS_HOT_FP8>  \
+#define LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, IS_FP8, IS_HOT_FP8, \
+                          K_INT8)                                        \
+  host_prep::prep_write_kernel<CS_T, POS_T, SLOT_T, IS_FP8, IS_HOT_FP8,  \
+                               K_INT8>                                   \
       <<<static_cast<int>(M), 32 * (HQ + 2), 0, st>>>(                   \
           reinterpret_cast<const half*>(qkv.data_ptr()), qkv.stride(0),  \
           pos.data_ptr<POS_T>(), CS_P, rot,                              \
@@ -1643,13 +1824,17 @@ void prep_write_out(torch::Tensor qkv, torch::Tensor pos, torch::Tensor cos_sin,
           epoch.data_ptr<int32_t>(), HQ, blocks, page_size, hot_pages,   \
           page_slots_len)
 
-#define DISPATCH_QUANTS(CS_T, CS_P, POS_T, SLOT_T)              \
-  if (fp8 && hot_fp8) {                                         \
-    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, true, true);   \
-  } else if (fp8) {                                             \
-    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, true, false);  \
-  } else {                                                      \
-    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, false, false); \
+#define DISPATCH_QUANTS(CS_T, CS_P, POS_T, SLOT_T)                     \
+  if (is_int8 && hot_fp8) {                                            \
+    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, true, true, true);    \
+  } else if (is_int8) {                                                \
+    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, true, false, true);   \
+  } else if (fp8 && hot_fp8) {                                         \
+    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, true, true, false);   \
+  } else if (fp8) {                                                    \
+    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, true, false, false);  \
+  } else {                                                             \
+    LAUNCH_PREP_WRITE(CS_T, CS_P, POS_T, SLOT_T, false, false, false); \
   }
 
 #define DISPATCH_SLOTS(CS_T, CS_P, POS_T)       \
@@ -1758,7 +1943,7 @@ __global__ __launch_bounds__(256) void protect_hot_kernel(
   }
 }
 
-template <typename PosT, bool FP8, bool HOT_FP8>
+template <typename PosT, bool FP8, bool HOT_FP8, bool IS_INT8 = false>
 __global__ __launch_bounds__(128) void install_hot_misses_kernel(
     const void* __restrict__ history_raw, const float* __restrict__ scales,
     void* __restrict__ hot_raw, float* __restrict__ hot_scales,
@@ -2019,7 +2204,8 @@ __global__ __launch_bounds__(128) void install_hot_misses_kernel(
                     reinterpret_cast<const uint2*>(s_ptr)[lane];
                 const float sc = scales[(first * 4 + tok_idx) * 2 + kv];
                 reinterpret_cast<uint4*>(d_ptr)[lane] =
-                    device_qsa::decode8_bits(packed_codes, sc);
+                    IS_INT8 ? device_qsa::decode8_int8_scaled(packed_codes, sc)
+                            : device_qsa::decode8_bits(packed_codes, sc);
               }
             }
           } else {
@@ -2102,7 +2288,7 @@ __global__ __launch_bounds__(128) void install_hot_misses_kernel(
   }
 }
 
-template <bool FP8, bool HOT_FP8>
+template <bool FP8, bool HOT_FP8, bool IS_INT8 = false>
 __global__ __launch_bounds__(128) void warm_hot_staged_kernel(
     const void* __restrict__ staged_raw,
     const float* __restrict__ staged_scales, void* __restrict__ hot_raw,
@@ -2286,7 +2472,8 @@ __global__ __launch_bounds__(128) void warm_hot_staged_kernel(
                 reinterpret_cast<const uint2*>(s_ptr)[lane];
             const float sc = staged_scales[(stg_first * 4 + tok_idx) * 2 + kv];
             reinterpret_cast<uint4*>(d_ptr)[lane] =
-                device_qsa::decode8_bits(packed_codes, sc);
+                IS_INT8 ? device_qsa::decode8_int8_scaled(packed_codes, sc)
+                        : device_qsa::decode8_bits(packed_codes, sc);
           }
         }
       } else {
@@ -2342,14 +2529,17 @@ void resolve_hot_out(torch::Tensor history, torch::Tensor scales,
   const int width = indices.size(1);
   if (rows == 0) return;
   const c10::cuda::CUDAGuard guard(indices.device());
-  const bool fp8 = history.scalar_type() == at::kByte;
+  const bool is_e4m3 = history.scalar_type() == at::kByte;
+  const bool is_int8 = history.scalar_type() == at::kChar;
+  const bool fp8 = is_e4m3 || is_int8;
   const bool hot_fp8 = hot_scales.has_value() && hot_scales->numel() > 0;
   TORCH_CHECK((fp8 || history.scalar_type() == at::kHalf) &&
               history.dim() == 5 && history.size(1) == 2 &&
               history.size(2) % 4 == 0 && history.size(3) == 1 &&
               history.size(4) == 256 && history.is_contiguous());
-  TORCH_CHECK(!hot_fp8 || fp8,
-              "Encoded hot storage requires E4M3 authoritative history");
+  TORCH_CHECK(
+      !hot_fp8 || fp8,
+      "Encoded hot storage requires E4M3 or INT8 authoritative history");
   const int num_blocks = history.size(0);
   const int page_size = history.size(2);
   const int hot_pages = hot.size(0) / 4;
@@ -2381,6 +2571,19 @@ void resolve_hot_out(torch::Tensor history, torch::Tensor scales,
           <<<install_grid, 128, 0, stream>>>(
               history.data_ptr(), scales.data_ptr<float>(), hot.data_ptr(),
               hs_ptr, tags.data_ptr<int32_t>(), stamps.data_ptr<int32_t>(),
+              epoch.data_ptr<int32_t>(), hands.data_ptr<int32_t>(),
+              page_slots.data_ptr<int32_t>(), stats.data_ptr<int64_t>(),
+              miss_queue.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
+              table.data_ptr<int32_t>(), requests.data_ptr<int32_t>(),
+              positions.data_ptr<PosT>(), lengths.data_ptr<int32_t>(),
+              resolved.data_ptr<int32_t>(), width, num_tiles, table_width,
+              table.stride(0), indices.stride(0), resolved.stride(0),
+              num_requests, num_blocks, page_size, hot_pages, num_hands);
+    } else if (is_int8) {
+      hot_resolve::install_hot_misses_kernel<PosT, true, false, true>
+          <<<install_grid, 128, 0, stream>>>(
+              history.data_ptr(), scales.data_ptr<float>(), hot.data_ptr(),
+              nullptr, tags.data_ptr<int32_t>(), stamps.data_ptr<int32_t>(),
               epoch.data_ptr<int32_t>(), hands.data_ptr<int32_t>(),
               page_slots.data_ptr<int32_t>(), stats.data_ptr<int64_t>(),
               miss_queue.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
@@ -2438,7 +2641,9 @@ void warm_hot_staged_out(torch::Tensor staged_history,
   const int staged_blocks = staged_history.size(0);
   if (num_requests <= 0 || staged_blocks <= 0) return;
   const c10::cuda::CUDAGuard guard(hot.device());
-  const bool fp8 = staged_history.scalar_type() == at::kByte;
+  const bool is_e4m3 = staged_history.scalar_type() == at::kByte;
+  const bool is_int8 = staged_history.scalar_type() == at::kChar;
+  const bool fp8 = is_e4m3 || is_int8;
   const bool hot_fp8 = hot_scales.has_value() && hot_scales->numel() > 0;
   const int page_size = staged_history.size(2);
   const int hot_pages = hot.size(0) / 4;
@@ -2461,6 +2666,18 @@ void warm_hot_staged_out(torch::Tensor staged_history,
         lengths.data_ptr<int32_t>(), num_requests, table.size(1),
         table.stride(0), staged_table.stride(0), static_cast<int>(num_blocks),
         staged_blocks, page_size, hot_pages, hands.numel(), per_req_budget);
+  } else if (is_int8) {
+    hot_resolve::warm_hot_staged_kernel<true, false, true>
+        <<<grid, 128, 0, stream>>>(
+            staged_history.data_ptr(), staged_scales.data_ptr<float>(),
+            hot.data_ptr(), nullptr, tags.data_ptr<int32_t>(),
+            stamps.data_ptr<int32_t>(), epoch.data_ptr<int32_t>(),
+            hands.data_ptr<int32_t>(), page_slots.data_ptr<int32_t>(),
+            table.data_ptr<int32_t>(), staged_table.data_ptr<int32_t>(),
+            lengths.data_ptr<int32_t>(), num_requests, table.size(1),
+            table.stride(0), staged_table.stride(0),
+            static_cast<int>(num_blocks), staged_blocks, page_size, hot_pages,
+            hands.numel(), per_req_budget);
   } else if (fp8) {
     hot_resolve::warm_hot_staged_kernel<true, false><<<grid, 128, 0, stream>>>(
         staged_history.data_ptr(), staged_scales.data_ptr<float>(),

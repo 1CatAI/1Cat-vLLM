@@ -21,6 +21,7 @@ def load_host_kv(
     DIM: tl.constexpr,
     HotScales=None,
     HOT_FP8: tl.constexpr = False,
+    HOT_INT8: tl.constexpr = False,
 ):
     hits = valid & (hot_tokens >= 0)
     safe_hot = tl.maximum(hot_tokens, 0).to(tl.int64)
@@ -34,7 +35,16 @@ def load_host_kv(
         hits[:, None],
         other=0,
     )
-    if HOT_FP8:
+    if HOT_INT8:
+        k_scales = tl.load(HotScales + safe_hot * 2, hits, other=0)
+        v_scales = tl.load(HotScales + safe_hot * 2 + 1, hits, other=0)
+        cached_k = (cached_k.to(tl.int8).to(tl.float32) * k_scales[None, :]).to(
+            tl.float16
+        )
+        cached_v = (cached_v.to(tl.int8).to(tl.float32) * v_scales[:, None]).to(
+            tl.float16
+        )
+    elif HOT_FP8:
         k_scales = tl.load(HotScales + safe_hot * 2, hits, other=0)
         v_scales = tl.load(HotScales + safe_hot * 2 + 1, hits, other=0)
         cached_k = (fp8_e4m3fn_bits_to_fp32_bitcast(cached_k) * k_scales[None, :]).to(

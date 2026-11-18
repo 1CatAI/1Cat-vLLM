@@ -26,6 +26,7 @@ from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
     FP8_E5M2,
     FP16,
+    INT8_PER_TOKEN_HEAD,
     KVCodec,
     canonical_kv_cache_dtype,
     resolve_kv_codec,
@@ -35,7 +36,8 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 RouteStage = Literal["decode", "verify", "mixed_decode", "prefill", "metadata", "any"]
 _NATIVE_CODECS = frozenset((FP16, FP8_E4M3, FP8_E5M2))
-_ALL_CODECS = _NATIVE_CODECS | {BF16}
+_PAGED_CODECS = _NATIVE_CODECS | {INT8_PER_TOKEN_HEAD}
+_ALL_CODECS = _PAGED_CODECS | {BF16}
 
 
 @dataclass(frozen=True)
@@ -144,16 +146,24 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
             "verify",
             {"head_dims": (256,), "gqa_ratios": (6, 8), "xqa": True},
         ),
-        ("decode_scalar_paged", "decode", {"fallback": True}),
-        ("prefill_smallq_decode_scalar", "verify", {"fallback": True}),
-        ("prefill_prefix_decode_rows_scalar", "mixed_decode", {"fallback": True}),
+        ("decode_scalar_paged", "decode", {"codecs": _PAGED_CODECS, "fallback": True}),
+        (
+            "prefill_smallq_decode_scalar",
+            "verify",
+            {"codecs": _PAGED_CODECS, "fallback": True},
+        ),
+        (
+            "prefill_prefix_decode_rows_scalar",
+            "mixed_decode",
+            {"codecs": _PAGED_CODECS, "fallback": True},
+        ),
         ("decode_dense_cache decode_paged_prefill", "decode", {}),
         ("decode_dense_reference", "decode", {"codecs": _ALL_CODECS}),
         (
             "decode_e4m3_compact_scalar_tail",
             "decode",
             {
-                "codecs": frozenset((FP8_E4M3,)),
+                "codecs": frozenset((FP8_E4M3, INT8_PER_TOKEN_HEAD)),
                 "head_dims": (256,),
                 "gqa_ratios": (6,),
                 "page_alignment": 16,
@@ -194,7 +204,7 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
             "prefill_smallq_e4m3_grouped_fp32",
             "verify",
             {
-                "codecs": frozenset((FP8_E4M3,)),
+                "codecs": frozenset((FP8_E4M3, INT8_PER_TOKEN_HEAD)),
                 "head_dims": (256,),
                 "gqa_ratios": (6,),
                 "page_alignment": 16,
@@ -204,7 +214,7 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
             "prefill_prefix_decode_rows_e4m3_grouped_fp32",
             "mixed_decode",
             {
-                "codecs": frozenset((FP8_E4M3,)),
+                "codecs": frozenset((FP8_E4M3, INT8_PER_TOKEN_HEAD)),
                 "head_dims": (256,),
                 "gqa_ratios": (6,),
                 "page_alignment": 16,
@@ -337,12 +347,15 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
                 "prefill_prefix_fp8_bridge_exact_dense_d256_tailpad"
             ),
             "prefill",
-            {"codecs": frozenset((FP8_E4M3, FP8_E5M2)), "head_dims": (256,)},
+            {
+                "codecs": frozenset((FP8_E4M3, FP8_E5M2, INT8_PER_TOKEN_HEAD)),
+                "head_dims": (256,),
+            },
         ),
         (
             "prefill_prefix_fp8_e4m3_bridge",
             "prefill",
-            {"codecs": frozenset((FP8_E4M3,))},
+            {"codecs": frozenset((FP8_E4M3, INT8_PER_TOKEN_HEAD))},
         ),
         (
             "decode_strategy_legacy_revision",
@@ -364,7 +377,7 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
                 "prefill_prefix_paged_anchored prefill_prefix_splitkv"
             ),
             "prefill",
-            {},
+            {"codecs": _PAGED_CODECS},
         ),
         (
             "flashinfer_sm70_fixed_entry flashinfer_sm70_splitkv3_fast_visible",
@@ -677,6 +690,12 @@ def log_kv_dtype_contract(kv_cache_dtype: str) -> None:
             "SM70 Flash-V100 is using explicit E5M2 KV cache. This controls "
             "KV storage only; model weight quantization is configured "
             "separately."
+        )
+    elif kv_cache_dtype in ("int8", "int8_per_token_head"):
+        logger.info(
+            "SM70 Flash-V100 is using per-token-head INT8 KV cache "
+            "(FP32 state). KV-cache dtype is independent of model weight "
+            "quantization."
         )
 
 

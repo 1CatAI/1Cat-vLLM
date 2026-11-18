@@ -148,27 +148,61 @@ _UNSET_RETENTION_INTERVAL = -1
 def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
     requested_dtype: str,
     resolved_dtype: str,
-) -> str:
+    *,
+    model_config: Any = None,
+    kernel_config: Any = None,
+    attention_backend: Any = None,
+) -> tuple[str, bool]:
     """Use E4M3 storage for the SM70 Flash-V100 ``fp8`` alias."""
-    if (
-        requested_dtype != "fp8"
-        or resolved_dtype != "fp8"
-        or not flash_v100_policy().enabled
-        or not current_platform.is_cuda()
-    ):
-        return resolved_dtype
+    from_checkpoint = requested_dtype == "auto" and resolved_dtype != "auto"
+    if requested_dtype == "int8":
+        return "int8_per_token_head", False
+    if not flash_v100_policy().enabled or not current_platform.is_cuda():
+        return resolved_dtype, from_checkpoint
     try:
         capability = current_platform.get_device_capability()
     except Exception:
-        return resolved_dtype
+        return resolved_dtype, from_checkpoint
     if capability is None or (capability.major, capability.minor) != (7, 0):
-        return resolved_dtype
-    logger.warning_once(
-        "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e4m3. "
-        "Use explicit fp8_e5m2 to request legacy E5M2 KV storage. Model weight "
-        "quantization is configured independently."
-    )
-    return "fp8_e4m3"
+        return resolved_dtype, from_checkpoint
+    if requested_dtype == "fp8" and resolved_dtype == "fp8":
+        logger.warning_once(
+            "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e4m3. "
+            "Use explicit fp8_e5m2 to request legacy E5M2 KV storage. Model weight "
+            "quantization is configured independently."
+        )
+        return "fp8_e4m3", False
+    if (
+        requested_dtype == "auto"
+        and model_config is not None
+        and not model_config.is_attention_free
+        and not getattr(model_config, "use_mla", False)
+        and getattr(model_config, "runner_type", "generate") == "generate"
+        and not getattr(kernel_config, "qsa_host_kv", False)
+    ):
+        backend_supports_int8 = True
+        if attention_backend is not None:
+            try:
+                from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+                backend_enum = (
+                    attention_backend
+                    if isinstance(attention_backend, AttentionBackendEnum)
+                    else AttentionBackendEnum[str(attention_backend)]
+                )
+                backend_cls = backend_enum.get_class()
+                backend_supports_int8 = (
+                    "int8_per_token_head" in backend_cls.supported_kv_cache_dtypes
+                )
+            except Exception:
+                backend_supports_int8 = False
+        if backend_supports_int8:
+            logger.info_once(
+                "Defaulting KV cache storage to int8_per_token_head. "
+                "Pass --kv-cache-dtype float16 or fp8_e4m3 explicitly to override."
+            )
+            return "int8_per_token_head", False
+    return resolved_dtype, from_checkpoint
 
 
 # object is used to allow for special typing forms
@@ -2099,9 +2133,14 @@ class EngineArgs:
         resolved_cache_dtype = resolve_kv_cache_dtype_string(
             self.kv_cache_dtype, model_config
         )
-        resolved_cache_dtype = _resolve_sm70_flash_v100_kv_cache_dtype_alias(
-            self.kv_cache_dtype,
-            resolved_cache_dtype,
+        resolved_cache_dtype, cache_dtype_from_checkpoint = (
+            _resolve_sm70_flash_v100_kv_cache_dtype_alias(
+                self.kv_cache_dtype,
+                resolved_cache_dtype,
+                model_config=model_config,
+                kernel_config=self.kernel_config,
+                attention_backend=self.attention_backend,
+            )
         )
 
         assert self.enable_prefix_caching is not None, (
@@ -2136,9 +2175,7 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        cache_config.cache_dtype_from_checkpoint = (
-            self.kv_cache_dtype == "auto" and resolved_cache_dtype != "auto"
-        )
+        cache_config.cache_dtype_from_checkpoint = cache_dtype_from_checkpoint
 
         if resolved_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (

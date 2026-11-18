@@ -1042,9 +1042,13 @@ class KernelConfig:
     """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
-    qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
+    qsa_host_kv_dtype: Literal["int8_per_token_head", "int8", "fp8_e4m3", "float16"] = (
+        "int8_per_token_head"
+    )
     """Authoritative target history format; FP16 isolates placement error."""
-    qsa_host_kv_draft_dtype: Literal["fp8_e4m3", "float16"] = "float16"
+    qsa_host_kv_draft_dtype: Literal[
+        "int8_per_token_head", "int8", "fp8_e4m3", "float16"
+    ] = "float16"
     """Preserve speculative cache precision independently of target storage."""
     qsa_host_kv_device_reference: bool = False
     """Keep identical encoded history on device for controlled placement A/B."""
@@ -1054,8 +1058,10 @@ class KernelConfig:
     device and the remainder directly from mapped host history."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
-    qsa_host_kv_hot_dtype: Literal["float16", "fp8_e4m3"] = "float16"
-    """Target hot storage; encoded E4M3 requires E4M3 authoritative history.
+    qsa_host_kv_hot_dtype: Literal[
+        "float16", "fp8_e4m3", "int8_per_token_head", "int8"
+    ] = "float16"
+    """Target hot storage; encoded E4M3/INT8 requires matching 8-bit history.
     Encoded hot reads round to the same FP16 operands as the decoded cache."""
     qsa_host_kv_draft_hot_tokens: int | None = Field(default=None, gt=0, multiple_of=16)
     """Optional independent draft hot capacity; None preserves target capacity."""
