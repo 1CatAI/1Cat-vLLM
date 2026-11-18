@@ -1185,12 +1185,27 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         correspond to each other, we create dummy multi-modal items
         to go along with the text.
         """
-        prompt_ids, _, _ = self._apply_hf_processor_text_mm(
-            prompt_text=prompt_text,
-            mm_items=MultiModalDataItems({}),
-            hf_processor_mm_kwargs={},
-            tokenization_kwargs=tokenization_kwargs,
-        )
+        try:
+            prompt_ids, _, _ = self._apply_hf_processor_text_mm(
+                prompt_text=prompt_text,
+                mm_items=MultiModalDataItems({}),
+                hf_processor_mm_kwargs={},
+                tokenization_kwargs=tokenization_kwargs,
+            )
+        except ValueError:
+            # transformers>=5 HF processors (e.g. Qwen3VLProcessor) validate
+            # that placeholder tokens in the text match the passed multimodal
+            # items, so calling them with text only fails when the prompt
+            # already contains placeholders. Without multimodal items the
+            # processor would not update the prompt anyway, so plain
+            # tokenization yields the same ids.
+            tokenizer = self.info.get_tokenizer()
+            tok_kwargs = {
+                k: v
+                for k, v in tokenization_kwargs.items()
+                if k in ("add_special_tokens", "truncation", "max_length")
+            }
+            prompt_ids = tokenizer.encode(prompt_text, **tok_kwargs)
 
         return prompt_ids
 
