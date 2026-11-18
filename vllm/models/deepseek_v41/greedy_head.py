@@ -40,36 +40,46 @@ def _verify(
     target_indices,
     bonus_indices,
     drafts,
+    cu_drafts,
     output,
-    DRAFTS: tl.constexpr,
+    STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    req = tl.program_id(0)
+    start = tl.where(req == 0, 0, tl.load(cu_drafts + req - 1, req > 0, 0))
+    end = tl.load(cu_drafts + req)
+    num_drafts = end - start
     position = tl.arange(0, BLOCK)
-    row = tl.load(target_indices + position, position < DRAFTS, 0)
-    target = tl.load(top_tokens + row).to(tl.int32)
-    proposed = tl.load(drafts + position, position < DRAFTS, -1)
+    in_drafts = position < num_drafts
+    row = tl.load(target_indices + start + position, in_drafts, 0)
+    target = tl.load(top_tokens + row, in_drafts, 0).to(tl.int32)
+    proposed = tl.load(drafts + start + position, in_drafts, -1)
     first_rejected = tl.min(
-        tl.where((position < DRAFTS) & (target != proposed), position, DRAFTS), 0
+        tl.where(in_drafts & (target != proposed), position, num_drafts), 0
     )
-    bonus_row = tl.load(bonus_indices)
+    bonus_row = tl.load(bonus_indices + req)
     bonus = tl.load(top_tokens + bonus_row).to(tl.int32)
-    token = tl.where(position < DRAFTS, target, bonus)
+    token = tl.where(position < num_drafts, target, bonus)
     token = tl.where(position <= first_rejected, token, -1)
-    tl.store(output + position, token, position <= DRAFTS)
+    tl.store(output + req * STRIDE + position, token, position < STRIDE)
 
 
 def verify_top_tokens(top_tokens, metadata):
     """Match the ordinary greedy rejection sampler, including its -1 padding."""
-    drafts = metadata.num_draft_tokens[0]
-    output = torch.empty((1, drafts + 1), dtype=torch.int32, device=top_tokens.device)
-    _verify[(1,)](
+    num_reqs = len(metadata.num_draft_tokens)
+    stride = metadata.max_spec_len + 1
+    output = torch.empty(
+        (num_reqs, stride), dtype=torch.int32, device=top_tokens.device
+    )
+    _verify[(num_reqs,)](
         top_tokens,
         metadata.target_logits_indices,
         metadata.bonus_logits_indices,
         metadata.draft_token_ids,
+        metadata.cu_num_draft_tokens,
         output,
-        DRAFTS=drafts,
-        BLOCK=triton.next_power_of_2(drafts + 1),
+        STRIDE=stride,
+        BLOCK=triton.next_power_of_2(stride),
         num_warps=1,
     )
     return output
@@ -121,9 +131,9 @@ def can_verify_top_tokens(runner, scheduler_output, spec_decode_metadata):
         and config.method == "dspark"
         and not config.use_dflash_ddtree()
         and spec_decode_metadata is not None
-        and len(spec_decode_metadata.num_draft_tokens) == 1
+        and len(spec_decode_metadata.num_draft_tokens) == runner.input_batch.num_reqs
         and spec_decode_metadata.max_spec_len <= 5
-        and runner.input_batch.num_reqs == 1
+        and runner.input_batch.num_reqs >= 1
         and runner.parallel_config.tensor_parallel_size == 4
         and not runner.broadcast_pp_output
         and not runner.is_pooling_model

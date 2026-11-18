@@ -331,8 +331,8 @@ __global__ void __launch_bounds__(W * 32)
                      const half* __restrict__ group_scales,
                      const half* __restrict__ input, half* __restrict__ output,
                      float* __restrict__ workspace, int* __restrict__ tickets,
-                     int n, int k, int m, int x_row_stride,
-                     int tiles_per_group) {
+                     int n, int k, int m, int x_row_stride, int tiles_per_group,
+                     half* __restrict__ output_b = nullptr, int n_a = 0) {
   static_assert(W * RT <= 32, "qpn8 rows: W * RT * 1 KB of shared partials");
   __shared__ float partials[W][RT * 256];
   __shared__ bool last;
@@ -404,13 +404,17 @@ __global__ void __launch_bounds__(W * 32)
     }
   __syncthreads();
   const int live = m * 32;
+  const bool in_b = output_b != nullptr && tile * 32 >= n_a;
+  half* out_ptr = in_b ? output_b : output;
+  const int out_ld = in_b ? (n - n_a) : (output_b != nullptr ? n_a : n);
+  const int out_col = in_b ? (tile * 32 - n_a) : (tile * 32);
   if (parts == 1) {
     for (int element = threadIdx.x; element < live; element += blockDim.x) {
       float value = 0.0f;
 #pragma unroll
       for (int w = 0; w < W; ++w) value += partials[w][element];
-      output[static_cast<size_t>(element >> 5) * n + tile * 32 +
-             (element & 31)] = __float2half(value);
+      out_ptr[static_cast<size_t>(element >> 5) * out_ld + out_col +
+              (element & 31)] = __float2half(value);
     }
     return;
   }
@@ -433,8 +437,8 @@ __global__ void __launch_bounds__(W * 32)
     float value = 0.0f;
     for (int p = 0; p < parts; ++p)
       value += __ldcg(all + p * RT * 256 + element);
-    output[static_cast<size_t>(element >> 5) * n + tile * 32 + (element & 31)] =
-        __float2half(value);
+    out_ptr[static_cast<size_t>(element >> 5) * out_ld + out_col +
+            (element & 31)] = __float2half(value);
   }
   if (threadIdx.x == 0) tickets[tile] = 0;
 }
@@ -493,6 +497,59 @@ void gemm_rows(torch::Tensor out, torch::Tensor input, torch::Tensor packed,
               "v41q8 rows: (warps, row_tiles) in (4|8|16, 2|4|8), W*RT<=32");
 }
 
+void gemm2_rows(torch::Tensor out_a, torch::Tensor out_b, torch::Tensor input,
+                torch::Tensor packed, torch::Tensor scales,
+                torch::Tensor tickets, int64_t warps, int64_t parts,
+                int64_t row_tiles) {
+  TORCH_CHECK(input.is_cuda() && input.dim() == 2 &&
+              input.scalar_type() == torch::kFloat16 &&
+              out_a.scalar_type() == torch::kFloat16 &&
+              out_b.scalar_type() == torch::kFloat16 && input.is_contiguous() &&
+              out_a.is_contiguous() && out_b.is_contiguous() &&
+              scales.scalar_type() == torch::kFloat16 &&
+              tickets.scalar_type() == torch::kInt32);
+  const int m = input.size(0), k = input.size(1);
+  const int n_a = out_a.size(1), n_b = out_b.size(1), n = n_a + n_b;
+  TORCH_CHECK(m >= 1 && m <= 8 * row_tiles && out_a.size(0) == m &&
+              out_b.size(0) == m);
+  TORCH_CHECK(n_a % 32 == 0 && n_b % 32 == 0 && k % 32 == 0 &&
+              packed.numel() == (int64_t)n * k);
+  TORCH_CHECK(scales.size(0) == k / 32 && scales.size(1) == n / 32);
+  TORCH_CHECK(tickets.numel() >= n / 32, "v41q8: tickets must be [N/32]");
+  TORCH_CHECK(parts >= 1 && (k / 16) % (warps * parts) == 0,
+              "v41q8: K/16 must divide by warps * parts");
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto workspace =
+      torch::empty({parts > 1 ? (n / 32) * parts * row_tiles * 256 : 1},
+                   input.options().dtype(torch::kFloat32));
+  const dim3 grid(n / 32, parts);
+  const auto* c = packed.data_ptr<uint8_t>();
+  const auto* s = reinterpret_cast<const half*>(scales.data_ptr<at::Half>());
+  const auto* x = reinterpret_cast<const half*>(input.data_ptr<at::Half>());
+  auto* ya = reinterpret_cast<half*>(out_a.data_ptr<at::Half>());
+  auto* yb = reinterpret_cast<half*>(out_b.data_ptr<at::Half>());
+#define V41Q8_ROWS2(W, RT)                                                    \
+  if (warps == W && row_tiles == RT) {                                        \
+    qpn8_rows_kernel<W, RT><<<grid, W * 32, 0, stream>>>(                     \
+        c, s, x, ya, workspace.data_ptr<float>(), tickets.data_ptr<int>(), n, \
+        k, m, k, 1 << 30, yb, n_a);                                           \
+    C10_CUDA_KERNEL_LAUNCH_CHECK();                                           \
+    return;                                                                   \
+  }
+  // clang-format off
+  V41Q8_ROWS2(4, 2)
+  V41Q8_ROWS2(4, 4)
+  V41Q8_ROWS2(4, 8)
+  V41Q8_ROWS2(8, 2)
+  V41Q8_ROWS2(8, 4)
+  V41Q8_ROWS2(16, 2)
+  // clang-format on
+#undef V41Q8_ROWS2
+  TORCH_CHECK(false,
+              "v41q8 rows2: (warps, row_tiles) in (4|8|16, 2|4|8), W*RT<=32");
+}
+
 }  // namespace v41q8
 
 TORCH_LIBRARY(v41q8, m) {
@@ -517,6 +574,10 @@ TORCH_LIBRARY(v41q8, m) {
   m.def(
       "gemm_rows(Tensor(a!) out, Tensor input, Tensor packed, Tensor scales, "
       "Tensor(b!) tickets, int warps, int parts, int row_tiles) -> ()");
+  m.def(
+      "gemm2_rows(Tensor(a!) out_a, Tensor(b!) out_b, Tensor input, Tensor "
+      "packed, Tensor scales, Tensor(c!) tickets, int warps, int parts, "
+      "int row_tiles) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(v41q8, CUDA, m) {
@@ -527,4 +588,5 @@ TORCH_LIBRARY_IMPL(v41q8, CUDA, m) {
   m.impl("gemm_grouped", &v41q8::gemm_grouped);
   m.impl("gemm2", &v41q8::gemm2);
   m.impl("gemm_rows", &v41q8::gemm_rows);
+  m.impl("gemm2_rows", &v41q8::gemm2_rows);
 }

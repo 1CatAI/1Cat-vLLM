@@ -41,6 +41,7 @@ class V41BatchLayout:
     prefill: torch.Tensor  # bool [max_reqs]
     query_start_loc: torch.Tensor  # int32 [max_reqs + 1]
     query_start_loc_cpu: torch.Tensor
+    seq_lens_cpu: torch.Tensor | None = None
 
 
 # Several requests per step (default off: the model admits exactly one).
@@ -150,6 +151,9 @@ class _LayoutBuffers:
             self.prefill,
             common.query_start_loc,
             common.query_start_loc_cpu,
+            None
+            if common.is_dummy_batch
+            else getattr(common, "seq_lens_cpu_upper_bound", None),
         )
         return self.layout
 

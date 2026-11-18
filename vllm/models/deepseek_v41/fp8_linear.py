@@ -252,6 +252,24 @@ def q8_rows(x, packed, half_scales, n, tickets=None):
     return out
 
 
+def q8_rows2(x, packed, half_scales, n_a, n_b):
+    """Two-output fused QPN8 GEMM for 8 < M <= 64 without split copies."""
+    m, k = x.shape[0], x.shape[-1]
+    n = n_a + n_b
+    tickets = _ROWS_TICKETS.get(packed.data_ptr())
+    if tickets is None:
+        tickets = _ROWS_TICKETS[packed.data_ptr()] = torch.zeros(
+            n // 32, dtype=torch.int32, device=x.device
+        )
+    warps, parts, row_tiles = q8_rows_config(m, n, k)
+    a = torch.empty(m, n_a, dtype=torch.float16, device=x.device)
+    b = torch.empty(m, n_b, dtype=torch.float16, device=x.device)
+    torch.ops.v41q8.gemm2_rows(
+        a, b, x.contiguous(), packed, half_scales, tickets, warps, parts, row_tiles
+    )
+    return [a, b]
+
+
 def _rows_eligible(x):
     return 8 < x.shape[0] <= _ROWS_MAX and x.dtype == torch.float16 and x.is_cuda
 
@@ -495,6 +513,32 @@ class V41Fp8LinearMethod(LinearMethodBase):
                 ],
                 dim=-1,
             )
+        if (
+            _DEQUANT_MM_ROWS
+            and x.shape[0] >= _DEQUANT_MM_ROWS
+            and x.is_cuda
+            and x.dtype == torch.float16
+            and x.stride(-1) == 1
+            and layer.weight.dtype == torch.float8_e4m3fn
+            and layer.weight.is_contiguous()
+            and layer.weight_scale_inv.dtype == torch.float8_e8m0fnu
+            and layer.weight_scale_inv.is_contiguous()
+        ):
+            n, k = layer.weight.shape
+            w16 = torch.empty(n, k, dtype=torch.float16, device=x.device)
+            _dequant_fp16[(triton.cdiv(n, 32), k // 32)](
+                layer.weight.view(torch.uint8),
+                layer.weight_scale_inv.view(torch.uint8),
+                w16,
+                N=n,
+                K=k,
+                num_warps=4,
+            )
+            out = torch.empty(x.shape[0], n, dtype=torch.float16, device=x.device)
+            for group in range(x.shape[1]):
+                c0, c1 = group * 1024, (group + 1) * 1024
+                torch.mm(x[:, group], w16[c0:c1].t(), out=out[:, c0:c1])
+            return out
         return torch.cat(
             [
                 fp8_block32_linear(
@@ -526,6 +570,18 @@ class Q8Fused:
 
     def __call__(self, x):
         if 8 < x.shape[0] <= self.max_m and not _ABLATE_DENSE:
+            if (
+                len(self.widths) == 2
+                and self.widths[0] % 32 == 0
+                and self.widths[1] % 32 == 0
+            ):
+                return q8_rows2(
+                    x,
+                    self.prepared[0],
+                    self.prepared[1],
+                    self.widths[0],
+                    self.widths[1],
+                )
             out = q8_rows(x, self.prepared[0], self.prepared[1], self.n)
             return [part.contiguous() for part in out.split(self.widths, dim=-1)]
         if len(self.widths) == 2 and 1 <= x.shape[0] <= 8 and not _ABLATE_DENSE:

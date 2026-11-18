@@ -1754,9 +1754,15 @@ def select_compressed_positions_batch(
         # single-request gather + cuBLAS scores, row by row (decode-only
         # steps, and so every graph, take the batched kernel below).
         result = torch.full((tokens, width), -1, device=q.device, dtype=torch.int32)
-        last_positions = positions[
-            torch.tensor(starts[1:], device=positions.device).clamp(min=1) - 1
-        ].tolist()
+        seq_cpu = getattr(layout, "seq_lens_cpu", None)
+        if seq_cpu is not None and not getattr(layout, "is_dummy", False):
+            last_positions = [
+                max(0, int(v) - 1) for v in seq_cpu[: layout.num_reqs].tolist()
+            ]
+        else:
+            last_positions = positions[
+                torch.tensor(starts[1:], device=positions.device).clamp(min=1) - 1
+            ].tolist()
         if (
             _INDEX_SHARD
             and all_gather is not None

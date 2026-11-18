@@ -7099,6 +7099,15 @@ class GPUModelRunner(
                 num_reqs_padded,
             )
 
+    def _mm_step(self) -> bool:
+        """Whether this step takes the multimodal input path. A model with
+        `text_steps_without_mm` runs steps without multimodal tokens (every
+        decode step, its CUDA graphs) on token ids, as a text-only model."""
+        model = self.get_model()
+        if not getattr(model, "text_steps_without_mm", False):
+            return True
+        return bool(model.step_has_mm_tokens())
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -7122,7 +7131,12 @@ class GPUModelRunner(
         # modal outputs after that to ensure the correct order
         ec_connector_output = None
 
-        if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
+        if (
+            self.supports_mm_inputs
+            and is_first_rank
+            and not is_encoder_decoder
+            and self._mm_step()
+        ):
             # Run the multimodal encoder if any.
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
@@ -11952,7 +11966,11 @@ class GPUModelRunner(
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
             model_kwargs = self._init_model_kwargs()
-            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
+            if (
+                self.supports_mm_inputs
+                and not self.model_config.is_encoder_decoder
+                and not getattr(self.get_model(), "text_steps_without_mm", False)
+            ):
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
 
                 model_kwargs = {

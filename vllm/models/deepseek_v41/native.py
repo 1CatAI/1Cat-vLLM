@@ -91,7 +91,7 @@ class H16Head:
         )
 
     def apply(self, layer, x, bias=None):
-        small = 1 <= x.shape[0] <= 8 and x.dtype == torch.float16
+        small = 1 <= x.shape[0] <= 32 and x.dtype == torch.float16
         if bias is None and x.is_cuda and small:
             out = torch.empty(x.shape[0], self.n, dtype=torch.float16, device=x.device)
             torch.ops.v41sk.h16_gemv(
@@ -193,8 +193,8 @@ def gate_route(gate, x, top_k, scale):
     if (
         h16 is None
         or x.dtype != torch.float16
-        or not 1 <= tokens <= 8
-        or tokens * top_k >= 64
+        or not 1 <= tokens <= 32
+        or tokens * top_k > 640
         or getattr(gate, "temperature", 1.0) != 1.0
     ):
         return None
@@ -750,7 +750,12 @@ class V41NativeMoEMethod(Mxfp4SM70MoEMethod):
         inter = w2.shape[2] * 2
         activated = torch.empty((slots, inter), dtype=x.dtype, device=x.device)
         probabilities = topk_weights.reshape(-1).float().contiguous()
-        if _W13_SWIGLU and 1 <= tokens <= 8 and x.shape[1] == 5120 and inter % 32 == 0:
+        if (
+            _W13_SWIGLU
+            and 1 <= tokens <= 768
+            and x.shape[1] == 5120
+            and inter % 32 == 0
+        ):
             torch.ops.v41sk.moe_w13_swiglu(
                 x,
                 w13,

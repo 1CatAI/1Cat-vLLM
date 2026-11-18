@@ -38,7 +38,7 @@ def short_rms_norm(x, weight, eps):
         x.ndim != 2
         or not x.is_cuda
         or x.dtype != torch.float16
-        or not short_rows(x.shape[0])
+        or x.shape[0] < 1
         or x.shape[1] not in (128, 512, 1280, 5120)
         or not x.is_contiguous()
         or weight.shape != (x.shape[1],)
@@ -46,8 +46,9 @@ def short_rms_norm(x, weight, eps):
         or weight.device != x.device
         or not weight.is_contiguous()
     ):
-        raise ValueError("V4.1 short RMS requires FP16 M1..6 and FP32 weights")
+        raise ValueError("V4.1 short RMS requires FP16 M>=1 and FP32 weights")
     output = torch.empty_like(x)
+    warps = 8 if (x.shape[1] >= 5120 and x.shape[0] > 32) else 4
     _short_rms[(x.shape[0],)](
         x,
         weight,
@@ -55,7 +56,7 @@ def short_rms_norm(x, weight, eps):
         H=x.shape[1],
         EPS=eps,
         BLOCK=triton.next_power_of_2(x.shape[1]),
-        num_warps=4,
+        num_warps=warps,
         enable_fp_fusion=False,
     )
     return output

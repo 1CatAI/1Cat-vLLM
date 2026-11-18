@@ -135,7 +135,7 @@ class V41Norm(nn.Module):
             x.is_cuda
             and x.dtype == torch.float16
             and x.ndim == 2
-            and short_rows(x.shape[0])
+            and x.shape[0] >= 1
             and x.shape[1] in (128, 512, 1280, 5120)
             and x.is_contiguous()
         ):
@@ -285,7 +285,7 @@ class V41MoE(nn.Module):
                 plain is not None
                 and x.dtype == torch.float16
                 and self.gate.temperature == 1.0
-                and x.shape[0] > 8
+                and x.shape[0] > 32
             ):
                 # Exact FP16 * 2^s products, FP32 accumulation (as h16_gemv).
                 logits = torch.mm(x.contiguous(), plain, out_dtype=torch.float32)
@@ -460,7 +460,7 @@ class V41Compressor(nn.Module):
             and _NATIVE
             and x.is_cuda
             and x.dtype == torch.float16
-            and 8 < x.shape[0] <= 1024
+            and x.shape[0] > 32
         ):
             # VLLM_V41_BATCH: the same exact FP16 * 2^s products on cuBLAS
             # with FP32 accumulation and output.
@@ -468,7 +468,7 @@ class V41Compressor(nn.Module):
             out.mul_(state[2])
             return out[:, :512].contiguous(), out[:, 512:].contiguous()
         if not (
-            _NATIVE and x.is_cuda and x.dtype == torch.float16 and 1 <= x.shape[0] <= 8
+            _NATIVE and x.is_cuda and x.dtype == torch.float16 and 1 <= x.shape[0] <= 32
         ):
             return None
         if not state:  # prepare_loaded_linear_weights builds it (or False)
@@ -2393,6 +2393,13 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP, SupportsMult
             spans.append(span)
         return spans
 
+    # Steps without image tokens (all decode steps and their graphs) keep the
+    # text path: token ids, embedding inside the graph, no encoder gather.
+    text_steps_without_mm = True
+
+    def step_has_mm_tokens(self) -> bool:
+        return self.model.vl_step
+
     def v41_set_vision(self, input_ids_np):
         """Runner hook (host ids of the step): does it hold image tokens?"""
         if VISION:
@@ -2453,7 +2460,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP, SupportsMult
             not isinstance(self.lm_head.quant_method, H16Head)
             or get_tensor_model_parallel_world_size() != 4
             or hidden_states.dtype != torch.float16
-            or not 1 <= hidden_states.shape[0] <= 6
+            or not 1 <= hidden_states.shape[0] <= 192
             or self.logits_processor.soft_cap is not None
             or self.logits_processor.scale != 1.0
             or self.lm_head.num_embeddings != self.lm_head.org_vocab_size
@@ -2516,6 +2523,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP, SupportsMult
                     module._v41_h16 = h16_exact(weight, keep_plain=_BATCH) or False
             if not isinstance(self.lm_head, PPMissingLayer):
                 attach_h16_head(self.lm_head)
+            engram_io = getattr(self.model, "engram_io", None)
+            if engram_io is not None and engram_io.owner is not None:
+                engram_io.owner.start_page_cache_warm()
             torch.accelerator.empty_cache()
         self.model.prepare_postload()
 
