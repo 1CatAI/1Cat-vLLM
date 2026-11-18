@@ -504,8 +504,8 @@ class CudaPlatformBase(Platform):
         else:
             return [
                 AttentionBackendEnum.FLASH_ATTN,
-                AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLASHINFER,
             ]
 

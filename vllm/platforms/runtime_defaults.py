@@ -364,7 +364,6 @@ def apply_runtime_policy_defaults(self):
             and not self.model_config.multimodal_config.language_model_only
         ):
             from vllm.config.multimodal import VideoDummyOptions
-            from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
             mm_cfg = self.model_config.multimodal_config
             limit_per_prompt = mm_cfg.limit_per_prompt
@@ -379,8 +378,6 @@ def apply_runtime_policy_defaults(self):
                     "Using SM70 Flash-V100 multimodal default: image=unlimited, "
                     "video=0. Set --limit-mm-per-prompt to override."
                 )
-            if mm_cfg.mm_encoder_attn_backend is None:
-                mm_cfg.mm_encoder_attn_backend = AttentionBackendEnum.TRITON_ATTN
             if (
                 mm_cfg.mm_encoder_batch_size == 0
                 and mm_cfg.get_limit_per_prompt("image") > 1

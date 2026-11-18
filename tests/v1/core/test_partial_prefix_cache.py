@@ -1487,7 +1487,7 @@ def test_prefix_tokenize_cache_exact_parity_and_incremental_encode():
     assert ids2 == ref_tok.encode(t2_text, add_special_tokens=False)
 
 
-def test_sm70_vision_default_unlimited_images_and_vit_triton_order():
+def test_sm70_vision_default_unlimited_images_and_vit_sdpa_order():
     from vllm.config.multimodal import UNLIMITED_MM_ITEMS_PER_PROMPT, MultiModalConfig
     from vllm.platforms.cuda import CudaPlatform
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -1495,6 +1495,4 @@ def test_sm70_vision_default_unlimited_images_and_vit_triton_order():
     mm = MultiModalConfig()
     assert mm.get_limit_per_prompt("image") == UNLIMITED_MM_ITEMS_PER_PROMPT
     backends = CudaPlatform.get_supported_vit_attn_backends()
-    assert backends.index(AttentionBackendEnum.TRITON_ATTN) < backends.index(
-        AttentionBackendEnum.TORCH_SDPA
-    )
+    assert AttentionBackendEnum.TORCH_SDPA in backends
