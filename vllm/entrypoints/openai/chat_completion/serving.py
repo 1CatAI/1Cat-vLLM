@@ -2354,7 +2354,7 @@ class OpenAIServingChat(OpenAIServing):
                     role=role,
                     reasoning=reasoning,
                     content="" if tool_call_class_items else content,
-                    tool_calls=tool_call_class_items or None,
+                    tool_calls=tool_call_class_items,
                 )
 
             elif request.tool_choice and request.tool_choice == "required":
@@ -2388,7 +2388,7 @@ class OpenAIServingChat(OpenAIServing):
                 message = ChatMessage(
                     role=role,
                     content="" if tool_call_class_items else content,
-                    tool_calls=tool_call_class_items or None,
+                    tool_calls=tool_call_class_items,
                     reasoning=reasoning,
                 )
 
