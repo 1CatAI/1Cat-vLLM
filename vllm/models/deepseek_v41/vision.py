@@ -28,7 +28,7 @@ from torch.nn import functional as F
 from transformers import BatchFeature
 
 import vllm.envs as envs
-from vllm.config.multimodal import BaseDummyOptions
+from vllm.config.multimodal import BaseDummyOptions, ImageDummyOptions
 from vllm.inputs import MultiModalDataDict
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import ImageProcessorItems, MultiModalDataItems
@@ -367,12 +367,14 @@ class DeepseekV41DummyInputsBuilder(BaseDummyInputsBuilder[DeepseekV41Processing
         # A square image at the token cap (1024 -> a 31 x 31 LLM grid).
         g = _geometry(self.info)
         side = 31 * g.patch_size * g.downsample_ratio
+        overrides = mm_options.get("image")
+        assert overrides is None or isinstance(overrides, ImageDummyOptions)
         return {
             "image": self._get_dummy_images(
                 width=side,
                 height=side,
                 num_images=mm_counts.get("image", 0),
-                overrides=mm_options.get("image"),
+                overrides=overrides,
             )
         }
 

@@ -2380,6 +2380,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP, SupportsMult
                 )
                 for h, w in grids
             ]
+        assert isinstance(patches, torch.Tensor)
         device = tower.image_start.device
         spans = []
         for chunk, (n_h, n_w) in zip(patches.split(sizes), grids):
