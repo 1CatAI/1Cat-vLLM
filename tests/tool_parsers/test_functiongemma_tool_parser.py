@@ -27,6 +27,8 @@ def mock_request():
     request = MagicMock(spec=ChatCompletionRequest)
     request.tools = []
     request.tool_choice = "auto"
+    # A spec mock has no pydantic fields; adjust_request reads this one.
+    request.parallel_tool_calls = True
     return request
 
 
