@@ -504,6 +504,8 @@ def try_graph_greedy_draft_rejection(
     )
     key = (
         id(model),
+        requests,
+        width,
         hidden.dtype,
         batch_top_k,
         bool(np.any(states.top_p.np[idx] != 1.0)),

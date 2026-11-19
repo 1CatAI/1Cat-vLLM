@@ -30,7 +30,7 @@ class AsyncScheduler(Scheduler):
             and draft_model_config.max_model_len is not None
             else self.max_model_len
         )
-        self._adaptive_mtp = is_adaptive_mtp_enabled(
+        self._adaptive_mtp = self.use_v2_model_runner and is_adaptive_mtp_enabled(
             speculative_config, self.num_spec_tokens
         )
         self._adaptive_mtp_min_k = adaptive_mtp_min_k(
@@ -118,9 +118,14 @@ class AsyncScheduler(Scheduler):
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
-        if self._adaptive_mtp and scheduler_output.finished_req_ids:
-            for finished_id in scheduler_output.finished_req_ids:
-                self._adaptive_mtp_state.pop(finished_id, None)
+        if self._adaptive_mtp:
+            if scheduler_output.finished_req_ids:
+                for finished_id in scheduler_output.finished_req_ids:
+                    self._adaptive_mtp_state.pop(finished_id, None)
+            if len(self._adaptive_mtp_state) > len(self.requests):
+                for stale_id in list(self._adaptive_mtp_state):
+                    if stale_id not in self.requests:
+                        del self._adaptive_mtp_state[stale_id]
         decode_req_ids = [
             req_id
             for req_id in scheduler_output.num_scheduled_tokens
