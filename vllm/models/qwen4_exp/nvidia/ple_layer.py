@@ -2878,13 +2878,15 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         """
         num_reqs = spec_state_indices_tensor.numel()
         hidden_size = x_spec.size(-1)
+        cap_qlen = conv_state.shape[-1] - 8
         if (
             layer_policy().value("ple_spec_conv")
             and 1 <= num_reqs <= 8
-            and spec_query_len == 5
+            and 5 <= cap_qlen <= 8
+            and 1 <= spec_query_len <= cap_qlen
             and self.conv_state_len == 9
             and self.short_conv_dilation == 3
-            and 1 <= x_spec.shape[0] <= 40
+            and 1 <= x_spec.shape[0] <= 64
             and x_spec.shape[1] == 10240
             and x_spec.is_cuda
             and x_spec.dtype == torch.float16
@@ -2892,7 +2894,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             and conv_weights.shape == (10240, 4)
             and conv_weights.dtype == torch.float16
             and conv_weights.is_contiguous()
-            and conv_state.shape[1:] == (10240, 13)
+            and conv_state.shape[1:] == (10240, 8 + cap_qlen)
             and conv_state.dtype in (torch.float16, torch.float32)
             and all(
                 t.dtype == torch.int32 and t.is_cuda and t.is_contiguous()
@@ -2914,7 +2916,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 spec_query_start_loc,
                 num_accepted_tokens,
             )
-            logger.info_once("SM70 MTP4 PLE rollback/conv/SiLU/state fusion enabled.")
+            logger.info_once(
+                "SM70 MTP%d PLE rollback/conv/SiLU/state fusion enabled.",
+                cap_qlen - 1,
+            )
             return output
         # Use a fixed packing width instead of synchronizing on lengths.max().
         max_len = spec_query_len
@@ -3691,12 +3696,14 @@ def qwen4_exp_ple_short_conv_add_inplace(
         if state_capacity > 0 and conv_state.size(-1) >= state_capacity:
             conv_state = conv_state[..., -state_capacity:]
         conv_weights = layer.conv1d.weight.squeeze(1)
+        cap_qlen = conv_state.shape[-1] - 8
         if (
             1 <= spec_ids.numel() <= 8
-            and meta.spec_query_len == 5
+            and 5 <= cap_qlen <= 8
+            and 1 <= meta.spec_query_len <= cap_qlen
             and layer.conv_state_len == 9
             and layer.short_conv_dilation == 3
-            and 1 <= inputs.shape[0] <= 40
+            and 1 <= inputs.shape[0] <= 64
             and inputs.shape[1] == 10240
             and inputs.is_cuda
             and inputs.dtype == torch.float16
@@ -3707,7 +3714,7 @@ def qwen4_exp_ple_short_conv_add_inplace(
             and conv_weights.shape == (10240, 4)
             and conv_weights.dtype == torch.float16
             and conv_weights.is_contiguous()
-            and conv_state.shape[1:] == (10240, 13)
+            and conv_state.shape[1:] == (10240, 8 + cap_qlen)
             and conv_state.dtype in (torch.float16, torch.float32)
             and all(
                 t.dtype == torch.int32 and t.is_cuda and t.is_contiguous()
@@ -3729,7 +3736,8 @@ def qwen4_exp_ple_short_conv_add_inplace(
                 meta.num_accepted_tokens,
             )
             logger.info_once(
-                "SM70 MTP4 PLE rollback/conv/SiLU/state/residual-add fusion enabled."
+                "SM70 MTP%d PLE rollback/conv/SiLU/state/residual-add fusion enabled.",
+                cap_qlen - 1,
             )
             return
     result = layer._short_conv(inputs)

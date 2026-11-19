@@ -2534,6 +2534,7 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                self._on_spec_decode_feedback(req_id, num_draft_tokens, num_accepted)
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -3300,6 +3301,15 @@ class Scheduler(SchedulerInterface):
             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
         )
         return spec_decoding_stats
+
+    def _on_spec_decode_feedback(
+        self,
+        req_id: str,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+    ) -> None:
+        """Hook for subclasses (e.g. AsyncScheduler adaptive MTP depth)."""
+        return None
 
     def shutdown(self) -> None:
         if self.kv_event_publisher:

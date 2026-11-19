@@ -201,7 +201,8 @@ class _GreedyDraftRejectionGraph:
         pools: tuple[Any, Any, Any],
     ) -> None:
         self.requests = batch.num_reqs
-        self.width = rejection.num_speculative_steps + 1
+        self.width = batch.num_tokens // self.requests
+        self.max_width = rejection.num_speculative_steps + 1
         self.top_k = top_k
         self.penalties = penalties
         self.pools = pools
@@ -226,8 +227,8 @@ class _GreedyDraftRejectionGraph:
         # Allocate branch flags outside the shared prefix graph pool so
         # multiple request-count graphs never alias conditional branch inputs.
         self.flags = torch.empty(rows, dtype=torch.bool, device=hidden.device)
-        self.output = self.inputs.new_empty(
-            (self.requests, self.width), dtype=torch.int64
+        self.output = self.inputs.new_zeros(
+            (self.requests, self.max_width), dtype=torch.int64
         )
         self.count = self.inputs.new_empty(self.requests, dtype=torch.int32)
         self.counters = self.inputs.new_zeros(2, dtype=torch.int64)
@@ -467,11 +468,14 @@ def try_graph_greedy_draft_rejection(
     pre_capture_only: bool = False,
 ) -> SamplerOutput | None:
     """Run compact/reference greedy-draft rejection on GPU with no host sync."""
-    width = rejection.num_speculative_steps + 1
+    max_width = rejection.num_speculative_steps + 1
     requests = getattr(batch, "num_reqs", 0)
+    if requests <= 0 or batch.num_tokens % requests != 0:
+        return None
+    width = batch.num_tokens // requests
     rows = requests * width
     if (
-        not 2 <= width <= 16
+        not 2 <= width <= min(16, max_width)
         or not 1 <= requests <= _MAX_GRAPH_REQUESTS
         or rows > 64
         or batch.num_tokens != rows

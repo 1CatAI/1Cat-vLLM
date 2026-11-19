@@ -25,6 +25,7 @@ def host_qsa_attention(
     gate=None,
     *,
     launch_rows=None,
+    lse=None,
 ):
     if query.dtype != torch.float16 or query.shape[2] != state.dim:
         raise ValueError("Direct host QSA requires FP16 queries matching D256")
@@ -33,7 +34,7 @@ def host_qsa_attention(
     from .device_kv_attention import device_history_attention
 
     if device_history_attention(
-        query, state, indices, table, requests, positions, lengths, out, gate
+        query, state, indices, table, requests, positions, lengths, out, gate, lse=lse
     ):
         return out
     resolved = state.resolve(indices, table, requests, positions, lengths)
@@ -48,12 +49,12 @@ def host_qsa_attention(
     tiles = triton.cdiv(indices.shape[1], block_n)
     splits = min(1 << (tiles.bit_length() - 1), target)
     if splits == 1:
-        partial, lse = out, out
+        partial, split_lse = out, out
     else:
         partial = torch.empty(
             (splits, *query.shape), dtype=torch.float32, device=query.device
         )
-        lse = torch.empty(
+        split_lse = torch.empty(
             (splits, *query.shape[:2]), dtype=torch.float32, device=query.device
         )
     gate = gate.view_as(query) if gate is not None else None
@@ -65,9 +66,9 @@ def host_qsa_attention(
         table,
         requests,
         partial,
-        lse,
+        split_lse,
         out,
-        None,
+        lse,
         gate,
         query.stride(0),
         query.stride(1),
@@ -111,9 +112,9 @@ def host_qsa_attention(
     if splits > 1:
         _qsa_merge_splitk_kernel[(query.shape[0], group)](
             partial,
-            lse,
+            split_lse,
             out,
-            None,
+            lse,
             gate,
             out.stride(0),
             out.stride(1),

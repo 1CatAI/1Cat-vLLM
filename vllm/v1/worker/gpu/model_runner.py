@@ -1829,6 +1829,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
         )
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
+        self._next_spec_steps = getattr(scheduler_output, "next_spec_steps", None)
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
@@ -1853,6 +1854,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
         mtp_profile_ctx = self._sm70_v2_mtp_profile_pending
         self._sm70_v2_mtp_profile_pending = None
+        next_spec_steps = getattr(self, "_next_spec_steps", None)
+        self._next_spec_steps = None
 
         if not self.is_last_pp_rank:
             assert self.pp_handler is not None
@@ -1981,6 +1984,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.num_computed_tokens.gpu,
                     self.model_state.ngram_eos_token_id,
                 )
+            propose_extra_kwargs: dict[str, Any] = {}
+            if next_spec_steps is not None and hasattr(
+                self.speculator, "multi_step_decode"
+            ):
+                propose_extra_kwargs["active_spec_steps"] = next_spec_steps
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -2012,6 +2020,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if requires_host_token_state
                     else None
                 ),
+                **propose_extra_kwargs,
             )
             self._step_profiler.finish_context(
                 mtp_profile_ctx, "draft_total", mtp_draft_start

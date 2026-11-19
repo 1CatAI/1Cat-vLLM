@@ -269,6 +269,8 @@ if TYPE_CHECKING:
     VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS: bool = False
+    VLLM_1CAT_ADAPTIVE_MTP: str = "auto"
+    VLLM_1CAT_ADAPTIVE_MTP_MIN_K: int = 2
     VLLM_SM70_QUANT_BACKEND: Literal["auto", "marlin", "turbomind"] = "auto"
     VLLM_SM70_AWQ_TURBOMIND: bool = True
     VLLM_SM70_GPTQ_TURBOMIND: bool = False
@@ -3633,6 +3635,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
         user_visible=False,
+    ),
+    "VLLM_1CAT_ADAPTIVE_MTP": env_var(
+        lambda: os.getenv("VLLM_1CAT_ADAPTIVE_MTP", "auto").strip().lower(),
+        description=(
+            "Async adaptive speculative depth (EntMTP) policy for MTP decode: "
+            "'auto' enables on SM70 when num_speculative_tokens >= 5, '1'/'on' "
+            "forces on for num_speculative_tokens >= 3, '0'/'off' disables."
+        ),
+        category="tuning",
+        declared_default="auto",
+        effective_default="auto",
+        automatic_conditions=(
+            "SM70 device with method='mtp' and num_speculative_tokens >= 5",
+        ),
+        acceleration_paths=("MTP verifier",),
+        user_visible=True,
+    ),
+    "VLLM_1CAT_ADAPTIVE_MTP_MIN_K": env_var(
+        lambda: int(os.getenv("VLLM_1CAT_ADAPTIVE_MTP_MIN_K", "2")),
+        description=(
+            "Minimum speculative draft depth k used by async adaptive MTP "
+            "(EntMTP) when shrinking depth on low-acceptance workloads."
+        ),
+        category="tuning",
+        declared_default="2",
+        effective_default="2",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
+        user_visible=True,
     ),
     "VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS": env_var(
         lambda: bool(int(os.getenv("VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS", "0"))),

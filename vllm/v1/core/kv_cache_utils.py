@@ -1914,6 +1914,11 @@ def _host_kv_state_blocks(vllm_config: VllmConfig) -> int:
     return int(getattr(policy, "qsa_host_kv_state_blocks", 0))
 
 
+def _host_kv_history_blocks(vllm_config: VllmConfig) -> int:
+    policy = cast(Any, getattr(vllm_config, "kernel_config", None))
+    return int(getattr(policy, "qsa_host_kv_history_blocks", 0))
+
+
 def _get_kv_cache_config_csa_linear(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1974,6 +1979,17 @@ def _get_kv_cache_config_csa_linear(
             * state_blocks
         )
         history_page = layout.device_compressed_page_bytes
+        target_history_blocks = _host_kv_history_blocks(vllm_config)
+        if target_history_blocks > history_blocks:
+            if history_page > 0 and available_memory > state_bytes:
+                max_fit = (
+                    available_memory - state_bytes
+                ) // history_page - state_blocks
+                history_blocks = max(
+                    history_blocks, min(target_history_blocks, max_fit)
+                )
+            elif history_page == 0:
+                history_blocks = target_history_blocks
         num_blocks = state_blocks + history_blocks
         required = state_bytes + history_page * num_blocks
         logger.info_once(

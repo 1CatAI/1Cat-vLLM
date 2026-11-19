@@ -384,12 +384,12 @@ def _use_grouped_mtp5(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
 
 
 def _use_grouped_batch(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
-    """Admit prepared SM70 grouped NVFP4 decode/verify across M=2..40 and TP shards."""
+    """Admit prepared SM70 grouped NVFP4 decode/verify across M=2..64 and TP shards."""
     return bool(
         getattr(layer, "sm70_nvfp4_grouped_batch", False)
         and _nvfp4_policy(layer).qpn_mtp5
         and x.ndim == 2
-        and 2 <= x.shape[0] <= 40
+        and 2 <= x.shape[0] <= 64
         and x.shape[1] == 2560
         and x.dtype == torch.float16
         and x.is_contiguous()
@@ -1238,13 +1238,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             # cache or additional activation buffer inside graph capture.
             device = layer.w13_tm_weight.device
             layer._nvfp4_grouped_rows = torch.empty(
-                400, 8, dtype=torch.int32, device=device
+                640, 8, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_experts = torch.empty(
-                400, dtype=torch.int32, device=device
+                640, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_sizes = torch.empty(
-                400, dtype=torch.int32, device=device
+                640, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_total = torch.empty(
                 1, dtype=torch.int32, device=device
@@ -1372,7 +1372,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                     if use_batch_reduce
                     else Stage.ACTIVE_GROUPED
                 ),
-                w13_split_k=4,
+                w13_split_k=8 if 6 <= num_tokens <= 8 else 4,
                 interleaved=interleaved_w13,
             )
             execute_fp4(layer.sm70_fp4_codec, plan, buffers, x, topk_ids, topk_weights)

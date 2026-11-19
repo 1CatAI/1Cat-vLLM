@@ -727,7 +727,7 @@ class Platform:
         if block_multiple is not None:
             kernel_block_alignment_size = lcm(
                 kernel_block_alignment_size,
-                kernel_block_alignment_size * block_multiple(vllm_config),
+                kernel_block_size * block_multiple(vllm_config),
             )
 
         if cache_config.mamba_cache_mode == "all":

@@ -9,7 +9,7 @@
 #include <torch/types.h>
 
 namespace {
-constexpr int kMaxTokens = 40;
+constexpr int kMaxTokens = 64;
 constexpr int kTopK = 10;
 constexpr int kMaxRoutes = kMaxTokens * kTopK;
 constexpr int kPack = 8;
@@ -25,24 +25,37 @@ __global__ void plan_kernel(const int32_t* ids, int32_t* rows, int32_t* experts,
   for (int e = t; e <= kExperts; e += blockDim.x) counts[e] = 0;
   if (t == 0) *total = 0;
   __syncthreads();
-  int expert = 0, ordinal = 0;
-  if (t < routes) {
-    expert = ids[t];
+  for (int r = t; r < routes; r += blockDim.x) {
+    int expert = ids[r];
     if (expert < 0 || expert >= kExperts) expert = kExperts;
-    ordinal = atomicAdd(counts + expert, 1);
+    atomicAdd(counts + expert, 1);
   }
   __syncthreads();
   for (int e = t; e <= kExperts; e += blockDim.x) {
     const int n_groups = (counts[e] + kPack - 1) / kPack;
     group_base[e] = n_groups > 0 ? atomicAdd(total, n_groups) : 0;
+    counts[e] = 0;
   }
   __syncthreads();
-  if (t < routes) {
+  for (int r = t; r < routes; r += blockDim.x) {
+    int expert = ids[r];
+    if (expert < 0 || expert >= kExperts) expert = kExperts;
+    const int ordinal = atomicAdd(counts + expert, 1);
     const int group = group_base[expert] + ordinal / kPack;
-    rows[group * kPack + ordinal % kPack] = t;
+    rows[group * kPack + ordinal % kPack] = r;
     if (ordinal % kPack == 0) {
       experts[group] = expert;
-      sizes[group] = min(kPack, counts[expert] - ordinal);
+    }
+  }
+  __syncthreads();
+  for (int e = t; e <= kExperts; e += blockDim.x) {
+    const int cnt = counts[e];
+    if (cnt > 0) {
+      const int base = group_base[e];
+      const int n_groups = (cnt + kPack - 1) / kPack;
+      for (int k = 0; k < n_groups; ++k) {
+        sizes[base + k] = min(kPack, cnt - k * kPack);
+      }
     }
   }
 }
@@ -563,6 +576,8 @@ void w2_dispatch(torch::Tensor out, torch::Tensor routed, torch::Tensor x,
       dispatch_inter(std::integral_constant<int, 160>{});
     } else if (tokens <= 20) {
       dispatch_inter(std::integral_constant<int, 200>{});
+    } else if (tokens <= 40) {
+      dispatch_inter(std::integral_constant<int, 400>{});
     } else {
       dispatch_inter(std::integral_constant<int, kMaxRoutes>{});
     }

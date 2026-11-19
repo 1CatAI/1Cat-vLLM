@@ -110,7 +110,7 @@ def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool
     admitted = (
         layer_policy().batch_fastpath and not reduced and 2 <= x.shape[0] <= 16
         if concurrent_batch
-        else layer_policy().hc_mtp_batch and reduced and x.shape[0] in (5, 10)
+        else layer_policy().hc_mtp_batch and reduced and 2 <= x.shape[0] <= 16
     )
 
     return bool(

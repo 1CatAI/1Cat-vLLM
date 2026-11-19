@@ -983,6 +983,11 @@ class QSAKeyStateCache(_QSAStateCache):
         # overwrite a committed key the next step needs to close the group.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
         capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
+        while (
+            capacity < self.cache_config.block_size
+            and self.cache_config.block_size % capacity != 0
+        ):
+            capacity += self.compress_ratio
         assert self.cache_config.block_size % capacity == 0, (
             f"QSA ring capacity {capacity} must divide the attention block "
             f"size {self.cache_config.block_size}"

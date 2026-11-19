@@ -14,7 +14,7 @@ __device__ half as_half(half x) { return x; }
 __device__ half as_half(float x) { return __float2half_rn(x); }
 __device__ void store_half(half* ptr, half x) { *ptr = x; }
 __device__ void store_half(float* ptr, half x) { *ptr = __half2float(x); }
-template <class State>
+template <class State, int QLen = 5>
 __global__ void ple_conv(const half* x, State* state, const half* weight,
                          const int* ids, const int* starts, const int* accepted,
                          half* out, int rows, int hidden, int64_t s0,
@@ -22,22 +22,23 @@ __global__ void ple_conv(const half* x, State* state, const half* weight,
   int c = blockIdx.x * 128 + threadIdx.x;
   if (c >= hidden) return;
   const int j = blockIdx.y, first = starts[j];
-  const int count = max(0, min(5, min(starts[j + 1] - first, rows - first)));
-  const int sid = ids[j], rollback = sid ? max(0, min(4, accepted[j] - 1)) : 0;
+  const int count = max(0, min(QLen, min(starts[j + 1] - first, rows - first)));
+  const int sid = ids[j],
+            rollback = sid ? max(0, min(QLen - 1, accepted[j] - 1)) : 0;
   x += static_cast<int64_t>(first) * hidden;
-  half h[14];
+  half h[9 + QLen];
 #pragma unroll
   for (int t = 0; t < 9; ++t)
     h[t] = sid ? as_half(state[sid * s0 + c * s1 + (rollback + t) * s2])
                : __float2half_rn(0.f);
 #pragma unroll
-  for (int t = 0; t < 5; ++t)
+  for (int t = 0; t < QLen; ++t)
     h[t + 9] = t < count ? x[t * hidden + c] : __float2half_rn(0.f);
   half w[4];
 #pragma unroll
   for (int k = 0; k < 4; ++k) w[k] = weight[c * 4 + k];
 #pragma unroll
-  for (int r = 0; r < 5; ++r) {
+  for (int r = 0; r < QLen; ++r) {
     float v = 0;
 #pragma unroll
     for (int k = 0; k < 4; ++k)
@@ -52,13 +53,13 @@ __global__ void ple_conv(const half* x, State* state, const half* weight,
       out[r * hidden + c] = __float2half_rn(0.f);
   if (sid) {
 #pragma unroll
-    for (int t = 0; t < 13; ++t)
+    for (int t = 0; t < 8 + QLen; ++t)
       if (t < 8 + count)
         store_half(state + sid * s0 + c * s1 + t * s2, h[t + 1]);
   }
 }
 
-template <class State>
+template <class State, int QLen = 5>
 __global__ void ple_conv_add(const half* x, State* state, const half* weight,
                              const int* ids, const int* starts,
                              const int* accepted, half* residual_inout,
@@ -68,8 +69,9 @@ __global__ void ple_conv_add(const half* x, State* state, const half* weight,
   if (c >= hidden) return;
   const int j = blockIdx.y, first = starts[j];
   const int next_first = starts[j + 1];
-  const int count = max(0, min(5, min(next_first - first, rows - first)));
-  const int sid = ids[j], rollback = sid ? max(0, min(4, accepted[j] - 1)) : 0;
+  const int count = max(0, min(QLen, min(next_first - first, rows - first)));
+  const int sid = ids[j],
+            rollback = sid ? max(0, min(QLen - 1, accepted[j] - 1)) : 0;
   if (j == 0) {
     for (int r = 0; r < min(first, rows); ++r) {
       residual_inout[r * hidden + c] =
@@ -77,19 +79,19 @@ __global__ void ple_conv_add(const half* x, State* state, const half* weight,
     }
   }
   x += static_cast<int64_t>(first) * hidden;
-  half h[14];
+  half h[9 + QLen];
 #pragma unroll
   for (int t = 0; t < 9; ++t)
     h[t] = sid ? as_half(state[sid * s0 + c * s1 + (rollback + t) * s2])
                : __float2half_rn(0.f);
 #pragma unroll
-  for (int t = 0; t < 5; ++t)
+  for (int t = 0; t < QLen; ++t)
     h[t + 9] = t < count ? x[t * hidden + c] : __float2half_rn(0.f);
   half w[4];
 #pragma unroll
   for (int k = 0; k < 4; ++k) w[k] = weight[c * 4 + k];
 #pragma unroll
-  for (int r = 0; r < 5; ++r) {
+  for (int r = 0; r < QLen; ++r) {
     float v = 0;
 #pragma unroll
     for (int k = 0; k < 4; ++k)
@@ -115,7 +117,7 @@ __global__ void ple_conv_add(const half* x, State* state, const half* weight,
   }
   if (sid) {
 #pragma unroll
-    for (int t = 0; t < 13; ++t)
+    for (int t = 0; t < 8 + QLen; ++t)
       if (t < 8 + count)
         store_half(state + sid * s0 + c * s1 + t * s2, h[t + 1]);
   }
@@ -598,54 +600,72 @@ void ple_spec_conv(torch::Tensor output, torch::Tensor state, torch::Tensor x,
                    torch::Tensor weight, torch::Tensor ids,
                    torch::Tensor starts, torch::Tensor accepted) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 10240 &&
-                  x.size(0) >= 1 && x.size(0) <= 40,
-              "SM70 PLE MTP4 requires M1..40 and H10240");
+                  x.size(0) >= 1 && x.size(0) <= 64,
+              "SM70 PLE spec requires M1..64 and H10240");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
   for (const auto& t : {output, state, x, weight, ids, starts, accepted})
     TORCH_CHECK(t.is_cuda() && t.device() == x.device(),
-                "PLE MTP4 tensors must share a CUDA device");
+                "PLE spec tensors must share a CUDA device");
   for (const auto& t : {output, x, weight})
     TORCH_CHECK(t.scalar_type() == at::kHalf && t.is_contiguous(),
-                "PLE MTP4 input, weight and output must be contiguous FP16");
+                "PLE spec input, weight and output must be contiguous FP16");
   for (const auto& t : {ids, starts, accepted})
     TORCH_CHECK(
         t.scalar_type() == at::kInt && t.dim() == 1 && t.is_contiguous(),
-        "PLE MTP4 metadata must be contiguous int32 vectors");
+        "PLE spec metadata must be contiguous int32 vectors");
   TORCH_CHECK(ids.numel() >= 1 && ids.numel() <= 8 &&
                   starts.numel() >= ids.numel() + 1 &&
                   accepted.numel() >= ids.numel(),
-              "PLE MTP4 fast path requires 1..8 speculative requests");
+              "PLE spec fast path requires 1..8 speculative requests");
+  const int64_t cap = state.dim() == 3 ? state.size(2) : 0;
+  const int64_t qlen = cap - 8;
   TORCH_CHECK(state.dim() == 3 && state.size(0) > 0 && state.size(1) == 10240 &&
-                  state.size(2) == 13 &&
+                  qlen >= 5 && qlen <= 8 &&
                   (state.scalar_type() == at::kHalf ||
                    state.scalar_type() == at::kFloat),
-              "PLE MTP4 requires FP16/FP32 [states,10240,13] cache");
-  TORCH_CHECK((state.stride(2) == 1 && state.stride(1) >= 13) ||
+              "PLE spec requires FP16/FP32 [states,10240,13..16] cache");
+  TORCH_CHECK((state.stride(2) == 1 && state.stride(1) >= cap) ||
                   (state.stride(1) == 1 && state.stride(2) >= 10240),
               "Unsupported PLE cache layout");
-  TORCH_CHECK(
-      state.stride(0) >= 10239 * state.stride(1) + 12 * state.stride(2) + 1,
-      "PLE cache rows must not overlap");
+  TORCH_CHECK(state.stride(0) >=
+                  10239 * state.stride(1) + (cap - 1) * state.stride(2) + 1,
+              "PLE cache rows must not overlap");
   TORCH_CHECK(weight.sizes() == at::IntArrayRef({10240, 4}) &&
                   output.sizes() == x.sizes(),
-              "Invalid PLE MTP4 weight/output geometry");
+              "Invalid PLE spec weight/output geometry");
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define LAUNCH(T)                                                            \
-  ple_conv<T><<<dim3(80, ids.numel()), 128, 0, stream>>>(                    \
+#define LAUNCH_Q(T, Q)                                                       \
+  ple_conv<T, Q><<<dim3(80, ids.numel()), 128, 0, stream>>>(                 \
       reinterpret_cast<const half*>(x.data_ptr()),                           \
       reinterpret_cast<T*>(state.data_ptr()),                                \
       reinterpret_cast<const half*>(weight.data_ptr()), ids.data_ptr<int>(), \
       starts.data_ptr<int>(), accepted.data_ptr<int>(),                      \
       reinterpret_cast<half*>(output.data_ptr()), x.size(0), 10240,          \
       state.stride(0), state.stride(1), state.stride(2))
+#define LAUNCH(T)     \
+  switch (qlen) {     \
+    case 5:           \
+      LAUNCH_Q(T, 5); \
+      break;          \
+    case 6:           \
+      LAUNCH_Q(T, 6); \
+      break;          \
+    case 7:           \
+      LAUNCH_Q(T, 7); \
+      break;          \
+    case 8:           \
+      LAUNCH_Q(T, 8); \
+      break;          \
+  }
   if (state.scalar_type() == at::kHalf) {
     LAUNCH(half);
   } else {
     LAUNCH(float);
   }
 #undef LAUNCH
+#undef LAUNCH_Q
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -653,55 +673,73 @@ void ple_spec_conv_add(torch::Tensor residual_inout, torch::Tensor state,
                        torch::Tensor x, torch::Tensor weight, torch::Tensor ids,
                        torch::Tensor starts, torch::Tensor accepted) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 10240 &&
-                  x.size(0) >= 1 && x.size(0) <= 40,
-              "SM70 PLE MTP4 add requires M1..40 and H10240");
+                  x.size(0) >= 1 && x.size(0) <= 64,
+              "SM70 PLE spec add requires M1..64 and H10240");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
   for (const auto& t :
        {residual_inout, state, x, weight, ids, starts, accepted})
     TORCH_CHECK(t.is_cuda() && t.device() == x.device(),
-                "PLE MTP4 add tensors must share a CUDA device");
+                "PLE spec add tensors must share a CUDA device");
   for (const auto& t : {residual_inout, x, weight})
     TORCH_CHECK(t.scalar_type() == at::kHalf && t.is_contiguous(),
-                "PLE MTP4 add input, weight and residual must be FP16");
+                "PLE spec add input, weight and residual must be FP16");
   for (const auto& t : {ids, starts, accepted})
     TORCH_CHECK(
         t.scalar_type() == at::kInt && t.dim() == 1 && t.is_contiguous(),
-        "PLE MTP4 add metadata must be contiguous int32 vectors");
+        "PLE spec add metadata must be contiguous int32 vectors");
   TORCH_CHECK(ids.numel() >= 1 && ids.numel() <= 8 &&
                   starts.numel() >= ids.numel() + 1 &&
                   accepted.numel() >= ids.numel(),
-              "PLE MTP4 add fast path requires 1..8 speculative requests");
+              "PLE spec add fast path requires 1..8 speculative requests");
+  const int64_t cap = state.dim() == 3 ? state.size(2) : 0;
+  const int64_t qlen = cap - 8;
   TORCH_CHECK(state.dim() == 3 && state.size(0) > 0 && state.size(1) == 10240 &&
-                  state.size(2) == 13 &&
+                  qlen >= 5 && qlen <= 8 &&
                   (state.scalar_type() == at::kHalf ||
                    state.scalar_type() == at::kFloat),
-              "PLE MTP4 add requires FP16/FP32 [states,10240,13] cache");
-  TORCH_CHECK((state.stride(2) == 1 && state.stride(1) >= 13) ||
+              "PLE spec add requires FP16/FP32 [states,10240,13..16] cache");
+  TORCH_CHECK((state.stride(2) == 1 && state.stride(1) >= cap) ||
                   (state.stride(1) == 1 && state.stride(2) >= 10240),
               "Unsupported PLE cache layout");
-  TORCH_CHECK(
-      state.stride(0) >= 10239 * state.stride(1) + 12 * state.stride(2) + 1,
-      "PLE cache rows must not overlap");
+  TORCH_CHECK(state.stride(0) >=
+                  10239 * state.stride(1) + (cap - 1) * state.stride(2) + 1,
+              "PLE cache rows must not overlap");
   TORCH_CHECK(weight.sizes() == at::IntArrayRef({10240, 4}) &&
                   residual_inout.sizes() == x.sizes(),
-              "Invalid PLE MTP4 add weight/residual geometry");
+              "Invalid PLE spec add weight/residual geometry");
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define LAUNCH_ADD(T)                                                        \
-  ple_conv_add<T><<<dim3(80, ids.numel()), 128, 0, stream>>>(                \
+#define LAUNCH_ADD_Q(T, Q)                                                   \
+  ple_conv_add<T, Q><<<dim3(80, ids.numel()), 128, 0, stream>>>(             \
       reinterpret_cast<const half*>(x.data_ptr()),                           \
       reinterpret_cast<T*>(state.data_ptr()),                                \
       reinterpret_cast<const half*>(weight.data_ptr()), ids.data_ptr<int>(), \
       starts.data_ptr<int>(), accepted.data_ptr<int>(),                      \
       reinterpret_cast<half*>(residual_inout.data_ptr()), x.size(0), 10240,  \
       state.stride(0), state.stride(1), state.stride(2))
+#define LAUNCH_ADD(T)     \
+  switch (qlen) {         \
+    case 5:               \
+      LAUNCH_ADD_Q(T, 5); \
+      break;              \
+    case 6:               \
+      LAUNCH_ADD_Q(T, 6); \
+      break;              \
+    case 7:               \
+      LAUNCH_ADD_Q(T, 7); \
+      break;              \
+    case 8:               \
+      LAUNCH_ADD_Q(T, 8); \
+      break;              \
+  }
   if (state.scalar_type() == at::kHalf) {
     LAUNCH_ADD(half);
   } else {
     LAUNCH_ADD(float);
   }
 #undef LAUNCH_ADD
+#undef LAUNCH_ADD_Q
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

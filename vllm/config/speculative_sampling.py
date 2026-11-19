@@ -73,10 +73,18 @@ class SpeculativeSamplingPolicy(ExecutionPolicy):
     router_batch: bool | None = None
     """Admit the retained MTP router batch projection."""
 
+    adaptive_mtp: str | None = None
+    """Async adaptive speculative depth (EntMTP) policy: auto, on/1, or off/0."""
+
+    adaptive_mtp_min_k: int | None = None
+    """Minimum speculative draft depth k used by async adaptive MTP."""
+
     aliases: ClassVar[dict[str, str]] = {
         "compact_aux_hidden": "VLLM_DFLASH_COMPACT_AUX_HIDDEN",
         "shared_batch": "VLLM_SM70_MTP_SHARED_BATCH",
         "router_batch": "VLLM_SM70_MTP_ROUTER_BATCH",
+        "adaptive_mtp": "VLLM_1CAT_ADAPTIVE_MTP",
+        "adaptive_mtp_min_k": "VLLM_1CAT_ADAPTIVE_MTP_MIN_K",
         "sync_accept_counts": "VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS",
         "token_matching": "VLLM_MTP_STOCHASTIC_TOKEN_MATCHING",
         "combine_bonus": "VLLM_SM70_REJECTION_COMBINE_BONUS",
@@ -146,6 +154,8 @@ class SpeculativeSamplingPolicy(ExecutionPolicy):
             "compact_aux_hidden",
             "shared_batch",
             "router_batch",
+            "adaptive_mtp",
+            "adaptive_mtp_min_k",
             "sync_accept_counts",
             "token_matching",
             "combine_bonus",
