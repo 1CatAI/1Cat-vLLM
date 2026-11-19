@@ -4,6 +4,7 @@
 import ast
 import json
 import math
+from collections.abc import Sequence
 from decimal import Decimal
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, TypeAlias
@@ -158,7 +159,7 @@ def _extract_tool_info(
 
 
 def find_tool_properties(
-    tools: list[Tool] | None,
+    tools: Sequence[Tool] | None,
     tool_name: str,
 ) -> dict[str, Any]:
     """Find a tool by name and return its properties dict, or {}."""
@@ -250,14 +251,14 @@ def get_json_schema_from_tools(
         tool_choice, ChatCompletionNamedToolChoiceParam
     ):
         tool_name = tool_choice.function.name
-        tool_map = {
+        chat_tool_map = {
             tool.function.name: tool
             for tool in tools
             if isinstance(tool, ChatCompletionToolsParam)
         }
-        if tool_name not in tool_map:
+        if tool_name not in chat_tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return _params_or_empty_object(tool_map[tool_name].function.parameters)
+        return _params_or_empty_object(chat_tool_map[tool_name].function.parameters)
     # tool_choice: "required"
     if tool_choice == "required":
         return _get_json_schema_from_tools(tools, parallel_tool_calls)

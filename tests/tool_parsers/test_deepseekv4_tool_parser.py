@@ -630,3 +630,61 @@ def test_foreign_wrapper_literal_in_argument_is_preserved(streaming, literal):
         assert result.tools_called
         arguments = result.tool_calls[0].function.arguments
     assert json.loads(arguments) == {"location": literal}
+
+
+FINISH_TOOL = ChatCompletionToolsParam(
+    function=FunctionDefinition(
+        name="edit",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "edits": {"type": "array"},
+                "opts": {"type": "object"},
+                "line": {"type": "integer"},
+            },
+        },
+    ),
+)
+
+
+def _param(name: str, value: str, string: str = "false") -> str:
+    return f'{PARAM_START}{name}" string="{string}">{value}{PARAM_END}'
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        # Object/array text that is not JSON: the batch path keeps it as a
+        # string, so it must not be streamed as raw text first.
+        [_param("edits", "['v8-motorprüfstand.html']")],
+        [_param("opts", '{"a": True}')],
+        [_param("opts", "{a: 1}")],
+        [_param("edits", "siehe oben")],
+        [_param("edits", "[1e999]")],
+        [_param("edits", "[1, 2,]")],
+        [_param("path", "x.html", "true"), _param("edits", "['a']")],
+        # A wrapper followed by another parameter is not unwrapped in batch.
+        [_param("arguments", '{"path": "a"}'), _param("line", "5")],
+        # Controls that already matched.
+        [_param("edits", '["v8-motorpr\\u00fcfstand.html"]')],
+        [_param("arguments", '{"path": "ä"}')],
+        [_param("path", "v8-motorprüfstand.html", "true"), _param("line", "5")],
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [1, 3, 7])
+def test_streamed_arguments_match_finish_time_arguments(params, chunk_size):
+    from vllm.entrypoints.openai.chat_completion.tool_stream import (
+        remaining_tool_args,
+    )
+
+    text = f'{TC_START}\n{INV_START}edit">\n' + "\n".join(params)
+    text += f"\n{INV_END}\n{TC_END}"
+    streamed = reconstruct_args(
+        stream(make_parser(tools=[FINISH_TOOL]), text, chunk_size=chunk_size)
+    )
+    batch = make_parser(tools=[FINISH_TOOL]).extract_tool_calls(text, make_request())
+    expected = batch.tool_calls[0].function.arguments
+
+    assert remaining_tool_args(expected, streamed) == ""
+    assert json.loads(streamed) == json.loads(expected)
