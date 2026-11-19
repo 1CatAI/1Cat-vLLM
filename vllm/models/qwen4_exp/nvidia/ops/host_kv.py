@@ -61,17 +61,21 @@ def _merge_windows(
     PartState,
     Out,
     Gate,
+    Lse,
     os0,
     os1,
     gs0,
     gs1,
+    ls0,
     H: tl.constexpr,
     D: tl.constexpr,
     FINAL: tl.constexpr,
     GATED: tl.constexpr,
+    OUT_FP32: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
 ):
     """Fold one window's normalized rows and (max, sum) into the running
-    rows; FINAL also writes the gated FP16 output like rows_fp8."""
+    rows; FINAL also writes the gated FP16 output (or FP32 + LSE for DCP)."""
     pid = tl.program_id(0)
     row, head = pid // H, pid % H
     m0 = tl.load(AccState + pid * 2)
@@ -87,21 +91,28 @@ def _merge_windows(
     b = tl.load(Part + pid * D + offs)
     value = tl.where(total > 0, (a * w0 + b * w1) / total, 0.0)
     if FINAL:
+        if WRITE_LSE:
+            lse_val = tl.where(total > 0, m + tl.log2(total), -float("inf"))
+            tl.store(Lse + row * ls0 + head, lse_val)
         if GATED:
             value = value.to(tl.float16).to(tl.float32)
             g = tl.load(Gate + row * gs0 + head * gs1 + offs).to(tl.float32)
             value = value / (1.0 + tl.exp2(-g * 1.4426950408889634))
-        tl.store(Out + row * os0 + head * os1 + offs, value.to(tl.float16))
+        tl.store(
+            Out + row * os0 + head * os1 + offs,
+            value if OUT_FP32 else value.to(tl.float16),
+        )
     else:
         tl.store(Acc + pid * D + offs, value)
         tl.store(AccState + pid * 2, m)
         tl.store(AccState + pid * 2 + 1, total)
 
 
-def merge_windows(acc, acc_state, part, part_state, out=None, gate=None):
+def merge_windows(acc, acc_state, part, part_state, out=None, gate=None, lse=None):
     rows, heads, dim = acc.shape
     final = out is not None
     gated = gate is not None
+    write_lse = final and lse is not None
     _merge_windows[(rows * heads,)](
         acc,
         acc_state,
@@ -109,14 +120,18 @@ def merge_windows(acc, acc_state, part, part_state, out=None, gate=None):
         part_state,
         out if final else acc,
         gate if gated else acc,
+        lse if write_lse else acc_state,
         out.stride(0) if final else 0,
         out.stride(1) if final else 0,
         gate.stride(0) if gated else 0,
         gate.stride(1) if gated else 0,
+        lse.stride(0) if write_lse else 0,
         H=heads,
         D=dim,
         FINAL=final,
         GATED=gated,
+        OUT_FP32=bool(final and out.dtype == torch.float32),
+        WRITE_LSE=write_lse,
         num_warps=2,
     )
 

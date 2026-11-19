@@ -337,18 +337,18 @@ def _router_batch_storage(weight: torch.Tensor, storage: str) -> torch.Tensor:
 
 
 def _verify_rows(rows: int) -> bool:
-    """MTP4 verification batches of one to eight requests (five rows each).
+    """Speculative verification batches up to 64 rows (MTP4..MTP7, c=1..8).
 
     The router and shared-expert batch kernels compute rows independently, so
     one launch covers every request with per-row results unchanged.
     """
-    return rows % 5 == 0 and 5 <= rows <= 40
+    return 2 <= rows <= 64
 
 
 def _batch_rows_ok(rows: int) -> bool:
     if torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction:
         return _verify_rows(rows)
-    return 2 <= rows <= 40
+    return 2 <= rows <= 64
 
 
 def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:

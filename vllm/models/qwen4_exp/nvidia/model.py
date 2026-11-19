@@ -556,9 +556,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
         mlp_out = (
             self.mlp.forward_partials(block_input)
             if (
-                hc_sequence_parallel
-                and isinstance(self.mlp, Qwen4ExpSparseMoeBlock)
+                isinstance(self.mlp, Qwen4ExpSparseMoeBlock)
                 and getattr(self.mlp_hyper_connection, "_partial_inputs", False)
+                and not getattr(
+                    getattr(self.mlp.experts, "runner", None),
+                    "_fused_output_is_reduced",
+                    False,
+                )
             )
             else self.mlp(block_input)
         )

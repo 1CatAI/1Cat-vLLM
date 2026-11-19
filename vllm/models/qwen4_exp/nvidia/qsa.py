@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 import torch
 from torch import nn
@@ -1142,6 +1142,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if self.host_kv_enabled:
             from .ops.host_kv import HostQSAKV
 
+            host_width = self.indexer.output_width
+            if getattr(self, "qsa_dcp_sharded", False):
+                from .ops.qsa_dcp import qsa_dcp_local_selection_width
+                from .ops.sm70_dcp2 import get_sm70_dcp2_runtime
+
+                host_width = qsa_dcp_local_selection_width(
+                    self.indexer.token_topk,
+                    self.indexer.compress_ratio,
+                    self.impl.dcp_world_size,
+                    self.cp_kv_cache_interleave_size,
+                    host_width,
+                )
+                self._sm70_dcp2_runtime = (
+                    get_sm70_dcp2_runtime(kv_cache.device)
+                    if self.impl.dcp_world_size == 2
+                    else None
+                )
+            else:
+                self._sm70_dcp2_runtime = None
+
             self.host_kv = HostQSAKV(
                 kv_cache.shape[0],
                 kv_cache.shape[2],
@@ -1150,7 +1170,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 hot_tokens=self.host_kv_hot_tokens,
                 rows=self.host_kv_staging_rows,
                 history=kv_cache,
-                width=self.indexer.output_width,
+                width=host_width,
                 device_reference=self.host_kv_device_reference,
                 direct_device=self.host_kv_direct_device,
                 is_speculative_draft=self.host_kv_is_draft,
@@ -1182,61 +1202,91 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         output,
         gate,
         workspace,
+        lse=None,
     ) -> None:
         from .ops.device_kv_attention import PREFILL_ROWS
         from .ops.host_kv import merge_windows
 
         state = self.host_kv
         rows = query.shape[0]
+        total_heads = query.shape[1]
         acc = torch.empty((rows, 6, 256), dtype=torch.float32, device=query.device)
         part = torch.empty_like(acc)
         acc_state = torch.empty((rows, 6, 2), dtype=torch.float32, device=query.device)
         part_state = torch.empty_like(acc_state)
         gate_rows = gate.view_as(query) if gate is not None else None
-        for number, plan in enumerate(windows):
-            history, scales, staged_table = state.stage_history(
-                table, lengths, self.host_kv_prefill_stage_tokens, plan
-            )
-            first = number == 0
-            if history.dtype in (torch.uint8, torch.int8):
-                torch.ops.vllm_sm70_qsa_device.run_rows_window(
-                    query,
-                    history,
-                    scales,
-                    indices,
-                    staged_table,
-                    requests,
-                    positions,
-                    lengths,
-                    acc if first else part,
-                    acc_state if first else part_state,
-                    12,
+        for h0 in range(0, total_heads, 6):
+            q_chunk = query[:, h0 : h0 + 6, :]
+            out_chunk = output[:, h0 : h0 + 6, :]
+            gate_chunk = gate_rows[:, h0 : h0 + 6, :] if gate_rows is not None else None
+            lse_chunk = lse[:, h0 : h0 + 6] if lse is not None else None
+            for number, plan in enumerate(windows):
+                history, scales, staged_table = state.stage_history(
+                    table, lengths, self.host_kv_prefill_stage_tokens, plan
                 )
-            else:
-                torch.ops.vllm_sm70_qsa_device.run_tiled_window(
-                    query,
-                    history,
-                    scales,
-                    indices,
-                    staged_table,
-                    requests,
-                    positions,
-                    lengths,
-                    *workspace,
-                    acc if first else part,
-                    acc_state if first else part_state,
-                    PREFILL_ROWS,
-                )
-            if not first:
-                last = number == len(windows) - 1
-                merge_windows(
-                    acc,
-                    acc_state,
-                    part,
-                    part_state,
-                    output if last else None,
-                    gate_rows if last else None,
-                )
+                first = number == 0
+                if history.dtype in (torch.uint8, torch.int8):
+                    torch.ops.vllm_sm70_qsa_device.run_rows_window(
+                        q_chunk,
+                        history,
+                        scales,
+                        indices,
+                        staged_table,
+                        requests,
+                        positions,
+                        lengths,
+                        acc if first else part,
+                        acc_state if first else part_state,
+                        12,
+                    )
+                else:
+                    torch.ops.vllm_sm70_qsa_device.run_tiled_window(
+                        q_chunk,
+                        history,
+                        scales,
+                        indices,
+                        staged_table,
+                        requests,
+                        positions,
+                        lengths,
+                        *workspace,
+                        acc if first else part,
+                        acc_state if first else part_state,
+                        PREFILL_ROWS,
+                    )
+                if not first:
+                    last = number == len(windows) - 1
+                    merge_windows(
+                        acc,
+                        acc_state,
+                        part,
+                        part_state,
+                        out_chunk if last else None,
+                        gate_chunk if last else None,
+                        lse_chunk if last else None,
+                    )
+
+    @staticmethod
+    def _dcp_local_positions_and_lengths(
+        positions: torch.Tensor,
+        lengths: torch.Tensor,
+        dcp_world_size: int,
+        dcp_rank: int,
+        interleave: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cycle = dcp_world_size * interleave
+        rank_off = dcp_rank * interleave
+        len_clamped = lengths.clamp(min=0)
+        local_lengths = (len_clamped // cycle) * interleave + (
+            (len_clamped % cycle) - rank_off
+        ).clamp(min=0, max=interleave)
+        pos_plus_1 = (positions + 1).clamp(min=0)
+        local_positions = (
+            (pos_plus_1 // cycle) * interleave
+            + ((pos_plus_1 % cycle) - rank_off).clamp(min=0, max=interleave)
+            - 1
+        )
+        return local_positions.to(positions.dtype), local_lengths.to(lengths.dtype)
 
     def host_kv_forward(
         self,
@@ -1250,6 +1300,134 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         gate,
         metadata=None,
     ) -> None:
+        if getattr(self, "qsa_dcp_sharded", False):
+            from vllm.distributed import get_dcp_group
+
+            from .ops.qsa import _qsa_output_gate
+            from .ops.qsa_dcp import qsa_localize_dcp_indices
+
+            if gate is None:
+                raise RuntimeError("Host QSA DCP requires its output gate")
+            local_indices_buffer = self.dcp_local_indices_buffer
+            partial_output_buffer = self.dcp_partial_output_buffer
+            partial_lse_buffer = self.dcp_partial_lse_buffer
+            if (
+                local_indices_buffer is None
+                or partial_output_buffer is None
+                or partial_lse_buffer is None
+            ):
+                raise RuntimeError("Host QSA DCP workspaces are not initialized")
+            dcp_world_size = self.impl.dcp_world_size
+            dcp_rank = self.impl.dcp_rank
+            local_indices = qsa_localize_dcp_indices(
+                indices,
+                local_indices_buffer[: query.shape[0]],
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+                interleave_size=self.cp_kv_cache_interleave_size,
+                local_block_size=self.host_kv.page_size,
+            )[:, : self.host_kv.width]
+            dcp2_rt = getattr(self, "_sm70_dcp2_runtime", None)
+            if (
+                dcp2_rt is not None
+                and dcp2_rt.enabled
+                and dcp_world_size == 2
+                and query.dtype == torch.float16
+                and 0 < query.shape[0] <= 64
+                and query.shape[1] == 6
+                and query.shape[2] == 256
+                and query.stride(2) == 1
+                and positions.dtype == torch.int64
+                and lengths.dtype == torch.int32
+                and 0 < lengths.shape[0] <= 128
+            ):
+                gathered_query, local_positions, local_lengths = dcp2_rt.q_prep(
+                    query,
+                    positions,
+                    lengths,
+                    self.cp_kv_cache_interleave_size,
+                )
+                partial_output = partial_output_buffer[: query.shape[0]]
+                partial_lse = partial_lse_buffer[: query.shape[0]]
+                self._host_kv_forward_local(
+                    gathered_query,
+                    local_indices,
+                    table,
+                    requests,
+                    local_positions,
+                    local_lengths,
+                    partial_output,
+                    None,
+                    metadata=metadata,
+                    lse=partial_lse,
+                )
+                dcp2_rt.combine_gate(
+                    partial_output,
+                    partial_lse,
+                    gate.view_as(output),
+                    output,
+                )
+                return
+            local_positions, local_lengths = self._dcp_local_positions_and_lengths(
+                positions,
+                lengths,
+                dcp_world_size,
+                dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+            group = get_dcp_group()
+            gathered_query = group.all_gather(query.contiguous(), dim=1)
+            partial_output = partial_output_buffer[: query.shape[0]]
+            partial_lse = partial_lse_buffer[: query.shape[0]]
+            self._host_kv_forward_local(
+                gathered_query,
+                local_indices,
+                table,
+                requests,
+                local_positions,
+                local_lengths,
+                partial_output,
+                None,
+                metadata=metadata,
+                lse=partial_lse,
+            )
+            merged = cast(
+                torch.Tensor,
+                cast(Any, self.impl).dcp_combine(
+                    partial_output,
+                    partial_lse,
+                    group,
+                    is_lse_base_on_e=False,
+                ),
+            )
+            output.copy_(merged)
+            _qsa_output_gate(output, gate.view_as(output))
+            return
+        self._host_kv_forward_local(
+            query,
+            indices,
+            table,
+            requests,
+            positions,
+            lengths,
+            output,
+            gate,
+            metadata=metadata,
+        )
+
+    def _host_kv_forward_local(
+        self,
+        query,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        output,
+        gate,
+        metadata=None,
+        lse=None,
+    ) -> None:
         from .ops.host_kv_attention import host_qsa_attention
 
         state = self.host_kv
@@ -1257,7 +1435,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if (
             self.host_kv_prefill_stage_tokens
             and query.shape[0] > max(state.resolve_rows, self.host_kv_decode_rows)
-            and query.shape[1:] == (6, 256)
+            and query.shape[1] > 0
+            and query.shape[1] % 6 == 0
+            and query.shape[2] == 256
             and indices.shape[1] <= state.width
         ):
             from .ops.device_kv_attention import (
@@ -1381,6 +1561,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                         output,
                         gate_rows,
                         12,
+                        lse,
                     )
                 else:
                     torch.ops.vllm_sm70_qsa_device.run_tiled(
@@ -1396,6 +1577,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                         gate_rows,
                         *workspace,
                         PREFILL_ROWS,
+                        1,
+                        lse,
                     )
                 if order >= 0:
                     _prefetch_next_prefix(
@@ -1449,6 +1632,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                         output,
                         gate,
                         workspace,
+                        lse=lse,
                     )
                     logger.info_once(
                         "QSA prefill stages host history in %d windows.",
@@ -1476,6 +1660,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     lengths,
                     output[start:stop],
                     gate[start:stop] if gate is not None else None,
+                    lse=lse[start:stop] if lse is not None else None,
                 )
             return
         # Preserve the default 32-row grouping and its arithmetic while
@@ -1495,6 +1680,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     output[start:stop],
                     gate[start:stop] if gate is not None else None,
                     launch_rows=end - base,
+                    lse=lse[start:stop] if lse is not None else None,
                 )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:

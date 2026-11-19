@@ -89,7 +89,11 @@ def _shared_replica_host_pool(pool_size: int, device: torch.device):
         return None
     parallel = config.parallel_config
     tp = parallel.tensor_parallel_size
-    if parallel.pipeline_parallel_size != 1 or parallel.data_parallel_size != 1:
+    if (
+        parallel.pipeline_parallel_size != 1
+        or parallel.data_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+    ):
         return None
     try:
         kv_heads = config.model_config.get_total_num_kv_heads()

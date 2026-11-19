@@ -573,10 +573,19 @@ class EagleSpeculator(TargetSamplingHooks):
         skip_attn: bool,
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
+        active_spec_steps: int | None = None,
     ) -> None:
+        steps = (
+            self.num_speculative_steps
+            if active_spec_steps is None
+            else max(1, min(int(active_spec_steps), self.num_speculative_steps))
+        )
+        if steps <= 1:
+            return
         multistep = getattr(self, "multistep_cudagraph_manager", None)
         if (
-            multistep is not None
+            steps == self.num_speculative_steps
+            and multistep is not None
             and self.vllm_config.kernel_config.capture_all_draft_steps
             and batch_desc.cg_mode == CUDAGraphMode.FULL
             and batch_desc in multistep.graphs
@@ -588,7 +597,7 @@ class EagleSpeculator(TargetSamplingHooks):
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
 
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, steps):
             attn_metadata = None
             slot_mappings_by_layer = None
             if not skip_attn:
@@ -857,6 +866,7 @@ class EagleSpeculator(TargetSamplingHooks):
         sampled_token_ids_cpu: np.ndarray | None = None,
         num_sampled_tokens_cpu: np.ndarray | None = None,
         all_token_ids_cpu: np.ndarray | None = None,
+        active_spec_steps: int | None = None,
     ) -> torch.Tensor:
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
@@ -977,7 +987,7 @@ class EagleSpeculator(TargetSamplingHooks):
             need_eager=is_profile,
         )
 
-        # Generate the remaining num_speculative_steps - 1 draft tokens.
+        # Generate the remaining draft tokens (trimmed by active_spec_steps if set).
         self._mtp_decode_begin()
         try:
             self.multi_step_decode(
@@ -985,6 +995,7 @@ class EagleSpeculator(TargetSamplingHooks):
                 dummy_run and skip_attn_for_dummy_run,
                 decode_batch_desc,
                 num_tokens_across_dp,
+                active_spec_steps=active_spec_steps,
             )
         finally:
             self._mtp_decode_end()

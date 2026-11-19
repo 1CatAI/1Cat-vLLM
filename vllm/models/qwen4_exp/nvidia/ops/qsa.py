@@ -1844,16 +1844,23 @@ def qsa_select_paged_tokens(
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
-        if contiguous_keys is not None and key_valid is not None:
-            assert all_visible is not None
-            logits, visible_blocks = _qsa_mqa_cublas(
-                q[row_slice],
-                contiguous_keys,
-                key_valid,
-                all_visible[row_slice],
-            )
-        else:
-            logits, visible_blocks = qsa_mqa_paged(
+        blocks = (
+            blocks_buffer[row_slice]
+            if tp_step
+            else blocks_buffer[: row_end - row_start]
+        )
+        fused_done = False
+        if (
+            contiguous_keys is None
+            and exact_topk
+            and block_topk == 512
+            and shared_key_scoring
+            and 0 < score_columns <= capacity_columns
+            and row_end > row_start
+        ):
+            from .qsa_shared_key import maybe_shared_key_topk
+
+            fused_done = maybe_shared_key_topk(
                 q[row_slice],
                 k_cache,
                 page_table,
@@ -1861,58 +1868,79 @@ def qsa_select_paged_tokens(
                 query_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
-                num_columns=score_columns,
-                shared_key_scoring=shared_key_scoring,
-            )
-        blocks = (
-            blocks_buffer[row_slice]
-            if tp_step
-            else blocks_buffer[: row_end - row_start]
-        )
-        use_cooperative_topk = (
-            blocks.shape[0] <= 32
-            and logits.stride(0) % 4 == 0
-            and current_platform.has_device_capability(90)
-            and not current_platform.is_device_capability_family(120)
-        )
-        if exact_topk:
-            logger.info_once(
-                "Using exact SM70 QSA lexicographic top-k "
-                "(score descending, block index ascending)."
-            )
-            if (
-                sparse_policy().qsa_decode_partition_topk
-                and q.shape[0] in (5, 10)
-                and page_table.shape[0] == 1
-                and score_columns >= 32768
-            ):
-                from .qsa_partition_topk import qsa_partition_topk
-
-                qsa_partition_topk(logits, visible_blocks, blocks)
-                logger.info_once("Using exact SM70 QSA partitioned decode Top-K.")
-            elif sparse_policy().value("qsa_mtp_topk") and 2 <= blocks.shape[0] <= 64:
-                torch.ops._C.qsa_lexicographic_topk(
-                    logits, visible_blocks, blocks, block_topk, True
-                )
-                logger.info_once("Using exact SM70 MTP batch QSA selector.")
-            else:
-                _sm70_qsa_lexicographic_topk_op()(
-                    logits, visible_blocks, blocks, block_topk
-                )
-        else:
-            topk_op = (
-                torch.ops._C.cooperative_topk
-                if use_cooperative_topk
-                else torch.ops._C.persistent_topk
-            )
-            topk_op(
-                logits,
-                visible_blocks,
-                blocks,
-                topk_workspace,
-                block_topk,
                 score_columns,
+                math.sqrt(q.shape[2]),
+                blocks,
             )
+        if not fused_done:
+            if contiguous_keys is not None and key_valid is not None:
+                assert all_visible is not None
+                logits, visible_blocks = _qsa_mqa_cublas(
+                    q[row_slice],
+                    contiguous_keys,
+                    key_valid,
+                    all_visible[row_slice],
+                )
+            else:
+                logits, visible_blocks = qsa_mqa_paged(
+                    q[row_slice],
+                    k_cache,
+                    page_table,
+                    token_to_req[row_slice],
+                    query_positions[row_slice],
+                    sequence_lengths,
+                    compress_ratio,
+                    num_columns=score_columns,
+                    shared_key_scoring=shared_key_scoring,
+                )
+            use_cooperative_topk = (
+                blocks.shape[0] <= 32
+                and logits.stride(0) % 4 == 0
+                and current_platform.has_device_capability(90)
+                and not current_platform.is_device_capability_family(120)
+            )
+            if exact_topk:
+                logger.info_once(
+                    "Using exact SM70 QSA lexicographic top-k "
+                    "(score descending, block index ascending)."
+                )
+                if (
+                    sparse_policy().qsa_decode_partition_topk
+                    and q.shape[0] in (5, 10)
+                    and page_table.shape[0] == 1
+                    and score_columns >= 32768
+                ):
+                    from .qsa_partition_topk import qsa_partition_topk
+
+                    qsa_partition_topk(logits, visible_blocks, blocks)
+                    logger.info_once("Using exact SM70 QSA partitioned decode Top-K.")
+                elif (
+                    sparse_policy().value("qsa_mtp_topk") and 2 <= blocks.shape[0] <= 64
+                ):
+                    torch.ops._C.qsa_lexicographic_topk(
+                        logits, visible_blocks, blocks, block_topk, True
+                    )
+                    logger.info_once("Using exact SM70 MTP batch QSA selector.")
+                else:
+                    _sm70_qsa_lexicographic_topk_op()(
+                        logits, visible_blocks, blocks, block_topk
+                    )
+            else:
+                topk_op = (
+                    torch.ops._C.cooperative_topk
+                    if use_cooperative_topk
+                    else torch.ops._C.persistent_topk
+                )
+                topk_op(
+                    logits,
+                    visible_blocks,
+                    blocks,
+                    topk_workspace,
+                    block_topk,
+                    score_columns,
+                )
+            # Each rank has consumed this tile, including in the TP row partition.
+            del logits, visible_blocks
         if not tp_step:
             expand_qsa_block_indices_cuda(
                 blocks,
@@ -1923,8 +1951,6 @@ def qsa_select_paged_tokens(
                 token_topk,
                 out[row_slice],
             )
-        # Each rank has consumed this tile, including in the TP row partition.
-        del logits, visible_blocks
     if tp_step:
         # Gather the compressed block IDs, not the four-times wider expanded
         # token matrix. Padding is confined to the last rank and discarded.

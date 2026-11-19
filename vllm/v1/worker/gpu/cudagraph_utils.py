@@ -19,6 +19,7 @@ from vllm.compilation.sm70_decode_graph import (
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.execution_policy import graph_policy
+from vllm.config.kernel import is_adaptive_mtp_enabled
 from vllm.config.speculative import (
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
@@ -252,6 +253,23 @@ class CudaGraphManager:
                 self.decode_query_lens,
             )
 
+        self._adaptive_mtp_tail_graphs = bool(
+            speculative_config is not None
+            and decode_query_len >= 4
+            and is_adaptive_mtp_enabled(speculative_config, decode_query_len - 1)
+            and not self.compilation_config.pass_config.enable_sp
+        )
+        if self._adaptive_mtp_tail_graphs:
+            self.decode_query_lens = tuple(
+                dict.fromkeys(
+                    (*self.decode_query_lens, *range(decode_query_len - 1, 2, -1))
+                )
+            )
+            logger.info_once(
+                "Capturing adaptive MTP single-request query lengths %s.",
+                self.decode_query_lens,
+            )
+
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.is_first_pp_rank = get_pp_group().is_first_rank
@@ -269,6 +287,11 @@ class CudaGraphManager:
                 vllm_config,
                 decode_query_len,
             )
+            if self._adaptive_mtp_tail_graphs and len(self.decode_query_lens) > 1:
+                for query_len in self.decode_query_lens:
+                    if query_len not in self._capture_sizes:
+                        self._capture_sizes.append(query_len)
+                self._capture_sizes.sort()
             logger.info_once(
                 "Using split SM70 MTP CUDA graph manager shapes: "
                 "decode_query_len=%d capture_sizes=%s shared_verifier_shapes=%s.",
@@ -320,7 +343,10 @@ class CudaGraphManager:
                         and num_tokens % query_len == 0
                     ):
                         if (
-                            self._sm70_dflash2_tail_graphs
+                            (
+                                self._sm70_dflash2_tail_graphs
+                                or self._adaptive_mtp_tail_graphs
+                            )
                             and query_len < self.decode_query_len
                             and num_tokens != query_len
                         ):

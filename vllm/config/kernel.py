@@ -1103,6 +1103,14 @@ class KernelConfig:
     Zero retains the shared capacity. A nonzero pool retains active states and
     bounded prefix checkpoints while history IDs use a separate range.
     """
+    qsa_host_kv_history_blocks: int = Field(default=0, ge=0)
+    """Target history-block capacity when qsa_host_kv_state_blocks is nonzero.
+
+    Zero retains the single-window default. A positive value expands the
+    decoupled history pool up to this block count (capped by available GPU
+    memory), multiplying total KV token capacity without inflating device
+    recurrent-state storage.
+    """
     qsa_host_kv_active: bool = Field(default=False, init=False)
     """Whether the host QSA cache geometry has been admitted."""
     qsa_host_kv_reason: str | None = Field(default=None, init=False)
@@ -1635,3 +1643,56 @@ def capture_sm70_fp8_linear_config() -> Sm70Fp8Config:
     policy = engine.kernel_config.sm70_fp8 if engine else Sm70Fp8Config()
     policy.resolve()
     return policy
+
+
+def is_adaptive_mtp_enabled(
+    speculative_config: Any,
+    num_spec_tokens: int,
+) -> bool:
+    """Return whether async adaptive MTP depth (EntMTP) is enabled."""
+    if (
+        speculative_config is None
+        or getattr(speculative_config, "method", None) != "mtp"
+        or num_spec_tokens < 3
+    ):
+        return False
+    from vllm.config.speculative_sampling import resolve_sampling_policy
+
+    policy = resolve_sampling_policy(speculative_config)
+    raw = (
+        str(policy.adaptive_mtp if policy.adaptive_mtp is not None else "auto")
+        .strip()
+        .lower()
+    )
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw == "auto":
+        from vllm.platforms import current_platform
+
+        return bool(
+            num_spec_tokens >= 5
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+        )
+    return False
+
+
+def adaptive_mtp_min_k(
+    num_spec_tokens: int,
+    speculative_config: Any = None,
+) -> int:
+    """Return the minimum adaptive MTP draft depth clamped to [2, k_max]."""
+    from vllm.config.speculative_sampling import resolve_sampling_policy
+
+    policy = resolve_sampling_policy(speculative_config)
+    try:
+        val = (
+            int(policy.adaptive_mtp_min_k)
+            if policy.adaptive_mtp_min_k is not None
+            else 2
+        )
+    except (TypeError, ValueError):
+        val = 2
+    return max(2, min(val, num_spec_tokens))

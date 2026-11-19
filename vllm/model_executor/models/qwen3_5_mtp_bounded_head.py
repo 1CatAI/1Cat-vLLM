@@ -443,21 +443,24 @@ def _proposal(
         valid_vocab = vocab
     assert 32 <= vocab <= 2147483647
     coarse = torch.empty(rows, vocab, device=x.device, dtype=torch.float16)
-    prefetch = vocab < 65536 and rows <= (8 if x.size(1) == 2560 else 16)
-    split_k = 8 if (x.size(1) == 2560 and rows <= 16) else 16
-    nacc = 1 if (vocab >= 65536 and rows <= 16) else 2
-    call_native(
-        sm70_ops.fp8_qpn8_gemm_sm70_out,
-        native_policy,
-        coarse,
-        x,
-        codes,
-        scales,
-        split_k,
-        nacc,
-        True,
-        prefetch,
-    )
+    for start in range(0, rows, 40):
+        stop = min(start + 40, rows)
+        chunk_rows = stop - start
+        prefetch = vocab < 65536 and chunk_rows <= (8 if x.size(1) == 2560 else 16)
+        split_k = 8 if (x.size(1) == 2560 and chunk_rows <= 16) else 16
+        nacc = 1 if (vocab >= 65536 and chunk_rows <= 16) else 2
+        call_native(
+            sm70_ops.fp8_qpn8_gemm_sm70_out,
+            native_policy,
+            coarse[start:stop],
+            x[start:stop],
+            codes,
+            scales,
+            split_k,
+            nacc,
+            True,
+            prefetch,
+        )
     norms = torch.empty(rows, 2, device=x.device, dtype=torch.float32)
     norm_block = max(1024, triton.next_power_of_2(x.size(1)))
     _input_norms[(rows,)](
