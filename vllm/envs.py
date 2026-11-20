@@ -637,6 +637,8 @@ if TYPE_CHECKING:
     VLLM_V41_SKIP_RENORM: str = "1"
     VLLM_V41_SKIP_SUBST: str = "1"
     VLLM_V41_STAGE_RING: str = "1"
+    VLLM_V41_PREFILL_PAIR_RELAY: str = "0"
+    VLLM_V41_PREFILL_PAIR_RELAY_VERIFY: str = "0"
     VLLM_V41_STAGE_SLOTS: str = "128"
     VLLM_V41_STASH_IN_PUBLISH: str = "1"
     VLLM_V41_SWAP_CTAS: str = "1024"
@@ -9353,6 +9355,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="'1'",
         effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_PAIR_RELAY": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_PAIR_RELAY", "0"),
+        description=(
+            "DS-V4.1 TP4 row-split prefill: publish the FP16 activation to three ranks"
+            " and copy the fourth slice from the NVLink partner (ranks 0-1, 2-3)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_PAIR_RELAY_VERIFY": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_PAIR_RELAY_VERIFY", "0"),
+        description=(
+            "Diagnostic for VLLM_V41_PREFILL_PAIR_RELAY: also write the original four"
+            " stores to shadow banks and count differing FP16 words per layer."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -22021,6 +22049,8 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_SKIP_RENORM",
         "VLLM_V41_SKIP_SUBST",
         "VLLM_V41_STAGE_RING",
+        "VLLM_V41_PREFILL_PAIR_RELAY",
+        "VLLM_V41_PREFILL_PAIR_RELAY_VERIFY",
         "VLLM_V41_STAGE_SLOTS",
         "VLLM_V41_STASH_IN_PUBLISH",
         "VLLM_V41_SWAP_CTAS",
