@@ -80,6 +80,8 @@ class DeepSeekV32ToolParser(ToolParser):
         self._active_param_string_attr: str | None = None
         self._active_param_mode: str | None = None
         self._active_param_parts: list[str] = []
+        # (name, raw value, string attr) of a wrapper param not yet sent.
+        self._pending_wrapper_param: tuple[str, str, str] | None = None
         self._args_started: list[bool] = []
 
         # Regex patterns for complete parsing
@@ -174,7 +176,7 @@ class DeepSeekV32ToolParser(ToolParser):
                 return inner
         return param_dict
 
-    def _convert_params_with_schema(
+    def _coerce_params(
         self,
         function_name: str,
         param_dict: dict[str, tuple[str, str]],
@@ -190,7 +192,18 @@ class DeepSeekV32ToolParser(ToolParser):
 
             param_types = extract_types_from_schema(param_config.get(name, {}))
             converted[name] = coerce_to_schema_type(value, param_types)
-        return self._repair_param_dict(converted, param_config)
+        return converted
+
+    def _convert_params_with_schema(
+        self,
+        function_name: str,
+        param_dict: dict[str, tuple[str, str]],
+    ) -> dict[str, Any]:
+        """Coerce all params of an invoke, then unwrap a lone wrapper."""
+        return self._repair_param_dict(
+            self._coerce_params(function_name, param_dict),
+            find_tool_properties(self.tools, function_name),
+        )
 
     def _get_param_config(self, function_name: str | None) -> dict[str, Any]:
         if not function_name or not self.tools:
@@ -304,6 +317,7 @@ class DeepSeekV32ToolParser(ToolParser):
         self._active_param_string_attr = None
         self._active_param_mode = None
         self._active_param_parts.clear()
+        self._pending_wrapper_param = None
         self.prev_tool_call_arr.clear()
         self.streamed_args_for_tool.clear()
         self._args_started.clear()
@@ -392,18 +406,6 @@ class DeepSeekV32ToolParser(ToolParser):
             arguments=json.dumps(value, ensure_ascii=False),
         )
 
-    def _param_types_for_name(self, name: str) -> list[str]:
-        param_config = self._get_param_config(self._active_tool_name)
-        if name in param_config and isinstance(param_config[name], dict):
-            return extract_types_from_schema(param_config[name])
-        return ["string"]
-
-    @staticmethod
-    def _can_stream_raw_param(param_types: list[str]) -> bool:
-        # Scalars and unions need the complete value so streaming and
-        # non-streaming share the same coercion fallback behavior.
-        return set(param_types).issubset({"object", "array"})
-
     def _should_buffer_wrapper_param(self, name: str) -> bool:
         if (
             self._active_tool_index is None
@@ -422,13 +424,48 @@ class DeepSeekV32ToolParser(ToolParser):
     ) -> None:
         assert self._active_param_name is not None
         assert self._active_param_string_attr is not None
-        raw_value = "".join(self._active_param_parts)
-        converted = self._convert_params_with_schema(
-            self._active_tool_name or "",
-            {self._active_param_name: (raw_value, self._active_param_string_attr)},
+        param = (
+            self._active_param_name,
+            "".join(self._active_param_parts),
+            self._active_param_string_attr,
+        )
+        if self._active_param_mode == "wrapper":
+            # The batch path unwraps the wrapper only when it is the sole
+            # parameter, which is known at the next parameter or invoke end.
+            self._pending_wrapper_param = param
+            return
+        self._emit_params(tool_call_deltas, index, param, unwrap=False)
+
+    def _emit_params(
+        self,
+        tool_call_deltas: dict[int, DeltaToolCall],
+        index: int,
+        param: tuple[str, str, str],
+        *,
+        unwrap: bool,
+    ) -> None:
+        # Complete values only, converted as in the batch path, so the
+        # finish-time arguments always extend what was streamed.
+        name, raw_value, string_attr = param
+        convert = self._convert_params_with_schema if unwrap else self._coerce_params
+        converted = convert(
+            self._active_tool_name or "", {name: (raw_value, string_attr)}
         )
         for key, value in converted.items():
             self._append_json_param_value(tool_call_deltas, index, key, value)
+
+    def _flush_pending_wrapper_param(
+        self,
+        tool_call_deltas: dict[int, DeltaToolCall],
+        index: int,
+        *,
+        unwrap: bool,
+    ) -> None:
+        if self._pending_wrapper_param is None:
+            return
+        param = self._pending_wrapper_param
+        self._pending_wrapper_param = None
+        self._emit_params(tool_call_deltas, index, param, unwrap=unwrap)
 
     def _finish_streaming_param(
         self,
@@ -436,14 +473,12 @@ class DeepSeekV32ToolParser(ToolParser):
         index: int,
         raw_content: str,
     ) -> None:
-        if self._active_param_mode in ("wrapper", "buffered"):
-            self._active_param_parts.append(raw_content)
-            self._finish_buffered_param(tool_call_deltas, index)
-        elif self._active_param_mode == "string":
+        if self._active_param_mode == "string":
             arguments = self._json_escape_string_content(raw_content) + '"'
             self._add_tool_call_delta(tool_call_deltas, index, arguments=arguments)
         else:
-            self._add_tool_call_delta(tool_call_deltas, index, arguments=raw_content)
+            self._active_param_parts.append(raw_content)
+            self._finish_buffered_param(tool_call_deltas, index)
 
         self._active_param_name = None
         self._active_param_string_attr = None
@@ -603,18 +638,14 @@ class DeepSeekV32ToolParser(ToolParser):
                 if safe_len > 0:
                     raw_content = self._buffer[:safe_len]
                     self._buffer = self._buffer[safe_len:]
-                    if self._active_param_mode in ("wrapper", "buffered"):
-                        self._active_param_parts.append(raw_content)
-                    elif self._active_param_mode == "string":
+                    if self._active_param_mode == "string":
                         self._add_tool_call_delta(
                             tool_call_deltas,
                             index,
                             arguments=self._json_escape_string_content(raw_content),
                         )
                     else:
-                        self._add_tool_call_delta(
-                            tool_call_deltas, index, arguments=raw_content
-                        )
+                        self._active_param_parts.append(raw_content)
                 return
 
             stripped_len = len(self._buffer) - len(self._buffer.lstrip())
@@ -624,6 +655,7 @@ class DeepSeekV32ToolParser(ToolParser):
 
             if self._buffer.startswith(invoke_end_token):
                 self._buffer = self._buffer[len(invoke_end_token) :]
+                self._flush_pending_wrapper_param(tool_call_deltas, index, unwrap=True)
                 self._close_streaming_tool_call(tool_call_deltas)
                 continue
 
@@ -632,6 +664,7 @@ class DeepSeekV32ToolParser(ToolParser):
                 return
 
             self._buffer = self._buffer[match.end() :]
+            self._flush_pending_wrapper_param(tool_call_deltas, index, unwrap=False)
             name = match.group(1)
             string_attr = self._string_attr(match.group(2))
             self._active_param_name = name
@@ -646,13 +679,10 @@ class DeepSeekV32ToolParser(ToolParser):
                 self._active_param_mode = "string"
                 continue
 
-            param_types = self._param_types_for_name(name)
-            if not self._can_stream_raw_param(param_types):
-                self._active_param_mode = "buffered"
-                continue
-
-            self._append_param_prefix(tool_call_deltas, index, name, as_string=False)
-            self._active_param_mode = "raw"
+            # Non-string values are sent once complete: the raw text of an
+            # object or array need not be JSON, and the batch path then
+            # keeps it as a string instead.
+            self._active_param_mode = "buffered"
 
     def extract_tool_calls_streaming(
         self,

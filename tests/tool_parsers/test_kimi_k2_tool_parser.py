@@ -461,6 +461,8 @@ class TestStreamingEdgeCases:
 class TestAdjustRequest:
     def test_sets_skip_special_tokens_false(self, parser):
         request = MagicMock(spec=ChatCompletionRequest)
+        # A spec mock has no pydantic fields; adjust_request reads this one.
+        request.parallel_tool_calls = True
         request.tools = [{"type": "function", "function": {"name": "test"}}]
         request.tool_choice = "auto"
         request.skip_special_tokens = True
@@ -470,6 +472,8 @@ class TestAdjustRequest:
 
     def test_no_change_when_tool_choice_none(self, parser):
         request = MagicMock(spec=ChatCompletionRequest)
+        # A spec mock has no pydantic fields; adjust_request reads this one.
+        request.parallel_tool_calls = True
         request.tools = [{"type": "function", "function": {"name": "test"}}]
         request.tool_choice = "none"
         request.skip_special_tokens = True
@@ -479,6 +483,8 @@ class TestAdjustRequest:
 
     def test_no_change_when_no_tools(self, parser):
         request = MagicMock(spec=ChatCompletionRequest)
+        # A spec mock has no pydantic fields; adjust_request reads this one.
+        request.parallel_tool_calls = True
         request.tools = None
         request.tool_choice = "auto"
         request.skip_special_tokens = True
