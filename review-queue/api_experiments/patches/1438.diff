@@ -1,0 +1,373 @@
+diff --git a/vllm/_sm70_startup_cleanup.py b/vllm/_sm70_startup_cleanup.py
+new file mode 100644
+index 0000000000..0a7e85fac3
+--- /dev/null
++++ b/vllm/_sm70_startup_cleanup.py
+@@ -0,0 +1,138 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SM70 engine startup self-cleanup (opt21 infrastructure).
++
++Runs once in the engine's parent process at startup, *before* workers spawn and
++before any torch.compile / CUDA-graph capture.  Its behaviour follows the
++compile-cache reuse toggle (``VLLM_DISABLE_COMPILE_CACHE``):
++
++* reuse DISABLED  -> reclaim the early compile-cache tree and any stale
++  ``/dev/shm`` offload leftovers, so a fresh run does not inherit state.
++* reuse ENABLED   -> leave every cache untouched.
++
++Every step is best-effort: it never raises into engine startup, and it only
++touches shared resources while no engine is resident (all GPUs quiet), which is
++also what makes reclaiming ``/dev/shm`` safe per the project's iron rules.
++"""
++
++import glob
++import os
++import subprocess
++
++import vllm.envs as envs
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# A GPU with at least this many MiB resident counts as "busy" (an engine is
++# running); shared caches and /dev/shm must then be left alone.
++_GPU_BUSY_MIB = 2000
++
++_COMPILE_CACHE_SUBDIR = "torch_compile_cache"
++_SHM_GLOB = "/dev/shm/vllm_offload_*.mmap"
++
++
++def _gpu_quiet() -> bool:
++    """True when every visible GPU shows negligible residency."""
++    try:
++        out = subprocess.run(
++            [
++                "nvidia-smi",
++                "--query-gpu=memory.used",
++                "--format=csv,noheader,nounits",
++            ],
++            capture_output=True,
++            text=True,
++            timeout=15,
++        )
++    except (OSError, subprocess.SubprocessError):
++        return False
++    if out.returncode != 0:
++        return False
++    try:
++        used = [int(x) for x in out.stdout.split()]
++    except ValueError:
++        return False
++    return bool(used) and all(mib < _GPU_BUSY_MIB for mib in used)
++
++
++def _path_in_use(path: str) -> bool:
++    """True if any process currently has ``path`` open or mapped."""
++    try:
++        out = subprocess.run(
++            ["lsof", "-t", "--", path],
++            capture_output=True,
++            text=True,
++            timeout=15,
++        )
++        if out.stdout.strip():
++            return True
++        # lsof exits 1 when nothing matches; anything else is unusable output,
++        # in which case fall through to the /proc scan.
++        if out.returncode in (0, 1):
++            return False
++    except (OSError, subprocess.SubprocessError):
++        pass
++    base = os.path.basename(os.path.realpath(path))
++    for pid in os.listdir("/proc"):
++        if not pid.isdigit():
++            continue
++        try:
++            with open(f"/proc/{pid}/maps", encoding="utf-8",
++                      errors="ignore") as fh:
++                for line in fh:
++                    if base in line:
++                        return True
++        except OSError:
++            continue
++    return False
++
++
++def _clean_compile_cache() -> None:
++    cache_dir = os.path.join(envs.VLLM_CACHE_ROOT, _COMPILE_CACHE_SUBDIR)
++    if not os.path.isdir(cache_dir):
++        return
++    import shutil
++
++    try:
++        shutil.rmtree(cache_dir)
++    except OSError as exc:
++        logger.warning_once("SM70 startup cleanup: cannot remove %s (%s)",
++                            cache_dir, exc)
++        return
++    logger.info_once("SM70 startup cleanup reclaimed compile cache %s",
++                     cache_dir)
++
++
++def _clean_shm_leftovers() -> None:
++    removed = 0
++    for path in glob.glob(_SHM_GLOB):
++        if _path_in_use(path):
++            continue
++        try:
++            os.unlink(path)
++            removed += 1
++        except OSError:
++            pass
++    if removed:
++        logger.info_once(
++            "SM70 startup cleanup reclaimed %d stale /dev/shm file(s)", removed)
++
++
++def sm70_startup_cleanup() -> None:
++    """Best-effort startup cleanup; never raises into engine startup."""
++    if not envs.VLLM_SM70_STARTUP_CACHE_CLEANUP:
++        return
++    if not envs.VLLM_DISABLE_COMPILE_CACHE:
++        logger.info_once(
++            "SM70 startup cleanup skipped: compile-cache reuse is enabled.")
++        return
++    if not _gpu_quiet():
++        logger.info_once(
++            "SM70 startup cleanup skipped: a GPU is still resident.")
++        return
++    try:
++        _clean_compile_cache()
++        _clean_shm_leftovers()
++    except Exception as exc:  # pragma: no cover - defensive
++        logger.warning_once("SM70 startup cleanup failed: %s", exc)
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+index 1632d4d061..681d37197e 100644
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -20,6 +20,7 @@
+ from fastapi.exceptions import RequestValidationError
+ from fastapi.middleware.cors import CORSMiddleware
+ from starlette.datastructures import State
++from starlette.responses import Response
+ 
+ import vllm.envs as envs
+ from vllm.config import ModelConfig, VllmConfig
+@@ -179,6 +180,15 @@ def build_app(
+         app = FastAPI(lifespan=lifespan)
+     app.state.args = args
+ 
++    # Global HEAD probe. Load balancers and K8s readiness probes commonly use
++    # HEAD / to check liveness; without a route vLLM answers 405, the probe
++    # declares the pod dead and traffic is drained. Answer 200 on every path
++    # without running any request logic.
++    @app.head("/")
++    @app.head("/{path:path}")
++    async def _head_probe(path: str = "") -> Response:  # noqa: ARG001
++        return Response(status_code=200)
++
+     from vllm.entrypoints.serve import register_vllm_serve_api_routers
+ 
+     register_vllm_serve_api_routers(app)
+@@ -670,6 +680,14 @@ async def run_server(args, **uvicorn_kwargs) -> None:
+ 
+     decorate_logs("APIServer", skip_if_decorated=True)
+ 
++    # Reclaim stale compile cache and /dev/shm offload leftovers **before any
++    # worker starts**. Triple-gated: this switch x VLLM_DISABLE_COMPILE_CACHE=1
++    # (reuse off) x every GPU idle. Inert under the default configuration
++    # (reuse on); files that are still mapped are never removed.
++    from vllm._sm70_startup_cleanup import sm70_startup_cleanup
++
++    sm70_startup_cleanup()
++
+     # Interrupt initialization if SIGTERM arrives before uvicorn installs its
+     # own signal handlers. Once uvicorn is running it replaces this.
+     def _interrupt_init(*_) -> None:
+@@ -710,6 +728,12 @@ async def run_server_worker(
+     # NOTE(simon):
+     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
+     # entrypoints.
++    # Mirror startup logs to a separate file. The handler detaches itself once
++    # "Application startup complete" is seen, so there is no runtime cost.
++    from vllm.logger import _StartupLogHandler
++
++    _StartupLogHandler.truncate()
++    _StartupLogHandler.install()
+     cli_env_setup()
+     parser = FlexibleArgumentParser(
+         description="vLLM OpenAI-Compatible RESTful API server."
+diff --git a/vllm/entrypoints/openai/models/serving.py b/vllm/entrypoints/openai/models/serving.py
+index 347752c912..1ce57245f2 100644
+--- a/vllm/entrypoints/openai/models/serving.py
++++ b/vllm/entrypoints/openai/models/serving.py
+@@ -46,6 +46,22 @@ def __init__(
+     def is_base_model(self, model_name: str) -> bool:
+         return any(model.name == model_name for model in self.base_model_paths)
+ 
++    def _compute_context_window(self) -> tuple[int | None, int | None]:
++        """Derive (context_window, max_output_tokens) from max_model_len.
++
++        Used for the advertised capabilities on the model card. The longer the
++        context, the more headroom generation needs -- long-context requests
++        tend to produce longer outputs too.
++        """
++        max_model_len = self.model_config.max_model_len
++        if max_model_len is None:
++            return None, None
++        if max_model_len < 50000:
++            return int(max_model_len * 0.9), int(max_model_len * 0.1)
++        if max_model_len < 100000:
++            return int(max_model_len * 0.85), int(max_model_len * 0.15)
++        return int(max_model_len * 0.8), int(max_model_len * 0.2)
++
+     async def check_model(self, model_name: str | None) -> ErrorResponse | None:
+         """Return an ErrorResponse if model_name is not served, else None."""
+         if not model_name or self.is_base_model(model_name):
+@@ -60,11 +76,14 @@ async def check_model(self, model_name: str | None) -> ErrorResponse | None:
+     async def show_available_models(self) -> ModelList:
+         """Show available models (base models only)."""
+         max_model_len = self.model_config.max_model_len
++        context_window, max_output_tokens = self._compute_context_window()
+         return ModelList(
+             data=[
+                 ModelCard(
+                     id=base_model.name,
+                     max_model_len=max_model_len,
++                    context_window=context_window,
++                    max_output_tokens=max_output_tokens,
+                     root=base_model.model_path,
+                     permission=[ModelPermission()],
+                 )
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..18ce517ca7 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -336,6 +336,9 @@
+     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
+     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
+     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
++    # Startup self-cleanup master switch (on by default).
++    VLLM_SM70_STARTUP_CACHE_CLEANUP: bool = True
++    VLLM_STARTUP_LOG_FILE: str | None = None
+     VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST: str | None = None
+     VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS: bool = True
+     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
+@@ -4411,6 +4414,36 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=("DFlash2 verifier",),
+         user_visible=True,
+     ),
++    "VLLM_STARTUP_LOG_FILE": env_var(
++        lambda: os.getenv("VLLM_STARTUP_LOG_FILE"),
++        description=(
++            "Path for the separate startup log file. Startup lines are "
++            "mirrored here until 'Application startup complete' is seen, then "
++            "the handler detaches. Defaults to "
++            "/tmp/log/vllm-starting-log.txt when unset."
++        ),
++        category="debug",
++        declared_default="None",
++        effective_default="None",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=True,
++    ),
++    "VLLM_SM70_STARTUP_CACHE_CLEANUP": env_var(
++        lambda: bool(int(os.getenv("VLLM_SM70_STARTUP_CACHE_CLEANUP", "1"))),
++        description=(
++            "opt21 infrastructure: at engine startup, when compile-cache "
++            "reuse is disabled (VLLM_DISABLE_COMPILE_CACHE=1), reclaim the "
++            "early compile cache and stale /dev/shm offload leftovers. Only "
++            "acts while every GPU is quiet; set 0 to opt out."
++        ),
++        category="configuration",
++        declared_default="True",
++        effective_default="True",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=True,
++    ),
+     "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": env_var(
+         lambda: os.getenv("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST", None),
+         description=(
+@@ -20265,6 +20298,11 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
+     hash everything else. This keeps the cache key aligned across workers."""
+ 
+     ignored_factors: set[str] = {
++        # One-shot startup cleanup switch: it does not affect any build
++        # artefact, so it must stay out of the cache key -- otherwise toggling
++        # it would invalidate the whole compile cache.
++        "VLLM_SM70_STARTUP_CACHE_CLEANUP",
++        "VLLM_STARTUP_LOG_FILE",
+         "VLLM_INPLACE_AR_MIN",
+         "VLLM_PYNCCL_ALLGATHER",
+         "VLLM_V41_ATTN_TIMING",
+diff --git a/vllm/logger.py b/vllm/logger.py
+index 5385bbc7bd..ed854e4750 100644
+--- a/vllm/logger.py
++++ b/vllm/logger.py
+@@ -342,6 +342,63 @@ def _trace_calls(log_path, root_dir, frame, event, arg=None):
+     return partial(_trace_calls, log_path, root_dir)
+ 
+ 
++class _StartupLogHandler(logging.Handler):
++    """Mirror vLLM's startup logs into a dedicated file.
++
++    A cold start can take several minutes, and its log lines end up interleaved
++    with runtime traffic in one large file. Diagnosing a failed start then means
++    scrolling through tens of thousands of lines. This handler writes a copy of
++    the vLLM logger's messages to its own file and detaches itself as soon as
++    "Application startup complete" is seen, so there is no runtime cost.
++
++    The path defaults to `/tmp/log/vllm-starting-log.txt` and can be overridden
++    with `VLLM_STARTUP_LOG_FILE`.
++    """
++
++    _default_log_file = "/tmp/log/vllm-starting-log.txt"
++    _installed = False
++
++    @staticmethod
++    def _path() -> str:
++        import vllm.envs as envs
++
++        return envs.VLLM_STARTUP_LOG_FILE or _StartupLogHandler._default_log_file
++
++    def __init__(self):
++        super().__init__(level=logging.DEBUG)
++        os.makedirs(os.path.dirname(self._path()), exist_ok=True)
++
++    def emit(self, record: logging.LogRecord) -> None:
++        try:
++            msg = self.format(record)
++            with open(self._path(), "a") as f:
++                f.write(msg + "\n")
++            if "Application startup complete" in msg:
++                self._remove()
++        except Exception:
++            self.handleError(record)
++
++    def _remove(self) -> None:
++        logging.getLogger("vllm").removeHandler(self)
++        _StartupLogHandler._installed = False
++
++    @staticmethod
++    def install() -> None:
++        if _StartupLogHandler._installed:
++            return
++        logging.getLogger("vllm").addHandler(_StartupLogHandler())
++        _StartupLogHandler._installed = True
++
++    @staticmethod
++    def truncate() -> None:
++        try:
++            os.makedirs(os.path.dirname(_StartupLogHandler._path()), exist_ok=True)
++            with open(_StartupLogHandler._path(), "w"):
++                pass
++        except Exception:
++            pass
++
++
+ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
+     """
+     Enable tracing of every function call in code under `root_dir`.

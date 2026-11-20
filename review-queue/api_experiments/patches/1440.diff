@@ -1,0 +1,667 @@
+diff --git a/vllm/entrypoints/anthropic/api_router.py b/vllm/entrypoints/anthropic/api_router.py
+index 1fe2be8996..e0cd52e1c7 100644
+--- a/vllm/entrypoints/anthropic/api_router.py
++++ b/vllm/entrypoints/anthropic/api_router.py
+@@ -5,7 +5,7 @@
+ from http import HTTPStatus
+ 
+ from fastapi import APIRouter, Depends, FastAPI, Request
+-from fastapi.responses import JSONResponse, StreamingResponse
++from fastapi.responses import JSONResponse, Response, StreamingResponse
+ 
+ from vllm.entrypoints.anthropic.protocol import (
+     AnthropicCountTokensRequest,
+@@ -45,6 +45,14 @@ def translate_error_response(response: ErrorResponse) -> JSONResponse:
+     )
+ 
+ 
++# The Anthropic endpoints need a HEAD probe too, or a health check pointed at
++# /v1/messages gets 405 and marks the instance dead.
++@router.head("/v1/messages")
++@router.head("/v1/messages/count_tokens")
++async def _head_messages() -> Response:
++    return Response(status_code=200)
++
++
+ @router.post(
+     "/v1/messages",
+     dependencies=[Depends(validate_json_request)],
+diff --git a/vllm/entrypoints/anthropic/protocol.py b/vllm/entrypoints/anthropic/protocol.py
+index 279f362534..ed4ec1e9e3 100644
+--- a/vllm/entrypoints/anthropic/protocol.py
++++ b/vllm/entrypoints/anthropic/protocol.py
+@@ -143,6 +143,31 @@ class AnthropicMessagesRequest(BaseModel):
+             "Will be accessible by the template."
+         ),
+     )
++    # Per-chunk output token ids are opt-in,
++    # mirroring the OpenAI protocol's `return_token_ids` (default off). A live
++    # TPS meter wants them; callers that do not should not pay for them. The
++    # same switch can be given as a request header (`x-return-token-ids`) for
++    # proxies that forward the body verbatim — see
++    # `AnthropicServingMessages._wants_token_ids`.
++    return_token_ids: bool = Field(
++        default=False,
++        description=(
++            "If true, each response carries the token ids its output decodes "
++            "from (`token_ids` per `content_block_delta`, or on the message for "
++            "a non-streaming reply). The Anthropic schema defines no such field; "
++            "this mirrors the OpenAI protocol's `return_token_ids`."
++        ),
++    )
++    # The prompt is typically tens of thousands of ids, so echoing it back is a
++    # separate, even more explicit opt-in than the output ids above.
++    return_prompt_token_ids: bool = Field(
++        default=False,
++        description=(
++            "If true, the response also carries the prompt's token ids in "
++            "`prompt_token_ids`. The Anthropic schema defines no such field; "
++            "this mirrors the OpenAI protocol's `prompt_token_ids`."
++        ),
++    )
+ 
+     @field_validator("model")
+     @classmethod
+@@ -197,6 +222,11 @@ class AnthropicStreamEvent(BaseModel):
+     index: int | None = None
+     error: AnthropicError | None = None
+     usage: AnthropicUsage | None = None
++    # Not part of the Anthropic spec, but useful for
++    # tracing the tokens in agent scenarios — the token ids a
++    # `content_block_delta` decodes from, mirroring the OpenAI protocol's
++    # per-chunk `choices[].token_ids`.
++    token_ids: list[int] | None = None
+ 
+ 
+ class AnthropicMessagesResponse(BaseModel):
+@@ -217,10 +247,43 @@ class AnthropicMessagesResponse(BaseModel):
+     kv_transfer_params: dict[str, Any] | None = Field(
+         default=None, description="KVTransfer parameters."
+     )
++    # The output tokens this message produced
++    # (mirroring the OpenAI protocol's `choices[].token_ids`), plus the prompt's
++    # ids when the request opted in with `return_prompt_token_ids`.
++    # Neither is in the Anthropic spec.
++    token_ids: list[int] | None = None
++    prompt_token_ids: list[int] | None = None
++
++    @field_validator("id", mode="before")
++    @classmethod
++    def _normalize_id(cls, v: Any) -> str:
++        """Normalise the id to the Anthropic `msg_` prefix.
++
++        Two things:
++
++        1. An empty id falls back to a uuid. The previous
++           `model_post_init` used `msg_{int(time.time()*1000)}`, and millisecond
++           timestamps collide under load.
++        2. A `chatcmpl-` prefix from upstream is rewritten. This endpoint
++           forwards to the OpenAI chat path internally, so `generator.id` is
++           `chatcmpl-{uuid}`; passing it through verbatim hands Anthropic
++           clients an id they do not recognise as a message.
+ 
+-    def model_post_init(self, __context):
+-        if not self.id:
+-            self.id = f"msg_{int(time.time() * 1000)}"
++        A `field_validator(mode="before")` is used rather than
++        `model_post_init`, whose `if not self.id` guard never fires because
++        callers always pass an id explicitly.
++        """
++        from vllm.utils import random_uuid
++
++        if not v:
++            return f"msg_{random_uuid()}"
++        v = str(v)
++        if v.startswith("msg_"):
++            return v
++        for prefix in ("chatcmpl-", "cmpl-"):
++            if v.startswith(prefix):
++                return f"msg_{v[len(prefix):]}"
++        return f"msg_{v}"
+ 
+ 
+ class AnthropicContextManagement(BaseModel):
+diff --git a/vllm/entrypoints/anthropic/serving.py b/vllm/entrypoints/anthropic/serving.py
+index f5f8766bf4..eaa75fdeb1 100644
+--- a/vllm/entrypoints/anthropic/serving.py
++++ b/vllm/entrypoints/anthropic/serving.py
+@@ -14,6 +14,7 @@
+ 
+ from fastapi import Request
+ 
++import vllm.envs as envs
+ from vllm.engine.protocol import EngineClient
+ from vllm.entrypoints.anthropic.protocol import (
+     AnthropicContentBlock,
+@@ -57,6 +58,33 @@ def wrap_data_with_event(data: str, event: str):
+     return f"event: {event}\ndata: {data}\n\n"
+ 
+ 
++def _extract_upstream_error(data_str: str) -> str | None:
++    """Return the message of an upstream `{"error": {...}}` SSE frame.
++
++    The OpenAI-compatible chat stream signals mid-stream failures by emitting
++    an error payload in place of a normal chunk. The Anthropic converter
++    expects every non-`[DONE]` frame to validate as
++    `ChatCompletionStreamResponse`, which such a payload cannot — so without
++    this check a single upstream hiccup turns into an opaque
++    `ValidationError` on the client instead of a readable error.
++
++    Returns `None` for ordinary chunks.
++    """
++    try:
++        payload = json.loads(data_str)
++    except (ValueError, TypeError):
++        return None
++    if not isinstance(payload, dict) or "error" not in payload:
++        return None
++    error = payload.get("error")
++    if isinstance(error, dict):
++        message = error.get("message")
++        if message:
++            return str(message)
++        return json.dumps(error, ensure_ascii=False)
++    return str(error)
++
++
+ def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
+     if usage is not None and usage.prompt_tokens_details is not None:
+         cached_tokens = usage.prompt_tokens_details.cached_tokens
+@@ -65,6 +93,48 @@ def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
+     return {}
+ 
+ 
++def _anthropic_input_tokens(usage: UsageInfo | None) -> int:
++    """Anthropic `input_tokens` counts **fresh** tokens only.
++
++    vLLM's `prompt_tokens` is fresh + cached (OpenAI semantics). Anthropic
++    reports cache hits separately in `cache_read_input_tokens` and counts only
++    the misses in `input_tokens`. Without the correction a client treats the
++    total as fresh, computes a cache hit rate of roughly 48.5% (the signature
++    is input ~= 2x cached) when the real figure is usually above 99%, and
++    compacts its context far too early.
++
++    When the cache breakdown is not known yet -- the first streaming chunk --
++    return 0 rather than falling back to the total.
++
++    Observed 1.5.2 streaming chunk sequence (`include_usage` +
++    `continuous_usage_stats`):
++        chunk#1  {"prompt_tokens": 437}
++        chunk#2  {"prompt_tokens": 437}
++        chunk#3  {"prompt_tokens": 437}
++        chunk#4  {"prompt_tokens": 437, "prompt_tokens_details": {"cached_tokens": 384}}
++
++    ``message_start`` rides on chunk#1, before ``prompt_tokens_details``
++    appears. The old code fell back to ``prompt_tokens`` (total 437) when the
++    real fresh count was 53. A client that receives neither
++    ``cache_read_input_tokens`` nor ``prompt_tokens_details`` has nothing to
++    subtract from, believes the context is 437 tokens, and compacts early --
++    which the user sees as their history disappearing.
++
++    So: no ``prompt_tokens_details`` means the breakdown is unknown, and 0 is
++    returned. The accurate value arrives with ``message_delta``, whose chunk
++    does carry the breakdown (437 - 384 = 53).
++    """
++    if usage is None:
++        return 0
++    if usage.prompt_tokens_details is None:
++        # Breakdown not ready yet: report 0 rather than the total, so the
++        # client does not mistake it for the fresh count.
++        return 0
++    prompt_tokens = usage.prompt_tokens or 0
++    cached = usage.prompt_tokens_details.cached_tokens or 0
++    return max(0, prompt_tokens - cached)
++
++
+ class AnthropicServingMessages(OpenAIServingChat):
+     """Handler for Anthropic Messages API requests"""
+ 
+@@ -361,6 +431,32 @@ def _convert_user_tool_result(
+                 }
+             )
+ 
++    @staticmethod
++    def _wants_token_ids(
++        request: AnthropicMessagesRequest,
++        raw_request: Request | None,
++    ) -> bool:
++        """Whether this request asked the response to carry per-chunk token ids.
++
++        the Anthropic response can echo the ids each
++        delta decodes from (mirroring the OpenAI protocol's
++        `choices[].token_ids`), but that is an extension no client needs by
++        default, so it is opt-in. Two equivalent ways to ask, so a caller can
++        pick whichever fits its path:
++
++        * the body field ``return_token_ids`` (vLLM's OpenAI-protocol name), for
++          callers that already build the request body; or
++        * the request header ``x-return-token-ids``, for a proxy that forwards
++          the body byte-for-byte and cannot add a field to it.
++        """
++        if getattr(request, "return_token_ids", False):
++            return True
++        if raw_request is not None:
++            flag = raw_request.headers.get("x-return-token-ids")
++            if flag is not None and flag.strip().lower() in ("1", "true", "yes", "on"):
++                return True
++        return False
++
+     @classmethod
+     def _build_base_request(
+         cls,
+@@ -386,6 +482,12 @@ def _build_base_request(
+             top_k=anthropic_request.top_k,
+             kv_transfer_params=anthropic_request.kv_transfer_params,
+             chat_template_kwargs=anthropic_request.chat_template_kwargs,
++            # off by default, matching vLLM's OpenAI
++            # protocol (`return_token_ids` defaults to None/off).
++            # `create_messages` turns it on only when the caller asked — the
++            # `x-return-token-ids` header or the body field of the same name —
++            # so a caller that does not want per-chunk ids is not made to pay.
++            return_token_ids=False,
+         )
+ 
+     @classmethod
+@@ -493,7 +595,64 @@ async def create_messages(
+         """
+         if logger.isEnabledFor(logging.DEBUG):
+             logger.debug("Received messages request %s", request.model_dump_json())
++        # Debug probe (off by default): log a structural summary of the
++        # request and dump the last complete one to
++        # `/tmp/anth_last_request.json` for offline replay. Only structure and
++        # lengths are logged, never the content itself.
++        if envs.VLLM_DEBUG_ANTHROPIC_TRACE:
++            try:
++                _parts = []
++                for _i, _m in enumerate(request.messages):
++                    _c = _m.content
++                    if isinstance(_c, str):
++                        _parts.append(f"{_i}:{_m.role}:str({len(_c)})")
++                    else:
++                        _kinds = []
++                        for _b in (_c or []):
++                            _t = getattr(_b, "type", "?")
++                            if _t == "tool_result":
++                                _rc = getattr(_b, "content", None)
++                                _rl = len(_rc) if isinstance(_rc, str) else (
++                                    sum(len(getattr(x, "text", "") or "")
++                                        for x in (_rc or []) if not isinstance(x, dict))
++                                    if isinstance(_rc, list) else 0
++                                )
++                                _kinds.append(
++                                    f"tool_result(id={getattr(_b,'tool_use_id',None)},len={_rl})")
++                            elif _t == "tool_use":
++                                _kinds.append(f"tool_use(id={getattr(_b,'id',None)},name={getattr(_b,'name',None)})")
++                            elif _t == "text":
++                                _kinds.append(f"text({len(getattr(_b,'text','') or '')})")
++                            elif _t == "thinking":
++                                _kinds.append(f"thinking({len(getattr(_b,'thinking','') or '')})")
++                            else:
++                                _kinds.append(_t)
++                        _parts.append(f"{_i}:{_m.role}:{_kinds}")
++                logger.info(
++                    "[ANTH-TRACE] stream=%s tools=%s tool_choice=%s msgs=%d "
++                    "ctk=%s max_tok=%s temp=%s | %s",
++                    getattr(request, "stream", None),
++                    [getattr(t, "name", "?") for t in (request.tools or [])],
++                    getattr(request, "tool_choice", None),
++                    len(request.messages),
++                    getattr(request, "chat_template_kwargs", None),
++                    getattr(request, "max_tokens", None),
++                    getattr(request, "temperature", None),
++                    " ; ".join(_parts),
++                )
++                # Keep the last complete request for offline replay.
++                try:
++                    with open("/tmp/anth_last_request.json", "w", encoding="utf-8") as _fh:
++                        _fh.write(request.model_dump_json())
++                except Exception:  # noqa: BLE001
++                    pass
++            except Exception as _e:  # noqa: BLE001
++                logger.info("[ANTH-TRACE] failed: %r", _e)
+         chat_req = self._convert_anthropic_to_openai_request(request)
++        # carry per-chunk output token ids only when
++        # asked for (see `_wants_token_ids`). Off unless requested keeps the
++        # response lean for every caller that does not run a live TPS meter.
++        chat_req.return_token_ids = self._wants_token_ids(request, raw_request)
+         if logger.isEnabledFor(logging.DEBUG):
+             logger.debug("Convert to OpenAI request %s", chat_req.model_dump_json())
+         generator = await self.create_chat_completion(chat_req, raw_request)
+@@ -502,24 +661,54 @@ async def create_messages(
+             return generator
+ 
+         elif isinstance(generator, ChatCompletionResponse):
+-            return self.messages_full_converter(generator)
++            return self.messages_full_converter(generator, request)
+ 
+-        return self.message_stream_converter(generator)
++        return self.message_stream_converter(generator, request)
+ 
+     def messages_full_converter(
+         self,
+         generator: ChatCompletionResponse,
++        request: AnthropicMessagesRequest,
+     ) -> AnthropicMessagesResponse:
++        # the Anthropic schema has no token-id
++        # fields; carry the OpenAI layer's ids through, mirroring
++        # choices[].token_ids / prompt_token_ids.
++        output_token_ids: list[int] = []
++        for output_choice in generator.choices:
++            if output_choice.token_ids:
++                output_token_ids.extend(output_choice.token_ids)
+         result = AnthropicMessagesResponse(
+             id=generator.id,
++            # These must be passed explicitly; do not rely on the protocol
++            # layer's field defaults.
++            #
++            # The response is serialised with
++            # `model_dump_json(exclude_unset=True)`, which emits only fields
++            # that were explicitly assigned. Field defaults such as
++            # `type: Literal["message"] = "message"` and
++            # `role: ... = "assistant"` are never set, so they are dropped.
++            # Observed:
++            #   exclude_unset=True  -> {"id":..., "content":[], "model":..., "usage":...}
++            #   exclude_unset=False -> {"id":..., "type":"message", "role":"assistant", ...}
++            #
++            # An Anthropic SDK receiving a message_start without `type`/`role`
++            # treats it as unparseable and drops it silently, so after a
++            # reload every assistant message vanishes from the client's
++            # history while the tool-call state survives.
++            type="message",
++            role="assistant",
+             content=[],
+             model=generator.model,
+             usage=AnthropicUsage(
+-                input_tokens=generator.usage.prompt_tokens,
++                input_tokens=_anthropic_input_tokens(generator.usage),
+                 output_tokens=generator.usage.completion_tokens,
+                 **_cache_usage_fields(generator.usage),
+             ),
+             kv_transfer_params=generator.kv_transfer_params,
++            token_ids=output_token_ids or None,
++            prompt_token_ids=(
++                generator.prompt_token_ids if request.return_prompt_token_ids else None
++            ),
+         )
+         choice = generator.choices[0]
+         if choice.finish_reason == "stop":
+@@ -562,6 +751,7 @@ def messages_full_converter(
+     async def message_stream_converter(
+         self,
+         generator: AsyncGenerator[str, None],
++        request: AnthropicMessagesRequest,
+     ) -> AsyncGenerator[str, None]:
+         try:
+ 
+@@ -602,6 +792,36 @@ def start(self, block: AnthropicContentBlock) -> None:
+             state = _ActiveBlockState()
+             # Map from tool call index to tool_use_id
+             tool_index_to_id: dict[int, str] = {}
++            # a chunk's output token ids
++            # (`choices[0].token_ids`) belong to exactly one content_block_delta,
++            # so they ride the first delta emitted for that chunk and are cleared
++            # afterwards (a chunk carrying both thinking and text must not count
++            # them twice).
++            pending_token_ids: list[int] | None = None
++
++            def take_token_ids() -> list[int] | None:
++                nonlocal pending_token_ids
++                ids, pending_token_ids = pending_token_ids, None
++                return ids
++
++            def content_delta_event(
++                index: int, delta: AnthropicDelta
++            ) -> AnthropicStreamEvent:
++                """A `content_block_delta` carrying this chunk's output ids.
++
++                `token_ids` is attached only when the
++                caller asked for ids (see `_wants_token_ids`). Assigning it
++                conditionally — never as a bare `token_ids=None` — keeps it out
++                of `model_fields_set`, so a reply that did not request ids has no
++                `token_ids` key at all rather than a null one.
++                """
++                event = AnthropicStreamEvent(
++                    index=index, type="content_block_delta", delta=delta
++                )
++                ids = take_token_ids()
++                if ids is not None:
++                    event.token_ids = ids
++                return event
+ 
+             def stop_active_block():
+                 events: list[str] = []
+@@ -656,6 +876,33 @@ def start_block(block: AnthropicContentBlock):
+                         )
+                         yield wrap_data_with_event(data, "message_stop")
+                     else:
++                        # The upstream chat stream can interleave an
++                        # `{"error": {...}}` frame when something goes wrong
++                        # (a tool parser exception, for instance). Passing it
++                        # to `ChatCompletionStreamResponse.model_validate_json`
++                        # raised `ValidationError: model/choices Field
++                        # required`, turning a readable upstream error into a
++                        # 500 for the whole turn, and the tool-call result was
++                        # lost.
++                        # Detect the error frame and emit it as an Anthropic
++                        # `error` event so the SDK can parse and surface it;
++                        # every other frame is handled as before.
++                        _upstream_error = _extract_upstream_error(data_str)
++                        if _upstream_error is not None:
++                            yield wrap_data_with_event(
++                                json.dumps(
++                                    {
++                                        "type": "error",
++                                        "error": {
++                                            "type": "api_error",
++                                            "message": _upstream_error,
++                                        },
++                                    },
++                                    ensure_ascii=False,
++                                ),
++                                "error",
++                            )
++                            return
+                         origin_chunk = ChatCompletionStreamResponse.model_validate_json(
+                             data_str
+                         )
+@@ -665,17 +912,36 @@ def start_block(block: AnthropicContentBlock):
+                                 type="message_start",
+                                 message=AnthropicMessagesResponse(
+                                     id=origin_chunk.id,
++                                    # Same as messages_full_converter:
++                                    # `exclude_unset=True` drops fields that
++                                    # were never assigned, so they must be
++                                    # passed explicitly. Missing -> the SDK
++                                    # discards the whole message_start and the
++                                    # assistant message never renders.
++                                    type="message",
++                                    role="assistant",
+                                     content=[],
+                                     model=origin_chunk.model,
+                                     stop_reason=None,
+                                     stop_sequence=None,
+                                     usage=AnthropicUsage(
+-                                        input_tokens=origin_chunk.usage.prompt_tokens
+-                                        if origin_chunk.usage
+-                                        else 0,
++                                        input_tokens=_anthropic_input_tokens(
++                                            origin_chunk.usage
++                                        ),
+                                         output_tokens=0,
+                                         **_cache_usage_fields(origin_chunk.usage),
+                                     ),
++                                    # prompt ids are
++                                    # echoed only when the request opted in (the
++                                    # prompt can be tens of thousands of ids).
++                                    # Spread in rather than passed as None so an
++                                    # un-opted-in reply has no `prompt_token_ids`
++                                    # key at all (mirrors content_delta_event).
++                                    **(
++                                        {"prompt_token_ids": origin_chunk.prompt_token_ids}
++                                        if request.return_prompt_token_ids
++                                        else {}
++                                    ),
+                                 ),
+                             )
+                             first_item = False
+@@ -694,9 +960,9 @@ def start_block(block: AnthropicContentBlock):
+                                 type="message_delta",
+                                 delta=AnthropicDelta(stop_reason=stop_reason),
+                                 usage=AnthropicUsage(
+-                                    input_tokens=origin_chunk.usage.prompt_tokens
+-                                    if origin_chunk.usage
+-                                    else 0,
++                                    input_tokens=_anthropic_input_tokens(
++                                        origin_chunk.usage
++                                    ),
+                                     output_tokens=origin_chunk.usage.completion_tokens
+                                     if origin_chunk.usage
+                                     else 0,
+@@ -711,6 +977,10 @@ def start_block(block: AnthropicContentBlock):
+                             finish_reason = origin_chunk.choices[0].finish_reason
+                             # continue
+ 
++                        # the ids this chunk decoded,
++                        # handed to whichever content_block_delta the chunk produces.
++                        pending_token_ids = origin_chunk.choices[0].token_ids
++
+                         # thinking / text content
+                         reasoning_delta = origin_chunk.choices[0].delta.reasoning
+                         if reasoning_delta is not None:
+@@ -726,14 +996,10 @@ def start_block(block: AnthropicContentBlock):
+                                         )
+                                     )
+                                     yield start_event
+-                                chunk = AnthropicStreamEvent(
+-                                    index=(
+-                                        state.block_index
+-                                        if state.block_index is not None
+-                                        else state.content_block_index
+-                                    ),
+-                                    type="content_block_delta",
+-                                    delta=AnthropicDelta(
++                                chunk = content_delta_event(
++                                    (state.block_index if state.block_index is not None
++                                     else state.content_block_index),
++                                        AnthropicDelta(
+                                         type="thinking_delta",
+                                         thinking=reasoning_delta,
+                                     ),
+@@ -752,14 +1018,10 @@ def start_block(block: AnthropicContentBlock):
+                                         AnthropicContentBlock(type="text", text="")
+                                     )
+                                     yield start_event
+-                                chunk = AnthropicStreamEvent(
+-                                    index=(
+-                                        state.block_index
+-                                        if state.block_index is not None
+-                                        else state.content_block_index
+-                                    ),
+-                                    type="content_block_delta",
+-                                    delta=AnthropicDelta(
++                                chunk = content_delta_event(
++                                    (state.block_index if state.block_index is not None
++                                     else state.content_block_index),
++                                        AnthropicDelta(
+                                         type="text_delta",
+                                         text=origin_chunk.choices[0].delta.content,
+                                     ),
+@@ -801,14 +1063,10 @@ def start_block(block: AnthropicContentBlock):
+                                         and tool_call.function.arguments
+                                         and state.tool_use_id == tool_call.id
+                                     ):
+-                                        chunk = AnthropicStreamEvent(
+-                                            index=(
+-                                                state.block_index
+-                                                if state.block_index is not None
+-                                                else state.content_block_index
+-                                            ),
+-                                            type="content_block_delta",
+-                                            delta=AnthropicDelta(
++                                        chunk = content_delta_event(
++                                            (state.block_index if state.block_index is not None
++                                             else state.content_block_index),
++                                                AnthropicDelta(
+                                                 type="input_json_delta",
+                                                 partial_json=tool_call.function.arguments,
+                                             ),
+@@ -826,14 +1084,10 @@ def start_block(block: AnthropicContentBlock):
+                                         and tool_call.function.arguments
+                                         and state.tool_use_id == tool_use_id
+                                     ):
+-                                        chunk = AnthropicStreamEvent(
+-                                            index=(
+-                                                state.block_index
+-                                                if state.block_index is not None
+-                                                else state.content_block_index
+-                                            ),
+-                                            type="content_block_delta",
+-                                            delta=AnthropicDelta(
++                                        chunk = content_delta_event(
++                                            (state.block_index if state.block_index is not None
++                                             else state.content_block_index),
++                                                AnthropicDelta(
+                                                 type="input_json_delta",
+                                                 partial_json=tool_call.function.arguments,
+                                             ),
+@@ -844,15 +1098,18 @@ def start_block(block: AnthropicContentBlock):
+                                         )
+                             continue
+                 else:
+-                    error_response = AnthropicStreamEvent(
+-                        type="error",
+-                        error=AnthropicError(
+-                            type="internal_error",
+-                            message="Invalid data format received",
+-                        ),
+-                    )
+-                    data = error_response.model_dump_json(exclude_unset=True)
+-                    yield wrap_data_with_event(data, "error")
++                                        # Non-`data:` SSE frames are legal: comment lines (a
++                    # `: keepalive` sentinel emitted after 120s of engine
++                    # silence), blank lines, and `event:` / `id:` / `retry:`
++                    # fields.
++                    #
++                    # The old code answered all of them with an
++                    # `error: Invalid data format` event, and the client
++                    # aborts the turn on an error: tool calls are not executed,
++                    # the body is never delivered, and the conversation history
++                    # collapses. Long-running turns always hit a keepalive, so
++                    # this fired routinely. Ignore them instead.
++                    continue
+ 
+         except Exception as e:
+             logger.exception("Error in message stream converter.")
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..41c1fc6397 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -785,6 +785,7 @@
+     VLLM_SPEC_DUMP_ALIGNMENT_LIMIT: int = 3
+     VLLM_SPEC_DUMP_ALIGNMENT_STEPS: str | None = None
+     VLLM_DEBUG_MTP_LOAD: bool = False
++    VLLM_DEBUG_ANTHROPIC_TRACE: bool = False
+     VLLM_DEBUG_MTP_LOAD_VERBOSE: bool = False
+     VLLM_DFLASH_PROFILE: bool = False
+     VLLM_DFLASH_PROFILE_LOG_INTERVAL: int = 32
+@@ -11825,6 +11826,20 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=True,
+     ),
++    "VLLM_DEBUG_ANTHROPIC_TRACE": env_var(
++        lambda: bool(int(os.getenv("VLLM_DEBUG_ANTHROPIC_TRACE", "0"))),
++        description=(
++            "vLLM: log a structural summary of each /v1/messages request and "
++            "dump the last complete one to /tmp/anth_last_request.json for "
++            "offline replay. Structure and lengths only, never the content. "
++            "Off by default."
++        ),
++        category="debug",
++        declared_default="False",
++        effective_default="False",
++        automatic_conditions=(),
++        user_visible=True,
++    ),
+     "VLLM_DEBUG_MTP_LOAD": env_var(
+         lambda: bool(int(os.getenv("VLLM_DEBUG_MTP_LOAD", "0"))),
+         description=(
