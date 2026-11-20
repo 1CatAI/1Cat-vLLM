@@ -570,6 +570,9 @@ if TYPE_CHECKING:
     VLLM_V41_PIN_ENGINE: str | None = None
     VLLM_V41_PIN_NUMA: str | None = None
     VLLM_V41_PP_AHEAD: str = "0"
+    VLLM_V41_PP_ANSWER_NO_SLEEP: str = "0"
+    VLLM_V41_PP_EMPTY_AHEAD: str = "0"
+    VLLM_V41_PP_LOOP_STATS: str = "0"
     VLLM_V41_PP_MICRO: str = "0"
     VLLM_V41_PP_RANK0: str = "0"
     VLLM_V41_PP_RECV_EARLY: str = "0"
@@ -8583,6 +8586,47 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "PP_MICRO)."
         ),
         category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PP_ANSWER_NO_SLEEP": env_var(
+        lambda: os.getenv("VLLM_V41_PP_ANSWER_NO_SLEEP", "0"),
+        description=(
+            "Sync PP: the engine core does not sleep its millisecond after the "
+            "loop iteration that took the answer of a step with tokens."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PP_EMPTY_AHEAD": env_var(
+        lambda: os.getenv("VLLM_V41_PP_EMPTY_AHEAD", "0"),
+        description=(
+            "Sync PP, three or more stages: an empty spacing step does not make "
+            "the engine core wait for the oldest queued step while that step "
+            "carries tokens and the queue has room."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PP_LOOP_STATS": env_var(
+        lambda: os.getenv("VLLM_V41_PP_LOOP_STATS", "0"),
+        description=(
+            "PP: N >= 1 logs one engine-core line per N token-step answers: "
+            "empty steps, sleeps and blocking draft takes between an answer and "
+            "the next step with tokens, and the time between them. 0: off."
+        ),
+        category="debug",
         declared_default="'0'",
         effective_default="'0'",
         automatic_conditions=(),
@@ -21953,6 +21997,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_PIN_ENGINE",
         "VLLM_V41_PIN_NUMA",
         "VLLM_V41_PP_AHEAD",
+        "VLLM_V41_PP_ANSWER_NO_SLEEP",
+        "VLLM_V41_PP_EMPTY_AHEAD",
+        "VLLM_V41_PP_LOOP_STATS",
         "VLLM_V41_PP_MICRO",
         "VLLM_V41_PP_RANK0",
         "VLLM_V41_PP_RECV_EARLY",
