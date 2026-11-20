@@ -171,9 +171,46 @@ def find_tool_properties(
     return {}
 
 
+_OPEN_SCHEMA_COMBINATORS = (
+    "additionalProperties",
+    "patternProperties",
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "$ref",
+    "not",
+)
+
+
+def is_closed_empty_object_schema(schema: Any) -> bool:
+    """Return True when a JSON schema accepts only an empty JSON object ``{}``."""
+    return (
+        isinstance(schema, dict)
+        and schema.get("type") == "object"
+        and not schema.get("properties")
+        and schema.get("additionalProperties") is False
+        and not any(k in schema for k in _OPEN_SCHEMA_COMBINATORS[1:])
+    )
+
+
 def _params_or_empty_object(params: dict[str, Any] | None) -> dict[str, Any]:
-    # Missing or empty parameters still constrain the arguments to an object.
-    return params if params else {"type": "object", "properties": {}}
+    # Missing or empty-property object parameters must close additionalProperties
+    # so forced tool calls cannot hallucinate undeclared keys or infinite
+    # whitespace runs before closing '}'.
+    if not params:
+        return {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+    if (
+        isinstance(params, dict)
+        and params.get("type") == "object"
+        and not params.get("properties")
+        and not any(k in params for k in _OPEN_SCHEMA_COMBINATORS)
+    ):
+        return {**params, "additionalProperties": False}
+    return params
 
 
 def _get_tool_schema_from_tool(tool: Tool) -> dict:

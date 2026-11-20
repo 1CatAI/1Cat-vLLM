@@ -600,6 +600,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             not dummy_run
             and not is_profile
             and keep_tail is not None
+            and not self.vllm_config.cache_config.enable_prefix_caching
             and _is_context_only_prefill(input_batch)
         ):
             chunk_end = (

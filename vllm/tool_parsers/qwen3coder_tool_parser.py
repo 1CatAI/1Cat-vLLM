@@ -1212,6 +1212,8 @@ class Qwen3CoderToolParser(ToolParser):
 
         return None
 
+    _uses_qwen_xml_tool_grammar = True
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,

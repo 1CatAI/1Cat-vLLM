@@ -133,8 +133,13 @@ class ToolParser:
             if isinstance(request, ChatCompletionRequest):
                 # tool_choice: "Forced Function" or "required" will override
                 # structured output json settings to make tool calling work correctly
+                from vllm.tool_parsers.utils import is_closed_empty_object_schema
+
                 request.structured_outputs = StructuredOutputsParams(
-                    json=json_schema_from_tool  # type: ignore[call-arg]
+                    json=json_schema_from_tool,  # type: ignore[call-arg]
+                    disable_any_whitespace=is_closed_empty_object_schema(
+                        json_schema_from_tool
+                    ),
                 )
                 request.response_format = None
             if isinstance(request, ResponsesRequest):

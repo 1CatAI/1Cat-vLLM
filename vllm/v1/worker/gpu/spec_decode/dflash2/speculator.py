@@ -56,6 +56,60 @@ def _proposal_nucleus_logits(
 
 
 @triton.jit
+def _apply_candidate_penalties(
+    scores,
+    candidates,
+    mask,
+    req_state,
+    tokens_ptr,
+    row,
+    num_steps: tl.constexpr,
+    step,
+    repetition_penalty_ptr,
+    frequency_penalty_ptr,
+    presence_penalty_ptr,
+    prompt_bin_mask_ptr,
+    prompt_bin_mask_stride,
+    output_bin_counts_ptr,
+    output_bin_counts_stride,
+    vocab_size,
+):
+    rep_penalty = tl.load(repetition_penalty_ptr + req_state)
+    freq_penalty = tl.load(frequency_penalty_ptr + req_state)
+    pres_penalty = tl.load(presence_penalty_ptr + req_state)
+    use_rep_penalty = rep_penalty != 1.0
+    if use_rep_penalty or freq_penalty != 0.0 or pres_penalty != 0.0:
+        in_vocab = mask & (candidates >= 0) & (candidates < vocab_size)
+        safe_tokens = tl.where(in_vocab, candidates, 0)
+        counts = tl.load(
+            output_bin_counts_ptr + req_state * output_bin_counts_stride + safe_tokens,
+            mask=in_vocab,
+            other=0,
+        ).to(tl.int32)
+        for prev_step in tl.range(step):
+            prev_token = tl.load(tokens_ptr + row * num_steps + prev_step)
+            counts = counts + (in_vocab & (safe_tokens == prev_token)).to(tl.int32)
+        output_mask = counts > 0
+        if use_rep_penalty:
+            packed = tl.load(
+                prompt_bin_mask_ptr
+                + req_state * prompt_bin_mask_stride
+                + safe_tokens // 32,
+                mask=in_vocab,
+                other=0,
+            )
+            in_prompt = ((packed >> (safe_tokens % 32)) & 1).to(tl.int1)
+            scale = tl.where(in_vocab & (in_prompt | output_mask), rep_penalty, 1.0)
+            scores = scores * tl.where(scores > 0, 1.0 / scale, scale)
+        scores = tl.where(
+            in_vocab,
+            scores - freq_penalty * counts - pres_penalty * output_mask,
+            scores,
+        )
+    return scores
+
+
+@triton.jit
 def _selector_walk_kernel(
     scores_ptr,
     candidate_ptr,
@@ -74,6 +128,15 @@ def _selector_walk_kernel(
     USE_FP64: tl.constexpr,
     PROPOSAL_TEMPERATURE_SCALE: tl.constexpr,
     PROPOSAL_TOP_P: tl.constexpr,
+    repetition_penalty_ptr=None,
+    frequency_penalty_ptr=None,
+    presence_penalty_ptr=None,
+    prompt_bin_mask_ptr=None,
+    prompt_bin_mask_stride=0,
+    output_bin_counts_ptr=None,
+    output_bin_counts_stride=0,
+    vocab_size=0,
+    HAS_PENALTIES: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_K)
@@ -91,7 +154,32 @@ def _selector_walk_kernel(
             mask=mask & valid,
             other=float("-inf"),
         ).to(tl.float32)
+        candidate_base = flat * top_k
+        candidates = tl.load(
+            candidate_ptr + candidate_base + offsets,
+            mask=mask & valid,
+            other=0,
+        )
         if SAMPLE_PROBABILISTIC and temperature != 0.0:
+            if HAS_PENALTIES and valid:
+                scores = _apply_candidate_penalties(
+                    scores,
+                    candidates,
+                    mask,
+                    req_state,
+                    tokens_ptr,
+                    row,
+                    num_steps,
+                    step,
+                    repetition_penalty_ptr,
+                    frequency_penalty_ptr,
+                    presence_penalty_ptr,
+                    prompt_bin_mask_ptr,
+                    prompt_bin_mask_stride,
+                    output_bin_counts_ptr,
+                    output_bin_counts_stride,
+                    vocab_size,
+                )
             # Cache the exact temperature-applied proposal scores expected by
             # the shared rejection sampler. This keeps Eagle/MTP's established
             # contract unchanged while matching the DFlash2 selector draw.
@@ -99,12 +187,6 @@ def _selector_walk_kernel(
             if PROPOSAL_TOP_P < 1.0:
                 scores = _proposal_nucleus_logits(scores, mask, PROPOSAL_TOP_P)
         scores = scores.to(tl.float64 if USE_FP64 else tl.float32)
-        candidate_base = flat * top_k
-        candidates = tl.load(
-            candidate_ptr + candidate_base + offsets,
-            mask=mask & valid,
-            other=0,
-        )
 
         # Candidate token IDs key an independent draft-noise stream.
         position = tl.load(sample_pos_ptr + flat) - 1
@@ -151,6 +233,15 @@ def _selector_walk_tail_kernel(
     USE_FP64: tl.constexpr,
     PROPOSAL_TEMPERATURE_SCALE: tl.constexpr,
     PROPOSAL_TOP_P: tl.constexpr,
+    repetition_penalty_ptr=None,
+    frequency_penalty_ptr=None,
+    presence_penalty_ptr=None,
+    prompt_bin_mask_ptr=None,
+    prompt_bin_mask_stride=0,
+    output_bin_counts_ptr=None,
+    output_bin_counts_stride=0,
+    vocab_size=0,
+    HAS_PENALTIES: tl.constexpr = False,
 ):
     """Write the final dependent slot separately on SM70.
 
@@ -174,17 +265,36 @@ def _selector_walk_tail_kernel(
         mask=mask & valid,
         other=float("-inf"),
     ).to(tl.float32)
-    if SAMPLE_PROBABILISTIC and temperature != 0.0:
-        scores = scores / (temperature * PROPOSAL_TEMPERATURE_SCALE)
-        if PROPOSAL_TOP_P < 1.0:
-            scores = _proposal_nucleus_logits(scores, mask, PROPOSAL_TOP_P)
-    scores = scores.to(tl.float64 if USE_FP64 else tl.float32)
     candidate_base = flat * top_k
     candidates = tl.load(
         candidate_ptr + candidate_base + offsets,
         mask=mask & valid,
         other=0,
     )
+    if SAMPLE_PROBABILISTIC and temperature != 0.0:
+        if HAS_PENALTIES and valid:
+            scores = _apply_candidate_penalties(
+                scores,
+                candidates,
+                mask,
+                req_state,
+                tokens_ptr,
+                row,
+                num_steps,
+                step,
+                repetition_penalty_ptr,
+                frequency_penalty_ptr,
+                presence_penalty_ptr,
+                prompt_bin_mask_ptr,
+                prompt_bin_mask_stride,
+                output_bin_counts_ptr,
+                output_bin_counts_stride,
+                vocab_size,
+            )
+        scores = scores / (temperature * PROPOSAL_TEMPERATURE_SCALE)
+        if PROPOSAL_TOP_P < 1.0:
+            scores = _proposal_nucleus_logits(scores, mask, PROPOSAL_TOP_P)
+    scores = scores.to(tl.float64 if USE_FP64 else tl.float32)
     # Candidate token IDs key an independent draft-noise stream.
     position = tl.load(sample_pos_ptr + flat) - 1
     _, index = gumbel_noised_argmax(
@@ -566,6 +676,7 @@ class DFlash2Speculator(DFlashSpeculator):
             ngram_assist and self.draft_block < self.num_speculative_steps
         )
         self._req_states = None
+        self._penalties_state: Any | None = None
         self._lookup_current_req_key: tuple[int, ...] = ()
         self._lookup_current_eligible = False
         self._lookup_last_emitted: torch.Tensor | None = None
@@ -652,6 +763,10 @@ class DFlash2Speculator(DFlashSpeculator):
     def set_req_states(self, req_states) -> None:
         """Expose the request token history used by the device lookup."""
         self._req_states = req_states
+
+    def set_penalties_state(self, penalties_state) -> None:
+        """Expose target sampling penalties so probabilistic proposals stay aligned."""
+        self._penalties_state = penalties_state
 
     def _reset_lookup_controller(self, req_key: tuple[int, ...]) -> None:
         self._lookup_controller_req_key = req_key
@@ -1013,6 +1128,27 @@ class DFlash2Speculator(DFlashSpeculator):
         candidate_ids = candidate_ids.contiguous()
         block_k = triton.next_power_of_2(self.selector_top_k)
         walk_steps = self.draft_block - 1 if self._use_sm70_tail else self.draft_block
+        penalties = self._penalties_state
+        if self.draft_logits is not None and penalties is not None:
+            has_penalties = True
+            rep_ptr = penalties.repetition_penalty.gpu
+            freq_ptr = penalties.frequency_penalty.gpu
+            pres_ptr = penalties.presence_penalty.gpu
+            prompt_mask_ptr = penalties.prompt_bin_mask
+            prompt_mask_stride = penalties.prompt_bin_mask.stride(0)
+            out_counts_ptr = penalties.output_bin_counts
+            out_counts_stride = penalties.output_bin_counts.stride(0)
+            vocab_size = int(penalties.vocab_size)
+        else:
+            has_penalties = False
+            rep_ptr = self.temperature
+            freq_ptr = self.temperature
+            pres_ptr = self.temperature
+            prompt_mask_ptr = self._selector_path_state
+            prompt_mask_stride = 0
+            out_counts_ptr = self._selector_path_state
+            out_counts_stride = 0
+            vocab_size = 0
         _selector_walk_kernel[(num_reqs,)](
             scores,
             candidate_ids,
@@ -1031,6 +1167,15 @@ class DFlash2Speculator(DFlashSpeculator):
             USE_FP64=self.use_fp64_gumbel,
             PROPOSAL_TEMPERATURE_SCALE=self.proposal_temperature_scale,
             PROPOSAL_TOP_P=self.proposal_top_p,
+            repetition_penalty_ptr=rep_ptr,
+            frequency_penalty_ptr=freq_ptr,
+            presence_penalty_ptr=pres_ptr,
+            prompt_bin_mask_ptr=prompt_mask_ptr,
+            prompt_bin_mask_stride=prompt_mask_stride,
+            output_bin_counts_ptr=out_counts_ptr,
+            output_bin_counts_stride=out_counts_stride,
+            vocab_size=vocab_size,
+            HAS_PENALTIES=has_penalties,
             num_warps=1,
         )
         if self._use_sm70_tail:
@@ -1051,6 +1196,15 @@ class DFlash2Speculator(DFlashSpeculator):
                 USE_FP64=self.use_fp64_gumbel,
                 PROPOSAL_TEMPERATURE_SCALE=self.proposal_temperature_scale,
                 PROPOSAL_TOP_P=self.proposal_top_p,
+                repetition_penalty_ptr=rep_ptr,
+                frequency_penalty_ptr=freq_ptr,
+                presence_penalty_ptr=pres_ptr,
+                prompt_bin_mask_ptr=prompt_mask_ptr,
+                prompt_bin_mask_stride=prompt_mask_stride,
+                output_bin_counts_ptr=out_counts_ptr,
+                output_bin_counts_stride=out_counts_stride,
+                vocab_size=vocab_size,
+                HAS_PENALTIES=has_penalties,
                 num_warps=1,
             )
 

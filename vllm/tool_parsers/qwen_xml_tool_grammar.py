@@ -8,6 +8,7 @@ Extracted from Qwen3XMLToolParser (1CatAI/1Cat-vLLM#653).
 
 import json
 from logging import Logger
+from typing import Any
 
 from xgrammar import Grammar
 from xgrammar.structural_tag import (
@@ -31,6 +32,80 @@ from vllm.tool_parsers.structural_tag_registry import (
     get_enable_structured_outputs_in_reasoning,
     get_model_structural_tag,
 )
+
+_JSON_OBJECT_NO_TOOL_HINT = (
+    "If no tool call is required to answer the user, reply directly with a raw "
+    "JSON object without markdown code fences."
+)
+_JSON_SCHEMA_NO_TOOL_HINT = (
+    "If no tool call is required to answer the user, reply directly with a raw "
+    "JSON value matching the requested schema without markdown code fences."
+)
+
+
+def _qwen_xml_response_format_hint(request: Any) -> str | None:
+    if not isinstance(request, ChatCompletionRequest) or not request.tools:
+        return None
+    if request.tool_choice != "auto":
+        return None
+    if (
+        request.structured_outputs is not None
+        and not request.structured_outputs.all_constraints_none()
+    ):
+        return None
+    response_format = request.response_format
+    if response_format is None:
+        return None
+    if response_format.type == "json_object":
+        return _JSON_OBJECT_NO_TOOL_HINT
+    if response_format.type == "json_schema":
+        json_schema = response_format.json_schema
+        if json_schema is not None and json_schema.json_schema is not None:
+            return _JSON_SCHEMA_NO_TOOL_HINT
+    return None
+
+
+def maybe_inject_qwen_xml_response_format_hint(
+    request: Any,
+    messages: list[Any],
+    tool_parser: Any,
+) -> list[Any]:
+    """Guide Qwen XML tool+JSON union away from code fences & false tool calls.
+
+    When both ``tools`` (``tool_choice="auto"``) and ``response_format``
+    (``json_object`` / ``json_schema``) are set, the chat template injects the
+    ``<tools>`` system block while ``adjust_qwen_xml_tool_request`` clears
+    ``request.response_format`` and masks markdown `````json`` fences in the
+    answer branch. Without a matching raw-JSON fallback hint, Qwen splits JSON
+    probability mass onto `````json`` and greedily picks ``<tool_call>`` on
+    non-tool prompts. Requests without ``response_format`` are untouched.
+    """
+    if tool_parser is None or not getattr(
+        tool_parser, "_uses_qwen_xml_tool_grammar", False
+    ):
+        return messages
+    hint = _qwen_xml_response_format_hint(request)
+    if hint is None or not messages:
+        return messages
+
+    first = messages[0]
+    if isinstance(first, dict) and first.get("role") in ("system", "developer"):
+        content = first.get("content")
+        if isinstance(content, str):
+            if hint in content:
+                return messages
+            updated_first = {
+                **first,
+                "content": f"{content}\n\n{hint}" if content else hint,
+            }
+            return [updated_first, *messages[1:]]
+        if isinstance(content, list):
+            updated_first = {
+                **first,
+                "content": [*content, {"type": "text", "text": f"\n\n{hint}"}],
+            }
+            return [updated_first, *messages[1:]]
+    return [{"role": "system", "content": hint}, *messages]
 
 
 def adjust_qwen_xml_tool_request(

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Flash-Next NVFP4 / MTP4 release recipe, 4x V100-SXM2-32GB.
+# Flash-Next NVFP4 / DCP=2 + MTP5 release recipe, 4x V100-SXM2-32GB.
 set -euo pipefail
 
 usage() {
@@ -9,7 +9,7 @@ usage() {
 Usage: serve_flash_next_nvfp4_v100.sh MODEL [--draft LOCAL_PATH] [vllm serve options...]
 
 MODEL is a local checkpoint directory or a Hugging Face model ID.
-Defaults: TP4, FP16 compute, MTP4, 256K context with INT8 KV history in
+Defaults: TP4, DCP2, FP16 compute, MTP5, 256K context with INT8 KV history in
 pinned host memory, 4096-token prefill, up to 8 sequences, prefix caching and
 GPU memory utilization 0.89. Without --draft the MTP layers inside MODEL are
 used; pass --draft for a separate MTP checkpoint directory.
@@ -44,12 +44,12 @@ while [[ $# -gt 0 ]]; do
     shift
   fi
 done
-speculative='{"method": "mtp", "num_speculative_tokens": 4, "draft_sample_method": "greedy"}'
+speculative='{"method": "mtp", "num_speculative_tokens": 5, "draft_sample_method": "greedy"}'
 if [[ -n $draft ]]; then
   draft_json=$(printf '%s' "$draft" | sed 's/\\/\\\\/g; s/"/\\"/g')
-  speculative="{\"method\": \"mtp\", \"model\": \"$draft_json\", \"num_speculative_tokens\": 4, \"draft_sample_method\": \"greedy\"}"
+  speculative="{\"method\": \"mtp\", \"model\": \"$draft_json\", \"num_speculative_tokens\": 5, \"draft_sample_method\": \"greedy\"}"
 fi
-kernel_config='{"sm70_hcx": true, "sm70_qsa_prep": true, "sm70_hcx_local_schedule": true, "hc_weight_storage": "sharded", "qsa_host_kv": true, "qsa_host_kv_dtype": "int8_per_token_head", "qsa_host_kv_hot_dtype": "int8_per_token_head", "qsa_host_kv_hot_tokens": 131072, "qsa_host_kv_prefill_stage_tokens": 262144, "qsa_host_kv_trim_warmup_cache": true}'
+kernel_config='{"sm70_hcx": true, "sm70_qsa_prep": true, "sm70_hcx_local_schedule": true, "hc_weight_storage": "sharded", "qsa_host_kv": true, "qsa_host_kv_dtype": "int8_per_token_head", "qsa_host_kv_draft_dtype": "int8_per_token_head", "qsa_host_kv_hot_dtype": "int8_per_token_head", "qsa_host_kv_hot_tokens": 262144, "qsa_host_kv_prefill_stage_tokens": 262144, "qsa_host_kv_trim_warmup_cache": true, "qsa_host_kv_state_blocks": 176, "qsa_host_kv_history_blocks": 768}'
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 vllm_cli=vllm
@@ -58,11 +58,12 @@ if [[ -x "$script_dir/vllm" ]]; then
 fi
 vllm_cli=$(command -v "$vllm_cli")
 exec "$vllm_cli" serve "$model" \
-  --tensor-parallel-size 4 --dtype half --kv-cache-dtype float16 \
+  --tensor-parallel-size 4 --decode-context-parallel-size 2 \
+  --dtype half --kv-cache-dtype float16 \
   --limit-mm-per-prompt '{"video": 0, "audio": 0}' --max-model-len 262144 \
   --max-num-batched-tokens 4096 --max-num-seqs 8 \
   --gpu-memory-utilization 0.89 --attention-backend FLASH_ATTN_V100 \
-  --enable-prefix-caching --partial-prefix-cache \
+  --enable-prefix-caching --partial-prefix-cache --mamba-cache-mode align \
   --block-size 2048 --mamba-block-size 2048 --mixed-prefill-step-latency-ms 0 \
   --mamba-ssm-cache-dtype float32 --enable-prompt-tokens-details \
   --kernel-config "$kernel_config" \

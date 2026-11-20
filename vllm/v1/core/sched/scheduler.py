@@ -799,6 +799,7 @@ class Scheduler(SchedulerInterface):
             if phase is not None:
                 self.phase_separation.begin_phase(phase, _now)
         _split_mtp_both_active = False
+        _concurrent_prefill_burst_target = 1024
         if self._split_mtp_phase_pure and self.phase_separation is None:
             _force_decode = self._split_mtp_force_decode_once
             self._split_mtp_force_decode_once = False
@@ -843,9 +844,26 @@ class Scheduler(SchedulerInterface):
                     phase = Phase.DECODE
                 else:
                     phase = Phase.PREFILL
-                    token_budget = min(
-                        token_budget, self._split_mtp_concurrent_prefill_cap
+                    _max_prefill_computed = max(
+                        (
+                            r.num_computed_tokens
+                            for r in _schedulable_running
+                            if prefill_remaining[r.request_id] > 0
+                        ),
+                        default=0,
                     )
+                    if _max_prefill_computed >= 49152:
+                        _concurrent_cap = min(
+                            self._split_mtp_concurrent_prefill_cap, 512
+                        )
+                    elif _max_prefill_computed >= 16384:
+                        _concurrent_cap = min(
+                            self._split_mtp_concurrent_prefill_cap, 1024
+                        )
+                    else:
+                        _concurrent_cap = self._split_mtp_concurrent_prefill_cap
+                    _concurrent_prefill_burst_target = min(1024, _concurrent_cap)
+                    token_budget = min(token_budget, _concurrent_cap)
             else:
                 self._split_mtp_decode_steps_due = 0
                 self._split_mtp_prefill_burst_tokens = 0
@@ -1771,7 +1789,10 @@ class Scheduler(SchedulerInterface):
                 )
                 if _next_has_short_tail:
                     self._split_mtp_decode_steps_due = 0
-                elif self._split_mtp_prefill_burst_tokens >= 1024:
+                elif (
+                    self._split_mtp_prefill_burst_tokens
+                    >= _concurrent_prefill_burst_target
+                ):
                     if not _unfinished_rems:
                         self._split_mtp_decode_steps_due = 3
                     elif (

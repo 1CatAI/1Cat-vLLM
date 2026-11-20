@@ -1190,6 +1190,8 @@ class Qwen3XMLToolParser(ToolParser):
             "vLLM Successfully import tool parser %s !", self.__class__.__name__
         )
 
+    _uses_qwen_xml_tool_grammar = True
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,
