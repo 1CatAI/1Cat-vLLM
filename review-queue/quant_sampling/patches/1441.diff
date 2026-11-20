@@ -1,0 +1,120 @@
+diff --git a/vllm/model_executor/kernels/linear/qpn/nvfp4_dequant.py b/vllm/model_executor/kernels/linear/qpn/nvfp4_dequant.py
+index e6f0bbc91b..1e237ee85f 100644
+--- a/vllm/model_executor/kernels/linear/qpn/nvfp4_dequant.py
++++ b/vllm/model_executor/kernels/linear/qpn/nvfp4_dequant.py
+@@ -215,7 +215,12 @@ def nvfp4_qpn2_dense_linear(
+ 
+ 
+ # Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu.
+-QPN2_DISPATCH_MAX_ROWS = 32
++# Keep this in step with the C++ mirror (``nvfp4_qpn2_sm70.cu``, which uses
++# 128). The DFlash2 verifier issues num_reqs * 8 rows, so 4 concurrent requests
++# already sit exactly on the old limit of 32. One row past it silently falls
++# back to the dense path, which interleaves with the sampling graph's
++# collectives and shows up as a hot-load deadlock at 4-way concurrency.
++QPN2_DISPATCH_MAX_ROWS = 128
+ 
+ 
+ def _nvfp4_qpn2_dispatch_linear(
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index a8c24e06bb..52b9e0e95c 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -369,11 +369,19 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+ 
+         from vllm.model_executor.kernels.linear import sm70_dense as dense_provider
+ 
++        # `_layer_execution_policy` / `_layer_trace` are only assigned in
++        # LinearBase.__init__. ParallelLMHead derives from
++        # VocabParallelEmbedding rather than LinearBase, so it has neither when
++        # it goes through the dense provider, and weight loading dies with
++        # AttributeError. Fall back to the global accessors: LinearBase only
++        # stores a snapshot of layer_policy() anyway, so the semantics match.
++        _policy = getattr(layer, "_layer_execution_policy", None) or layer_policy()
++        _trace = getattr(layer, "_layer_trace", None) or capture_runtime_trace()
+         state = dense_provider.DenseLinearState(
+             layer.weight,
+             prefix=getattr(layer, "prefix", ""),
+-            policy=layer._layer_execution_policy,
+-            trace=layer._layer_trace,
++            policy=_policy,
++            trace=_trace,
+             forbidden=getattr(layer, "_sm70_f16_forbidden", False),
+             max_m=getattr(layer, "_sm70_f16_max_m", None),
+             glm_cublaslt=getattr(layer, "_sm70_glm53_tp8_cublaslt", False),
+@@ -385,7 +393,7 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+             input_parallel=getattr(layer, "input_is_parallel", True),
+             suffix_allowed=is_layer_sm70_f16_dense(
+                 getattr(layer, "prefix", ""),
+-                policy=layer._layer_execution_policy,
++                policy=_policy,
+             ),
+         )
+ 
+@@ -421,11 +429,12 @@ def apply(
+             return sm70_out
+         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+             return linear_batch_invariant(x, layer.weight, bias)
+-        if layer._layer_trace.unquant_debug and x.dim() >= 2:
++        # As above: ParallelLMHead has no _layer_trace.
++        if getattr(layer, "_layer_trace", None) is not None and layer._layer_trace.unquant_debug and x.dim() >= 2:
+             x_2d = x.reshape(-1, x.shape[-1])
+             log_fn = (
+                 logger.info
+-                if x_2d.size(0) <= layer._layer_execution_policy.dense_max_m
++                if x_2d.size(0) <= layer_policy().dense_max_m
+                 else logger.info_once
+             )
+             log_fn(
+diff --git a/vllm/model_executor/layers/quantization/sm70_turbomind.py b/vllm/model_executor/layers/quantization/sm70_turbomind.py
+index f2cc6f303e..3c8c8369a7 100644
+--- a/vllm/model_executor/layers/quantization/sm70_turbomind.py
++++ b/vllm/model_executor/layers/quantization/sm70_turbomind.py
+@@ -554,7 +554,18 @@ def prepare_nvfp4_linear(
+ 
+ # Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu: rows up to this
+ # take the QPN2 decode kernels, larger M takes the dense prefill.
+-QPN2_DISPATCH_MAX_ROWS = 32
++# Keep this in step with the C++ mirror, which already uses 128
++# (csrc/sm70_turbomind/ops/nvfp4_qpn2_sm70.cu:55).
++#
++# The DFlash2 verifier issues num_reqs * (1 + nst) = num_reqs * 8 rows, so 4
++# concurrent requests is 32 rows and 8 is 64. The old limit of 32 put 4-way
++# concurrency exactly on the boundary; one row past it silently switched to
++# the dequant-to-fp16-then-cuBLAS dense fallback, which interleaves with the
++# device-side sampling graph's collectives and deadlocks under hot load --
++# observed as unbalanced GPU power (some cards idling at 160W+, others stuck
++# near 70W) alongside "No available shared memory broadcast block found in 60
++# seconds".
++QPN2_DISPATCH_MAX_ROWS = 128
+ QPN2_GROUP_SIZE = 16
+ 
+ # Launch configurations (split-K, accumulator chains) measured on the
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index 33ce9c770f..389760eb2c 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -1116,7 +1116,22 @@ def combine_hidden_states(
+         # AWQ target paths can surface fp32 auxiliary states even when the
+         # draft projection is initialized in fp16. Match the FC weight dtype
+         # before dispatching the linear kernel.
+-        projection_dtype = _dflash_context_projection_dtype(self.model.fc)
++        #
++        # A quantized fc (compressed-tensors NVFP4 on SM70 TurboMind) exposes
++        # only an **empty uint8 weight stub** after prepare_nvfp4_linear, whose
++        # dtype is not the activation dtype the kernel wants.
++        # _dflash_context_projection_dtype() therefore falls back to
++        # quant_method.params_dtype (= model_config.dtype), while the SM70
++        # NVFP4 GEMM requires float16 activations and fails warmup with
++        # "nvfp4_gemm_sm70: input must be float16.". Test for the empty stub
++        # instead: empty means force float16.
++        fc_weight = getattr(self.model.fc, "weight", None)
++        if fc_weight is not None and fc_weight.numel() == 0:
++            projection_dtype = torch.float16
++        elif fc_weight is not None:
++            projection_dtype = fc_weight.dtype
++        else:
++            projection_dtype = None
+         if projection_dtype is not None and hidden_states.dtype != projection_dtype:
+             hidden_states = hidden_states.to(dtype=projection_dtype)
+         result = self.model.fc(hidden_states)
