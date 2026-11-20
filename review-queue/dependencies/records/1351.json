@@ -1,0 +1,99 @@
+{
+  "initial_inventory": {
+    "number": 1351,
+    "title": "Bump typepy from 1.3.2 to 2.0.0",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1351",
+    "isDraft": false,
+    "headRefOid": "6f9475bb59c4fce2b3024ef0f0854a9efbede264",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1351,
+    "title": "Bump typepy from 1.3.2 to 2.0.0",
+    "body": "Bumps [typepy](https://github.com/thombashi/typepy) from 1.3.2 to 2.0.0.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a href=\"https://github.com/thombashi/typepy/releases\">typepy's releases</a>.</em></p>\n<blockquote>\n<h2>v2.0.0</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Replace pytz with ZoneInfo + misc datetime fixes by <a href=\"https://github.com/JYOuyang\"><code>@​JYOuyang</code></a> in <a href=\"https://redirect.github.com/thombashi/typepy/pull/13\">thombashi/typepy#13</a></li>\n</ul>\n<h2>New Contributors</h2>\n<ul>\n<li><a href=\"https://github.com/JYOuyang\"><code>@​JYOuyang</code></a> made their first contribution in <a href=\"https://redirect.github.com/thombashi/typepy/pull/13\">thombashi/typepy#13</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a href=\"https://github.com/thombashi/typepy/compare/v1.3.5...v2.0.0\">https://github.com/thombashi/typepy/compare/v1.3.5...v2.0.0</a></p>\n<h2>v1.3.5</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Bump the actions-dependencies group across 1 directory with 6 updates by <a href=\"https://github.com/dependabot\"><code>@​dependabot</code></a>[bot] in <a href=\"https://redirect.github.com/thombashi/typepy/pull/9\">thombashi/typepy#9</a></li>\n<li>Fixed an invalid input handle for DateTimeConverter by <a href=\"https://github.com/thombashi\"><code>@​thombashi</code></a> in <a href=\"https://redirect.github.com/thombashi/typepy/pull/10\">thombashi/typepy#10</a></li>\n<li>Add support for Python 3.14 by <a href=\"https://github.com/thombashi\"><code>@​thombashi</code></a> in <a href=\"https://redirect.github.com/thombashi/typepy/pull/11\">thombashi/typepy#11</a></li>\n<li>Fix logic issues in type checking and conversion functions by <a href=\"https://github.com/thombashi\"><code>@​thombashi</code></a> in <a href=\"https://redirect.github.com/thombashi/typepy/pull/12\">thombashi/typepy#12</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a href=\"https://github.com/thombashi/typepy/compare/v1.3.4...v1.3.5\">https://github.com/thombashi/typepy/compare/v1.3.4...v1.3.5</a></p>\n<h2>v1.3.4</h2>\n<p><strong>Full Changelog</strong>: <a href=\"https://github.com/thombashi/typepy/compare/v1.3.3...v1.3.4\">https://github.com/thombashi/typepy/compare/v1.3.3...v1.3.4</a></p>\n<h2>v1.3.3</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Replace deprecated <code>abctractproperty</code></li>\n<li>Drop support for Python 3.7/3.8</li>\n<li>Add support for Python 3.13</li>\n<li>Add GitHub Actions workflow for building and publishing to PyPI</li>\n<li>Update copyright years</li>\n<li>Bump actions/setup-python from 4 to 5 by <a href=\"https://github.com/dependabot\"><code>@​dependabot</code></a> in <a href=\"https://redirect.github.com/thombashi/typepy/pull/4\">thombashi/typepy#4</a></li>\n</ul>\n<h2>New Contributors</h2>\n<ul>\n<li><a href=\"https://github.com/dependabot\"><code>@​dependabot</code></a> made their first contribution in <a href=\"https://redirect.github.com/thombashi/typepy/pull/4\">thombashi/typepy#4</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a href=\"https://github.com/thombashi/typepy/compare/v1.3.2...v1.3.3\">https://github.com/thombashi/typepy/compare/v1.3.2...v1.3.3</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a href=\"https://github.com/thombashi/typepy/commit/2d7ed7069bd74696433a27ddabdac2feb77c246d\"><code>2d7ed70</code></a> Bump version to 2.0.0</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/f65a5b32b36d442c5af211b17d4f9b85d2a269ac\"><code>f65a5b3</code></a> Merge pull request <a href=\"https://redirect.github.com/thombashi/typepy/issues/13\">#13</a> from JYOuyang/jyo-tz</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/dd5f44864053920820946f8abf00b57037136186\"><code>dd5f448</code></a> setup.py: PEP 508 env marker to install tzdata if on Windows.</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/c702aa0d7ce8257d249a034a7f52337c5aa38446\"><code>c702aa0</code></a> Replace pytz with ZoneInfo + misc datetime fixes</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/92958dc4094188387319538bb8ee9f313b36aa43\"><code>92958dc</code></a> Bump version to 1.3.5</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/d514e7629c552d98e831fc53b28c64b9373711cf\"><code>d514e76</code></a> Merge pull request <a href=\"https://redirect.github.com/thombashi/typepy/issues/12\">#12</a> from thombashi/fix-logic-issues</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/4692c23ce14051a96124fd8af46c1ff4db2b3eaa\"><code>4692c23</code></a> Fix logic issues in type checking and conversion functions</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/de7043ee844f7cc80bb370cdf4343fd5c6a526a3\"><code>de7043e</code></a> Merge pull request <a href=\"https://redirect.github.com/thombashi/typepy/issues/11\">#11</a> from thombashi/add-py314</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/998a550231692b11732c3deb39a61ba0e2c672c8\"><code>998a550</code></a> Add support for Python 3.14</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/8d4fad51df1008c8cdad35a5fe375ab820b0fd1a\"><code>8d4fad5</code></a> Add permissions section to GitHub Actions workflow</li>\n<li>Additional commits viewable in <a href=\"https://github.com/thombashi/typepy/compare/v1.3.2...v2.0.0\">compare view</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility score](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=typepy&package-manager=pip&previous-version=1.3.2&new-version=2.0.0)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't alter it yourself. You can also trigger a rebase manually by commenting `@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits that have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all of the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop Dependabot creating any more for this major version (unless you reopen the PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop Dependabot creating any more for this minor version (unless you reopen the PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop Dependabot creating any more for this dependency (unless you reopen the PR or upgrade to it yourself)\n\n\n</details>",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1351",
+    "isDraft": false,
+    "headRefName": "dependabot/pip/typepy-2.0.0",
+    "headRefOid": "6f9475bb59c4fce2b3024ef0f0854a9efbede264",
+    "baseRefName": "main",
+    "baseRefOid": "6db9c816cd9b936fa7d6aed31a404b4d23d1e6fc",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "dependabot"
+    },
+    "labels": {
+      "nodes": [
+        {
+          "name": "dependencies"
+        }
+      ]
+    }
+  },
+  "discussion": {
+    "number": 1351,
+    "id": "PR_kwDORjYFXs8AAAABMq-okg",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "6f9475bb59c4fce2b3024ef0f0854a9efbede264",
+    "title": "Bump typepy from 1.3.2 to 2.0.0",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1351",
+    "body": "Bumps [typepy](https://github.com/thombashi/typepy) from 1.3.2 to 2.0.0.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a href=\"https://github.com/thombashi/typepy/releases\">typepy's releases</a>.</em></p>\n<blockquote>\n<h2>v2.0.0</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Replace pytz with ZoneInfo + misc datetime fixes by <a href=\"https://github.com/JYOuyang\"><code>@​JYOuyang</code></a> in <a href=\"https://redirect.github.com/thombashi/typepy/pull/13\">thombashi/typepy#13</a></li>\n</ul>\n<h2>New Contributors</h2>\n<ul>\n<li><a href=\"https://github.com/JYOuyang\"><code>@​JYOuyang</code></a> made their first contribution in <a href=\"https://redirect.github.com/thombashi/typepy/pull/13\">thombashi/typepy#13</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a href=\"https://github.com/thombashi/typepy/compare/v1.3.5...v2.0.0\">https://github.com/thombashi/typepy/compare/v1.3.5...v2.0.0</a></p>\n<h2>v1.3.5</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Bump the actions-dependencies group across 1 directory with 6 updates by <a href=\"https://github.com/dependabot\"><code>@​dependabot</code></a>[bot] in <a href=\"https://redirect.github.com/thombashi/typepy/pull/9\">thombashi/typepy#9</a></li>\n<li>Fixed an invalid input handle for DateTimeConverter by <a href=\"https://github.com/thombashi\"><code>@​thombashi</code></a> in <a href=\"https://redirect.github.com/thombashi/typepy/pull/10\">thombashi/typepy#10</a></li>\n<li>Add support for Python 3.14 by <a href=\"https://github.com/thombashi\"><code>@​thombashi</code></a> in <a href=\"https://redirect.github.com/thombashi/typepy/pull/11\">thombashi/typepy#11</a></li>\n<li>Fix logic issues in type checking and conversion functions by <a href=\"https://github.com/thombashi\"><code>@​thombashi</code></a> in <a href=\"https://redirect.github.com/thombashi/typepy/pull/12\">thombashi/typepy#12</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a href=\"https://github.com/thombashi/typepy/compare/v1.3.4...v1.3.5\">https://github.com/thombashi/typepy/compare/v1.3.4...v1.3.5</a></p>\n<h2>v1.3.4</h2>\n<p><strong>Full Changelog</strong>: <a href=\"https://github.com/thombashi/typepy/compare/v1.3.3...v1.3.4\">https://github.com/thombashi/typepy/compare/v1.3.3...v1.3.4</a></p>\n<h2>v1.3.3</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Replace deprecated <code>abctractproperty</code></li>\n<li>Drop support for Python 3.7/3.8</li>\n<li>Add support for Python 3.13</li>\n<li>Add GitHub Actions workflow for building and publishing to PyPI</li>\n<li>Update copyright years</li>\n<li>Bump actions/setup-python from 4 to 5 by <a href=\"https://github.com/dependabot\"><code>@​dependabot</code></a> in <a href=\"https://redirect.github.com/thombashi/typepy/pull/4\">thombashi/typepy#4</a></li>\n</ul>\n<h2>New Contributors</h2>\n<ul>\n<li><a href=\"https://github.com/dependabot\"><code>@​dependabot</code></a> made their first contribution in <a href=\"https://redirect.github.com/thombashi/typepy/pull/4\">thombashi/typepy#4</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a href=\"https://github.com/thombashi/typepy/compare/v1.3.2...v1.3.3\">https://github.com/thombashi/typepy/compare/v1.3.2...v1.3.3</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a href=\"https://github.com/thombashi/typepy/commit/2d7ed7069bd74696433a27ddabdac2feb77c246d\"><code>2d7ed70</code></a> Bump version to 2.0.0</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/f65a5b32b36d442c5af211b17d4f9b85d2a269ac\"><code>f65a5b3</code></a> Merge pull request <a href=\"https://redirect.github.com/thombashi/typepy/issues/13\">#13</a> from JYOuyang/jyo-tz</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/dd5f44864053920820946f8abf00b57037136186\"><code>dd5f448</code></a> setup.py: PEP 508 env marker to install tzdata if on Windows.</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/c702aa0d7ce8257d249a034a7f52337c5aa38446\"><code>c702aa0</code></a> Replace pytz with ZoneInfo + misc datetime fixes</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/92958dc4094188387319538bb8ee9f313b36aa43\"><code>92958dc</code></a> Bump version to 1.3.5</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/d514e7629c552d98e831fc53b28c64b9373711cf\"><code>d514e76</code></a> Merge pull request <a href=\"https://redirect.github.com/thombashi/typepy/issues/12\">#12</a> from thombashi/fix-logic-issues</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/4692c23ce14051a96124fd8af46c1ff4db2b3eaa\"><code>4692c23</code></a> Fix logic issues in type checking and conversion functions</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/de7043ee844f7cc80bb370cdf4343fd5c6a526a3\"><code>de7043e</code></a> Merge pull request <a href=\"https://redirect.github.com/thombashi/typepy/issues/11\">#11</a> from thombashi/add-py314</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/998a550231692b11732c3deb39a61ba0e2c672c8\"><code>998a550</code></a> Add support for Python 3.14</li>\n<li><a href=\"https://github.com/thombashi/typepy/commit/8d4fad51df1008c8cdad35a5fe375ab820b0fd1a\"><code>8d4fad5</code></a> Add permissions section to GitHub Actions workflow</li>\n<li>Additional commits viewable in <a href=\"https://github.com/thombashi/typepy/compare/v1.3.2...v2.0.0\">compare view</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility score](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=typepy&package-manager=pip&previous-version=1.3.2&new-version=2.0.0)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't alter it yourself. You can also trigger a rebase manually by commenting `@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits that have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all of the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop Dependabot creating any more for this major version (unless you reopen the PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop Dependabot creating any more for this minor version (unless you reopen the PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop Dependabot creating any more for this dependency (unless you reopen the PR or upgrade to it yourself)\n\n\n</details>",
+    "author": {
+      "login": "dependabot"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "dependabot/pip/typepy-2.0.0",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1351,
+    "title": "Bump typepy from 1.3.2 to 2.0.0",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1351",
+    "isDraft": false,
+    "headRefOid": "6f9475bb59c4fce2b3024ef0f0854a9efbede264",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "requirements/test/cuda.txt"
+    ],
+    "diff_bytes": 372,
+    "diff_sha256": "d48d2aba1e3b98bdbbd98cdbb9a06104b958253ff5f3b4710be35fa140544f19"
+  },
+  "full_tree_diff_proof": null
+}
