@@ -1300,16 +1300,20 @@ __global__ void flash_attention_decode_partition_int8_pth_kernel(
   __shared__ __half q_shared[6][D];
   __shared__ float scores_shared[6][PARTITION_SIZE];
   __shared__ float v_scale_shared[PARTITION_SIZE];
-  __shared__ int pblk_shared[PARTITION_SIZE];
-  __shared__ int tok_off_shared[PARTITION_SIZE];
+  constexpr int kMaxPagesInPart = (PARTITION_SIZE / 16) + 2;
+  __shared__ int pblk_shared[kMaxPagesInPart];
+  const int first_page = start_token_idx / block_size;
+  const int num_pages_in_part =
+      (start_token_idx + part_tokens - 1) / block_size - first_page + 1;
   for (int i = threadIdx.x; i < 6 * D; i += blockDim.x)
     q_shared[i / D][i % D] = q[(i / D) * q_stride1 + i % D];
+  for (int p = threadIdx.x; p < num_pages_in_part; p += blockDim.x)
+    pblk_shared[p] = block_table[first_page + p];
+  __syncthreads();
   for (int i = threadIdx.x; i < part_tokens; i += blockDim.x) {
     const int abs_tok = start_token_idx + i;
-    const int pblk = block_table[abs_tok / block_size];
+    const int pblk = pblk_shared[abs_tok / block_size - first_page];
     const int tok_off = abs_tok % block_size;
-    pblk_shared[i] = pblk;
-    tok_off_shared[i] = tok_off;
     v_scale_shared[i] =
         __ldg(&v_scales[static_cast<int64_t>(pblk) * vs_block_stride +
                         static_cast<int64_t>(tok_off) * vs_token_stride]);
@@ -1320,8 +1324,9 @@ __global__ void flash_attention_decode_partition_int8_pth_kernel(
   for (int head = 0; head < 6; ++head) local_max[head] = -1.0e20f;
   for (int token_local = warp_idx; token_local < part_tokens;
        token_local += kWarpsPerBlock) {
-    const int pblk = pblk_shared[token_local];
-    const int token_offset = tok_off_shared[token_local];
+    const int abs_tok = start_token_idx + token_local;
+    const int pblk = pblk_shared[abs_tok / block_size - first_page];
+    const int token_offset = abs_tok % block_size;
     const int64_t k_index = static_cast<int64_t>(pblk) * k_block_stride +
                             static_cast<int64_t>(token_offset) * k_token_stride;
     float score[6] = {};
@@ -1372,15 +1377,23 @@ __global__ void flash_attention_decode_partition_int8_pth_kernel(
   }
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float acc[6] = {};
-    for (int i = 0; i < part_tokens; ++i) {
-      const int64_t v_index =
-          static_cast<int64_t>(pblk_shared[i]) * v_block_stride +
-          static_cast<int64_t>(tok_off_shared[i]) * v_token_stride + d;
-      const float vv =
-          static_cast<float>(__ldg(&v_cache[v_index])) * v_scale_shared[i];
+    int cur_local = 0;
+    for (int p = 0; p < num_pages_in_part; ++p) {
+      const int page_off_start =
+          p == 0 ? (start_token_idx - first_page * block_size) : 0;
+      const int page_tokens =
+          min(part_tokens - cur_local, block_size - page_off_start);
+      int64_t v_index =
+          static_cast<int64_t>(pblk_shared[p]) * v_block_stride +
+          static_cast<int64_t>(page_off_start) * v_token_stride + d;
+      for (int t = 0; t < page_tokens; ++t, ++cur_local, v_index += v_token_stride) {
+        const float vv =
+            static_cast<float>(__ldg(&v_cache[v_index])) *
+            v_scale_shared[cur_local];
 #pragma unroll
-      for (int head = 0; head < 6; ++head)
-        acc[head] = fmaf(scores_shared[head][i], vv, acc[head]);
+        for (int head = 0; head < 6; ++head)
+          acc[head] = fmaf(scores_shared[head][cur_local], vv, acc[head]);
+      }
     }
 #pragma unroll
     for (int head = 0; head < 6; ++head) {
@@ -1523,6 +1536,9 @@ at::Tensor scalar_attention_int8_pth_candidate(
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0, "SM70 only");
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      flash_attention_decode_partition_int8_pth_kernel<256, 1024>,
+      cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   flash_attention_decode_partition_int8_pth_kernel<256, 1024>
       <<<dim3(static_cast<unsigned>(partitions)), 256, 0, stream>>>(
           reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr<int8_t>(),

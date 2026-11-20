@@ -1919,6 +1919,81 @@ def _host_kv_history_blocks(vllm_config: VllmConfig) -> int:
     return int(getattr(policy, "qsa_host_kv_history_blocks", 0))
 
 
+def _read_linux_host_memory_bytes(
+    meminfo_path: str = "/proc/meminfo",
+) -> tuple[int, int] | None:
+    """Return ``(mem_total_bytes, mem_available_bytes)`` on Linux, else None."""
+    try:
+        mem_total_kb = 0
+        mem_avail_kb = 0
+        with open(meminfo_path, encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    mem_total_kb = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    mem_avail_kb = int(line.split()[1])
+                if mem_total_kb and mem_avail_kb:
+                    return mem_total_kb * 1024, mem_avail_kb * 1024
+    except OSError:
+        return None
+    return None
+
+
+def _cap_host_kv_history_blocks_by_ram(
+    vllm_config: VllmConfig,
+    layout: Any,
+    state_blocks: int,
+    min_history_blocks: int,
+    target_history_blocks: int,
+) -> int:
+    """Bound optional extra host-KV history blocks on RAM-constrained hosts."""
+    if target_history_blocks <= min_history_blocks:
+        return target_history_blocks
+    host_mem = _read_linux_host_memory_bytes()
+    if host_mem is None:
+        return target_history_blocks
+    mem_total, mem_available = host_mem
+    host_page_bytes = sum(
+        layout.main_kv_page_sizes[i]
+        for i, name in enumerate(layout.main_kv_names)
+        if name in layout.host_main_kv_names
+    ) + sum(
+        layout.compressed_page_sizes[i]
+        for i, name in enumerate(layout.compressed_names)
+        if name in layout.host_compressed_names
+    )
+    if host_page_bytes <= 0:
+        return target_history_blocks
+    parallel_cfg = vllm_config.parallel_config
+    local_ranks = max(
+        1,
+        int(getattr(parallel_cfg, "tensor_parallel_size", 1))
+        * int(getattr(parallel_cfg, "data_parallel_size_local", 1)),
+    )
+    cluster_host_page_bytes = host_page_bytes * local_ranks
+    # Keep at least 16 GiB (up to 20 GiB on >=80 GiB hosts) unpinned for OS
+    # page cache, Python/API workers, and transient prefill/vision staging.
+    reserve_bytes = min(20 << 30, max(16 << 30, mem_total // 4))
+    pinned_budget = max(0, mem_available - reserve_bytes)
+    max_total_blocks = pinned_budget // cluster_host_page_bytes
+    max_history_by_ram = max(min_history_blocks, max_total_blocks - state_blocks)
+    if max_history_by_ram < target_history_blocks:
+        logger.warning_once(
+            "Capping qsa_host_kv_history_blocks from %d to %d based on host "
+            "RAM (MemAvailable=%s GiB, MemTotal=%s GiB, reserve=%s GiB, "
+            "%d local ranks x %s MiB/block).",
+            target_history_blocks,
+            max_history_by_ram,
+            format_gib(mem_available),
+            format_gib(mem_total),
+            format_gib(reserve_bytes),
+            local_ranks,
+            f"{host_page_bytes / (1 << 20):.2f}",
+        )
+        return max_history_by_ram
+    return target_history_blocks
+
+
 def _get_kv_cache_config_csa_linear(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1979,7 +2054,13 @@ def _get_kv_cache_config_csa_linear(
             * state_blocks
         )
         history_page = layout.device_compressed_page_bytes
-        target_history_blocks = _host_kv_history_blocks(vllm_config)
+        target_history_blocks = _cap_host_kv_history_blocks_by_ram(
+            vllm_config,
+            layout,
+            state_blocks,
+            history_blocks,
+            _host_kv_history_blocks(vllm_config),
+        )
         if target_history_blocks > history_blocks:
             if history_page > 0 and available_memory > state_bytes:
                 max_fit = (

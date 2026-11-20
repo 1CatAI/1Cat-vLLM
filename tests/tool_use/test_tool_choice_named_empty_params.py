@@ -20,7 +20,7 @@ from vllm.tool_parsers.utils import get_json_schema_from_tools
 
 pytestmark = pytest.mark.cpu_test
 
-EMPTY_OBJECT = {"type": "object", "properties": {}}
+EMPTY_OBJECT = {"type": "object", "properties": {}, "additionalProperties": False}
 PARAMS = {"type": "object", "properties": {"x": {"type": "string"}}}
 
 

@@ -162,7 +162,8 @@ def load_int8_scalar_tail_attention(device: torch.device):
     from vllm.config import get_current_vllm_config_or_none
 
     operator = builtin_int8_scalar_tail_attention()
-    if operator is None:
+    grouped_operator = builtin_int8_pth_attention()
+    if operator is None and grouped_operator is None:
         return None
     config = get_current_vllm_config_or_none()
     model = getattr(config, "model_config", None)
@@ -173,16 +174,21 @@ def load_int8_scalar_tail_attention(device: torch.device):
         return _int8_scalar_tail_cache[cache_key]
     partitions = (capability + 1023) // 1024
     buffers = (
-        torch.empty((1, 6, partitions, 256), dtype=torch.float32, device=device),
-        torch.empty((1, 6, partitions), dtype=torch.float32, device=device),
-        torch.empty((1, 6, partitions), dtype=torch.float32, device=device),
-        torch.full((1,), partitions, dtype=torch.int32, device=device),
+        (
+            torch.empty((1, 6, partitions, 256), dtype=torch.float32, device=device),
+            torch.empty((1, 6, partitions), dtype=torch.float32, device=device),
+            torch.empty((1, 6, partitions), dtype=torch.float32, device=device),
+            torch.full((1,), partitions, dtype=torch.int32, device=device),
+        )
+        if operator is not None
+        else None
     )
     logger.info_once(
         "Loaded SM70 INT8 PTH scalar tail attention (%s): %d partitions, "
-        "FP32 numerator/max/sum.",
+        "FP32 numerator/max/sum (2CTA Tensor Core fastpath=%s).",
         BUILTIN_INT8_SCALAR_OP,
         partitions,
+        grouped_operator is not None,
         scope="process",
     )
 
@@ -240,6 +246,64 @@ def load_int8_scalar_tail_attention(device: torch.device):
         ):
             return False
         k_scales, v_scales = per_token_head_scales_for_kv_views(k, v)
+        if (
+            grouped_operator is not None
+            and k.shape[1] % 16 == 0
+            and k.stride(3) == 1
+            and v.stride(3) == 1
+            and k.data_ptr() % 16 == 0
+            and v.data_ptr() % 16 == 0
+            and all(
+                tensor.stride(dim) % 8 == 0 for tensor in (k, v) for dim in range(3)
+            )
+            and out.shape == q.shape
+            and out.device == device
+            and out.dtype == torch.float16
+            and out.is_contiguous()
+            and table.device == device
+            and table.dtype == torch.int32
+            and table.is_contiguous()
+            and lengths.ndim == 1
+            and lengths.shape[0] == 1
+            and lengths.device == device
+            and lengths.dtype == torch.int32
+            and lengths.is_contiguous()
+        ):
+            stream = torch.cuda.current_stream(device).cuda_stream
+            key = ("int8_pth_v1", bucket, 80, device, stream)
+            bank = _WORKSPACES.setdefault(key, [])
+            panels = int(k.shape[2])
+            for partial, lse in bank:
+                if partial.shape[0] >= panels:
+                    break
+            else:
+                partial = torch.empty(
+                    (panels, 80, 8, 6, 256), dtype=torch.float32, device=device
+                )
+                lse = torch.empty(
+                    (panels, 80, 8, 6, 2), dtype=torch.float32, device=device
+                )
+                bank.append((partial, lse))
+            if panels == 1:
+                partial_view, lse_view = partial[0], lse[0]
+            else:
+                partial_view, lse_view = partial[:panels], lse[:panels]
+            grouped_operator(
+                q,
+                k,
+                v,
+                k_scales,
+                v_scales,
+                out,
+                table,
+                lengths,
+                partial_view,
+                lse_view,
+                float(softmax_scale),
+            )
+            return True
+        if operator is None or buffers is None:
+            return False
         if k.shape[2] == 1:
             operator(
                 q,
