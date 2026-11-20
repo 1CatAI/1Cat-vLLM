@@ -1,0 +1,491 @@
+diff --git a/tests/models/glm5next/test_vision_budget.py b/tests/models/glm5next/test_vision_budget.py
+new file mode 100644
+index 000000000..2fc9de1fc
+--- /dev/null
++++ b/tests/models/glm5next/test_vision_budget.py
+@@ -0,0 +1,137 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The GLM-5.3 vision budgets (encoder cache, rotary table) must cover every
++grid the real processors emit with the checkpoint's settings."""
++
++import json
++from types import SimpleNamespace
++
++import pytest
++from PIL import Image
++
++from vllm.models.glm5next.nvidia.multimodal import (
++    Glm5NextProcessingInfo,
++    max_grid_side,
++)
++from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
++from vllm.transformers_utils.processors.glm5next import (
++    Glm5NextImageProcessor,
++    Glm5NextProcessor,
++    Glm5NextVideoProcessor,
++    smart_resize,
++)
++
++# GLM-5.3-Flash checkpoint: vision_config of config.json and the processors
++# of processor_config.json.
++_VISION_CONFIG = {"patch_size": 14, "spatial_merge_size": 2, "temporal_patch_size": 2}
++_IMAGE_PROCESSOR = {
++    "patch_size": 14,
++    "temporal_patch_size": 2,
++    "merge_size": 2,
++    "patch_expand_factor": 1,
++    "min_image_tokens": 16,
++    "max_image_tokens": 8000,
++}
++_VIDEO_PROCESSOR = {**_IMAGE_PROCESSOR, "max_image_tokens": 240000}
++
++
++class _Context:
++    def get_hf_config(self, *args):
++        return Glm5NextConfig(vision_config=_VISION_CONFIG)
++
++    def get_merged_mm_kwargs(self, kwargs):
++        return dict(kwargs)
++
++
++class _Info(Glm5NextProcessingInfo):
++    """Processing info on the checkpoint's processor settings, without
++    loading the checkpoint's tokenizer."""
++
++    def get_hf_processor(self, **kwargs: object):
++        return SimpleNamespace(
++            image_processor=Glm5NextImageProcessor(**_IMAGE_PROCESSOR),
++            video_processor=Glm5NextVideoProcessor(),
++        )
++
++
++def _info() -> _Info:
++    return _Info(_Context())  # type: ignore[arg-type]
++
++
++def _processed_tokens(width: int, height: int) -> int:
++    processor = Glm5NextImageProcessor(**_IMAGE_PROCESSOR)
++    grid = processor(Image.new("RGB", (width, height)), return_tensors="pt")
++    _, grid_h, grid_w = grid["image_grid_thw"][0].tolist()
++    return grid_h * grid_w // _IMAGE_PROCESSOR["merge_size"] ** 2
++
++
++@pytest.mark.parametrize(
++    ("width", "height", "expected_tokens"),
++    [
++        (3840, 2160, 7973),  # 4K screenshot, 16:9
++        (3840, 2880, 7931),  # phone photo, 4:3, after a 3840 px downscale
++        (2160, 3840, 7973),  # portrait 4K
++        (640, 480, 414),  # small image, below the ceiling
++    ],
++)
++def test_image_encoder_budget_covers_processed_images(width, height, expected_tokens):
++    info = _info()
++    # The per-item maximum the encoder cache is sized from.
++    budget = info.get_mm_max_tokens_per_item(seq_len=524288, mm_counts={"image": 1})
++
++    tokens = _processed_tokens(width, height)
++
++    assert tokens == expected_tokens
++    assert tokens <= budget["image"]
++
++
++def test_profiling_image_reaches_processor_ceiling():
++    info = _info()
++    size = info.get_image_size_with_most_features()
++
++    assert info.get_max_image_tokens() == _IMAGE_PROCESSOR["max_image_tokens"]
++    assert _processed_tokens(size.width, size.height) == info.get_max_image_tokens()
++
++
++def test_rotary_rows_cover_longest_grid(tmp_path):
++    (tmp_path / "processor_config.json").write_text(
++        json.dumps(
++            {"image_processor": _IMAGE_PROCESSOR, "video_processor": _VIDEO_PROCESSOR}
++        )
++    )
++    image_processor, video_processor = (
++        Glm5NextProcessor.media_processors_from_pretrained(str(tmp_path))
++    )
++    image_rows = max_grid_side(image_processor)
++    # The video processor serves under its 30,000-token cap.
++    video_rows = max_grid_side(video_processor)
++
++    assert (image_rows, video_rows) == (16000, 60000)
++
++    # The longest image is one aligned cell high and the whole budget wide;
++    # a 20 px strip shows the side real uploads can reach past 8192 rows.
++    for width, height, longest_side in [
++        (224000, 28, 16000),
++        (28, 224000, 16000),
++        (200000, 20, 14286),
++    ]:
++        image = Image.new("RGB", (width, height))
++        grid = image_processor(image, return_tensors="pt")["image_grid_thw"][0]
++        assert max(grid[1:].tolist()) == longest_side <= image_rows
++
++    # Two frames, one cell high: a video canvas of exactly video_rows patches
++    # fits the capped budget unchanged, a longer strip is refit below it.
++    def video_canvas_width(width: int) -> int:
++        return smart_resize(
++            t=2,
++            h=28,
++            w=width,
++            t_factor=2,
++            h_factor=28,
++            w_factor=28,
++            min_pixels=1,
++            max_pixels=video_processor.max_image_tokens * 2 * 28 * 28,
++        )[1]
++
++    assert video_canvas_width(video_rows * 14) == video_rows * 14
++    assert video_canvas_width(10**7) // 14 <= video_rows
+diff --git a/tests/multimodal/test_hasher.py b/tests/multimodal/test_hasher.py
+index fdedcaea2..10e7295b4 100644
+--- a/tests/multimodal/test_hasher.py
++++ b/tests/multimodal/test_hasher.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import struct
+ import uuid
++from io import BytesIO
+ from pathlib import Path
+ 
+ import numpy as np
+@@ -9,6 +11,8 @@ import torch
+ from PIL import Image, ImageDraw
+ 
+ from vllm.multimodal.hasher import MultiModalHasher
++from vllm.multimodal.image import normalize_image
++from vllm.multimodal.media import ImageMediaIO, MediaWithBytes
+ 
+ pytestmark = pytest.mark.cpu_test
+ 
+@@ -109,3 +113,45 @@ def test_hash_image_exif_id():
+     assert hasher.hash_kwargs(image=image1) == hasher.hash_kwargs(image=id.bytes)
+     # second image has non-UUID in ImageID, so it should hash to the image data
+     assert hasher.hash_kwargs(image=image2) == hasher.hash_kwargs(image=image2a)
++
++
++def test_hash_image_malformed_exif():
++    # Test that images with malformed EXIF headers (e.g. invalid TIFF header)
++    # do not raise an unhandled exception during hashing and fall back to image data.
++    buf = BytesIO()
++    Image.new("RGB", (64, 48)).save(buf, "JPEG")
++    jpg = buf.getvalue()
++    rest = jpg[2:]
++    rest = rest[2 + struct.unpack(">H", rest[2:4])[0] :]
++    payload = b"Exif\x00\x00XXXX\x00\x00\x00\x08" + bytes(32)
++    data = b"\xff\xd8\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload + rest
++
++    image = normalize_image(Image.open(BytesIO(data)))
++    image.load()
++
++    hasher = MultiModalHasher
++    # Should hash without raising SyntaxError or any other exception
++    hash_val = hasher.hash_kwargs(image=image)
++    assert isinstance(hash_val, str) and len(hash_val) > 0
++
++    # Also verify MediaWithBytes wrapping the image with malformed EXIF
++    media_item = MediaWithBytes(image, data)
++    hash_media = hasher.hash_kwargs(image=media_item)
++    assert isinstance(hash_media, str) and len(hash_media) > 0
++
++
++@pytest.mark.parametrize("mode", ["RGB", "RGBA", "P"])
++def test_hash_loaded_png_with_malformed_exif(mode):
++    """The chat API path (load_bytes, then hashing) survives a PNG whose eXIf
++    chunk has no valid TIFF header, whatever mode conversion it takes, and
++    hashes the original bytes."""
++    buf = BytesIO()
++    Image.new(mode, (16, 8)).save(buf, "PNG", exif=b"Exif\x00\x00" + bytes(8))
++    data = buf.getvalue()
++
++    media = ImageMediaIO().load_bytes(data)
++
++    # Same original bytes around an image without EXIF give the same hash.
++    reference = MediaWithBytes(Image.new("RGB", (1, 1)), data)
++    hasher = MultiModalHasher
++    assert hasher.hash_kwargs(image=media) == hasher.hash_kwargs(image=reference)
+diff --git a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+index 23d70cc1d..8303895bd 100644
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -97,6 +97,7 @@ from .multimodal import (
+     Glm5NextMultiModalProcessor,
+     Glm5NextProcessingInfo,
+     Glm5NextVisionTransformer,
++    max_grid_side,
+ )
+ 
+ logger = init_logger(__name__)
+@@ -1480,6 +1481,8 @@ class Glm5NextForConditionalGeneration(
+         return Glm5NextForCausalLM.get_mamba_state_copy_func()
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        from vllm.transformers_utils.processors.glm5next import Glm5NextProcessor
++
+         super(Glm4vForConditionalGeneration, self).__init__()
+         config = vllm_config.model_config.hf_config
+         multimodal_config = vllm_config.model_config.multimodal_config
+@@ -1497,6 +1500,12 @@ class Glm5NextForConditionalGeneration(
+             self.visual = Glm5NextVisionTransformer(
+                 config.text_config,
+                 config.vision_config,
++                max_grid_side=max(
++                    max_grid_side(processor)
++                    for processor in Glm5NextProcessor.media_processors_from_pretrained(
++                        self.model_config.model
++                    )
++                ),
+                 # Read eps from the VISION sub-config, not the top-level
+                 # `config.rms_norm_eps`: Glm5NextConfig.__getattribute__ mirrors
+                 # the latter onto text_config (1e-5), silently ignoring the
+diff --git a/vllm/models/glm5next/nvidia/multimodal.py b/vllm/models/glm5next/nvidia/multimodal.py
+index 293dffe9f..1e72ff942 100644
+--- a/vllm/models/glm5next/nvidia/multimodal.py
++++ b/vllm/models/glm5next/nvidia/multimodal.py
+@@ -2,8 +2,10 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """GLM-5.3-Flash vision tower and multimodal processor."""
+ 
++import math
+ from collections.abc import Mapping
+ from functools import partial
++from typing import TYPE_CHECKING
+ 
+ import numpy as np
+ import torch
+@@ -44,6 +46,14 @@ from vllm.models.deepseek_v4.common.ops import fused_q_kv_rmsnorm
+ from vllm.multimodal.parse import ImageSize, MultiModalDataItems
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
++if TYPE_CHECKING:
++    from vllm.transformers_utils.processors.glm5next import (
++        Glm5NextImageProcessor,
++        Glm5NextVideoProcessor,
++    )
++
++    _MediaProcessor = Glm5NextImageProcessor | Glm5NextVideoProcessor
++
+ 
+ class Glm5NextVisionPatchEmbed(nn.Module):
+     def __init__(
+@@ -349,6 +359,7 @@ class Glm5NextVisionTransformer(nn.Module):
+         self,
+         text_config,  # noqa: ANN001
+         vision_config,
++        max_grid_side: int,
+         norm_eps: float = 1e-6,
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
+@@ -388,9 +399,15 @@ class Glm5NextVisionTransformer(nn.Module):
+ 
+         norm_layer = partial(RMSNorm, eps=norm_eps)
+         head_dim = self.hidden_size // self.num_heads
++        # rot_pos_emb indexes this table by grid row and column. A fixed 8192
++        # rows read past its end on very wide or tall inputs (a 20x200000
++        # image has a 14,286-patch side), a device-side assert that kills the
++        # engine. The table covers the longest side the processors can emit;
++        # the text model's 1M positions would too, at 64 MiB on the first
++        # pipeline stage.
+         self.rotary_pos_emb = get_rope(
+             head_size=head_dim,
+-            max_position=8192,
++            max_position=max_grid_side,
+             is_neox_style=True,
+             rope_parameters={"partial_rotary_factor": 0.5},
+         )
+@@ -612,6 +629,29 @@ class Glm5NextVisionTransformer(nn.Module):
+         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+ 
+ 
++def _processor_pixel_budget(processor: "_MediaProcessor") -> tuple[int, int]:
++    from vllm.transformers_utils.processors.glm5next import _pixel_budget
++
++    return _pixel_budget(
++        processor.min_image_tokens,
++        processor.max_image_tokens,
++        processor.patch_size,
++        processor.merge_size,
++        processor.temporal_patch_size,
++    )
++
++
++def max_grid_side(processor: "_MediaProcessor") -> int:
++    """Longest grid side, in patches, that ``processor`` can emit.
++
++    ``smart_resize`` keeps ``t_bar * h_bar * w_bar <= max_pixels`` with
++    ``t_bar >= temporal_patch_size`` and every side at least one aligned cell,
++    so the longest side belongs to a canvas one cell high."""
++    max_pixels = _processor_pixel_budget(processor)[1]
++    cell = processor.patch_size * processor.merge_size * processor.patch_expand_factor
++    return max_pixels // (processor.temporal_patch_size * cell * processor.patch_size)
++
++
+ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
+     """Wires up the vLLM-native processor for the multimodal checkpoint.
+ 
+@@ -634,28 +674,40 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
+             self._glm5_hf_processor = proc
+         return proc
+ 
+-    def _processor_pixel_budget(self, proc) -> tuple[int, int]:
+-        from vllm.transformers_utils.processors.glm5next import _pixel_budget
+-
+-        return _pixel_budget(
+-            proc.min_image_tokens,
+-            proc.max_image_tokens,
+-            proc.patch_size,
+-            proc.merge_size,
+-            proc.temporal_patch_size,
+-        )
+-
+     def _get_image_max_pixels(self) -> int:
+         mm_kwargs = self.ctx.get_merged_mm_kwargs({})
+         if (override := mm_kwargs.get("max_pixels")) is not None:
+             return int(override)
+-        return self._processor_pixel_budget(self.get_hf_processor().image_processor)[1]
++        return _processor_pixel_budget(self.get_hf_processor().image_processor)[1]
+ 
+     def _get_video_max_pixels(self) -> int:
+         mm_kwargs = self.ctx.get_merged_mm_kwargs({})
+         if (override := mm_kwargs.get("max_pixels")) is not None:
+             return int(override)
+-        return self._processor_pixel_budget(self.get_hf_processor().video_processor)[1]
++        return _processor_pixel_budget(self.get_hf_processor().video_processor)[1]
++
++    def get_image_size_with_most_features(self) -> ImageSize:
++        # The inherited square probe strands budget whenever the token
++        # ceiling is not a perfect square: with max_image_tokens=8000 the
++        # square refits to 2492x2492 (89x89 = 7921 tokens) while a
++        # 2240x2800 canvas reaches 80x100 = 8000, so the encoder cache came
++        # up short of the processor's own maximum and refused valid images
++        # (#59539). Factor the ceiling exactly instead of probing a square.
++        vision_config = self.get_hf_config().vision_config
++        factor = (
++            vision_config.patch_size
++            * vision_config.spatial_merge_size
++            * self.get_hf_processor().image_processor.patch_expand_factor
++        )
++        pixels_per_token = vision_config.temporal_patch_size * factor * factor
++        max_tokens = max(1, self._get_image_max_pixels() // pixels_per_token)
++        short_side = math.isqrt(max_tokens)
++        while max_tokens % short_side:
++            short_side -= 1
++        return ImageSize(
++            width=(max_tokens // short_side) * factor,
++            height=short_side * factor,
++        )
+ 
+     def _get_vision_info(
+         self,
+diff --git a/vllm/multimodal/hasher.py b/vllm/multimodal/hasher.py
+index 6caf9c114..c5b7ec667 100644
+--- a/vllm/multimodal/hasher.py
++++ b/vllm/multimodal/hasher.py
+@@ -47,6 +47,19 @@ def _get_hasher_factory(algorithm: str) -> Callable[[], "hashlib._Hash"]:
+         raise ValueError(f"Unsupported hash algorithm: {algorithm}")
+ 
+ 
++def _get_image_id_bytes(image: Image.Image) -> bytes | None:
++    try:
++        exif = image.getexif()
++        image_id = exif.get(Image.ExifTags.Base.ImageID)
++        if isinstance(image_id, uuid.UUID):
++            return image_id.bytes
++    except Exception:
++        # Tolerate malformed EXIF metadata (e.g. invalid TIFF header)
++        # and fall back to serializing raw image data or bytes.
++        pass
++    return None
++
++
+ class MultiModalHasher:
+     @classmethod
+     def serialize_item(cls, obj: object) -> Iterable[bytes | memoryview]:
+@@ -59,11 +72,9 @@ class MultiModalHasher:
+             return (np.array(obj).tobytes(),)
+ 
+         if isinstance(obj, Image.Image):
+-            exif = obj.getexif()
+-            if Image.ExifTags.Base.ImageID in exif and isinstance(
+-                exif[Image.ExifTags.Base.ImageID], uuid.UUID
+-            ):
+-                return (exif[Image.ExifTags.Base.ImageID].bytes,)
++            image_id = _get_image_id_bytes(obj)
++            if image_id is not None:
++                return (image_id,)
+ 
+             data = {"mode": obj.mode, "data": np.asarray(obj)}
+             palette = obj.palette
+@@ -75,11 +86,9 @@ class MultiModalHasher:
+             return cls.iter_item_to_bytes("image", data)
+ 
+         if isinstance(obj, MediaWithBytes) and isinstance(obj.media, Image.Image):
+-            exif = obj.media.getexif()
+-            if Image.ExifTags.Base.ImageID in exif and isinstance(
+-                exif[Image.ExifTags.Base.ImageID], uuid.UUID
+-            ):
+-                return (exif[Image.ExifTags.Base.ImageID].bytes,)
++            image_id = _get_image_id_bytes(obj.media)
++            if image_id is not None:
++                return (image_id,)
+ 
+             return cls.iter_item_to_bytes("image", obj.original_bytes)
+ 
+diff --git a/vllm/transformers_utils/processors/glm5next.py b/vllm/transformers_utils/processors/glm5next.py
+index 67b5446bc..678fb3595 100644
+--- a/vllm/transformers_utils/processors/glm5next.py
++++ b/vllm/transformers_utils/processors/glm5next.py
+@@ -834,16 +834,30 @@ class Glm5NextProcessor(ProcessorMixin):
+ 
+     @classmethod
+     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+-        """Build the processor directly from the checkpoint config.
++        """Build the processor directly from the checkpoint config (see
++        ``media_processors_from_pretrained``)."""
++        from transformers import AutoTokenizer
++
++        image_processor, video_processor = cls.media_processors_from_pretrained(
++            pretrained_model_name_or_path, **kwargs
++        )
++        return cls(
++            image_processor=image_processor,
++            tokenizer=AutoTokenizer.from_pretrained(
++                pretrained_model_name_or_path, **kwargs
++            ),
++            video_processor=video_processor,
++        )
++
++    @staticmethod
++    def media_processors_from_pretrained(pretrained_model_name_or_path, **kwargs):
++        """Image and video processor from the checkpoint config.
+ 
+         GLM-5.3-Flash stores nested image/video configs in
+         ``processor_config.json`` and declares a custom processor class. This
+         method reads those configs directly and caps only the video token budget.
+         """
+-        from transformers import AutoTokenizer
+-
+         model_path = pretrained_model_name_or_path
+-        tokenizer = AutoTokenizer.from_pretrained(model_path, **kwargs)
+ 
+         def _cap_cfg(cfg: dict, *, is_video: bool) -> dict:
+             # Video keeps a serving token cap (the checkpoint's 240k-token
+@@ -887,12 +901,7 @@ class Glm5NextProcessor(ProcessorMixin):
+         video_processor = Glm5NextVideoProcessor(
+             **{k: v for k, v in vp_cfg.items() if k != "video_processor_type"}
+         )
+-
+-        return cls(
+-            image_processor=image_processor,
+-            tokenizer=tokenizer,
+-            video_processor=video_processor,
+-        )
++        return image_processor, video_processor
+ 
+     def __call__(
+         self,
