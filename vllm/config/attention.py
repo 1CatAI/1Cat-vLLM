@@ -21,12 +21,26 @@ class V41IndexTiledPolicy(ExecutionPolicy):
     """Opt in to the register-tiled packed decode scorer."""
     library: str | None = None
     """Library filename; empty selects the repository's v41idx build."""
+    tensor_core: bool | None = None
+    """Opt in to the tensor-core scorer (v41idx3), bitwise the tiled scorer's;
+    requires ``enabled``."""
+    tensor_core_library: str | None = None
+    """Library filename; empty selects the repository's v41idx3 build."""
     active: bool = Field(default=False, init=False)
     """Set only by a packed V4.1 indexer before graph compilation."""
     aliases: ClassVar[dict[str, str]] = {
         "enabled": "VLLM_V41_INDEX_TILED",
         "library": "VLLM_V41_INDEX_TILED_LIB",
+        "tensor_core": "VLLM_V41_INDEX_TC",
+        "tensor_core_library": "VLLM_V41_INDEX_TC_LIB",
     }
+
+    def resolve(self) -> None:
+        super().resolve()
+        # With the tensor-core scorer off, the graph key is the tiled scorer's.
+        self.hash_fields = ("enabled", "library") + (
+            ("tensor_core", "tensor_core_library") if self.tensor_core else ()
+        )
 
 
 @config

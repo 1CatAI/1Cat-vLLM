@@ -514,6 +514,8 @@ if TYPE_CHECKING:
     VLLM_V41_EXPERT_FAST_HIT: str = "1"
     VLLM_V41_INDEX_TILED: bool = False
     VLLM_V41_INDEX_TILED_LIB: str = ""
+    VLLM_V41_INDEX_TC: bool = False
+    VLLM_V41_INDEX_TC_LIB: str = ""
     VLLM_V41_FP8_GEMV: str = "1"
     VLLM_V41_FREE_SLOTS: str | None = None
     VLLM_V41_FUSED_SPARSE: str = "0"
@@ -8005,6 +8007,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: os.getenv("VLLM_V41_INDEX_TILED_LIB", ""),
         description=(
             "Library for the SM70 packed V4.1 tiled index scorer; empty "
+            "selects the repository build."
+        ),
+        category="experimental",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=("DeepSeek V4.1 SM70",),
+        user_visible=True,
+    ),
+    "VLLM_V41_INDEX_TC": env_var(
+        lambda: env_with_choices("VLLM_V41_INDEX_TC", "0", ["0", "1", ""])() == "1",
+        description=(
+            "Score the packed V4.1 decode index on SM70 tensor cores (v41idx3), "
+            "bitwise the tiled scorer; requires VLLM_V41_INDEX_TILED=1 and "
+            "eight index heads per rank."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DeepSeek V4.1 SM70",),
+        user_visible=True,
+    ),
+    "VLLM_V41_INDEX_TC_LIB": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_TC_LIB", ""),
+        description=(
+            "Library for the SM70 packed V4.1 tensor-core index scorer; empty "
             "selects the repository build."
         ),
         category="experimental",
