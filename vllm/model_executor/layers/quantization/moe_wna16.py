@@ -104,8 +104,8 @@ class MoeWNA16Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "MoeWNA16Config":
         linear_quant_method = cls.get_from_keys(config, ["quant_method"])
-        weight_bits = cls.get_from_keys(config, ["bits"])
-        group_size = cls.get_from_keys(config, ["group_size"])
+        weight_bits = cls.get_from_keys(config, ["bits", "w_bit"])
+        group_size = cls.get_from_keys(config, ["group_size", "q_group_size"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         if linear_quant_method == "gptq":
             has_zp = not cls.get_from_keys(config, ["sym"])
@@ -141,7 +141,7 @@ class MoeWNA16Config(QuantizationConfig):
     def is_moe_wna16_compatible(cls, quant_config: dict[str, Any]):
         # Extract data from quant config.
         quant_method = quant_config.get("quant_method", "").lower()
-        num_bits = quant_config.get("bits")
+        num_bits = quant_config.get("bits", quant_config.get("w_bit"))
         desc_act = quant_config.get("desc_act")
 
         capability_tuple = current_platform.get_device_capability()
