@@ -2684,6 +2684,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
+            if quant_algo:
+                raise ValueError(
+                    f"Unsupported quant_algo {quant_algo!r} for layer {prefix!r} "
+                    "in ModelOpt mixed precision config."
+                )
             # Layer not in quantized_layers — leave unquantized
             return UnquantizedLinearMethod()
 
