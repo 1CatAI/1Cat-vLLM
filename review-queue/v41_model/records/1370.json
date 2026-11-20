@@ -1,0 +1,150 @@
+{
+  "initial_inventory": {
+    "number": 1370,
+    "title": "[Model][SM70] DeepSeek-V4.1: PP2 x TP4 for the #1277 package (8 V100s)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1370",
+    "isDraft": false,
+    "headRefOid": "49744bc71d2071fc852c1cecb5761f9d841b7dae",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1370,
+    "title": "[Model][SM70] DeepSeek-V4.1: PP2 x TP4 for the #1277 package (8 V100s)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). This PR supersedes the PP2 x TP4 part of #1031, which PLI Labs' founder opened from a personal account against the native-weights route. This one is built on the merged DeepSeek-V4.1 package (#1277) and its GGUF route, and is the base that our other DeepSeek-V4.1 PRs build on.\n\n## Purpose\n\nRun the #1277 DeepSeek-V4.1-Flash package on 8 V100s as two pipeline stages of four tensor-parallel GPUs each (PP2 x TP4), one NVLink board per stage.\n\n- **Stage cut.** The only admissible cut is before layer 20 (`contract.pp_split_problem`). The KV and indexer caches, the Engram tables and hash state, and the ratio-2 compressor states never cross the boundary. The hand-off is the FP32 four-stream hyper-connection residual plus the collapse weights of the last stage-1 FFN (`{\"hidden\", \"pre\"}`).\n- **model.py.** Per-stage layer ranges with `PPMissingLayer` placeholders (global layer ids kept), a per-stage KV store and metadata anchor (layer 20 on stage 2, which also keeps its window ring), the boundary branch (expand in place, reference mixes and collapse) and the FP32 hand-off. Engram and its sidecar reader belong to stage 1 only.\n- **pp_commit.py.** A first stage that is not the last never samples, so it commits its own per-step state: a prefill forward at once; a decode forward from the broadcast sampled counts, or at the start of the next step from the request's `num_computed_tokens` delta. The device kernels still trap a missing, double or wrong commit.\n- **Expert cache.** A stage-local `shared_original` cache with a cold set of zero: `expert_cache_offload_fraction=0` together with `expert_cache_spare_slots=0` keeps every expert resident (no cold pool, no swap coordinator, no decode resolve). The validation admits exactly that pair or a normal offload with spares.\n- **Runner / scheduler / engine core.** The DSpark drafter runs on the last stage; accepted drafts reach non-last ranks; drafts are taken in `step_with_batch_queue` after the step that produced them is applied; a dummy-run unwrap and a stage-2 anchor ring fix found at boot.\n- **Two optional switches, both default off:** `VLLM_V41_MARKOV_SHARD=1` (greedy DSpark draft head computed from vocabulary shards, with a cross-rank self-check before it is used) and `VLLM_V41_INDEX_OVERLAP=1` (prefill indexer: each score tile's TP all-reduce and top-k on a side stream while the next tile is scored; eager prefill only). `VLLM_V41_PP_BOUNDARY_SIM` is a test reference (one stage takes the boundary branch before a given layer) and is unset in serving.\n\nEvery new path is gated on `pipeline_parallel_size > 1`, a non-last rank, or a switch that defaults off; PP=1 serving is unchanged. Example profiles: `benchmarks/deepseek_v41/serve-pp2.yaml` (FULL graphs 1-6 per stage, DSpark 5 on stage 2) and `serve-pp2-eager.yaml`.\n\n## Test Plan\n\nCPU, on this branch rebased onto current `main` (`3c051b52e`):\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, the changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check   # runtime_reference.md regenerated in this PR\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/gguf/test_shared_expert_pp_stage.py \\\n  tests/models/test_deepseek_v41_index_overlap.py tests/models/test_deepseek_v41_pp_commit.py \\\n  tests/models/test_deepseek_v41_pp_drafter.py tests/models/test_deepseek_v41_pp_forward.py \\\n  tests/models/test_deepseek_v41_pp_split.py tests/v1/worker/test_gpu_model_runner.py\n# the Markov-shard kernels run in the Triton interpreter, which must be on before triton is imported:\nTRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_markov_shard.py\n```\n\nGPU: the serving numbers below were measured on 8x V100-SXM2-32GB (two 4-GPU NVLink boards, PP2 x TP4) on our build of #1277 with this port and no other speed change.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| DeepSeek-V4.1 PP2 x TP4 | GGUF (#1277 route) | PP=2, TP=4, split 20, FULL graphs 1-6, DSpark 5, one request | split 20 only; any other cut refused at load with the reason | executed on 8x V100 (serving, on the #1277 merge); CPU tests on `main` | PP>2; more than one request per step (`StageCommit` refuses it) |\n| DeepSeek-V4.1 PP=1 | GGUF | TP=4 | unchanged; every PP2 branch gated off | CPU tests (`test_deepseek_v41_pp_forward`, `test_gpu_model_runner`) | not re-served on `main` |\n| `VLLM_V41_MARKOV_SHARD=1` | — | greedy rows, TP group | self-check on all ranks, else refuses to start | CPU (Triton interpreter, 4 emulated ranks) | GPU rounding not covered by the CPU test |\n| `VLLM_V41_INDEX_OVERLAP=1` | — | eager prefill only, never under capture | off by default | CPU AST/knob test | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in (`--pipeline-parallel-size 2`); both switches default off.\n- Required CLI options and environment switches: `serve-pp2.yaml` (`tensor-parallel-size: 4`, `pipeline-parallel-size: 2`, `kernel-config.sm70_gguf.expert_cache_offload_fraction: 0`, `expert_cache_spare_slots: 0`).\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our #1277 build with this port; this branch is the same change rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none for the numbers below.\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: `VLLM_V41_MARKOV_SHARD`, `VLLM_V41_INDEX_OVERLAP`, `VLLM_V41_PP_BOUNDARY_SIM` registered with metadata; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +3 registered, 0 unregistered reads; `expert_cache_offload_fraction` now admits 0 (only with 0 spare slots) and `expert_cache_spare_slots` admits 0 (only then).\n\n## Test Result\n\nMEASURED, 2026-11-03, 8x V100-SXM2-32GB, PP2 x TP4, one request, DSpark 5 drafts per round, this port with no speed switch on (A/B harness, ms per verify round including the first token):\n\n| | tok/s | ms per round |\n| --- | ---: | ---: |\n| T=0 | 99.2 | 31.1 |\n| T=1 | 88.0 | 31.7 (1.78 accepted drafts per round) |\n\nRe-run on `main` for this PR (CPU only, no visible GPU): on 2026-11-05, branch rebased onto `3c051b52e`:\n\n- ruff 0.14.0 `check` and `format --check` on the 31 changed Python files: pass.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- pytest, the seven files above: 91 passed, 2 skipped, 10 failed, 17 errors. Every failure and error is in `tests/v1/worker/test_gpu_model_runner.py`, and the same 27 names fail the same way on unmodified `main` on the same machine (no CUDA device visible, NCCL unavailable). No failure outside that set.\n- `TRITON_INTERPRET=1` pytest `tests/models/test_deepseek_v41_markov_shard.py`: 15 passed.\n\nNot re-run on `main`: the serving numbers above and any GPU test. `main` is 68 commits past the #1277 merge; of the files this PR changes, `vllm/envs.py`, `vllm/v1/core/sched/scheduler.py` and `vllm/v1/worker/gpu_model_runner.py` changed on `main` since then. The port rebased onto `main` without conflicts and the CPU tests above ran on the rebased tree.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1370",
+    "isDraft": false,
+    "headRefName": "pli/v41-pp2",
+    "headRefOid": "49744bc71d2071fc852c1cecb5761f9d841b7dae",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1370,
+    "id": "PR_kwDORjYFXs8AAAABNIAm7A",
+    "state": "CLOSED",
+    "isDraft": false,
+    "headRefOid": "49744bc71d2071fc852c1cecb5761f9d841b7dae",
+    "title": "[Model][SM70] DeepSeek-V4.1: PP2 x TP4 for the #1277 package (8 V100s)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1370",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). This PR supersedes the PP2 x TP4 part of #1031, which PLI Labs' founder opened from a personal account against the native-weights route. This one is built on the merged DeepSeek-V4.1 package (#1277) and its GGUF route, and is the base that our other DeepSeek-V4.1 PRs build on.\n\n## Purpose\n\nRun the #1277 DeepSeek-V4.1-Flash package on 8 V100s as two pipeline stages of four tensor-parallel GPUs each (PP2 x TP4), one NVLink board per stage.\n\n- **Stage cut.** The only admissible cut is before layer 20 (`contract.pp_split_problem`). The KV and indexer caches, the Engram tables and hash state, and the ratio-2 compressor states never cross the boundary. The hand-off is the FP32 four-stream hyper-connection residual plus the collapse weights of the last stage-1 FFN (`{\"hidden\", \"pre\"}`).\n- **model.py.** Per-stage layer ranges with `PPMissingLayer` placeholders (global layer ids kept), a per-stage KV store and metadata anchor (layer 20 on stage 2, which also keeps its window ring), the boundary branch (expand in place, reference mixes and collapse) and the FP32 hand-off. Engram and its sidecar reader belong to stage 1 only.\n- **pp_commit.py.** A first stage that is not the last never samples, so it commits its own per-step state: a prefill forward at once; a decode forward from the broadcast sampled counts, or at the start of the next step from the request's `num_computed_tokens` delta. The device kernels still trap a missing, double or wrong commit.\n- **Expert cache.** A stage-local `shared_original` cache with a cold set of zero: `expert_cache_offload_fraction=0` together with `expert_cache_spare_slots=0` keeps every expert resident (no cold pool, no swap coordinator, no decode resolve). The validation admits exactly that pair or a normal offload with spares.\n- **Runner / scheduler / engine core.** The DSpark drafter runs on the last stage; accepted drafts reach non-last ranks; drafts are taken in `step_with_batch_queue` after the step that produced them is applied; a dummy-run unwrap and a stage-2 anchor ring fix found at boot.\n- **Two optional switches, both default off:** `VLLM_V41_MARKOV_SHARD=1` (greedy DSpark draft head computed from vocabulary shards, with a cross-rank self-check before it is used) and `VLLM_V41_INDEX_OVERLAP=1` (prefill indexer: each score tile's TP all-reduce and top-k on a side stream while the next tile is scored; eager prefill only). `VLLM_V41_PP_BOUNDARY_SIM` is a test reference (one stage takes the boundary branch before a given layer) and is unset in serving.\n\nEvery new path is gated on `pipeline_parallel_size > 1`, a non-last rank, or a switch that defaults off; PP=1 serving is unchanged. Example profiles: `benchmarks/deepseek_v41/serve-pp2.yaml` (FULL graphs 1-6 per stage, DSpark 5 on stage 2) and `serve-pp2-eager.yaml`.\n\n## Test Plan\n\nCPU, on this branch rebased onto current `main` (`3c051b52e`):\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, the changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check   # runtime_reference.md regenerated in this PR\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/gguf/test_shared_expert_pp_stage.py \\\n  tests/models/test_deepseek_v41_index_overlap.py tests/models/test_deepseek_v41_pp_commit.py \\\n  tests/models/test_deepseek_v41_pp_drafter.py tests/models/test_deepseek_v41_pp_forward.py \\\n  tests/models/test_deepseek_v41_pp_split.py tests/v1/worker/test_gpu_model_runner.py\n# the Markov-shard kernels run in the Triton interpreter, which must be on before triton is imported:\nTRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_markov_shard.py\n```\n\nGPU: the serving numbers below were measured on 8x V100-SXM2-32GB (two 4-GPU NVLink boards, PP2 x TP4) on our build of #1277 with this port and no other speed change.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| DeepSeek-V4.1 PP2 x TP4 | GGUF (#1277 route) | PP=2, TP=4, split 20, FULL graphs 1-6, DSpark 5, one request | split 20 only; any other cut refused at load with the reason | executed on 8x V100 (serving, on the #1277 merge); CPU tests on `main` | PP>2; more than one request per step (`StageCommit` refuses it) |\n| DeepSeek-V4.1 PP=1 | GGUF | TP=4 | unchanged; every PP2 branch gated off | CPU tests (`test_deepseek_v41_pp_forward`, `test_gpu_model_runner`) | not re-served on `main` |\n| `VLLM_V41_MARKOV_SHARD=1` | — | greedy rows, TP group | self-check on all ranks, else refuses to start | CPU (Triton interpreter, 4 emulated ranks) | GPU rounding not covered by the CPU test |\n| `VLLM_V41_INDEX_OVERLAP=1` | — | eager prefill only, never under capture | off by default | CPU AST/knob test | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in (`--pipeline-parallel-size 2`); both switches default off.\n- Required CLI options and environment switches: `serve-pp2.yaml` (`tensor-parallel-size: 4`, `pipeline-parallel-size: 2`, `kernel-config.sm70_gguf.expert_cache_offload_fraction: 0`, `expert_cache_spare_slots: 0`).\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our #1277 build with this port; this branch is the same change rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none for the numbers below.\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: `VLLM_V41_MARKOV_SHARD`, `VLLM_V41_INDEX_OVERLAP`, `VLLM_V41_PP_BOUNDARY_SIM` registered with metadata; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +3 registered, 0 unregistered reads; `expert_cache_offload_fraction` now admits 0 (only with 0 spare slots) and `expert_cache_spare_slots` admits 0 (only then).\n\n## Test Result\n\nMEASURED, 2026-11-03, 8x V100-SXM2-32GB, PP2 x TP4, one request, DSpark 5 drafts per round, this port with no speed switch on (A/B harness, ms per verify round including the first token):\n\n| | tok/s | ms per round |\n| --- | ---: | ---: |\n| T=0 | 99.2 | 31.1 |\n| T=1 | 88.0 | 31.7 (1.78 accepted drafts per round) |\n\nRe-run on `main` for this PR (CPU only, no visible GPU): on 2026-11-05, branch rebased onto `3c051b52e`:\n\n- ruff 0.14.0 `check` and `format --check` on the 31 changed Python files: pass.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- pytest, the seven files above: 91 passed, 2 skipped, 10 failed, 17 errors. Every failure and error is in `tests/v1/worker/test_gpu_model_runner.py`, and the same 27 names fail the same way on unmodified `main` on the same machine (no CUDA device visible, NCCL unavailable). No failure outside that set.\n- `TRITON_INTERPRET=1` pytest `tests/models/test_deepseek_v41_markov_shard.py`: 15 passed.\n\nNot re-run on `main`: the serving numbers above and any GPU test. `main` is 68 commits past the #1277 merge; of the files this PR changes, `vllm/envs.py`, `vllm/v1/core/sched/scheduler.py` and `vllm/v1/worker/gpu_model_runner.py` changed on `main` since then. The port rebased onto `main` without conflicts and the CPU tests above ran on the rebased tree.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-pp2",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wOVQxMjo0OTo1M1q0MjAyNi0xMS0wOVQxMjo0OTo1M1rPAAAAAVtCqNs="
+      },
+      "nodes": [
+        {
+          "id": "PRR_kwDORjYFXs8AAAABW0Ko2w",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "state": "COMMENTED",
+          "body": "Ancestry audit: this current head 49744bc71d2071fc852c1cecb5761f9d841b7dae is fully retained in the open #1379 head ab911bf837779d954d0ab7cba2ab019dca39b4e8; both live heads were checked before this action. Consolidating the review into #1379 and closing this duplicate queue entry as superseded. This does not mean the change was merged or its runtime acceptance passed. Source commits and this discussion remain available, and outstanding build/model/quality gates remain with #1379. Audit assisted by Codex.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1370#pullrequestreview-5826062555",
+          "submittedAt": "2026-11-09T12:49:53Z",
+          "commit": {
+            "oid": "49744bc71d2071fc852c1cecb5761f9d841b7dae"
+          },
+          "comments": {
+            "totalCount": 0,
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            },
+            "nodes": []
+          }
+        }
+      ]
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1370,
+    "title": "[Model][SM70] DeepSeek-V4.1: PP2 x TP4 for the #1277 package (8 V100s)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1370",
+    "isDraft": false,
+    "headRefOid": "49744bc71d2071fc852c1cecb5761f9d841b7dae",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/main_smoke.py",
+      "benchmarks/deepseek_v41/serve-pp2-eager.yaml",
+      "benchmarks/deepseek_v41/serve-pp2.yaml",
+      "benchmarks/deepseek_v41/tools/pp2_m1.py",
+      "docs/design/architecture/runtime_reference.md",
+      "tests/models/gguf/test_shared_expert_pp_stage.py",
+      "tests/models/test_deepseek_v41_index_overlap.py",
+      "tests/models/test_deepseek_v41_markov_shard.py",
+      "tests/models/test_deepseek_v41_pp_commit.py",
+      "tests/models/test_deepseek_v41_pp_drafter.py",
+      "tests/models/test_deepseek_v41_pp_forward.py",
+      "tests/models/test_deepseek_v41_pp_split.py",
+      "tests/v1/worker/test_gpu_model_runner.py",
+      "vllm/config/kernel.py",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/quantization/gguf_expert_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_layout.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_prefill.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_runtime.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_v41_moe.py",
+      "vllm/model_executor/model_loader/gguf_adapters/deepseek_v41.py",
+      "vllm/model_executor/model_loader/gguf_loader.py",
+      "vllm/models/deepseek_v41/attention_ops.py",
+      "vllm/models/deepseek_v41/contract.py",
+      "vllm/models/deepseek_v41/dense_tm.py",
+      "vllm/models/deepseek_v41/dspark.py",
+      "vllm/models/deepseek_v41/markov_shard.py",
+      "vllm/models/deepseek_v41/model.py",
+      "vllm/models/deepseek_v41/pp_commit.py",
+      "vllm/v1/core/sched/scheduler.py",
+      "vllm/v1/engine/core.py",
+      "vllm/v1/spec_decode/dspark.py",
+      "vllm/v1/worker/gpu_model_runner.py"
+    ],
+    "diff_bytes": 218126,
+    "diff_sha256": "69d6f273fd2c244d13688764eae0397ce33f7eca5871f03868b65a4f41bcc851"
+  },
+  "full_tree_diff_proof": null
+}

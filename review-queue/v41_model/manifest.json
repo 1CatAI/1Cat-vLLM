@@ -1,0 +1,98 @@
+{
+  "group": "v41_model",
+  "title": "DeepSeek-V4.1 model and speculative state queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1379,
+      "title": "[Model][MRV2][DeepSeek-V4.1] DeepSeek-V4.1 and its DSpark drafter on Model Runner V2",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1379",
+      "head": "ab911bf837779d954d0ab7cba2ab019dca39b4e8",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "bef09bca157a6834254e7483a69caf31a3f9fa1d549dbcfafc8bd81121f4835b",
+      "files": 62,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1375,
+      "title": "[Spec Decode][DeepSeek-V4.1] Coupled sampled DSpark drafts with keyed verification",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1375",
+      "head": "2db180f0900c6096e26af03d5b873621255c8d67",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "4a556f3072d9afc0890d638c1b5a9c5e43c7c2dc649ab982e93d1f6192074bf9",
+      "files": 9,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1376,
+      "title": "[Perf][DeepSeek-V4.1] Skip layers 21-39 in early prefill chunks (VLLM_V41_PREFILL_SKIP_ROWS)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1376",
+      "head": "bcfeaaffbf6b8281d011f201991450989106ee9b",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "d02c0df9bab6a56394c76fc405b41ba5cf0eb965b2d9871807d5f69a03c282df",
+      "files": 38,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1381,
+      "title": "[Bugfix][SM70][DeepSeek-V4.1] Refill the packed-KV hot ring on a session-prefix hit (#1341)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1381",
+      "head": "38d9ecf8a6a242795adf9b6fd69273ce1ba9b51a",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "7987596a391e8e2872ce11907e90e13ca1fd3e986df954fc5c753cec79cd54ab",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1221,
+      "title": "[Spec Decode][MRV2] DSpark speculator and compressed-index context buckets for Model Runner V2",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1221",
+      "head": "450e65c5262eae2853d97144e5f6fb12cde854e9",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "4957d7058aa322353779e10811b6ab31808699e38b6c211287564f0779fa7a16",
+      "files": 14,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1373,
+      "title": "[Perf][V1][PP] Retain persistent request rows across empty steps",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1373",
+      "head": "78f90ccb70278c3a17dc7ac309333a14a44138e7",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "b45075d6191ae313ceaddb939b4939df8c26a27b0d25fb5999a95dd1674a4acb",
+      "files": 18,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1370,
+      "title": "[Model][SM70] DeepSeek-V4.1: PP2 x TP4 for the #1277 package (8 V100s)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1370",
+      "head": "49744bc71d2071fc852c1cecb5761f9d841b7dae",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "69d6f273fd2c244d13688764eae0397ce33f7eca5871f03868b65a4f41bcc851",
+      "files": 34,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    },
+    {
+      "number": 1377,
+      "title": "[Spec Decode][DeepSeek-V4.1] Coupled drafts and keyed verification on vocabulary shards",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1377",
+      "head": "dfbc25b1af4cc2620196c17494d32bbc1015b38f",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "3ec99bf33a54453ba8593c2a5f5955ccb9b68e7d2f38f0e310e9ce2454b298cb",
+      "files": 43,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    }
+  ],
+  "validation_gaps": "DeepSeek-V4.1 checkpoint, DSpark drafter, stochastic coupling, stateful prefix-hit and session replay require model-level acceptance. #1376 skips model layers during prefill and cannot be admitted on speed evidence alone. #1373 persistent PP batches are kept out of the generic bugfix candidate pending PP2+speculation/session qualification. Generic step-ownership fix #1371 is tested separately.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}

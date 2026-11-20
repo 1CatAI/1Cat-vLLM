@@ -1,0 +1,159 @@
+{
+  "initial_inventory": {
+    "number": 1377,
+    "title": "[Spec Decode][DeepSeek-V4.1] Coupled drafts and keyed verification on vocabulary shards",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1377",
+    "isDraft": false,
+    "headRefOid": "dfbc25b1af4cc2620196c17494d32bbc1015b38f",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1377,
+    "title": "[Spec Decode][DeepSeek-V4.1] Coupled drafts and keyed verification on vocabulary shards",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1370 and #1375.** This branch is #1370 (two commits), then #1375 (one commit), then one commit; review only the last commit, \"Coupled drafts and keyed verification on vocabulary shards\". It uses #1370's Markov-shard emulation and TP layout and #1375's keyed draws. Stack order: #1370, #1375, this PR. Our MRV2 PR builds on it.\n\n## Purpose\n\nTwo opt-in follow-ups to the coupled sampled drafts of #1375 (a port of `Elevatormusic/TensorFold#25`). Both default off, and both are exact: they produce the same keyed samples as the gathered path.\n\n- **`VLLM_V41_COUPLED_SHARD=1`.** The coupled draft step of the DSpark Markov head runs on each TP rank's vocabulary shard inside the drafter's captured query graph (`query_graph.py`, `markov_coupled.coupled_shard_tokens`): every rank scores its own rows with keyed draws at the global token ids, and one slot all-reduce per step picks the winner, instead of gathering the full draft logits. `VLLM_V41_COUPLED_SHARD_CHECK=1` compares it with the gathered path at run time (debug).\n- **`VLLM_V41_COUPLED_LOCAL=1`** (with `VLLM_V41_COUPLED_DRAFTS=1`). Keyed verification of the target from the vocabulary shards (`model.local_logits`, `coupled_draw.KeyedShard`) when every row is random and only a temperature applies, without gathering the full target logits. Greedy rows, top-k / top-p / min-p, min-tokens, logprobs, penalties, allowed or bad words, a thinking budget, grammar, PP broadcast and any other logits processing take the gathered path (`coupled_draw.local_fallback`, `_can_use_v41_keyed_local`). `VLLM_V41_COUPLED_LOCAL_CHECK=1` compares both (debug).\n- The local-logits path refuses a biased head; the rejection sampler clears the candidate ids that the skipped `forward()` would have cleared.\n- `tests/models/test_deepseek_v41_fork4card_pp1.py`: the 4-card TP4/PP1 interaction of the coupled paths with cold-expert verify truncation (`VLLM_V41_TRUNC`).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\n# kernels in the Triton interpreter (on before triton is imported), TP ranks emulated as threads:\nTRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_coupled_drafts.py \\\n  tests/models/test_deepseek_v41_coupled_fused.py tests/models/test_deepseek_v41_coupled_shard.py \\\n  tests/models/test_deepseek_v41_coupled_local.py tests/models/test_deepseek_v41_fork4card_pp1.py \\\n  tests/models/test_deepseek_v41_markov_shard.py\nCUDA_VISIBLE_DEVICES= pytest -q tests/v1/sample/test_rejection_sampler.py tests/v1/worker/test_gpu_model_runner.py \\\n  tests/v1/spec_decode/test_dspark.py tests/v1/spec_decode/test_rejection_sampler_utils.py\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Coupled shard drafts | DeepSeek-V4.1 + DSpark | `VLLM_V41_COUPLED_SHARD=1`, coupled drafts on, one request, TP group | sharded keyed argmax in the query graph; else the fused coupled kernels (logged once) | CPU interpreter, 4 emulated ranks, ties across shards; measured on 8x V100 | GPU rounding not covered by the CPU test |\n| Local keyed verification | same | `VLLM_V41_COUPLED_LOCAL=1`, all rows random, temperature only | shard verification; else the gathered path (reason logged once) | CPU interpreter, fallback matrix; measured on 8x V100 | same |\n| Switches off | all | default | unchanged | CPU tests of the touched files, same results as #1370 | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; all four switches default off.\n- Required CLI options and environment switches: #1370 PP2 x TP4 profile, `VLLM_V41_COUPLED_DRAFTS=1`, then `VLLM_V41_COUPLED_SHARD=1` and/or `VLLM_V41_COUPLED_LOCAL=1`.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change on #1370 + #1375, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none.\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; each fallback logs its reason once.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: four experimental variables registered with metadata; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +4 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one request, DSpark 5, paired arms over 11 prompts, ms per verify round:\n\n| switch | T=1 change | prompts faster |\n| --- | ---: | --- |\n| `COUPLED_SHARD=1` | -0.26 / -0.20 ms (two runs) | 11 of 11, 9 of 11 |\n| `COUPLED_LOCAL=1` | -0.12 to -0.24 ms | |\n\nOutputs identical. With greedy requests (T=0) the coupled paths are inactive.\n\n**Re-run for this PR, 2026-11-05,** CPU only (no visible GPU), on #1370 + #1375 rebased onto `main` `3c051b52e`:\n\n- `TRITON_INTERPRET=1` pytest, the six files above: 108 passed.\n- pytest `test_rejection_sampler.py`, `test_gpu_model_runner.py`, `test_dspark.py`, `test_rejection_sampler_utils.py`: 15 passed, 3 skipped, 110 failed, 17 errors on both this branch and #1370 alone, with identical failing names (no CUDA device visible). Nothing new fails.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check` on the 14 changed Python files: pass.\n\nNot re-run: any GPU test or serving; the table was not re-measured on this branch.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1377",
+    "isDraft": false,
+    "headRefName": "pli/v41-coupled-shard",
+    "headRefOid": "dfbc25b1af4cc2620196c17494d32bbc1015b38f",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1377,
+    "id": "PR_kwDORjYFXs8AAAABNI15Tw",
+    "state": "CLOSED",
+    "isDraft": false,
+    "headRefOid": "dfbc25b1af4cc2620196c17494d32bbc1015b38f",
+    "title": "[Spec Decode][DeepSeek-V4.1] Coupled drafts and keyed verification on vocabulary shards",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1377",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1370 and #1375.** This branch is #1370 (two commits), then #1375 (one commit), then one commit; review only the last commit, \"Coupled drafts and keyed verification on vocabulary shards\". It uses #1370's Markov-shard emulation and TP layout and #1375's keyed draws. Stack order: #1370, #1375, this PR. Our MRV2 PR builds on it.\n\n## Purpose\n\nTwo opt-in follow-ups to the coupled sampled drafts of #1375 (a port of `Elevatormusic/TensorFold#25`). Both default off, and both are exact: they produce the same keyed samples as the gathered path.\n\n- **`VLLM_V41_COUPLED_SHARD=1`.** The coupled draft step of the DSpark Markov head runs on each TP rank's vocabulary shard inside the drafter's captured query graph (`query_graph.py`, `markov_coupled.coupled_shard_tokens`): every rank scores its own rows with keyed draws at the global token ids, and one slot all-reduce per step picks the winner, instead of gathering the full draft logits. `VLLM_V41_COUPLED_SHARD_CHECK=1` compares it with the gathered path at run time (debug).\n- **`VLLM_V41_COUPLED_LOCAL=1`** (with `VLLM_V41_COUPLED_DRAFTS=1`). Keyed verification of the target from the vocabulary shards (`model.local_logits`, `coupled_draw.KeyedShard`) when every row is random and only a temperature applies, without gathering the full target logits. Greedy rows, top-k / top-p / min-p, min-tokens, logprobs, penalties, allowed or bad words, a thinking budget, grammar, PP broadcast and any other logits processing take the gathered path (`coupled_draw.local_fallback`, `_can_use_v41_keyed_local`). `VLLM_V41_COUPLED_LOCAL_CHECK=1` compares both (debug).\n- The local-logits path refuses a biased head; the rejection sampler clears the candidate ids that the skipped `forward()` would have cleared.\n- `tests/models/test_deepseek_v41_fork4card_pp1.py`: the 4-card TP4/PP1 interaction of the coupled paths with cold-expert verify truncation (`VLLM_V41_TRUNC`).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\n# kernels in the Triton interpreter (on before triton is imported), TP ranks emulated as threads:\nTRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_coupled_drafts.py \\\n  tests/models/test_deepseek_v41_coupled_fused.py tests/models/test_deepseek_v41_coupled_shard.py \\\n  tests/models/test_deepseek_v41_coupled_local.py tests/models/test_deepseek_v41_fork4card_pp1.py \\\n  tests/models/test_deepseek_v41_markov_shard.py\nCUDA_VISIBLE_DEVICES= pytest -q tests/v1/sample/test_rejection_sampler.py tests/v1/worker/test_gpu_model_runner.py \\\n  tests/v1/spec_decode/test_dspark.py tests/v1/spec_decode/test_rejection_sampler_utils.py\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Coupled shard drafts | DeepSeek-V4.1 + DSpark | `VLLM_V41_COUPLED_SHARD=1`, coupled drafts on, one request, TP group | sharded keyed argmax in the query graph; else the fused coupled kernels (logged once) | CPU interpreter, 4 emulated ranks, ties across shards; measured on 8x V100 | GPU rounding not covered by the CPU test |\n| Local keyed verification | same | `VLLM_V41_COUPLED_LOCAL=1`, all rows random, temperature only | shard verification; else the gathered path (reason logged once) | CPU interpreter, fallback matrix; measured on 8x V100 | same |\n| Switches off | all | default | unchanged | CPU tests of the touched files, same results as #1370 | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; all four switches default off.\n- Required CLI options and environment switches: #1370 PP2 x TP4 profile, `VLLM_V41_COUPLED_DRAFTS=1`, then `VLLM_V41_COUPLED_SHARD=1` and/or `VLLM_V41_COUPLED_LOCAL=1`.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change on #1370 + #1375, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none.\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; each fallback logs its reason once.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: four experimental variables registered with metadata; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +4 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one request, DSpark 5, paired arms over 11 prompts, ms per verify round:\n\n| switch | T=1 change | prompts faster |\n| --- | ---: | --- |\n| `COUPLED_SHARD=1` | -0.26 / -0.20 ms (two runs) | 11 of 11, 9 of 11 |\n| `COUPLED_LOCAL=1` | -0.12 to -0.24 ms | |\n\nOutputs identical. With greedy requests (T=0) the coupled paths are inactive.\n\n**Re-run for this PR, 2026-11-05,** CPU only (no visible GPU), on #1370 + #1375 rebased onto `main` `3c051b52e`:\n\n- `TRITON_INTERPRET=1` pytest, the six files above: 108 passed.\n- pytest `test_rejection_sampler.py`, `test_gpu_model_runner.py`, `test_dspark.py`, `test_rejection_sampler_utils.py`: 15 passed, 3 skipped, 110 failed, 17 errors on both this branch and #1370 alone, with identical failing names (no CUDA device visible). Nothing new fails.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check` on the 14 changed Python files: pass.\n\nNot re-run: any GPU test or serving; the table was not re-measured on this branch.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-coupled-shard",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wOVQxMjo0OTo1OVq0MjAyNi0xMS0wOVQxMjo0OTo1OVrPAAAAAVtCrRg="
+      },
+      "nodes": [
+        {
+          "id": "PRR_kwDORjYFXs8AAAABW0KtGA",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "state": "COMMENTED",
+          "body": "Ancestry audit: this current head dfbc25b1af4cc2620196c17494d32bbc1015b38f is fully retained in the open #1379 head ab911bf837779d954d0ab7cba2ab019dca39b4e8; both live heads were checked before this action. Consolidating the review into #1379 and closing this duplicate queue entry as superseded. This does not mean the change was merged or its runtime acceptance passed. Source commits and this discussion remain available, and outstanding build/model/quality gates remain with #1379. Audit assisted by Codex.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1377#pullrequestreview-5826063640",
+          "submittedAt": "2026-11-09T12:49:59Z",
+          "commit": {
+            "oid": "dfbc25b1af4cc2620196c17494d32bbc1015b38f"
+          },
+          "comments": {
+            "totalCount": 0,
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            },
+            "nodes": []
+          }
+        }
+      ]
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1377,
+    "title": "[Spec Decode][DeepSeek-V4.1] Coupled drafts and keyed verification on vocabulary shards",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1377",
+    "isDraft": false,
+    "headRefOid": "dfbc25b1af4cc2620196c17494d32bbc1015b38f",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/main_smoke.py",
+      "benchmarks/deepseek_v41/serve-pp2-eager.yaml",
+      "benchmarks/deepseek_v41/serve-pp2.yaml",
+      "benchmarks/deepseek_v41/tools/pp2_m1.py",
+      "docs/design/architecture/runtime_reference.md",
+      "tests/models/gguf/test_shared_expert_pp_stage.py",
+      "tests/models/test_deepseek_v41_coupled_drafts.py",
+      "tests/models/test_deepseek_v41_coupled_fused.py",
+      "tests/models/test_deepseek_v41_coupled_local.py",
+      "tests/models/test_deepseek_v41_coupled_shard.py",
+      "tests/models/test_deepseek_v41_fork4card_pp1.py",
+      "tests/models/test_deepseek_v41_index_overlap.py",
+      "tests/models/test_deepseek_v41_markov_shard.py",
+      "tests/models/test_deepseek_v41_pp_commit.py",
+      "tests/models/test_deepseek_v41_pp_drafter.py",
+      "tests/models/test_deepseek_v41_pp_forward.py",
+      "tests/models/test_deepseek_v41_pp_split.py",
+      "tests/v1/worker/test_gpu_model_runner.py",
+      "vllm/config/kernel.py",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/quantization/gguf_expert_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_layout.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_prefill.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_runtime.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_v41_moe.py",
+      "vllm/model_executor/model_loader/gguf_adapters/deepseek_v41.py",
+      "vllm/model_executor/model_loader/gguf_loader.py",
+      "vllm/models/deepseek_v41/attention_ops.py",
+      "vllm/models/deepseek_v41/contract.py",
+      "vllm/models/deepseek_v41/dense_tm.py",
+      "vllm/models/deepseek_v41/dspark.py",
+      "vllm/models/deepseek_v41/markov_coupled.py",
+      "vllm/models/deepseek_v41/markov_shard.py",
+      "vllm/models/deepseek_v41/model.py",
+      "vllm/models/deepseek_v41/pp_commit.py",
+      "vllm/models/deepseek_v41/query_graph.py",
+      "vllm/v1/core/sched/scheduler.py",
+      "vllm/v1/engine/core.py",
+      "vllm/v1/sample/rejection_sampler.py",
+      "vllm/v1/spec_decode/coupled_draw.py",
+      "vllm/v1/spec_decode/dspark.py",
+      "vllm/v1/worker/gpu_model_runner.py"
+    ],
+    "diff_bytes": 335787,
+    "diff_sha256": "3ec99bf33a54453ba8593c2a5f5955ccb9b68e7d2f38f0e310e9ce2454b298cb"
+  },
+  "full_tree_diff_proof": null
+}

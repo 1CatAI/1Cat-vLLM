@@ -1,0 +1,103 @@
+{
+  "initial_inventory": {
+    "number": 1375,
+    "title": "[Spec Decode][DeepSeek-V4.1] Coupled sampled DSpark drafts with keyed verification",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1375",
+    "isDraft": false,
+    "headRefOid": "2db180f0900c6096e26af03d5b873621255c8d67",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1375,
+    "title": "[Spec Decode][DeepSeek-V4.1] Coupled sampled DSpark drafts with keyed verification",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Credit.** The coupled sampled drafts are the idea and design of `Elevatormusic/TensorFold#25` (merged in TensorFold). This PR is our port of that design to the #1277 DeepSeek-V4.1 DSpark path. Independent of our other PRs: it applies to `main` alone. Our MRV2 PR builds on it.\n\n## Purpose\n\nAt temperature above 0, a DSpark draft that is sampled independently of the target rarely matches the target's sample, so acceptance drops. Coupled drafts make the drafter and the verifier share one keyed Gumbel draw per (request key, output position, token):\n\n- the target samples `argmax(logits + G)` (Gumbel-max, an exact sample from the target distribution);\n- the drafter proposes `argmax(draft_logits / T + G)` with the same `G`;\n- verification accepts the longest draft prefix equal to the target's keyed samples.\n\nThe emitted sequence is exactly the non-speculative keyed sequence whatever the drafts are, so speculation never changes the output, only how many rounds it takes. `G` comes from a 32-bit hash (lowbias32) of the request key, position and token; the request key is the request seed when one is given, else the engine seed and the request id, so requests are never coupled to each other. The fused variant draws inside the DSpark Markov head (`markov_coupled.py`) instead of materializing the draft logits.\n\nSwitches, all default off:\n\n- `VLLM_V41_COUPLED_DRAFTS=1` turns it on (`0` default);\n- `VLLM_V41_COUPLED_DRAFT_TEMP` scales the drafter temperature (default `0.5`; our serving used `1.0`);\n- `VLLM_V41_COUPLED_TRACE=<prefix>` writes a per-process TSV of every keyed verification row (debug; host syncs every step).\n\nWith the switch off, `rejection_sampler.py`, `dspark.py` and `gpu_model_runner.py` take their existing paths.\n\nBehavior note for reviewers: with the switch on, a seeded request's sampled tokens come from the keyed draws rather than the torch generator, so the tokens for a given seed differ from the switch-off run (the distribution is the same).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\n# the coupled kernels run in the Triton interpreter, which must be on before triton is imported:\nTRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_coupled_drafts.py \\\n  tests/models/test_deepseek_v41_coupled_fused.py\n# the files this PR touches, compared with main:\nCUDA_VISIBLE_DEVICES= pytest -q tests/v1/sample/test_rejection_sampler.py tests/v1/worker/test_gpu_model_runner.py \\\n  tests/v1/spec_decode/test_dspark.py tests/v1/spec_decode/test_rejection_sampler_utils.py\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Coupled drafts, V1 runner | DeepSeek-V4.1 + DSpark | `VLLM_V41_COUPLED_DRAFTS=1`, T > 0 rows | keyed draws on both sides; greedy rows unchanged | CPU (interpreter) tests; serving measured on 8x V100 | not re-served on `main` |\n| Fused (Markov head) | same | DSpark Markov head | draws inside the head | CPU (interpreter) test | GPU compile of the fused kernel on `main` |\n| Switch off | all | default | existing sampler / drafter | CPU tests of the touched files, same results as `main` | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in, `VLLM_V41_COUPLED_DRAFTS=1`; default off.\n- Required CLI options and environment switches: DSpark speculative config on DeepSeek-V4.1.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port (#1370); this branch is the change rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none.\n- User-entry route-hit, speed, and output-quality evidence: below. Exact by construction (keyed draws); the CPU test checks exactness of a simulated speculative loop.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: three experimental variables registered with metadata; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +3 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4 (#1370), one request, DSpark 5, T=1: accepted drafts per round 1.85 -> 2.25, +14 % tok/s, about 0.3 ms more per round; no cost at T=0 (greedy rows are unchanged). This is an acceptance gain, not a faster kernel.\n\n**Re-run on `main` for this PR, 2026-11-05,** CPU only (no visible GPU), branch rebased onto `3c051b52e`:\n\n- `TRITON_INTERPRET=1` pytest, the two coupled test files: 28 passed.\n- pytest `test_rejection_sampler.py`, `test_gpu_model_runner.py`, `test_dspark.py`, `test_rejection_sampler_utils.py`: 14 passed, 3 skipped, 110 failed, 17 errors on both this branch and unmodified `main`, with identical failing names (no CUDA device visible). Nothing new fails.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass (`runtime_reference.md` regenerated in this PR).\n- ruff 0.14.0 `check` and `format --check` on the changed Python files: pass.\n\nNot re-run on `main`: any GPU test or serving; the numbers above were not re-measured on this branch.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1375",
+    "isDraft": false,
+    "headRefName": "pli/v41-coupled-drafts",
+    "headRefOid": "2db180f0900c6096e26af03d5b873621255c8d67",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1375,
+    "id": "PR_kwDORjYFXs8AAAABNId5SA",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "2db180f0900c6096e26af03d5b873621255c8d67",
+    "title": "[Spec Decode][DeepSeek-V4.1] Coupled sampled DSpark drafts with keyed verification",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1375",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Credit.** The coupled sampled drafts are the idea and design of `Elevatormusic/TensorFold#25` (merged in TensorFold). This PR is our port of that design to the #1277 DeepSeek-V4.1 DSpark path. Independent of our other PRs: it applies to `main` alone. Our MRV2 PR builds on it.\n\n## Purpose\n\nAt temperature above 0, a DSpark draft that is sampled independently of the target rarely matches the target's sample, so acceptance drops. Coupled drafts make the drafter and the verifier share one keyed Gumbel draw per (request key, output position, token):\n\n- the target samples `argmax(logits + G)` (Gumbel-max, an exact sample from the target distribution);\n- the drafter proposes `argmax(draft_logits / T + G)` with the same `G`;\n- verification accepts the longest draft prefix equal to the target's keyed samples.\n\nThe emitted sequence is exactly the non-speculative keyed sequence whatever the drafts are, so speculation never changes the output, only how many rounds it takes. `G` comes from a 32-bit hash (lowbias32) of the request key, position and token; the request key is the request seed when one is given, else the engine seed and the request id, so requests are never coupled to each other. The fused variant draws inside the DSpark Markov head (`markov_coupled.py`) instead of materializing the draft logits.\n\nSwitches, all default off:\n\n- `VLLM_V41_COUPLED_DRAFTS=1` turns it on (`0` default);\n- `VLLM_V41_COUPLED_DRAFT_TEMP` scales the drafter temperature (default `0.5`; our serving used `1.0`);\n- `VLLM_V41_COUPLED_TRACE=<prefix>` writes a per-process TSV of every keyed verification row (debug; host syncs every step).\n\nWith the switch off, `rejection_sampler.py`, `dspark.py` and `gpu_model_runner.py` take their existing paths.\n\nBehavior note for reviewers: with the switch on, a seeded request's sampled tokens come from the keyed draws rather than the torch generator, so the tokens for a given seed differ from the switch-off run (the distribution is the same).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\n# the coupled kernels run in the Triton interpreter, which must be on before triton is imported:\nTRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_coupled_drafts.py \\\n  tests/models/test_deepseek_v41_coupled_fused.py\n# the files this PR touches, compared with main:\nCUDA_VISIBLE_DEVICES= pytest -q tests/v1/sample/test_rejection_sampler.py tests/v1/worker/test_gpu_model_runner.py \\\n  tests/v1/spec_decode/test_dspark.py tests/v1/spec_decode/test_rejection_sampler_utils.py\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Coupled drafts, V1 runner | DeepSeek-V4.1 + DSpark | `VLLM_V41_COUPLED_DRAFTS=1`, T > 0 rows | keyed draws on both sides; greedy rows unchanged | CPU (interpreter) tests; serving measured on 8x V100 | not re-served on `main` |\n| Fused (Markov head) | same | DSpark Markov head | draws inside the head | CPU (interpreter) test | GPU compile of the fused kernel on `main` |\n| Switch off | all | default | existing sampler / drafter | CPU tests of the touched files, same results as `main` | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in, `VLLM_V41_COUPLED_DRAFTS=1`; default off.\n- Required CLI options and environment switches: DSpark speculative config on DeepSeek-V4.1.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port (#1370); this branch is the change rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none.\n- User-entry route-hit, speed, and output-quality evidence: below. Exact by construction (keyed draws); the CPU test checks exactness of a simulated speculative loop.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: three experimental variables registered with metadata; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +3 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4 (#1370), one request, DSpark 5, T=1: accepted drafts per round 1.85 -> 2.25, +14 % tok/s, about 0.3 ms more per round; no cost at T=0 (greedy rows are unchanged). This is an acceptance gain, not a faster kernel.\n\n**Re-run on `main` for this PR, 2026-11-05,** CPU only (no visible GPU), branch rebased onto `3c051b52e`:\n\n- `TRITON_INTERPRET=1` pytest, the two coupled test files: 28 passed.\n- pytest `test_rejection_sampler.py`, `test_gpu_model_runner.py`, `test_dspark.py`, `test_rejection_sampler_utils.py`: 14 passed, 3 skipped, 110 failed, 17 errors on both this branch and unmodified `main`, with identical failing names (no CUDA device visible). Nothing new fails.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass (`runtime_reference.md` regenerated in this PR).\n- ruff 0.14.0 `check` and `format --check` on the changed Python files: pass.\n\nNot re-run on `main`: any GPU test or serving; the numbers above were not re-measured on this branch.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-coupled-drafts",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1375,
+    "title": "[Spec Decode][DeepSeek-V4.1] Coupled sampled DSpark drafts with keyed verification",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1375",
+    "isDraft": false,
+    "headRefOid": "2db180f0900c6096e26af03d5b873621255c8d67",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/models/test_deepseek_v41_coupled_drafts.py",
+      "tests/models/test_deepseek_v41_coupled_fused.py",
+      "vllm/envs.py",
+      "vllm/models/deepseek_v41/dspark.py",
+      "vllm/models/deepseek_v41/markov_coupled.py",
+      "vllm/v1/sample/rejection_sampler.py",
+      "vllm/v1/spec_decode/coupled_draw.py",
+      "vllm/v1/spec_decode/dspark.py",
+      "vllm/v1/worker/gpu_model_runner.py"
+    ],
+    "diff_bytes": 53668,
+    "diff_sha256": "4a556f3072d9afc0890d638c1b5a9c5e43c7c2dc649ab982e93d1f6192074bf9"
+  },
+  "full_tree_diff_proof": null
+}

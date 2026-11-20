@@ -1,0 +1,350 @@
+diff --git a/tests/models/test_deepseek_v41_hot_refill.py b/tests/models/test_deepseek_v41_hot_refill.py
+new file mode 100644
+index 0000000000..a779d7746e
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_hot_refill.py
+@@ -0,0 +1,158 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Session-prefix hits past the packed-KV hot ring (1Cat #1341).
++
++Readers take hot slot ``c % hot_rows`` as row ``c`` for every ``c`` in
++``(newest - hot_rows, newest]``. The previous request wrote rows past the hit
++(its answer and up to 4 rejected drafts); once the ring has wrapped, those sit
++in the slots of rows about ``hot_rows`` back. After ``refill_hot(cached)``
++every slot a reader can take as current must hold the host row it stands for.
++"""
++
++import types
++
++import pytest
++import torch
++
++from vllm.models.deepseek_v41.kv_store import V41PackedKV
++from vllm.models.deepseek_v41.model import DeepseekV41Model
++
++# Ratio-4 and ratio-128 KV source layers, as in the V4.1-Flash config.
++SOURCES = {2: 4, 8: 128, 14: 4, 20: 4}
++DRAFTS = 4  # 5 draft tokens: rejected drafts reach processed + 4
++WIDTH = 3
++
++
++def _store(hot_positions, prompt, answer):
++    """A store after a request of prompt + answer tokens plus rejected drafts."""
++    st = types.SimpleNamespace(
++        sources=SOURCES,
++        hot_rows={s: max(1, hot_positions // r) for s, r in SOURCES.items()},
++    )
++    written = prompt + answer + DRAFTS
++    st.host = {
++        s: torch.zeros(written // r + 1, WIDTH, dtype=torch.int32)
++        for s, r in SOURCES.items()
++    }
++    st.hot = {s: torch.zeros(st.hot_rows[s], WIDTH, dtype=torch.int32) for s in SOURCES}
++    for s, r in SOURCES.items():
++        for row in range(written // r):
++            value = torch.tensor([row, 1, 7], dtype=torch.int32)
++            st.hot[s][row % st.hot_rows[s]] = value
++            st.host[s][row] = value
++    return st
++
++
++def _stale_slots(st, cached, prompt, answer):
++    """Mark the rows past the hit, then count slots that disagree with host."""
++    written = prompt + answer + DRAFTS
++    for s, r in SOURCES.items():
++        for row in range(cached // r, written // r):
++            st.hot[s][row % st.hot_rows[s]][1] = 99
++
++
++def _mismatched(st, cached):
++    bad = 0
++    for s, r in SOURCES.items():
++        hi = cached // r - 1
++        rows = st.hot_rows[s]
++        for c in range(max(0, hi - rows + 1), hi + 1):
++            bad += not torch.equal(st.hot[s][c % rows], st.host[s][c])
++    return bad
++
++
++@pytest.mark.parametrize(
++    ("prompt", "answer", "hot_positions"),
++    [
++        (40000, 64, 32768),
++        (39560, 64, 32768),  # the prompt length reported in #1341
++        (250000, 64, 32768),
++        (500000, 64, 32768),
++        (37000, 1, 32768),
++        (100, 64, 64),
++        (2000, 300, 1024),
++    ],
++)
++def test_refill_restores_every_current_slot(prompt, answer, hot_positions):
++    st = _store(hot_positions, prompt, answer)
++    _stale_slots(st, prompt, prompt, answer)
++    copied = V41PackedKV.refill_hot(st, prompt)
++    assert _mismatched(st, prompt) == 0
++    # Exactly the rows a reader can take as current are copied.
++    want = sum(
++        min(st.hot_rows[s], prompt // r)
++        for s, r in SOURCES.items()
++        if prompt // r - 1 + 256 >= st.hot_rows[s]
++    )
++    assert copied == want
++
++
++def test_without_refill_the_wrapped_ring_is_stale():
++    # The check above can fail: past the ring, the old rows are read as current.
++    st = _store(32768, 40000, 64)
++    _stale_slots(st, 40000, 40000, 64)
++    assert _mismatched(st, 40000) > 0
++
++
++def test_below_the_ring_the_hot_slots_are_unchanged():
++    # Before the ring wraps, the slots are already right; a refill may copy
++    # (the ratio-128 ring is short) but must not change any slot.
++    st = _store(32768, 20000, 64)
++    _stale_slots(st, 20000, 20000, 64)
++    before = {s: t.clone() for s, t in st.hot.items()}
++    V41PackedKV.refill_hot(st, 20000)
++    assert _mismatched(st, 20000) == 0
++    for s in SOURCES:
++        assert torch.equal(st.hot[s], before[s])
++
++
++class _Store:
++    def __init__(self):
++        self.refills = []
++
++    def refill_hot(self, cached):
++        self.refills.append(cached)
++        return 0
++
++
++def _model(store):
++    vocab = 16
++    return types.SimpleNamespace(
++        hash_state=types.SimpleNamespace(
++            history=torch.zeros(4, dtype=torch.long),
++            token_map=torch.arange(vocab, dtype=torch.int32),
++            metadata=torch.zeros(3, dtype=torch.int32),
++        ),
++        layers=[],
++        _v41_shared=types.SimpleNamespace(store=store),
++        _v41_hot_refill_logged=False,
++    )
++
++
++@pytest.mark.parametrize(("env", "want"), [(None, [6]), ("1", [6]), ("0", [])])
++def test_restore_prefix_refills_the_hot_ring(monkeypatch, env, want):
++    if env is None:
++        monkeypatch.delenv("VLLM_V41_HOT_REFILL", raising=False)
++    else:
++        monkeypatch.setenv("VLLM_V41_HOT_REFILL", env)
++    store = _Store()
++    model = _model(store)
++    DeepseekV41Model.restore_prefix(model, 6, [1, 2, 3, 4, 5, 6, 7])
++    assert store.refills == want
++    assert model.hash_state.history.tolist() == [4, 5, 6, 6]
++
++
++def test_restore_prefix_without_packed_kv(monkeypatch):
++    monkeypatch.setenv("VLLM_V41_HOT_REFILL", "1")
++    model = _model(None)
++    DeepseekV41Model.restore_prefix(model, 4, [1, 2, 3, 4, 5])
++    assert model.hash_state.history.tolist() == [2, 3, 4, 4]
++
++
++def test_ring_reach_leaves_room_for_rejected_drafts(monkeypatch):
++    # Window rings hold 256 rows; a hit at P needs rows [P - 128, P). Rejected
++    # drafts reach processed + 4, so a hit may be at most 128 - 4 behind.
++    from vllm import envs
++
++    monkeypatch.delenv("VLLM_V41_RING_REACH", raising=False)
++    assert int(envs.VLLM_V41_RING_REACH) == 128 - DRAFTS
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..13973e943e 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -491,6 +491,7 @@
+     VLLM_V41_HC_V3: str = "1"
+     VLLM_V41_HC_V3_GROUPS: str = "8"
+     VLLM_V41_HC_WINDOW: str = "2048"
++    VLLM_V41_HOT_REFILL: str = "1"
+     VLLM_V41_HITLOG_RELAXED: str = "1"
+     VLLM_V41_INDEX_DECODE_BLOCKS: str = "8"
+     VLLM_V41_INDEX_TILE_MB: str = "64"
+@@ -507,6 +508,7 @@
+     VLLM_V41_PREFILL_DMA: str = "1"
+     VLLM_V41_PREFILL_GROUP: str | None = None
+     VLLM_V41_PREFILL_TIMING: str = "0"
++    VLLM_V41_RING_REACH: str = "124"
+     VLLM_V41_ROUTED_PREFILL_MAX: str = "1536"
+     VLLM_V41_ROUTER_FUSED: str = "1"
+     VLLM_V41_ROUTE_TRACE: str | None = None
+@@ -7574,6 +7576,20 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_HOT_REFILL": env_var(
++        lambda: os.getenv("VLLM_V41_HOT_REFILL", "1"),
++        description=(
++            "DS-V4.1 packed KV: on a same-session prefix hit, refill the hot ring"
++            " from the host copy so rows the previous request wrote past the hit"
++            " are not read as current (1Cat #1341). '0' restores the old behaviour."
++        ),
++        category="configuration",
++        declared_default="'1'",
++        effective_default="'1'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
+     "VLLM_V41_INDEX_DECODE_BLOCKS": env_var(
+         lambda: os.getenv("VLLM_V41_INDEX_DECODE_BLOCKS", "8"),
+         description=(
+@@ -7741,6 +7757,20 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_RING_REACH": env_var(
++        lambda: os.getenv("VLLM_V41_RING_REACH", "124"),
++        description=(
++            "DS-V4.1 session prefix: a hit is admitted only within this many positions"
++            " of the last processed position (window rings hold 256; 5 drafts reach +4;"
++            " 1Cat #1341). Old value 128."
++        ),
++        category="configuration",
++        declared_default="'124'",
++        effective_default="'124'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
+     "VLLM_V41_ROUTED_PREFILL_MAX": env_var(
+         lambda: os.getenv("VLLM_V41_ROUTED_PREFILL_MAX", "1536"),
+         description=(
+@@ -20309,6 +20339,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
+         "VLLM_V41_HC_V3",
+         "VLLM_V41_HC_V3_GROUPS",
+         "VLLM_V41_HC_WINDOW",
++        "VLLM_V41_HOT_REFILL",
+         "VLLM_V41_HITLOG_RELAXED",
+         "VLLM_V41_INDEX_DECODE_BLOCKS",
+         "VLLM_V41_INDEX_TILE_MB",
+@@ -20325,6 +20356,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
+         "VLLM_V41_PREFILL_DMA",
+         "VLLM_V41_PREFILL_GROUP",
+         "VLLM_V41_PREFILL_TIMING",
++        "VLLM_V41_RING_REACH",
+         "VLLM_V41_ROUTED_PREFILL_MAX",
+         "VLLM_V41_ROUTER_FUSED",
+         "VLLM_V41_ROUTE_TRACE",
+diff --git a/vllm/models/deepseek_v41/kv_store.py b/vllm/models/deepseek_v41/kv_store.py
+index 69d83fb56d..8ab30fdef7 100644
+--- a/vllm/models/deepseek_v41/kv_store.py
++++ b/vllm/models/deepseek_v41/kv_store.py
+@@ -195,6 +195,34 @@ def insert_compressed(self, source, values, positions, valid_tokens):
+             )
+ 
+     # -- readers --------------------------------------------------------
++    def refill_hot(self, cached):
++        """Session hit at `cached`: rewrite the hot slots of the rows before
++        the hit (1Cat #1341).
++
++        Readers take slot c % hot_rows as row c for c in
++        (newest - hot_rows, newest]. The previous request wrote rows past the
++        hit (its answer and up to 4 rejected drafts); once the ring has wrapped
++        those sit in the slots of rows ~hot_rows back, which the readers treat
++        as current. The host copy (rank 0 writes every row) is authoritative
++        for the rows before the hit. Returns the number of rows copied.
++        """
++        copied = 0
++        for source, ratio in self.sources.items():
++            hi = cached // ratio - 1  # last row completed before the hit
++            rows = self.hot_rows[source]
++            # stale rows (at most ~133 past hi) cannot wrap yet
++            if hi < 0 or hi + 256 < rows:
++                continue
++            lo = max(0, hi - rows + 1)
++            n, start = hi - lo + 1, lo % rows
++            first = min(n, rows - start)
++            hot, host = self.hot[source], self.host[source]
++            hot[start : start + first].copy_(host[lo : lo + first], non_blocking=True)
++            if n > first:
++                hot[: n - first].copy_(host[lo + first : hi + 1], non_blocking=True)
++            copied += n
++        return copied
++
+     def fill_selected(self, source, topk, positions):
+         """Decode: copy each token's selected rows (hot or host) into `selected`."""
+         tokens = topk.shape[0]
+diff --git a/vllm/models/deepseek_v41/model.py b/vllm/models/deepseek_v41/model.py
+index 1a224cb554..b6c4ed7799 100644
+--- a/vllm/models/deepseek_v41/model.py
++++ b/vllm/models/deepseek_v41/model.py
+@@ -21,6 +21,7 @@
+     tensor_model_parallel_all_gather,
+     tensor_model_parallel_all_reduce,
+ )
++from vllm.logger import init_logger
+ from vllm.model_executor.kernels.deepseek_v41_compression import V41C2State
+ from vllm.model_executor.kernels.mhc.deepseek_v41 import (
+     collapse_hc,
+@@ -67,6 +68,8 @@
+ from .norm import short_rms_norm
+ from .quant_rope import apply_rope, attention_qdq, rope_table
+ 
++logger = init_logger(__name__)
++
+ _HC_FUSED = envs.VLLM_V41_HC_FUSED == "1"
+ _ROUTER_FUSED = envs.VLLM_V41_ROUTER_FUSED == "1"
+ 
+@@ -753,6 +756,9 @@ def __init__(self, vllm_config, prefix):
+                 torch.device("cuda", torch.accelerator.current_device_index()),
+                 get_tp_group(),
+             )
++        # Handle for restore_prefix (VLLM_V41_HOT_REFILL, 1Cat #1341).
++        self._v41_shared = shared
++        self._v41_hot_refill_logged = False
+         self.norm = V41Norm(c.hidden_size)
+         for name, shape, dtype in (
+             ("token_map", (c.vocab_size,), torch.int32),
+@@ -963,6 +969,20 @@ def restore_prefix(self, cached, prompt_ids):
+                 state.partial.zero_()
+                 state.position.fill_(cached)
+                 state.metadata[2] = 0
++        # 1Cat #1341: past the hot ring's size, the previous request's rows past
++        # the hit (answer + rejected drafts) sit in slots readers treat as
++        # current. Refill those slots from the host copy.
++        store = self._v41_shared.store
++        if envs.VLLM_V41_HOT_REFILL == "1" and store is not None:
++            copied = store.refill_hot(cached)
++            if not self._v41_hot_refill_logged:
++                self._v41_hot_refill_logged = True
++                logger.info(
++                    "VLLM_V41_HOT_REFILL=1 active: session hit at %d refilled "
++                    "%d hot rows",
++                    cached,
++                    copied,
++                )
+ 
+     def output_budget(self, max_tokens, prompt_tokens):
+         # CPU request lists can contain optimistic placeholders under async
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 7eb13c8b57..7c3289a08c 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -38,8 +38,10 @@
+ 
+ 
+ _V41_SESSION_PREFIX = envs.VLLM_V41_SESSION_PREFIX == "1"
+-# A hit at P needs window rows [P - 128, P) still in the 256-row rings.
+-_V41_RING_REACH = 128
++# A hit at P needs window rows [P - 128, P) still in the 256-row rings. Rejected
++# drafts (5 draft tokens) reach processed + 4 and overwrite the slots of
++# P - 128 .. P - 125 when the hit is 125-128 behind (1Cat #1341): default 124.
++_V41_RING_REACH = int(envs.VLLM_V41_RING_REACH)
+ 
+ 
+ @dataclass

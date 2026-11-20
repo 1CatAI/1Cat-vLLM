@@ -1,0 +1,156 @@
+{
+  "initial_inventory": {
+    "number": 1379,
+    "title": "[Model][MRV2][DeepSeek-V4.1] DeepSeek-V4.1 and its DSpark drafter on Model Runner V2",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1379",
+    "isDraft": false,
+    "headRefOid": "ab911bf837779d954d0ab7cba2ab019dca39b4e8",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1379,
+    "title": "[Model][MRV2][DeepSeek-V4.1] DeepSeek-V4.1 and its DSpark drafter on Model Runner V2",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1370, #1375, #1377 and #1221.** This branch is #1370 (two commits), #1375 (one), #1377 (one), then the three commits of #1221 by `Peuqui` (the MRV2 DSpark speculator and its compressed-index context buckets, included unchanged with their author), then one commit. Review only the last commit, \"DeepSeek-V4.1 and its DSpark drafter on Model Runner V2\". If #1221 lands first, its three commits drop out of this diff.\n\n## Purpose\n\nRuns the #1277 DeepSeek-V4.1 package under Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`, default off), with the V4.1 DSpark drafter on MRV2's speculator of #1221.\n\n- **`model_states/deepseek_v41.py`: a V4.1 model state.** V4.1 keeps private per-sequence state (the Engram hash history and the ratio-2 compressor states). The V1 runner commits it after every forward; this state does the same through the MRV2 hooks: the prefill flag through `prepare_attn`, prefix restore on `add_request` (`model.restore_prefix`, on every PP stage, as V1's `_update_states` does), the sampled-count commit in `postprocess_state` (`model.commit_speculative_state`; on a first PP stage, #1370's \"sampled counts arrived\" path of `pp_commit.StageCommit`), and the coupled-draft keys and host temperatures of #1375.\n- **`spec_decode/dspark/v41.py`: the V4.1 DSpark speculator.** The V4.1 drafter owns its CUDA graphs (query, context buckets, greedy and coupled draft graphs), so the runner-level draft graph is off for it. Draft sampling follows V1's order (greedy graph, coupled shard graph of #1377, fused coupled kernels, keyed loop, then MRV2's loop), and coupled-draft verification uses keyed target samples, which is exact. Each fallback logs its reason once.\n- **`model_runner.py`:** `pp_before_forward` / `pp_after_forward` hooks on a first PP stage that is not the last, the target graph query length, and a prefill-skip context around each runtime forward. The prefill-skip context is inert here: it binds only when the model carries #1376's skip rows, so with #1376 merged MRV2 gets the same skip.\n- **`input_batch.py`: `DummyPositions.CHAIN`.** Dummy, profile and capture batches carry positions 0..n-1, as the V1 runner's dummy run does. V4.1's Engram hash traps on positions that are not one token chain, and with MRV2's zeroed dummy positions every first-stage worker died in the first capture warmup (\"unspecified launch failure\"). Other models keep `ZEROS`.\n\nScheduling stays synchronous for V4.1 under MRV2. One behaviour differs from V1: a T > 0 request that asks for logprobs uses MRV2's rejection sampler instead of the keyed draws (same distribution, different sample); every MRV2 boot logs this.\n\nRebase note: `main`'s `build_attn_metadata` has no `ubatch_id`, so the V4.1 `prepare_attn` does not take or pass one (our older base did; passing it on `main` is a `TypeError` on every forward, which `test_prepare_attn_matches_default_plus_prefill_flag` catches).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\n# plain, then with the Triton kernels in the interpreter (on before triton is imported):\nCUDA_VISIBLE_DEVICES= pytest -q tests/v1/worker/test_mrv2_v41.py tests/v1/worker/test_mrv2_v41_dummy_positions.py \\\n  tests/v1/worker/test_mrv2_dspark_context_buckets.py\nTRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q <the same three files>\n# runner regression, this branch vs #1377 alone:\nCUDA_VISIBLE_DEVICES= pytest -q tests/v1/worker/test_gpu_model_runner.py tests/v1/sample/test_rejection_sampler.py \\\n  tests/v1/spec_decode/test_dspark.py tests/config/test_runtime_default_ownership.py\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| V4.1 model state | DeepSeek-V4.1 | `VLLM_USE_V2_MODEL_RUNNER=1`, `model_type` deepseek_v41 | `DeepseekV41ModelState`; other models keep the default state | CPU tests (state selection, prepare_attn vs default, PP restore on every stage, commit order, async-scheduler model); measured on 8x V100 | GPU rounding not covered by the CPU tests |\n| V4.1 DSpark speculator | DeepSeek-V4.1 + DSpark | MRV2 on, DSpark draft model | V4.1 speculator; other drafters keep #1221's speculator | CPU tests of draft-sampling order and fallbacks; measured on 8x V100 | same |\n| Dummy positions | all MRV2 models | dummy / profile / capture batches | `CHAIN` for V4.1, `ZEROS` otherwise | CPU test through the real capture inputs and hash kernels (Triton interpreter); boot on 8x V100 | — |\n| MRV2 off | all | default | unchanged V1 runner | CPU tests of the touched files, same failing names as #1377 | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_USE_V2_MODEL_RUNNER` defaults off.\n- Required CLI options and environment switches: #1370 PP2 x TP4 profile, DSpark drafter, `VLLM_USE_V2_MODEL_RUNNER=1`.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port and our other default-off levers; this branch is the MRV2 change on #1370 + #1375 + #1377 + #1221, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none.\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; each speculator fallback logs its reason once.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: no new variables; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: unchanged.\n\n## Test Result\n\n**MEASURED, 2026-11-04,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark, one request, paired MRV2-on vs MRV2-off arms on the same build:\n\n- Decode, ms per verify round (on - off): -2.759 ms (95 % interval -2.898 to -2.620). Output tokens identical (bitwise) at T=0.\n- Throughput, tok/s, two runs each: T=0, V1 120.5 / 120.2 vs MRV2 134.2 / 135.0; T=1, V1 121.8 / 122.0 vs MRV2 136.6 / 136.4.\n- Context-depth sweep, ms per round, MRV2 - V1, two runs: 2K -2.59 / -2.87; 8K -2.78 / -2.85; 16K -2.67 / -2.67; **32K +1.41 / +1.44 (MRV2 slower)**; 64K -2.70 / -2.94. At 150K, 26.65 vs 30.02 ms per round. The 32K regression is reproducible and its cause is not yet known; we are tracing MRV2's per-step work at that depth and will report it here.\n- 150K-token prompt, first token: about 83 s with #1376's prefill skip under MRV2, vs 105.5 s without the skip.\n\n**Re-run for this PR, 2026-11-05,** CPU only (no visible GPU), on this branch rebased onto `main` `3c051b52e`:\n\n- pytest `test_mrv2_v41.py`, `test_mrv2_v41_dummy_positions.py`, `test_mrv2_dspark_context_buckets.py`: 46 passed, 14 skipped (Triton kernel cases); with `TRITON_INTERPRET=1`, 60 passed.\n- Runner regression (`test_gpu_model_runner.py`, `test_rejection_sampler.py`, `test_dspark.py`, `test_runtime_default_ownership.py`): 41 passed, 2 skipped, 115 failed, 17 errors on both this branch and #1377 alone, with identical failing names (no CUDA device visible). Nothing new fails.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check` on the changed Python files: pass.\n\nNot re-run: any GPU test, boot or serving on this branch; the numbers above were not re-measured on it.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1379",
+    "isDraft": false,
+    "headRefName": "pli/v41-mrv2",
+    "headRefOid": "ab911bf837779d954d0ab7cba2ab019dca39b4e8",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1379,
+    "id": "PR_kwDORjYFXs8AAAABNJAwRA",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "ab911bf837779d954d0ab7cba2ab019dca39b4e8",
+    "title": "[Model][MRV2][DeepSeek-V4.1] DeepSeek-V4.1 and its DSpark drafter on Model Runner V2",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1379",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1370, #1375, #1377 and #1221.** This branch is #1370 (two commits), #1375 (one), #1377 (one), then the three commits of #1221 by `Peuqui` (the MRV2 DSpark speculator and its compressed-index context buckets, included unchanged with their author), then one commit. Review only the last commit, \"DeepSeek-V4.1 and its DSpark drafter on Model Runner V2\". If #1221 lands first, its three commits drop out of this diff.\n\n## Purpose\n\nRuns the #1277 DeepSeek-V4.1 package under Model Runner V2 (`VLLM_USE_V2_MODEL_RUNNER=1`, default off), with the V4.1 DSpark drafter on MRV2's speculator of #1221.\n\n- **`model_states/deepseek_v41.py`: a V4.1 model state.** V4.1 keeps private per-sequence state (the Engram hash history and the ratio-2 compressor states). The V1 runner commits it after every forward; this state does the same through the MRV2 hooks: the prefill flag through `prepare_attn`, prefix restore on `add_request` (`model.restore_prefix`, on every PP stage, as V1's `_update_states` does), the sampled-count commit in `postprocess_state` (`model.commit_speculative_state`; on a first PP stage, #1370's \"sampled counts arrived\" path of `pp_commit.StageCommit`), and the coupled-draft keys and host temperatures of #1375.\n- **`spec_decode/dspark/v41.py`: the V4.1 DSpark speculator.** The V4.1 drafter owns its CUDA graphs (query, context buckets, greedy and coupled draft graphs), so the runner-level draft graph is off for it. Draft sampling follows V1's order (greedy graph, coupled shard graph of #1377, fused coupled kernels, keyed loop, then MRV2's loop), and coupled-draft verification uses keyed target samples, which is exact. Each fallback logs its reason once.\n- **`model_runner.py`:** `pp_before_forward` / `pp_after_forward` hooks on a first PP stage that is not the last, the target graph query length, and a prefill-skip context around each runtime forward. The prefill-skip context is inert here: it binds only when the model carries #1376's skip rows, so with #1376 merged MRV2 gets the same skip.\n- **`input_batch.py`: `DummyPositions.CHAIN`.** Dummy, profile and capture batches carry positions 0..n-1, as the V1 runner's dummy run does. V4.1's Engram hash traps on positions that are not one token chain, and with MRV2's zeroed dummy positions every first-stage worker died in the first capture warmup (\"unspecified launch failure\"). Other models keep `ZEROS`.\n\nScheduling stays synchronous for V4.1 under MRV2. One behaviour differs from V1: a T > 0 request that asks for logprobs uses MRV2's rejection sampler instead of the keyed draws (same distribution, different sample); every MRV2 boot logs this.\n\nRebase note: `main`'s `build_attn_metadata` has no `ubatch_id`, so the V4.1 `prepare_attn` does not take or pass one (our older base did; passing it on `main` is a `TypeError` on every forward, which `test_prepare_attn_matches_default_plus_prefill_flag` catches).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\n# plain, then with the Triton kernels in the interpreter (on before triton is imported):\nCUDA_VISIBLE_DEVICES= pytest -q tests/v1/worker/test_mrv2_v41.py tests/v1/worker/test_mrv2_v41_dummy_positions.py \\\n  tests/v1/worker/test_mrv2_dspark_context_buckets.py\nTRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q <the same three files>\n# runner regression, this branch vs #1377 alone:\nCUDA_VISIBLE_DEVICES= pytest -q tests/v1/worker/test_gpu_model_runner.py tests/v1/sample/test_rejection_sampler.py \\\n  tests/v1/spec_decode/test_dspark.py tests/config/test_runtime_default_ownership.py\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| V4.1 model state | DeepSeek-V4.1 | `VLLM_USE_V2_MODEL_RUNNER=1`, `model_type` deepseek_v41 | `DeepseekV41ModelState`; other models keep the default state | CPU tests (state selection, prepare_attn vs default, PP restore on every stage, commit order, async-scheduler model); measured on 8x V100 | GPU rounding not covered by the CPU tests |\n| V4.1 DSpark speculator | DeepSeek-V4.1 + DSpark | MRV2 on, DSpark draft model | V4.1 speculator; other drafters keep #1221's speculator | CPU tests of draft-sampling order and fallbacks; measured on 8x V100 | same |\n| Dummy positions | all MRV2 models | dummy / profile / capture batches | `CHAIN` for V4.1, `ZEROS` otherwise | CPU test through the real capture inputs and hash kernels (Triton interpreter); boot on 8x V100 | — |\n| MRV2 off | all | default | unchanged V1 runner | CPU tests of the touched files, same failing names as #1377 | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_USE_V2_MODEL_RUNNER` defaults off.\n- Required CLI options and environment switches: #1370 PP2 x TP4 profile, DSpark drafter, `VLLM_USE_V2_MODEL_RUNNER=1`.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port and our other default-off levers; this branch is the MRV2 change on #1370 + #1375 + #1377 + #1221, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none.\n- User-entry route-hit, speed, and output-quality evidence: below.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; each speculator fallback logs its reason once.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: no new variables; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: unchanged.\n\n## Test Result\n\n**MEASURED, 2026-11-04,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark, one request, paired MRV2-on vs MRV2-off arms on the same build:\n\n- Decode, ms per verify round (on - off): -2.759 ms (95 % interval -2.898 to -2.620). Output tokens identical (bitwise) at T=0.\n- Throughput, tok/s, two runs each: T=0, V1 120.5 / 120.2 vs MRV2 134.2 / 135.0; T=1, V1 121.8 / 122.0 vs MRV2 136.6 / 136.4.\n- Context-depth sweep, ms per round, MRV2 - V1, two runs: 2K -2.59 / -2.87; 8K -2.78 / -2.85; 16K -2.67 / -2.67; **32K +1.41 / +1.44 (MRV2 slower)**; 64K -2.70 / -2.94. At 150K, 26.65 vs 30.02 ms per round. The 32K regression is reproducible and its cause is not yet known; we are tracing MRV2's per-step work at that depth and will report it here.\n- 150K-token prompt, first token: about 83 s with #1376's prefill skip under MRV2, vs 105.5 s without the skip.\n\n**Re-run for this PR, 2026-11-05,** CPU only (no visible GPU), on this branch rebased onto `main` `3c051b52e`:\n\n- pytest `test_mrv2_v41.py`, `test_mrv2_v41_dummy_positions.py`, `test_mrv2_dspark_context_buckets.py`: 46 passed, 14 skipped (Triton kernel cases); with `TRITON_INTERPRET=1`, 60 passed.\n- Runner regression (`test_gpu_model_runner.py`, `test_rejection_sampler.py`, `test_dspark.py`, `test_runtime_default_ownership.py`): 41 passed, 2 skipped, 115 failed, 17 errors on both this branch and #1377 alone, with identical failing names (no CUDA device visible). Nothing new fails.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check` on the changed Python files: pass.\n\nNot re-run: any GPU test, boot or serving on this branch; the numbers above were not re-measured on it.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-mrv2",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1379,
+    "title": "[Model][MRV2][DeepSeek-V4.1] DeepSeek-V4.1 and its DSpark drafter on Model Runner V2",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1379",
+    "isDraft": false,
+    "headRefOid": "ab911bf837779d954d0ab7cba2ab019dca39b4e8",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/main_smoke.py",
+      "benchmarks/deepseek_v41/serve-pp2-eager.yaml",
+      "benchmarks/deepseek_v41/serve-pp2.yaml",
+      "benchmarks/deepseek_v41/tools/pp2_m1.py",
+      "docs/design/architecture/runtime_reference.md",
+      "tests/models/gguf/test_shared_expert_pp_stage.py",
+      "tests/models/test_deepseek_v41_coupled_drafts.py",
+      "tests/models/test_deepseek_v41_coupled_fused.py",
+      "tests/models/test_deepseek_v41_coupled_local.py",
+      "tests/models/test_deepseek_v41_coupled_shard.py",
+      "tests/models/test_deepseek_v41_fork4card_pp1.py",
+      "tests/models/test_deepseek_v41_index_overlap.py",
+      "tests/models/test_deepseek_v41_markov_shard.py",
+      "tests/models/test_deepseek_v41_pp_commit.py",
+      "tests/models/test_deepseek_v41_pp_drafter.py",
+      "tests/models/test_deepseek_v41_pp_forward.py",
+      "tests/models/test_deepseek_v41_pp_split.py",
+      "tests/v1/worker/test_gpu_model_runner.py",
+      "tests/v1/worker/test_mrv2_dspark_context_buckets.py",
+      "tests/v1/worker/test_mrv2_v41.py",
+      "tests/v1/worker/test_mrv2_v41_dummy_positions.py",
+      "tests/v1/worker/test_sm70_long_attention_graphs.py",
+      "tools/pre_commit/layering_baseline.json",
+      "vllm/config/kernel.py",
+      "vllm/config/vllm.py",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/quantization/gguf_expert_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_layout.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_prefill.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_runtime.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_v41_moe.py",
+      "vllm/model_executor/model_loader/gguf_adapters/deepseek_v41.py",
+      "vllm/model_executor/model_loader/gguf_loader.py",
+      "vllm/models/deepseek_v41/attention_ops.py",
+      "vllm/models/deepseek_v41/contract.py",
+      "vllm/models/deepseek_v41/dense_tm.py",
+      "vllm/models/deepseek_v41/dspark.py",
+      "vllm/models/deepseek_v41/markov_coupled.py",
+      "vllm/models/deepseek_v41/markov_shard.py",
+      "vllm/models/deepseek_v41/model.py",
+      "vllm/models/deepseek_v41/pp_commit.py",
+      "vllm/models/deepseek_v41/query_graph.py",
+      "vllm/v1/core/sched/scheduler.py",
+      "vllm/v1/engine/core.py",
+      "vllm/v1/sample/rejection_sampler.py",
+      "vllm/v1/spec_decode/coupled_draw.py",
+      "vllm/v1/spec_decode/dspark.py",
+      "vllm/v1/worker/gpu/cudagraph_utils.py",
+      "vllm/v1/worker/gpu/input_batch.py",
+      "vllm/v1/worker/gpu/model_runner.py",
+      "vllm/v1/worker/gpu/model_states/__init__.py",
+      "vllm/v1/worker/gpu/model_states/deepseek_v41.py",
+      "vllm/v1/worker/gpu/model_states/default.py",
+      "vllm/v1/worker/gpu/spec_decode/__init__.py",
+      "vllm/v1/worker/gpu/spec_decode/dflash/utils.py",
+      "vllm/v1/worker/gpu/spec_decode/dspark/__init__.py",
+      "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+      "vllm/v1/worker/gpu/spec_decode/dspark/v41.py",
+      "vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py",
+      "vllm/v1/worker/gpu/spec_decode/utils.py",
+      "vllm/v1/worker/gpu_model_runner.py"
+    ],
+    "diff_bytes": 495341,
+    "diff_sha256": "bef09bca157a6834254e7483a69caf31a3f9fa1d549dbcfafc8bd81121f4835b"
+  },
+  "full_tree_diff_proof": null
+}
