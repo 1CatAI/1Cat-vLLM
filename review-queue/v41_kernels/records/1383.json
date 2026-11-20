@@ -1,0 +1,121 @@
+{
+  "initial_inventory": {
+    "number": 1383,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Build the routed-expert plan inside the q8 quantize launch (VLLM_V41_PLAN_FUSE, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1383",
+    "isDraft": false,
+    "headRefOid": "45021a037847d42e4ff3c3c3a3df2ab0f3c19cd5",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1383,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Build the routed-expert plan inside the q8 quantize launch (VLLM_V41_PLAN_FUSE, default off)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nIndependent of our other PRs; applies to `main` alone. Our fast routed-expert kernel PR builds on it.\n\n## Purpose\n\nAt decode, the DeepSeek-V4.1 TP4 row-split routed experts (GGUF IQ experts through `gguf_v41_moe.py`) run `q8_aligned` (Q8 quantization of the activations) and then `gate_up7`, which first builds the per-expert plan (`moe_plan`) and then does its dots.\n\nWith **`VLLM_V41_PLAN_FUSE=1`** (default off), a new v41k kernel `q8_plan` quantizes the activations and writes the plan in one launch, and `gate_up7p` reads the plan instead of building it. This removes one launch and the plan prologue from every MoE layer.\n\n- `benchmarks/deepseek_v41/v41k/v41k.cu`: `q8_plan`, `gate_up7p`.\n- `gguf_v41_moe.py`: `_q8_and_plan` selects them when the switch is on, raises if the loaded `v41k.so` lacks them, and logs the first use once (module logger added; `main`'s file had none).\n- `benchmarks/deepseek_v41/plan_fuse_check.py`: one-GPU bit check of today's pair against the fused pair: q8 bytes and scales, the whole 512-entry plan buffer (prefilled with garbage), the gate/up output, and a finite check, M = 1..6, 300 trials per M. This PR adds `--no-time` (bit checks only).\n- `tests/models/test_deepseek_v41_plan_fuse.py`: CPU dispatch tests.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_plan_fuse.py\npython benchmarks/deepseek_v41/v41k/build.py                 # sm_70\npython benchmarks/deepseek_v41/plan_fuse_check.py --lib v41k.so --no-time   # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Fused plan | GGUF IQ routed experts | SM70, decode M <= 6, `VLLM_V41_PLAN_FUSE=1` | `q8_plan` + `gate_up7p`; missing ops raise | GPU bit check (one V100); CPU dispatch tests; measured on 8x V100 | other gtypes than checked here |\n| Switch off | all | default | `q8_aligned` + `gate_up7`, unchanged | CPU dispatch tests | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_PLAN_FUSE` defaults off.\n- Required CLI options and environment switches: `VLLM_V41_PLAN_FUSE=1` and a `v41k.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change alone, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41k.so` (this tree's `benchmarks/deepseek_v41/v41k`).\n- User-entry route-hit, speed, and output-quality evidence: below; the route logs `VLLM_V41_PLAN_FUSE=1: expert plan built in q8_plan, gate_up7p` once.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: one experimental variable with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +1 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark 5, one request, paired ABBA arms, switch on vs off: **-0.36 ms per round at T=0, -0.27 ms at T=1.** Output texts identical.\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- sm_70 build of `v41k.so` from this tree, then `plan_fuse_check.py --no-time` on one V100-SXM2-32GB for gtypes 29 / 16 / 17 (IQ1_M, IQ2_XXS, IQ2_XS): **0 mismatches** in the plan buffer, q8 bytes and scales, and gate/up output, M = 1..6, 300 trials per M; every output finite.\n\n- pytest `test_deepseek_v41_plan_fuse.py`, CPU only: 408 passed.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: timing (the GPU check ran with `--no-time`) and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1383",
+    "isDraft": false,
+    "headRefName": "pli/v41-plan-fuse",
+    "headRefOid": "45021a037847d42e4ff3c3c3a3df2ab0f3c19cd5",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1383,
+    "id": "PR_kwDORjYFXs8AAAABNJeByg",
+    "state": "CLOSED",
+    "isDraft": false,
+    "headRefOid": "45021a037847d42e4ff3c3c3a3df2ab0f3c19cd5",
+    "title": "[Perf][SM70][DeepSeek-V4.1] Build the routed-expert plan inside the q8 quantize launch (VLLM_V41_PLAN_FUSE, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1383",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nIndependent of our other PRs; applies to `main` alone. Our fast routed-expert kernel PR builds on it.\n\n## Purpose\n\nAt decode, the DeepSeek-V4.1 TP4 row-split routed experts (GGUF IQ experts through `gguf_v41_moe.py`) run `q8_aligned` (Q8 quantization of the activations) and then `gate_up7`, which first builds the per-expert plan (`moe_plan`) and then does its dots.\n\nWith **`VLLM_V41_PLAN_FUSE=1`** (default off), a new v41k kernel `q8_plan` quantizes the activations and writes the plan in one launch, and `gate_up7p` reads the plan instead of building it. This removes one launch and the plan prologue from every MoE layer.\n\n- `benchmarks/deepseek_v41/v41k/v41k.cu`: `q8_plan`, `gate_up7p`.\n- `gguf_v41_moe.py`: `_q8_and_plan` selects them when the switch is on, raises if the loaded `v41k.so` lacks them, and logs the first use once (module logger added; `main`'s file had none).\n- `benchmarks/deepseek_v41/plan_fuse_check.py`: one-GPU bit check of today's pair against the fused pair: q8 bytes and scales, the whole 512-entry plan buffer (prefilled with garbage), the gate/up output, and a finite check, M = 1..6, 300 trials per M. This PR adds `--no-time` (bit checks only).\n- `tests/models/test_deepseek_v41_plan_fuse.py`: CPU dispatch tests.\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_plan_fuse.py\npython benchmarks/deepseek_v41/v41k/build.py                 # sm_70\npython benchmarks/deepseek_v41/plan_fuse_check.py --lib v41k.so --no-time   # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Fused plan | GGUF IQ routed experts | SM70, decode M <= 6, `VLLM_V41_PLAN_FUSE=1` | `q8_plan` + `gate_up7p`; missing ops raise | GPU bit check (one V100); CPU dispatch tests; measured on 8x V100 | other gtypes than checked here |\n| Switch off | all | default | `q8_aligned` + `gate_up7`, unchanged | CPU dispatch tests | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_PLAN_FUSE` defaults off.\n- Required CLI options and environment switches: `VLLM_V41_PLAN_FUSE=1` and a `v41k.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port; this branch is the change alone, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41k.so` (this tree's `benchmarks/deepseek_v41/v41k`).\n- User-entry route-hit, speed, and output-quality evidence: below; the route logs `VLLM_V41_PLAN_FUSE=1: expert plan built in q8_plan, gate_up7p` once.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: one experimental variable with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +1 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark 5, one request, paired ABBA arms, switch on vs off: **-0.36 ms per round at T=0, -0.27 ms at T=1.** Output texts identical.\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- sm_70 build of `v41k.so` from this tree, then `plan_fuse_check.py --no-time` on one V100-SXM2-32GB for gtypes 29 / 16 / 17 (IQ1_M, IQ2_XXS, IQ2_XS): **0 mismatches** in the plan buffer, q8 bytes and scales, and gate/up output, M = 1..6, 300 trials per M; every output finite.\n\n- pytest `test_deepseek_v41_plan_fuse.py`, CPU only: 408 passed.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: timing (the GPU check ran with `--no-time`) and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-plan-fuse",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wOVQxMjo1MDoxNVq0MjAyNi0xMS0wOVQxMjo1MDoxNVrPAAAAAVtCt90="
+      },
+      "nodes": [
+        {
+          "id": "PRR_kwDORjYFXs8AAAABW0K33Q",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "state": "COMMENTED",
+          "body": "Ancestry audit: current head 45021a037847d42e4ff3c3c3a3df2ab0f3c19cd5 is included in the still-open #1385 head 2fe80a0f046cce68fcb3d2ca43903b8708216428, verified against live heads and commit history. Closing this earlier stack entry as superseded so review and outstanding validation are tracked in #1385. This is not a merge or a claim that unexecuted hardware/model cases passed. The original commits, authorship and discussion are preserved. Audit assisted by Codex.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1383#pullrequestreview-5826066397",
+          "submittedAt": "2026-11-09T12:50:15Z",
+          "commit": {
+            "oid": "45021a037847d42e4ff3c3c3a3df2ab0f3c19cd5"
+          },
+          "comments": {
+            "totalCount": 0,
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            },
+            "nodes": []
+          }
+        }
+      ]
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1383,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Build the routed-expert plan inside the q8 quantize launch (VLLM_V41_PLAN_FUSE, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1383",
+    "isDraft": false,
+    "headRefOid": "45021a037847d42e4ff3c3c3a3df2ab0f3c19cd5",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/plan_fuse_check.py",
+      "benchmarks/deepseek_v41/v41k/v41k.cu",
+      "tests/models/test_deepseek_v41_plan_fuse.py",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/quantization/gguf_v41_moe.py"
+    ],
+    "diff_bytes": 30806,
+    "diff_sha256": "52aa3113ba3eef82f9378be2f2ea70ebe8aad6e3c860de98095f78d388488309"
+  },
+  "full_tree_diff_proof": null
+}

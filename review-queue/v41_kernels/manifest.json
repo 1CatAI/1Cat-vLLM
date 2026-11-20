@@ -1,0 +1,142 @@
+{
+  "group": "v41_kernels",
+  "title": "DeepSeek-V4.1 native kernel qualification queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1382,
+      "title": "[Perf][SM70] Admit small aligned FP16 sum2 messages to the TP4 push all-reduce (VLLM_V41_SUM2_PUSH_ANY, default off)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1382",
+      "head": "d488114cd1753a411f26248945ebeb822fe891ae",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "64c340a56f48b043c97ddb937d47ddf665e2465d78090df2ed561aa6bdc72534",
+      "files": 6,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1385,
+      "title": "[Perf][SM70][DeepSeek-V4.1] Instruction-diet routed-expert kernels (VLLM_V41_EXPERT_DIET, default off)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1385",
+      "head": "2fe80a0f046cce68fcb3d2ca43903b8708216428",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "de7796c0b723adb3a9233ad712d8f06bfafcf804ca4bbac6be004f665cb6b006",
+      "files": 17,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1386,
+      "title": "[Perf][SM70][DeepSeek-V4.1] Reduce decode index scores over the live prefix through an IPC bank (VLLM_V41_INDEX_REDUCE, default off)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1386",
+      "head": "7b1b689f528382ee20041d5fc27a4f05d61060dc",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "8e2d03af80ef6fc222fdb20d3a1cec1e530bd4f1b451c7e8e675ea245b1e7d2b",
+      "files": 6,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1387,
+      "title": "[Perf][SM70][DeepSeek-V4.1] Compact-scheduled grouped prefill GEMM for IQ routed experts (VLLM_V41_PREFILL_IQ_GEMM, default off)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1387",
+      "head": "1872a3882a71b7089597c826cedbe6b54fc86175",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "63f7392ec3e93aea0426ac38e41dec47c6fb82a79204774c85e1431472b2b21d",
+      "files": 6,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1388,
+      "title": "[Model][SM70] DeepSeek-V4.1 indexer: fused SM70 prefill index scores (VLLM_V41_INDEX_FUSE, default off)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1388",
+      "head": "90eccca2679040fd6729f2ecc720caf31819f1b5",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "5c5b53523310771cff3ae16f7d3554e0e6598d5a77554a27310762e3652da45c",
+      "files": 39,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1389,
+      "title": "[Perf][SM70] DeepSeek-V4.1 decode: fuse attention prep and post kernels (VLLM_V41_FUSE_ATTN_PREP/POST, default off)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1389",
+      "head": "04b5f9d4f41672caafdd4b8c7fc09789561f0c3c",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "c48ccd0af1b5d589f403b0b2718b2de054264587d76eacc39fb5f966152828ab",
+      "files": 40,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1390,
+      "title": "[Perf][SM70] DeepSeek-V4.1 decode: dense GGUF mat-vec on a v41k dmv13_x kernel (VLLM_V41_DMV_X, default off)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1390",
+      "head": "c9a380b7fae39728b395dac945bec65f7c513676",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "a25961b633c4f68ae168ffe4fdc49fe141d430957783b6c898cb6f5553a45dad",
+      "files": 7,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1372,
+      "title": "[Perf][SM70][DeepSeek-V4] Tile live packed decode index scoring",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1372",
+      "head": "e3acc82f3a14c2d890a8a47fed05a24346df9169",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "5d41456dd55ee43ab14e6391e0cfdfa82de2ed891ce6797bdb1c41ea4feb6680",
+      "files": 15,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1374,
+      "title": "[Perf][SM70][DeepSeek-V4] Shard the DSpark main projection output rows",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1374",
+      "head": "a19f07f72bb381738785ca1938963267d1dc4181",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "898f9f74edac099cd5a481896a61093f700c089f8a5c66cc3396e0c564c64427",
+      "files": 11,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1273,
+      "title": "[Perf][SM70] One grouped GEMM for DeepSeek-V4 wo_a; opt-in TurboMind tuning freeze after warmup",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1273",
+      "head": "9a71c5c6271e4b8db665f407511ecd9a9a410457",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "9fa262fb6db8e3c32930d57baa314a7761c6aecc2689c90f086e58069fbb51be",
+      "files": 12,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1383,
+      "title": "[Perf][SM70][DeepSeek-V4.1] Build the routed-expert plan inside the q8 quantize launch (VLLM_V41_PLAN_FUSE, default off)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1383",
+      "head": "45021a037847d42e4ff3c3c3a3df2ab0f3c19cd5",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "52aa3113ba3eef82f9378be2f2ea70ebe8aad6e3c860de98095f78d388488309",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    },
+    {
+      "number": 1384,
+      "title": "[Perf][SM70][DeepSeek-V4.1] Fast routed-expert decode kernels (VLLM_V41_EXPERT_FAST, default off)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1384",
+      "head": "c32b74a62cd14fda8ea0b5d356ea048598dce26e",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "8143f1c7e0cfcb030f6fc97d314ca2847e5837e1350fcc4052d43d1072622c56",
+      "files": 14,
+      "discussion_complete": true,
+      "superseded_ancestor": true
+    }
+  ],
+  "validation_gaps": "Many operators are default-off alternatives with shared dependencies. Preserve their opt-in admission and numerical contracts. Need native builds plus target-checkpoint route-hit, TP4 graph replay, slow-rank/concurrent-state, prefill/decode tails and quality checks; component timing alone does not qualify model integration. Do not enable these defaults during consolidation.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}

@@ -1,0 +1,100 @@
+{
+  "initial_inventory": {
+    "number": 1387,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Compact-scheduled grouped prefill GEMM for IQ routed experts (VLLM_V41_PREFILL_IQ_GEMM, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1387",
+    "isDraft": false,
+    "headRefOid": "1872a3882a71b7089597c826cedbe6b54fc86175",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1387,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Compact-scheduled grouped prefill GEMM for IQ routed experts (VLLM_V41_PREFILL_IQ_GEMM, default off)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nIndependent of our other PRs; applies to `main` alone (TP4 row-split down).\n\n## Purpose\n\nAt prefill (more than 6 rows), the DeepSeek-V4.1 routed experts in `gguf_shared_prefill.py` run gate/up and down through `gguf_grouped_prefill_gemm_sm70_out`.\n\nWith **`VLLM_V41_PREFILL_IQ_GEMM=1`** (default off), the IQ1_M, IQ2_XXS and IQ2_XS GEMMs run instead on `v41prefmoe.gemm` (`benchmarks/deepseek_v41/v41prefmoe/csrc/prefill_iq.cu`). It uses the same OpenMMLab TurboMind / 1Cat SM70 canonical MMA, operand decoders and epilogue (the headers already in `csrc/`, included from there), with a compact per-expert tile schedule: a small kernel writes a device plan of the routed tokens on the stream, and the GEMM walks that plan instead of the existing grouped scheduler. Decode never enters it.\n\n- `gguf_prefill_iq.py`: the stream-owned context for one forward. It refuses gated or non-canonical descriptors, a wrong group size, tuning, M <= 6 and a changed stream. Tiles per codec and role (`VLLM_V41_PREFILL_IQ_TILES`, default `1,1,1,1,1,1`) and the grid (`VLLM_V41_PREFILL_IQ_GRID`, default `160`) are parsed once at import; bad values raise.\n- `gguf_prefill_iq_observe.py` (`VLLM_V41_PREFILL_IQ_OBSERVE=1`, default off): a census of the descriptors the existing path sees, for choosing tiles. It cannot be on together with the GEMM.\n- `benchmarks/deepseek_v41/v41prefmoe/build.py`: builds `v41prefmoe.so` for sm_70 and copies it next to `gguf_prefill_iq.py`, which loads it (missing library raises).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\ncd benchmarks/deepseek_v41/v41prefmoe && TORCH_CUDA_ARCH_LIST=7.0 python build.py   # then load it, check v41prefmoe::gemm\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Compact prefill GEMM | GGUF IQ1_M / IQ2_XXS / IQ2_XS routed experts | SM70, TP4 row-split down, prefill M > 6, canonical ungated descriptors, switch on | `v41prefmoe.gemm`; other conditions raise | measured on 8x V100 (greedy-identical output at 32K / 150K / 300K); sm_70 build | no standalone kernel comparison in this PR; SASS identical to the measured build |\n| Switch off | all | default | `gguf_grouped_prefill_gemm_sm70_out`, unchanged | source | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_PREFILL_IQ_GEMM` and `VLLM_V41_PREFILL_IQ_OBSERVE` default off.\n- Required CLI options and environment switches: `VLLM_V41_PREFILL_IQ_GEMM=1`, TP4, and `v41prefmoe.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port and our other default-off levers; this branch is the change alone, rebased onto `main` `3c051b52e`. The measured build compiled the same TurboMind headers from a copy beside the kernel; this PR includes them from `csrc/` instead (all 42 files byte-identical to `main`'s).\n- PYTHONPATH, source overlays, or external native libraries used: `v41prefmoe.so` (this tree's `benchmarks/deepseek_v41/v41prefmoe`).\n- User-entry route-hit, speed, and output-quality evidence: below; the first launch logs `V4.1 prefill IQ GEMM: enabled SM70 grouped canonical`.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: four tuning variables with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +4 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-05,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one request, switch on vs off: time to first token **-4.1 % at 32K, -4.3 % at 150K, -2.4 % at 300K**; greedy output identical at all three; decode neutral (on/off ratio 0.9998 and 0.9987).\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- sm_70 build of `v41prefmoe.so` from this tree (headers from `csrc/`): OK, `v41prefmoe::gemm` registered. Its SASS (21 kernels) is instruction-for-instruction identical to the library of the measured build, so the measured kernels are the ones in this PR.\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass; import check: pass.\n- The existing tests that touch `gguf_shared_prefill.py` (`test_shared_expert_loading.py`, `test_deepseek_v41_graph_metadata.py`) need four or one CUDA devices and were skipped on the CPU host.\n\nNot re-run: any GPU run of the kernel (this PR has no standalone kernel check; the evidence is the serving A/B above), timing and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1387",
+    "isDraft": false,
+    "headRefName": "pli/v41-prefill-iq-gemm",
+    "headRefOid": "1872a3882a71b7089597c826cedbe6b54fc86175",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1387,
+    "id": "PR_kwDORjYFXs8AAAABNJrxIQ",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "1872a3882a71b7089597c826cedbe6b54fc86175",
+    "title": "[Perf][SM70][DeepSeek-V4.1] Compact-scheduled grouped prefill GEMM for IQ routed experts (VLLM_V41_PREFILL_IQ_GEMM, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1387",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nIndependent of our other PRs; applies to `main` alone (TP4 row-split down).\n\n## Purpose\n\nAt prefill (more than 6 rows), the DeepSeek-V4.1 routed experts in `gguf_shared_prefill.py` run gate/up and down through `gguf_grouped_prefill_gemm_sm70_out`.\n\nWith **`VLLM_V41_PREFILL_IQ_GEMM=1`** (default off), the IQ1_M, IQ2_XXS and IQ2_XS GEMMs run instead on `v41prefmoe.gemm` (`benchmarks/deepseek_v41/v41prefmoe/csrc/prefill_iq.cu`). It uses the same OpenMMLab TurboMind / 1Cat SM70 canonical MMA, operand decoders and epilogue (the headers already in `csrc/`, included from there), with a compact per-expert tile schedule: a small kernel writes a device plan of the routed tokens on the stream, and the GEMM walks that plan instead of the existing grouped scheduler. Decode never enters it.\n\n- `gguf_prefill_iq.py`: the stream-owned context for one forward. It refuses gated or non-canonical descriptors, a wrong group size, tuning, M <= 6 and a changed stream. Tiles per codec and role (`VLLM_V41_PREFILL_IQ_TILES`, default `1,1,1,1,1,1`) and the grid (`VLLM_V41_PREFILL_IQ_GRID`, default `160`) are parsed once at import; bad values raise.\n- `gguf_prefill_iq_observe.py` (`VLLM_V41_PREFILL_IQ_OBSERVE=1`, default off): a census of the descriptors the existing path sees, for choosing tiles. It cannot be on together with the GEMM.\n- `benchmarks/deepseek_v41/v41prefmoe/build.py`: builds `v41prefmoe.so` for sm_70 and copies it next to `gguf_prefill_iq.py`, which loads it (missing library raises).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\ncd benchmarks/deepseek_v41/v41prefmoe && TORCH_CUDA_ARCH_LIST=7.0 python build.py   # then load it, check v41prefmoe::gemm\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Compact prefill GEMM | GGUF IQ1_M / IQ2_XXS / IQ2_XS routed experts | SM70, TP4 row-split down, prefill M > 6, canonical ungated descriptors, switch on | `v41prefmoe.gemm`; other conditions raise | measured on 8x V100 (greedy-identical output at 32K / 150K / 300K); sm_70 build | no standalone kernel comparison in this PR; SASS identical to the measured build |\n| Switch off | all | default | `gguf_grouped_prefill_gemm_sm70_out`, unchanged | source | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_PREFILL_IQ_GEMM` and `VLLM_V41_PREFILL_IQ_OBSERVE` default off.\n- Required CLI options and environment switches: `VLLM_V41_PREFILL_IQ_GEMM=1`, TP4, and `v41prefmoe.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port and our other default-off levers; this branch is the change alone, rebased onto `main` `3c051b52e`. The measured build compiled the same TurboMind headers from a copy beside the kernel; this PR includes them from `csrc/` instead (all 42 files byte-identical to `main`'s).\n- PYTHONPATH, source overlays, or external native libraries used: `v41prefmoe.so` (this tree's `benchmarks/deepseek_v41/v41prefmoe`).\n- User-entry route-hit, speed, and output-quality evidence: below; the first launch logs `V4.1 prefill IQ GEMM: enabled SM70 grouped canonical`.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: four tuning variables with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +4 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-05,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, one request, switch on vs off: time to first token **-4.1 % at 32K, -4.3 % at 150K, -2.4 % at 300K**; greedy output identical at all three; decode neutral (on/off ratio 0.9998 and 0.9987).\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- sm_70 build of `v41prefmoe.so` from this tree (headers from `csrc/`): OK, `v41prefmoe::gemm` registered. Its SASS (21 kernels) is instruction-for-instruction identical to the library of the measured build, so the measured kernels are the ones in this PR.\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass; import check: pass.\n- The existing tests that touch `gguf_shared_prefill.py` (`test_shared_expert_loading.py`, `test_deepseek_v41_graph_metadata.py`) need four or one CUDA devices and were skipped on the CPU host.\n\nNot re-run: any GPU run of the kernel (this PR has no standalone kernel check; the evidence is the serving A/B above), timing and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-prefill-iq-gemm",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1387,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Compact-scheduled grouped prefill GEMM for IQ routed experts (VLLM_V41_PREFILL_IQ_GEMM, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1387",
+    "isDraft": false,
+    "headRefOid": "1872a3882a71b7089597c826cedbe6b54fc86175",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/v41prefmoe/build.py",
+      "benchmarks/deepseek_v41/v41prefmoe/csrc/prefill_iq.cu",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/quantization/gguf_prefill_iq.py",
+      "vllm/model_executor/layers/quantization/gguf_prefill_iq_observe.py",
+      "vllm/model_executor/layers/quantization/gguf_shared_prefill.py"
+    ],
+    "diff_bytes": 31275,
+    "diff_sha256": "63f7392ec3e93aea0426ac38e41dec47c6fb82a79204774c85e1431472b2b21d"
+  },
+  "full_tree_diff_proof": null
+}
