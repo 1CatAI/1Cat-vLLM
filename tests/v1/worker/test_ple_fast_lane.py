@@ -164,12 +164,12 @@ def test_native_lane_matches_python_owner(monkeypatch, cache_rows, clamp):
         lane.close()
 
 
-def _fp8_lane(shards, shard_rows, cache_rows, targets=2):
-    """A Lane over raw 160-byte FP8 rows split into separately allocated shards."""
+def _fp8_lane(shards, shard_rows, cache_rows, targets=2, row_bytes=160):
+    """A Lane over raw checkpoint bytes split into separate shards."""
     lane = Lane.__new__(Lane)
     lane.request = torch.zeros(request_shape(MAX_REQS, MAX_TOKENS), dtype=torch.long)
     lane.results = [
-        torch.full((MAX_TOKENS, 16 * 160), 0xEE, dtype=torch.uint8)
+        torch.full((MAX_TOKENS, 16 * row_bytes), 0xEE, dtype=torch.uint8)
         for _ in range(targets)
     ]
     lane.flags = [torch.zeros(16, dtype=torch.int32) for _ in range(targets)]
@@ -181,7 +181,7 @@ def _fp8_lane(shards, shard_rows, cache_rows, targets=2):
         MAX_REQS,
         MAX_TOKENS,
         pointers[0],
-        160,
+        row_bytes,
         TABLE_ROWS,
         MULTIPLIERS,
         SIZES,
@@ -189,7 +189,7 @@ def _fp8_lane(shards, shard_rows, cache_rows, targets=2):
         EOS,
         [r.data_ptr() for r in lane.results],
         [f.data_ptr() for f in lane.flags],
-        cache_rows * 160,
+        cache_rows * row_bytes,
         1000,
         True,
         None,
@@ -203,10 +203,11 @@ def _fp8_lane(shards, shard_rows, cache_rows, targets=2):
 
 
 @pytest.mark.parametrize("cache_rows", [0, 1 << 16])
-def test_native_lane_serves_sharded_fp8_rows(monkeypatch, cache_rows):
+@pytest.mark.parametrize("row_bytes", [160, 320])
+def test_native_lane_serves_sharded_fp8_rows(monkeypatch, cache_rows, row_bytes):
     monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
     rng = np.random.default_rng(1339)
-    full = rng.integers(0, 256, (TABLE_ROWS, 160), dtype=np.uint8)
+    full = rng.integers(0, 256, (TABLE_ROWS, row_bytes), dtype=np.uint8)
     full[::7, :2] = 0x7F  # FP8 NaN bytes: copied as is, never validated as IQ4
     shard_rows = 997  # the last shard is shorter
     shards = [
@@ -214,7 +215,7 @@ def test_native_lane_serves_sharded_fp8_rows(monkeypatch, cache_rows):
         for i in range(0, TABLE_ROWS, shard_rows)
     ]
     module = ngram_module()
-    lane = _fp8_lane(shards, shard_rows, cache_rows)
+    lane = _fp8_lane(shards, shard_rows, cache_rows, targets=4, row_bytes=row_bytes)
     try:
         for _ in range(16):
             reqs = int(rng.integers(1, MAX_REQS + 1))

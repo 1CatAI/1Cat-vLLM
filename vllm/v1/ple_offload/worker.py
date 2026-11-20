@@ -958,7 +958,10 @@ class PleOffloadRunner:
     @staticmethod
     def _fast_lane_fp8_shards(layer) -> tuple[list[int], int, int, int] | None:
         """(shard pointers, rows per shard, row bytes, rows) of a whole-table
-        FP8 disk layer whose results are raw rows in n-gram id order."""
+        FP8/BF16 disk layer whose results are raw rows in n-gram id order.
+
+        Keep the historical helper name; the native lane copies opaque bytes.
+        """
         pointers = list(getattr(layer, "_disk_shard_pointers", None) or [])
         if (
             not pointers
@@ -969,7 +972,7 @@ class PleOffloadRunner:
         return (
             pointers,
             int(layer._disk_shard_size),
-            int(layer.head_dim),
+            int(layer.head_dim * layer.ngram_embedding.weight.element_size()),
             int(layer.ngram_embedding.org_vocab_size),
         )
 
@@ -1033,7 +1036,9 @@ class PleOffloadRunner:
         logger.info(
             "PLE fast lane serving %d TP result buffer(s) natively (%s rows).",
             len(targets),
-            "IQ4_NL" if fp8 is None else f"FP8 x{len(shard_ptrs)} shards",
+            "IQ4_NL"
+            if fp8 is None
+            else f"{layer.ngram_embedding.weight.dtype} x{len(shard_ptrs)} shards",
         )
 
     def _start_draft_prefetch(self, registrations: list[PleOffloadRegistration]):
@@ -1072,9 +1077,11 @@ class PleOffloadRunner:
         if not layouts:
             return
         policy = self.vllm_config.kernel_config
-        if not policy.ple_packed_gguf_results:
-            raise ValueError("Packed PLE results are disabled in the CPU configuration")
         for name, layout in layouts.items():
+            if layout.get("format") != "bf16" and not policy.ple_packed_gguf_results:
+                raise ValueError(
+                    "Packed PLE results are disabled in the CPU configuration"
+                )
             self._layers[name].bind_offload_result_layout(layout)
         if layouts:
             logger.info("Bound packed PLE result layouts: %s", layouts)
