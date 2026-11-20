@@ -1,0 +1,32 @@
+{
+  "group": "frontend_fixes",
+  "title": "Repair tool parsing, DeepSeek rendering and usage reporting",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1414,
+      "title": "[Bugfix][Frontend] Backport vllm-project/vllm#61297, #44383, #46091: whole-number integer tool arguments, zero cached tokens, empty qwen3_coder tool blocks",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1414",
+      "head": "4d5711ed3e1fbc7b7801c2346c41aa70d01273af",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "1b4f316c063f9e35e39c9675d3d54db4113bd23b9bf882e2602b3fec8bfaf999",
+      "files": 11,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1413,
+      "title": "[Bugfix][DeepSeek-V4] Backport vllm-project/vllm#51856, #51262, #54838, #55954, #56141, #56271: prompt rendering and DSML tool parsing",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1413",
+      "head": "37376ba12e227ef582737e526ef5160408e96904",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "b09a2f0a51b9a6133f6c355cb61950a6fa8da60611b93d1fa011612019030d9a",
+      "files": 7,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "A corrected source candidate includes iterative empty-block handling, exact whole-number parsing and DeepSeek-V4 dialect boundaries, with both original test sets retained. Run real parser/tokenizer regression tests and the serving cache-usage paths on54633. CPU parser success is scoped evidence, not a DeepSeek model quality benchmark.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}
