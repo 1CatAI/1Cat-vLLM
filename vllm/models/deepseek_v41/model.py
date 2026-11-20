@@ -484,19 +484,28 @@ class V41Indexer(nn.Module):
     def __init__(self, c, quant_config, source, ratio, prefix):
         super().__init__()
 
-        from .index_tiled import IndexTiledScorer
+        from .index_tiled import IndexTensorCoreScorer, IndexTiledScorer
 
         policy = get_current_vllm_config().attention_config.v41_index_tiled
         if not isinstance(policy.enabled, bool):
             raise RuntimeError("V4.1 tiled index policy was not initialized")
         if policy.enabled and not _PACKED_KV:
             raise ValueError("V4.1 tiled index requires packed KV")
+        if policy.tensor_core and not policy.enabled:
+            raise ValueError("VLLM_V41_INDEX_TC needs VLLM_V41_INDEX_TILED=1")
         self.heads = c.index_n_heads // 4
         # The model adapter binds the effective policy before graph-key creation.
         policy.active = bool(_PACKED_KV and policy.enabled)
-        self.index_scorer = (
-            IndexTiledScorer(policy.library, self.heads) if policy.active else None
-        )
+        if not policy.active:
+            self.index_scorer = None
+        elif policy.tensor_core:
+            self.index_scorer = IndexTensorCoreScorer(
+                policy.tensor_core_library,
+                self.heads,
+                torch.device("cuda", torch.accelerator.current_device_index()),
+            )
+        else:
+            self.index_scorer = IndexTiledScorer(policy.library, self.heads)
         kwargs = dict(bias=False, return_bias=False, quant_config=quant_config)
         self.wq_b = ColumnParallelLinear(
             c.q_lora_rank,

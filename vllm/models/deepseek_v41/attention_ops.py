@@ -1022,6 +1022,8 @@ def select_packed_positions(
             index_topk(result, scores, positions, valid_tokens, ratio, top_k)
         return result
     # Prefill: unpack the live keys once, then the reference cuBLAS path.
+    if scorer is not None:
+        scorer.report()  # an eager call: the decode scorer's counters
     end = int(positions[-1].item() + 1) // ratio
     # At least top_k rows: a fixed result width (no per-length recompiles).
     fp16 = torch.empty(max(end, top_k), 128, dtype=torch.float16, device=q.device)
