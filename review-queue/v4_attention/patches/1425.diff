@@ -1,0 +1,1063 @@
+diff --git a/csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu b/csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu
+index 9c024f1e2d..34b49d2cfa 100644
+--- a/csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu
++++ b/csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu
+@@ -5095,7 +5095,7 @@ at::Tensor private_grouped_e4m3_fp32_paged(
+       block_table.dim() == 2 && batch_size >= 1 && batch_size <= 16 &&
+           block_table.is_contiguous() &&
+           block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
+-          block_table.size(1) * k.size(1) <= 266240 &&
++          block_table.size(1) <= (INT_MAX - 4096) / k.size(1) &&
+           q.size(0) % batch_size == 0 &&
+           (batch_size == 1
+                ? (q.size(0) >= 2 && q.size(0) <= 8)
+@@ -5344,6 +5344,8 @@ at::Tensor sm70_grouped_fp16_entry(const at::Tensor& q, const at::Tensor& k,
+ }  // namespace
+ 
+ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
++  ops.def("sm70_grouped_long_context_revision() -> int",
++          []() -> int64_t { return 1; });
+   ops.def(
+       "sm70_grouped_fp16_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
+       "Tensor block_table, Tensor row_lengths, Tensor(b!) partial, "
+diff --git a/csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu b/csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu
+index 7d161e59d4..517959fbc6 100644
+--- a/csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu
++++ b/csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu
+@@ -1052,7 +1052,7 @@ __global__ void flash_attention_decode_partition_kernel(
+       KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+       SEQ_LEN_ROUTE == 0 && !ANCHORED_SWA &&
+       std::is_same_v<PARTIAL_T, float>, "Private scalar six-head contract");
+-  const int partition_idx = blockIdx.z;
++  const int partition_idx = blockIdx.x;
+   const int seq_len = seq_lens[0];
+   const int start_token_idx = partition_idx * PARTITION_SIZE;
+   if (seq_len <= 0 || start_token_idx >= seq_len ||
+@@ -1208,9 +1208,8 @@ __global__ void flash_attention_decode_reduce_kernel(
+     return;
+   }
+ 
+-  extern __shared__ float shared_mem[];
+-  float* max_shared = shared_mem;
+-  float* weight_shared = shared_mem + max_num_partitions;
++  // The reduction footprint is independent of the served context window.
++  __shared__ float weight_shared[kThreadsPerBlock];
+ 
+   float local_max = -1.0e20f;
+   for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
+@@ -1218,10 +1217,10 @@ __global__ void flash_attention_decode_reduce_kernel(
+         static_cast<int64_t>(batch_idx) * stats_stride0 +
+         static_cast<int64_t>(head_idx) * stats_stride1 + i;
+     const float m = max_logits[stats_index];
+-    max_shared[i] = m;
+     local_max = fmaxf(local_max, m);
+   }
+   const float global_max = block_reduce_max<kWarpsPerBlock>(local_max);
++  __syncthreads();
+ 
+   float local_sum = 0.f;
+   for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
+@@ -1229,8 +1228,7 @@ __global__ void flash_attention_decode_reduce_kernel(
+         static_cast<int64_t>(batch_idx) * stats_stride0 +
+         static_cast<int64_t>(head_idx) * stats_stride1 + i;
+     const float weight =
+-        exp_sums[stats_index] * __expf(max_shared[i] - global_max);
+-    weight_shared[i] = weight;
++        exp_sums[stats_index] * __expf(max_logits[stats_index] - global_max);
+     local_sum += weight;
+   }
+   const float global_sum = block_reduce_sum<kWarpsPerBlock>(local_sum);
+@@ -1243,17 +1241,29 @@ __global__ void flash_attention_decode_reduce_kernel(
+       static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
+       static_cast<int64_t>(head_idx) * tmp_out_stride1;
+ 
+-  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+-    float acc = 0.f;
+-    for (int i = 0; i < num_partitions; ++i) {
+-      acc = fmaf(weight_shared[i],
+-                 static_cast<float>(
+-                     tmp_out[tmp_out_base +
+-                             static_cast<int64_t>(i) * tmp_out_stride2 + d]),
++  static_assert(D == kThreadsPerBlock, "One output coordinate per thread");
++  float acc = 0.f;
++  for (int tile = 0; tile < num_partitions; tile += kThreadsPerBlock) {
++    const int i = tile + threadIdx.x;
++    if (i < num_partitions) {
++      const int64_t stats_index =
++          static_cast<int64_t>(batch_idx) * stats_stride0 +
++          static_cast<int64_t>(head_idx) * stats_stride1 + i;
++      weight_shared[threadIdx.x] =
++          exp_sums[stats_index] * __expf(max_logits[stats_index] - global_max);
++    }
++    __syncthreads();
++    const int count = min(kThreadsPerBlock, num_partitions - tile);
++    for (int j = 0; j < count; ++j) {
++      acc = fmaf(weight_shared[j],
++                 static_cast<float>(tmp_out[
++                     tmp_out_base + static_cast<int64_t>(tile + j) *
++                                        tmp_out_stride2 + threadIdx.x]),
+                  acc);
+     }
+-    out[out_base + d] = __float2half(acc * inv_global_sum);
++    __syncthreads();
+   }
++  out[out_base + threadIdx.x] = __float2half(acc * inv_global_sum);
+ }
+ 
+ }  // namespace
+@@ -1275,20 +1285,26 @@ at::Tensor scalar_attention_candidate(
+               out.is_contiguous(), "Output shape/dtype mismatch");
+   TORCH_CHECK(table.dim() == 2 && table.size(0) == 1 && table.size(1) > 0 &&
+               table.scalar_type() == at::kInt && table.is_contiguous() &&
+-              table.size(1) * k.size(1) <= 266240 &&
++              table.size(1) <= (INT_MAX - 4096) / k.size(1) &&
+               lengths.sizes() == at::IntArrayRef({1}) &&
+               lengths.scalar_type() == at::kInt && lengths.is_contiguous() &&
+               active.sizes() == at::IntArrayRef({1}) &&
+               active.scalar_type() == at::kInt && active.is_contiguous(),
+               "Invalid scalar q1 page/length metadata");
+-  TORCH_CHECK(partial.sizes() == at::IntArrayRef({1, 6, 256, 256}) &&
++  const int64_t partitions = partial.dim() == 4 ? partial.size(2) : 0;
++  TORCH_CHECK(partitions > 0 &&
++              partitions <= (static_cast<int64_t>(INT_MAX) - 4096 + 1023) / 1024 &&
++              partial.sizes() == at::IntArrayRef({1, 6, partitions, 256}) &&
+               partial.scalar_type() == at::kFloat && partial.is_contiguous() &&
+-              maximum.sizes() == at::IntArrayRef({1, 6, 256}) &&
++              maximum.sizes() == at::IntArrayRef({1, 6, partitions}) &&
+               sums.sizes() == maximum.sizes() &&
+               maximum.scalar_type() == at::kFloat &&
+               sums.scalar_type() == at::kFloat &&
+               maximum.is_contiguous() && sums.is_contiguous(),
+-              "Scalar q1 requires unchanged FP32 partition workspaces");
++              "Scalar q1 requires matching FP32 partition workspaces");
++  TORCH_CHECK(table.size(1) <=
++                  (partitions * 1024 + k.size(1) - 1) / k.size(1),
++              "Scalar q1 workspace does not cover the page table");
+   for (const auto* t : {&k, &v, static_cast<const at::Tensor*>(&out), &table,
+       &lengths, static_cast<const at::Tensor*>(&partial),
+       static_cast<const at::Tensor*>(&maximum),
+@@ -1303,21 +1319,21 @@ at::Tensor scalar_attention_candidate(
+   const auto stream = at::cuda::getCurrentCUDAStream().stream();
+   flash_attention_decode_partition_kernel<256, 1024,
+       flash_v100::KV_CACHE_DTYPE_FP8_E4M3, 0, false, float>
+-      <<<dim3(1, 1, 256), 256, 4096, stream>>>(
++      <<<dim3(static_cast<unsigned>(partitions)), 256, 4096, stream>>>(
+       reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr(), v.data_ptr(),
+       partial.data_ptr<float>(), maximum.data_ptr<float>(), sums.data_ptr<float>(),
+       table.data_ptr<int>(), lengths.data_ptr<int>(), active.data_ptr<int>(),
+-      1, table.size(1), 256, 6, 1, k.size(1), q.stride(0), q.stride(1),
++      1, table.size(1), partitions, 6, 1, k.size(1), q.stride(0), q.stride(1),
+       partial.stride(0), partial.stride(1), partial.stride(2),
+       maximum.stride(0), maximum.stride(1),
+       k.stride(0), k.stride(1), k.stride(2),
+       v.stride(0), v.stride(1), v.stride(2),
+       scale, k_scale, v_scale, -1, -1, 0, 0, 0, nullptr, 0);
+   flash_attention_decode_reduce_kernel<256, 1024, 0, float>
+-      <<<dim3(1, 6, 1), 256, 2 * 256 * sizeof(float), stream>>>(
++      <<<dim3(1, 6, 1), 256, 0, stream>>>(
+       partial.data_ptr<float>(), maximum.data_ptr<float>(), sums.data_ptr<float>(),
+       lengths.data_ptr<int>(), active.data_ptr<int>(),
+-      reinterpret_cast<__half*>(out.data_ptr()), 1, 256, 6,
++      reinterpret_cast<__half*>(out.data_ptr()), 1, partitions, 6,
+       partial.stride(0), partial.stride(1), partial.stride(2),
+       maximum.stride(0), maximum.stride(1), out.stride(0), out.stride(1),
+       0, 0, 0, 0);
+@@ -1341,6 +1357,8 @@ at::Tensor sm70_scalar_attention_entry(
+ }  // namespace
+ 
+ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
++  ops.def("sm70_scalar_attention_workspace_revision() -> int",
++          []() -> int64_t { return 1; });
+   ops.def(
+       "sm70_scalar_attention_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
+       "Tensor table, Tensor lengths, Tensor(a!) partial, Tensor(a!) maximum, "
+diff --git a/docs/design/sm70_e4m3_dynamic_context.md b/docs/design/sm70_e4m3_dynamic_context.md
+new file mode 100644
+index 0000000000..af6e196efc
+--- /dev/null
++++ b/docs/design/sm70_e4m3_dynamic_context.md
+@@ -0,0 +1,76 @@
++# SM70 E4M3 attention capacity from the model window
++
++## Purpose
++
++Extend the existing grouped long-context and compact scalar-tail E4M3 decode
++routes to the configured model window. These providers already ship in the FA2
++extension; this change extends their usable context range and validates it.
++
++The existing long-route qualification is 262144 tokens. A block table describes
++the engine's allocated window even when the current request is short. Serving
++with a larger window, for example Yarn at `--max-model-len 1048576`, can exceed
++provider page-table or workspace checks during graph warmup. Existing grouped
++optimizations therefore cannot safely serve that configuration as qualified.
++
++## Capacity and native compatibility
++
++`sm70_grouped_long.py` resolves `model_config.max_model_len` and queries two
++independent native revisions: grouped dynamic context and scalar workspace.
++Revision 1 admits the served window within the native integer-addressing limits.
++Older binaries retain their known 256K capability. New Python code alone cannot
++expand an older native provider's contract.
++
++The scalar provider must cover the grouped graph's entire context bound.
++A mixed build with an insufficient scalar ABI declines the scalar-tail route.
++External manifests retain their declared capabilities. Missing model
++configuration retains the conservative built-in qualification.
++
++Page-table admission accepts at most `ceil(context / page_size)` columns.
++Only E4M3 calls with a qualified long-context graph descriptor and the dynamic
++native ABI can exceed the ordinary grouped table ceiling. FP16 and other codec
++qualifications retain their existing boundaries.
++
++## Workspace and native launch
++
++The scalar provider allocates `ceil(max_model_len / 1024)` partitions before
++profiling and graph capture. Its cache key includes the resolved capacity and
++device. Serial layers and captured target graphs reuse the same FP32 numerator,
++maximum and sum buffers.
++
++The native scalar entry validates shape, device/layout, integer bounds and
++workspace coverage of the page-rounded table. Partition indexing uses `grid.x`,
++removing the 65535-partition `grid.z` restriction. Reduction processes weights
++in fixed-size shared-memory tiles while preserving ascending FP32 accumulation
++order and stable softmax normalization.
++
++The grouped kernel retains its 80 splits and arithmetic. Its E4M3 table check
++uses the structural integer limit; Python admission enforces the negotiated
++provider capacity. The existing operator names and execution family are reused.
++
++## Graph behavior and scope
++
++The existing graph manager consumes the family owner's context contract.
++Capture fixes workspace and launch grids for the served window. Replay uses
++device lengths without allocating or copying lengths to the host. No context
++buckets, scheduler policy or model-specific runner logic are added. Existing
++route policy and external manifests retain their meanings. No new configuration
++or environment variable is required.
++
++## Validation
++
++- CPU: model-window resolution, independent native revisions, mixed builds,
++  page rounding, invalid bounds, workspace cache isolation and ordinary fallback.
++- GPU: FP64 references over the same quantized KV, q1 through q8, multiple heads
++  and request batches, page/partition boundaries, zero lengths and restored live
++  graph inputs. Numeric cases extend through 2M tokens.
++- A separate overprovided-workspace launch uses 65537 partitions and a short
++  live sequence to exercise grid/reduction coverage without a long KV cache.
++- Full engine: Qwen3.8-27B NVFP4, DFlash block 8, TP4 on four V100s, E4M3 KV,
++  a 1M served window and 1024 generated tokens per measured request.
++  Performance compares the ordinary path with the existing optimized routes
++  enabled under the expanded context contract. The reported context range is
++  32K through 512K; kernel coverage beyond it is validated separately.
++
++Production edits occupy two CUDA units and three existing Python family owners.
++The family README describes the boundary. The regression fixture updates source
++fingerprints while retaining the original legacy admission predicate bodies.
+diff --git a/tests/kernels/attention/test_sm70_e4m3_dynamic_context.py b/tests/kernels/attention/test_sm70_e4m3_dynamic_context.py
+new file mode 100644
+index 0000000000..73d8182641
+--- /dev/null
++++ b/tests/kernels/attention/test_sm70_e4m3_dynamic_context.py
+@@ -0,0 +1,267 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Served-window E4M3 dynamic context against same-KV FP64 attention."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++
++def _routes(monkeypatch, context):
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("requires SM70")
++    from vllm.v1.attention.ops import sm70_grouped_long as long
++    from vllm.v1.attention.ops import sm70_grouped_scalar as scalar
++
++    monkeypatch.setattr(
++        long,
++        "get_current_vllm_config_or_none",
++        lambda: SimpleNamespace(model_config=SimpleNamespace(max_model_len=context)),
++    )
++    monkeypatch.delenv("VLLM_SM70_E4M3_LONG_ATTENTION", raising=False)
++    monkeypatch.delenv("VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", raising=False)
++    assert long.builtin_dynamic_context(), "rebuild the grouped DSO"
++    assert long.builtin_dynamic_context(scalar=True), "rebuild the scalar DSO"
++    assert long.builtin_context_limit() == context, "rebuild the grouped DSO"
++    assert long.builtin_context_limit(scalar=True) == context, "rebuild scalar DSO"
++    for module in (long, scalar):
++        monkeypatch.setattr(module, "is_forward_context_available", lambda: True)
++        monkeypatch.setattr(
++            module,
++            "get_forward_context",
++            lambda: SimpleNamespace(
++                batch_descriptor=SimpleNamespace(attention_context_bucket=context)
++            ),
++        )
++
++    def declined(*args, **kwargs):
++        pytest.fail("qualified grouped input declined")
++
++    grouped = long.wrap_long_attention(declined)
++    scalar.load_scalar_tail_attention.cache_clear()
++    tail = scalar.load_scalar_tail_attention("", torch.device("cuda:0"))
++    assert tail is not None
++
++    def call(q, k, v, table, lengths, out):
++        kwargs = dict(out=out, softmax_scale=0.0625, k_scale=0.5, v_scale=1.25)
++        if q.shape[0] == 1:
++            assert tail(
++                q,
++                k,
++                v,
++                table,
++                lengths,
++                **kwargs,
++                kv_cache_dtype="fp8_e4m3",
++                window_size=(-1, -1),
++                max_seq_len_hint=context,
++                partition_size_hint=None,
++                anchor_lens=None,
++                anchored_window=0,
++            )
++        else:
++            grouped(q, k, v, table, lengths, **kwargs)
++
++    return call
++
++
++def _inputs(context, rows, page=2048, batch=1, heads=1):
++    torch.manual_seed(20261106 + rows + batch)
++    pages = (context + page - 1) // page
++    storage = (
++        torch.randn(
++            batch * pages, 2, page, heads, 256, device="cuda", dtype=torch.float16
++        )
++        .to(torch.float8_e4m3fn)
++        .view(torch.uint8)
++    )
++    k, v = storage.unbind(1)
++    q = torch.randn(batch * rows, heads * 6, 256, device="cuda", dtype=torch.float16)
++    table = torch.randperm(batch * pages, device="cuda").int().reshape(batch, pages)
++    lengths = torch.arange(
++        context - rows + 1, context + 1, device="cuda", dtype=torch.int32
++    ).repeat(batch)
++    return q, k, v, table, lengths, torch.empty_like(q)
++
++
++def _oracle(inputs):
++    q, k, v, table, lengths, actual = inputs
++    expected = torch.empty_like(q, dtype=torch.float64)
++    batch = table.shape[0]
++    rows = q.shape[0] // batch
++    for request in range(batch):
++        section = slice(request * rows, (request + 1) * rows)
++        limit = int(lengths[section].max())
++        if limit == 0:
++            expected[section].zero_()
++            continue
++        for head in range(k.shape[2]):
++            key = k[table[request].long(), :, head].reshape(-1, 256)[:limit]
++            value = v[table[request].long(), :, head].reshape(-1, 256)[:limit]
++            key = key.view(torch.float8_e4m3fn).double() * 0.5
++            value = value.view(torch.float8_e4m3fn).double() * 1.25
++            query = q[section, head * 6 : (head + 1) * 6].double()
++            scores = (query @ key.T) * 0.0625
++            scores.masked_fill_(
++                torch.arange(limit, device="cuda")[None, None]
++                >= lengths[section, None, None],
++                -torch.inf,
++            )
++            expected[section, head * 6 : (head + 1) * 6] = (
++                scores.softmax(-1).nan_to_num(0) @ value
++            )
++    assert torch.isfinite(actual).all()
++    torch.testing.assert_close(actual.double(), expected, rtol=0.03, atol=3e-4)
++    relative = float(
++        (actual.double() - expected).norm() / expected.norm().clamp_min(1e-30)
++    )
++    assert relative < 0.007
++    return relative
++
++
++@pytest.mark.parametrize("context", [32768, 262144, 524288, 1048576])
++@pytest.mark.parametrize("rows", range(1, 9))
++def test_dynamic_fp64_oracle_and_live_graph(monkeypatch, context, rows):
++    call = _routes(monkeypatch, context)
++    inputs = _inputs(context, rows)
++    call(*inputs)
++    error = _oracle(inputs)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        call(*inputs)
++    eager = torch.empty_like(inputs[-1])
++    for length in (min(262145, context), 0, context):
++        inputs[0].normal_(0, 0.7)
++        inputs[4].fill_(length)
++        # Page IDs are live graph inputs, independent of the original order.
++        inputs[3].copy_(inputs[3].flip(1))
++        call(*inputs[:-1], eager)
++        inputs[-1].fill_(float("nan"))
++        graph.replay()
++        assert torch.equal(inputs[-1], eager)
++        if length == 0:
++            assert torch.count_nonzero(eager) == 0
++    print(f"context={context} rows={rows} relative_l2={error:.8g}")
++
++
++@pytest.mark.parametrize("page,heads", [(1024, 1), (3296, 2)])
++@pytest.mark.parametrize("rows", [1, 7, 8])
++def test_dynamic_page_rounding_and_six_head_groups(monkeypatch, page, heads, rows):
++    call = _routes(monkeypatch, 1048576)
++    inputs = _inputs(1048576, rows, page=page, heads=heads)
++    call(*inputs)
++    _oracle(inputs)
++
++
++@pytest.mark.parametrize("batch", [2, 4, 8, 16])
++def test_dynamic_independent_request_graphs(monkeypatch, batch):
++    call = _routes(monkeypatch, 1048576)
++    inputs = _inputs(1048576, 8, batch=batch)
++    # Only the first request is 1M; keep independent shorter/empty requests.
++    for request in range(1, batch):
++        inputs[4][request * 8 : (request + 1) * 8].fill_(32768 // request)
++    call(*inputs)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        call(*inputs)
++    inputs[4][-8:] = 0
++    graph.replay()
++    _oracle(inputs)
++
++
++def test_scalar_reads_values_beyond_old_partition_ceiling(monkeypatch):
++    call = _routes(monkeypatch, 1048576)
++    q, k, v, table, lengths, out = _inputs(1048576, 1)
++    q.zero_()
++    v.zero_()
++    # Uniform softmax with a known suffix mean exposes a truncated 256K launch.
++    v[table[0, 128:].long()] = 0x38  # E4M3 1.0
++    call(q, k, v, table, lengths, out)
++    torch.testing.assert_close(out, torch.full_like(out, 0.75 * 1.25), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("context", [1023, 1024, 1025, 262145, 1048593, 2097152])
++@pytest.mark.parametrize("rows", [1, 8])
++def test_dynamic_partition_and_reduction_boundaries(monkeypatch, context, rows):
++    call = _routes(monkeypatch, context)
++    inputs = _inputs(context, rows)
++    call(*inputs)
++    _oracle(inputs)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        call(*inputs)
++    inputs[4].zero_()
++    graph.replay()
++    assert torch.count_nonzero(inputs[-1]) == 0
++    inputs[4].fill_(context)
++    graph.replay()
++    _oracle(inputs)
++
++
++def test_scalar_reads_suffix_beyond_one_million(monkeypatch):
++    context, page = 2097152, 2048
++    call = _routes(monkeypatch, context)
++    q, k, v, table, lengths, out = _inputs(context, 1, page=page)
++    q.zero_()
++    v.zero_()
++    v[table[0, 1048576 // page :].long()] = 0x38
++    call(q, k, v, table, lengths, out)
++    torch.testing.assert_close(out, torch.full_like(out, 0.5 * 1.25), rtol=0, atol=0)
++
++
++def test_native_scalar_rejects_workspace_that_cannot_cover_table(monkeypatch):
++    _routes(monkeypatch, 2097152)
++    q, k, v, table, lengths, out = _inputs(2097152, 1)
++    p = 1024
++    partial = torch.empty((1, 6, p, 256), device="cuda", dtype=torch.float32)
++    maximum = torch.empty((1, 6, p), device="cuda", dtype=torch.float32)
++    sums = torch.empty_like(maximum)
++    active = torch.full((1,), p, device="cuda", dtype=torch.int32)
++    with pytest.raises(RuntimeError, match="workspace does not cover"):
++        torch.ops._vllm_fa2_C.sm70_scalar_attention_fwd(
++            q,
++            k,
++            v,
++            out,
++            table,
++            lengths,
++            partial,
++            maximum,
++            sums,
++            active,
++            0.0625,
++            0.5,
++            1.25,
++        )
++
++
++def test_scalar_grid_and_shared_memory_do_not_limit_partition_capacity(monkeypatch):
++    _routes(monkeypatch, 1048576)
++    q, k, v, table, lengths, out = _inputs(1, 1)
++    q.zero_()
++    v.fill_(0x38)
++    # Overprovision storage without allocating a 64M-token KV cache. Only the
++    # first partition has work, but the launch must exceed grid.z's old bound
++    # and must not request shared memory proportional to the workspace size.
++    p = 65537
++    partial = torch.empty((1, 6, p, 256), device="cuda", dtype=torch.float32)
++    maximum = torch.empty((1, 6, p), device="cuda", dtype=torch.float32)
++    sums = torch.empty_like(maximum)
++    active = torch.full((1,), p, device="cuda", dtype=torch.int32)
++    torch.ops._vllm_fa2_C.sm70_scalar_attention_fwd(
++        q,
++        k,
++        v,
++        out,
++        table,
++        lengths,
++        partial,
++        maximum,
++        sums,
++        active,
++        0.0625,
++        0.5,
++        1.25,
++    )
++    torch.testing.assert_close(out, torch.full_like(out, 1.25), rtol=0, atol=0)
+diff --git a/tests/v1/attention/fixtures/sm70_grouped_legacy.json b/tests/v1/attention/fixtures/sm70_grouped_legacy.json
+index 9cce955c06..63f1426a1a 100644
+--- a/tests/v1/attention/fixtures/sm70_grouped_legacy.json
++++ b/tests/v1/attention/fixtures/sm70_grouped_legacy.json
+@@ -10,7 +10,7 @@
+       "clear_grouped_fp16_workspaces": "0756cfab4968df1fc4bb2615ce48e79340e4935c27372f9276b00b33f42b05c7",
+       "load_grouped_fp16_fp32": "1a64dbca0832be40b74b14f16f2d583c49eafebcceb26f79b78ce3defaec1f4a",
+       "short_split_capability": "2fba5cc2593d3fc40197ac20e5f251681066667b059f37e240413ac743f5b2a3",
+-      "_run": "78e9bc99737ee994acd6cca264ebd8ac00a67b0bb44b9a4184e8c7e5278ba31a"
++      "_run": "b76e613c4910eec4ebb16640f7651253fae121259a62cb5904cc0ff9879cc4aa"
+     },
+     "sm70_e4m3_grouped": {
+       "load_grouped_e4m3_fp32": "6e7449a086a1571199450ef6c4fc52a19cdfddc734eeef1cfc2402db30211448"
+@@ -18,22 +18,26 @@
+     "sm70_grouped_scalar": {
+       "builtin_scalar_tail_attention": "e51544d711a18c7a2eb5a465a09683384dd5fcf10e4434a09a92af5d15e52593",
+       "scalar_tail_attention_available": "dbd126a501945ca7d85a55ed6767174fcdaa0c9b5bdc7d2da442c30573fcf82c",
+-      "load_scalar_tail_attention": "7024acc448ede009e40fe5d042d60c9f1a665f569e40e6d28783809ed5a45ca5"
++      "load_scalar_tail_attention": "67cfed362a2d137f22a028d0827ccef97ea15848f11669d2af18a32a253e7f0a",
++      "_load_scalar_tail_attention": "397c0e50169dd1b0a752047148171bc3d55cb9ed97b85bc863421d505291b966"
+     },
+     "sm70_grouped_long": {
+       "builtin_long_attention": "a073d2e01e4b5323f954b1a2bc36c0c78a9d26533cc96e486133135d27f16347",
+-      "long_attention_enabled": "7e9af6039ef16a79adedd962e5e91972ae3aeb12732ed124817afc31cad1d01f",
++      "long_attention_enabled": "6e45834a2ca565d6e85e695dbcaff9d418eb6f17c36ec0ee135279b6e8046385",
+       "load_attention_library": "47e1e29dd3e794a507da670a58737412626ff5eb72fc1bf731aa9164766f0e8c",
+       "load_long_attention": "7399edbbf32f29064968df775a1acce04150e7b0210ab6f957b66d8ec4470a77",
+       "long_attention_capability": "491bb6309021400d625e3f635483824a370c7eb7d6f2cdcfefeac462279e75af",
++      "builtin_dynamic_context": "f7a8501d898760eb5837ee89aeb7afdcabea85db9896b97cadeed53484ea4fcd",
++      "builtin_context_limit": "27dd81b252651e213be707fc8419bdd27d140dd6a4482074489cfbf30b4f1283",
++      "context_table_supported": "c15d00dd8da30c06aef369ec035b1a3c4a04b88cd064fe67c18b3e07d767324a",
+       "long_attention_query_rows": "d9ed6e468073eeefa23d81747aa39caa7dd80d4fa74298b0d618dcd6517a5afb",
+       "long_attention_contract": "92d41fa8d0523cb68a964e1a76055751c38ee105ca402df0ce475b087bafad67",
+-      "resolve_long_attention": "0be40aa013af87307237deca4c2f39ed0a68fac7a6ca2481a0a2c58ae6cab6ad",
+-      "long_attention_graph_contract": "42ad143f799b9153c126dfa8598ee099359edf7c441ee7f3c4209e6a8cdd13db",
+-      "long_attention_max_batch_size": "65cf326be956429133ac1dce452026fe90df96a82660041a0cac426be312a228",
++      "resolve_long_attention": "24fc304ccc6461cf3cf3f4f78e9f5375f9bb380cd58e07b20f31f03d122f1f1f",
++      "long_attention_graph_contract": "cb0572293ac6a224eab4f0716f6f8051ffd07280db5083e1cd5d4ece298fb998",
++      "long_attention_max_batch_size": "05db3b4547a550c259ce6c25b743982f0dc797fb7728f86819e50af4e297c435",
+       "long_attention_page_supported": "24d07fe622f8f5f6cf14e02b8c760c6ef6b6e67e68544ed4b8e441fa9e248e3f",
+       "_report_unadmitted_page_size": "b20417cdd7a0c6dca9fee2ad252c2f79780cd36f873042a3326614041738914a",
+-      "wrap_long_attention": "cf4a87ecdb5f51cd27d81489d3755357e7d1e7384245480714663538864fe372",
++      "wrap_long_attention": "c18f9049412c93fac06b4d9555ef36c3f7b1a3df7009a329fffad585c72f974b",
+       "run_six_head_groups": "794d86a704dfd24b5f931e786668b4fe3f0587f4ac1c5d2af5de9518eb946b9d"
+     }
+   }
+diff --git a/tests/v1/attention/test_sm70_e4m3_dynamic_context.py b/tests/v1/attention/test_sm70_e4m3_dynamic_context.py
+new file mode 100644
+index 0000000000..5fbbc7832a
+--- /dev/null
++++ b/tests/v1/attention/test_sm70_e4m3_dynamic_context.py
+@@ -0,0 +1,168 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Served-window planning, independent native ABIs and conservative fallback."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.config.flash_v100 import FlashV100Options
++from vllm.v1.attention.ops import sm70_grouped_long as long
++from vllm.v1.attention.ops import sm70_grouped_scalar as scalar
++
++pytestmark = pytest.mark.cpu_test
++
++
++@pytest.mark.parametrize("context", [32768, 262144, 1048576, 2097152, 8388608])
++@pytest.mark.parametrize("revision", [None, 0, 1])
++@pytest.mark.parametrize("is_scalar", [False, True])
++def test_native_abi_and_served_window(monkeypatch, context, revision, is_scalar):
++    native = SimpleNamespace()
++    if revision is not None:
++        name = (
++            "sm70_scalar_attention_workspace_revision"
++            if is_scalar
++            else "sm70_grouped_long_context_revision"
++        )
++        setattr(native, name, lambda: revision)
++    monkeypatch.setattr(torch.ops, "_vllm_fa2_C", native)
++    monkeypatch.setattr(long, "builtin_long_attention", lambda: object())
++    monkeypatch.setattr(
++        long,
++        "get_current_vllm_config_or_none",
++        lambda: SimpleNamespace(model_config=SimpleNamespace(max_model_len=context)),
++    )
++    expected = context if revision == 1 else min(context, 262144)
++    assert long.builtin_context_limit(scalar=is_scalar) == expected
++    assert long.builtin_context_limit(context, scalar=is_scalar) == expected
++
++
++@pytest.mark.parametrize("context", [0, -1, True, 2**31, 1.5])
++def test_invalid_window_fails_before_launch(context):
++    with pytest.raises(ValueError, match="positive int32"):
++        long.builtin_context_limit(context)
++
++
++@pytest.mark.parametrize("page", [1024, 1648, 2048, 3296])
++@pytest.mark.parametrize("context", [32768, 262145, 1048576, 2097152])
++def test_table_page_rounding(context, page):
++    width = (context + page - 1) // page
++    assert long.context_table_supported(torch.empty(1, width), page, context)
++    assert not long.context_table_supported(torch.empty(1, width + 1), page, context)
++    assert not long.context_table_supported(torch.empty(1, 0), page, context)
++
++
++def test_graph_uses_explicit_window_and_preserves_opt_out(monkeypatch):
++    monkeypatch.setattr(long, "builtin_long_attention", lambda: object())
++    monkeypatch.setattr(long, "builtin_dynamic_context", lambda **_: True)
++    policy = FlashV100Options(e4m3_long_enabled=True)
++    assert long.long_attention_graph_contract(2097152, policy=policy)[0] == 2097152
++    policy.e4m3_long_enabled = False
++    assert long.long_attention_graph_contract(2097152, policy=policy) == (None, ())
++
++
++def test_old_scalar_does_not_inherit_new_grouped_abi(monkeypatch):
++    monkeypatch.setattr(scalar, "builtin_scalar_tail_attention", lambda: object())
++    monkeypatch.setattr(scalar, "builtin_context_limit", lambda *_, **__: 262144)
++    monkeypatch.setattr(
++        scalar,
++        "resolve_long_attention",
++        lambda: (object(), dict(long.BUILTIN_MANIFEST, max_context=2097152)),
++    )
++    scalar.load_scalar_tail_attention.cache_clear()
++    try:
++        assert scalar.load_scalar_tail_attention("", torch.device("cpu")) is None
++    finally:
++        scalar.load_scalar_tail_attention.cache_clear()
++
++
++def test_scalar_plan_tracks_window_and_reuses_only_matching_buffers(monkeypatch):
++    context = 32768
++    calls = []
++    monkeypatch.setattr(
++        scalar,
++        "builtin_scalar_tail_attention",
++        lambda: lambda *args: calls.append(args),
++    )
++    monkeypatch.setattr(scalar, "builtin_context_limit", lambda value, **_: value)
++    monkeypatch.setattr(scalar, "builtin_dynamic_context", lambda **_: True)
++    monkeypatch.setattr(
++        scalar,
++        "resolve_long_attention",
++        lambda: (object(), dict(long.BUILTIN_MANIFEST, max_context=context)),
++    )
++    monkeypatch.setattr(scalar, "is_forward_context_available", lambda: True)
++    monkeypatch.setattr(
++        scalar,
++        "get_forward_context",
++        lambda: SimpleNamespace(
++            batch_descriptor=SimpleNamespace(attention_context_bucket=context)
++        ),
++    )
++    scalar.load_scalar_tail_attention.cache_clear()
++    try:
++        plans = []
++        for context in (32768, 2097152, 32768):
++            run = scalar.load_scalar_tail_attention("", torch.device("cpu"))
++            plans.append(run)
++            q = torch.zeros((1, 6, 256), dtype=torch.float16)
++            kv = torch.empty((1, 2048, 1, 256), dtype=torch.uint8)
++            assert run(
++                q,
++                kv,
++                kv,
++                torch.zeros((1, (context + 2047) // 2048), dtype=torch.int32),
++                torch.full((1,), context, dtype=torch.int32),
++                out=torch.empty_like(q),
++                softmax_scale=0.0625,
++                k_scale=1.0,
++                v_scale=1.0,
++                kv_cache_dtype="fp8_e4m3",
++                window_size=(-1, -1),
++                max_seq_len_hint=context,
++                partition_size_hint=None,
++                anchor_lens=None,
++                anchored_window=0,
++            )
++            assert calls[-1][6].shape == (1, 6, (context + 1023) // 1024, 256)
++        assert plans[0] is plans[2] and plans[0] is not plans[1]
++        assert calls[0][6].data_ptr() == calls[2][6].data_ptr()
++    finally:
++        scalar.load_scalar_tail_attention.cache_clear()
++
++
++@pytest.mark.parametrize("revision", [False, True])
++@pytest.mark.parametrize("enabled", [False, True])
++@pytest.mark.parametrize("bound", [None, 0, 262144, 1048576, 2097152])
++def test_wide_admission_requires_graph_coverage_and_new_native(
++    monkeypatch, revision, enabled, bound
++):
++    import vllm.forward_context as forward
++    from tests.v1.attention.test_sm70_grouped_codecs import scenario
++    from vllm.v1.attention.kv_codecs import FP8_E4M3
++    from vllm.v1.attention.ops.sm70_grouped import grouped_fp32_reason
++
++    monkeypatch.setattr(long, "builtin_dynamic_context", lambda **_: revision)
++    monkeypatch.setattr(
++        long,
++        "long_attention_graph_contract",
++        lambda value: (value, (8,)) if enabled else (None, ()),
++    )
++    monkeypatch.setattr(forward, "is_forward_context_available", lambda: True)
++    monkeypatch.setattr(
++        forward,
++        "get_forward_context",
++        lambda: SimpleNamespace(
++            batch_descriptor=SimpleNamespace(attention_context_bucket=bound),
++            runtime_resources={},
++        ),
++    )
++    instance, q, k, v, table, lengths, metadata, out = scenario(FP8_E4M3, page=2048)
++    table.shape = (8, 512)
++    metadata.block_table.shape = (1, 512)
++    reason = grouped_fp32_reason(
++        FP8_E4M3, instance, q, k, v, table, lengths, metadata, out=out
++    )
++    admitted = revision and enabled and bound is not None and bound >= 1048576
++    assert reason == (None if admitted else "context_capacity")
+diff --git a/vllm/v1/attention/ops/sm70_grouped.README.md b/vllm/v1/attention/ops/sm70_grouped.README.md
+index c1f4c88222..9a5e6240a1 100644
+--- a/vllm/v1/attention/ops/sm70_grouped.README.md
++++ b/vllm/v1/attention/ops/sm70_grouped.README.md
+@@ -14,7 +14,13 @@ return types. Backend callers import from this owner.
+ | E4M3 | 1–16 | B1: 2–8; B>1: B×8 | positive multiple of 16 | uint8 | D256/GQA6, aligned cache; batch requires revision 6 |
+ | E4M3 explicit groups | 1–16 | G×8, padded rows allowed | positive multiple of 16 | uint8 | compact group table and device row lengths |
+ 
+-All three contracts retain the 266240-token capacity ceiling. The E4M3
++FP16 and ordinary E4M3 calls retain the 266240-token capacity ceiling. A qualified
++E4M3 graph uses the served `max_model_len` when the loaded grouped operator reports
++the dynamic-context ABI; old binaries remain limited to 256K. The long-context
++owner resolves this window for graph capture, table admission and scalar workspace
++planning. Scalar partitions cover 1024 tokens each, with a fixed-size tiled FP32
++reduction; there is no separate length environment variable or 1M ceiling.
++Both wrappers admit only the page-rounded table for the resolved window. The E4M3
+ predicate retains its existing CPU descriptor admission for policy tests; the
+ native loader determines availability. FP16's CUDA guard, query/output
+ alignment and narrower shape limits are unchanged. Preserve the legacy
+@@ -28,8 +34,9 @@ its predicates re-export the common wrappers. `sm70_grouped_scalar.py` and
+ `sm70_grouped_long.py` own the existing specialized family members. Their old
+ `sm70_e4m3_{scalar,long}` paths alias the same module objects, preserving mutable
+ state, caches and patches; original logger names remain unchanged. Their
+-arithmetic, manifests, workspace geometry, launch ABI and route policies have
+-not been generalized or numerically changed by this admission refactor.
++six-head FP32 state remains unchanged. The dynamic scalar workspace and native
++ABI compatibility are described in
++`docs/design/sm70_e4m3_dynamic_context.md`.
+ 
+ Adding an entry declares admission and a provider; it does not implement a new
+ native storage reader or ABI. An unsupported codec fails closed. Native INT8
+diff --git a/vllm/v1/attention/ops/sm70_grouped.py b/vllm/v1/attention/ops/sm70_grouped.py
+index fc102256e6..2b644161ca 100644
+--- a/vllm/v1/attention/ops/sm70_grouped.py
++++ b/vllm/v1/attention/ops/sm70_grouped.py
+@@ -225,7 +225,35 @@ def grouped_fp32_reason(
+         return "kv_shape_or_unmeasured_page"
+     if contract.early_cache_dtype and not codec.stores(k, v):
+         return "kv_layout"
+-    if not 0 < parent.shape[1] * k.shape[1] <= MAX_CONTEXT:
++    context_limit = MAX_CONTEXT
++    if codec is FP8_E4M3 and parent.shape[1] * k.shape[1] > MAX_CONTEXT:
++        from vllm.forward_context import (
++            get_forward_context,
++            is_forward_context_available,
++        )
++        from vllm.v1.attention.ops.sm70_grouped_long import (
++            builtin_dynamic_context,
++            long_attention_graph_contract,
++        )
++
++        descriptor = (
++            get_forward_context().batch_descriptor
++            if is_forward_context_available()
++            else None
++        )
++        bucket = getattr(descriptor, "attention_context_bucket", None)
++        if bucket is not None and bucket > 0:
++            capacity, _ = long_attention_graph_contract(bucket)
++            if (
++                capacity is not None
++                and bucket <= capacity
++                and builtin_dynamic_context()
++            ):
++                context_limit = max(
++                    context_limit,
++                    ((capacity + k.shape[1] - 1) // k.shape[1]) * k.shape[1],
++                )
++    if not 0 < parent.shape[1] * k.shape[1] <= context_limit:
+         return "context_capacity"
+     if not explicit and (parent_seq is None or parent_seq.shape != (groups,)):
+         return "request_metadata"
+diff --git a/vllm/v1/attention/ops/sm70_grouped_long.py b/vllm/v1/attention/ops/sm70_grouped_long.py
+index 76db55ab6d..5f34d64af2 100644
+--- a/vllm/v1/attention/ops/sm70_grouped_long.py
++++ b/vllm/v1/attention/ops/sm70_grouped_long.py
+@@ -10,17 +10,14 @@
+ 
+ import torch
+ 
++from vllm.config import get_current_vllm_config_or_none
+ from vllm.config.execution_policy import flash_v100_options
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.logger import init_logger
+ 
+ logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_long")
+ 
+-# Capacity the shipped operator was qualified for. This is a claim about the
+-# compiled kernel, not a service limit: the graph bound the route is captured at
+-# is the smaller of this and the context the model is actually served with, so a
+-# deployment with a different window is routed on its own value and the operator
+-# is never asked for more context than it was admitted for.
++# Compatibility capacity of binaries predating the dynamic-context ABI.
+ BUILTIN_MAX_CONTEXT = 262144
+ MANIFEST_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST"
+ DISABLE_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION"
+@@ -35,7 +32,7 @@
+ # route was qualified with. The source digest names that layout so a rebuilt
+ # kernel cannot silently inherit the workspace identity of a different one.
+ BUILTIN_SOURCE_SHA256 = (
+-    "e98db3a38dfae231ec164c3e14c9e755f362af9c089dcc36331b32b7b8d8e55f"
++    "1d91f30dcac2359d4e19c56e8b3c17f99cd82e4dfac6eda39e6505e58a1f7e5d"
+ )
+ # Every B1 verifier tail width uses the long-context graph contract at this
+ # capacity; q1 additionally has the compact scalar tail.
+@@ -133,6 +130,48 @@ def long_attention_capability(manifest) -> int:
+     return capability
+ 
+ 
++def builtin_dynamic_context(*, scalar: bool = False) -> bool:
++    """The loaded DSO, including each independently built operator, owns its ABI."""
++    name = (
++        "sm70_scalar_attention_workspace_revision"
++        if scalar
++        else "sm70_grouped_long_context_revision"
++    )
++    revision = (
++        getattr(torch.ops._vllm_fa2_C, name, None)
++        if builtin_long_attention() is not None
++        else None
++    )
++    return revision is not None and revision() >= 1
++
++
++def builtin_context_limit(capacity: int | None = None, *, scalar: bool = False) -> int:
++    """Resolve the served window against the loaded operator's workspace ABI."""
++    if capacity is None:
++        config = get_current_vllm_config_or_none()
++        capacity = (
++            config.model_config.max_model_len
++            if config is not None and config.model_config is not None
++            else BUILTIN_MAX_CONTEXT
++        )
++    if type(capacity) is not int or not 0 < capacity <= 2**31 - 4096:
++        raise ValueError("SM70 E4M3 context must fit positive int32 page arithmetic")
++    return (
++        capacity
++        if builtin_dynamic_context(scalar=scalar)
++        else min(capacity, BUILTIN_MAX_CONTEXT)
++    )
++
++
++def context_table_supported(table, page_size: int, capacity: int) -> bool:
++    """The graph's served window admits its page-rounded table, never wider."""
++    return (
++        table.ndim == 2
++        and page_size > 0
++        and 0 < table.shape[1] <= (capacity + page_size - 1) // page_size
++    )
++
++
+ def long_attention_query_rows(manifest) -> tuple[int, ...]:
+     """The query widths the route admits, mirroring the native [2, 8] check."""
+     query_rows = tuple(manifest.get("query_rows", [8]))
+@@ -158,7 +197,7 @@ def long_attention_contract(manifest, capacity: int | None = None):
+     )
+ 
+ 
+-def resolve_long_attention(policy=None):
++def resolve_long_attention(policy=None, capacity: int | None = None):
+     """The route in effect: an explicit manifest candidate, else the shipped one."""
+     policy = flash_v100_options() if policy is None else policy
+     if not long_attention_enabled(policy):
+@@ -169,20 +208,22 @@ def resolve_long_attention(policy=None):
+     operator = builtin_long_attention()
+     if operator is None:
+         return None, None
++    capability = builtin_context_limit(capacity)
++    manifest = dict(BUILTIN_MANIFEST, max_context=capability)
+     logger.info_once(
+         "Using the shipped SM70 E4M3 q8 long-context route (%s): capability=%d "
+         "query_rows=%s; 80 splits, compensated FP32 state.",
+         BUILTIN_OP,
+-        BUILTIN_MAX_CONTEXT,
++        capability,
+         BUILTIN_QUERY_ROWS,
+         scope="process",
+     )
+-    return operator, BUILTIN_MANIFEST
++    return operator, manifest
+ 
+ 
+ def long_attention_graph_contract(capacity: int | None = None, *, policy=None):
+     """The captured bound for ``capacity``, or ``(None, ())`` when route is off."""
+-    _, manifest = resolve_long_attention(policy)
++    _, manifest = resolve_long_attention(policy, capacity)
+     if manifest is None:
+         return None, ()
+     return long_attention_contract(manifest, capacity)
+@@ -267,6 +308,7 @@ def run(
+             and q.shape[1] > 0
+             and q.shape[2] == 256
+             and k.ndim == 4
++            and context_table_supported(table, k.shape[1], capability)
+             and table.is_contiguous()
+             and row_lengths.ndim == 1
+             and row_lengths.shape[0] == q.shape[0]
+diff --git a/vllm/v1/attention/ops/sm70_grouped_scalar.py b/vllm/v1/attention/ops/sm70_grouped_scalar.py
+index a7c6565b5c..68771abfc5 100644
+--- a/vllm/v1/attention/ops/sm70_grouped_scalar.py
++++ b/vllm/v1/attention/ops/sm70_grouped_scalar.py
+@@ -11,6 +11,9 @@
+ from vllm.v1.attention.kv_codecs import FP8_E4M3, resolve_kv_codec
+ from vllm.v1.attention.ops.sm70_grouped_long import (
+     BUILTIN_MAX_CONTEXT,
++    builtin_context_limit,
++    builtin_dynamic_context,
++    context_table_supported,
+     load_attention_library,
+     long_attention_capability,
+     resolve_long_attention,
+@@ -57,8 +60,19 @@ def scalar_tail_attention_available() -> bool:
+     return builtin_scalar_tail_attention() is not None
+ 
+ 
+-@lru_cache(maxsize=4)
+ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
++    _, long_manifest = resolve_long_attention()
++    if long_manifest is None:
++        return None
++    return _load_scalar_tail_attention(
++        manifest_name, device, long_attention_capability(long_manifest)
++    )
++
++
++@lru_cache(maxsize=4)
++def _load_scalar_tail_attention(
++    manifest_name: str, device: torch.device, capability: int
++):
+     if manifest_name:
+         module, manifest = load_attention_library(manifest_name)
+     else:
+@@ -66,19 +80,19 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
+         if operator is None:
+             raise ValueError("The compact scalar tail operator is not compiled in")
+         builtin = type("_Builtin", (), {"run": operator})
+-        module, manifest = builtin, BUILTIN_SCALAR_MANIFEST
++        module, manifest = (
++            builtin,
++            dict(
++                BUILTIN_SCALAR_MANIFEST,
++                max_context=builtin_context_limit(capability, scalar=True),
++            ),
++        )
+     # The tail rides the long-context graph variant, so it is only meaningful
+     # while that route is on, and the kernel has to cover every bound the graph
+     # can be captured at -- which never exceeds the long-context capability.
+-    _, long_manifest = resolve_long_attention()
+-    if long_manifest is None:
+-        logger.info_once(
+-            "SM70 compact scalar tail attention is inactive: the E4M3 "
+-            "long-context route is disabled.",
+-            scope="process",
+-        )
++    if not manifest_name and manifest["max_context"] < capability:
++        # A new grouped DSO must not widen an old scalar workspace ABI.
+         return None
+-    capability = long_attention_capability(long_manifest)
+     if not (
+         manifest.get("share_kv_six_heads")
+         and manifest.get("compact_page_map")
+@@ -91,17 +105,22 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
+         )
+     # Allocate before memory profiling and graph capture. Model layers execute
+     # serially on the worker stream; all target graphs retain this same storage.
++    dynamic = not manifest_name and builtin_dynamic_context(scalar=True)
++    if not dynamic and capability > BUILTIN_MAX_CONTEXT:
++        raise ValueError("Scalar capacity requires the dynamic workspace ABI")
++    partitions = (capability + 1023) // 1024 if dynamic else 256
+     buffers = (
+-        torch.empty((1, 6, 256, 256), dtype=torch.float32, device=device),
+-        torch.empty((1, 6, 256), dtype=torch.float32, device=device),
+-        torch.empty((1, 6, 256), dtype=torch.float32, device=device),
+-        torch.full((1,), 256, dtype=torch.int32, device=device),
++        torch.empty((1, 6, partitions, 256), dtype=torch.float32, device=device),
++        torch.empty((1, 6, partitions), dtype=torch.float32, device=device),
++        torch.empty((1, 6, partitions), dtype=torch.float32, device=device),
++        torch.full((1,), partitions, dtype=torch.int32, device=device),
+     )
+     logger.info_once(
+         "Loaded SM70 compact scalar tail attention: module=%s SHA256=%s; "
+-        "256 partitions, FP32 numerator/max/sum.",
++        "%d partitions, FP32 numerator/max/sum.",
+         manifest["module_name"],
+         manifest["library_sha256"],
++        partitions,
+         scope="process",
+     )
+ 
+@@ -131,7 +150,7 @@ def run(
+         bucket = getattr(descriptor, "attention_context_bucket", None)
+         if not (
+             bucket is not None
+-            and bucket <= capability
++            and 0 < bucket <= capability
+             and q.ndim == 3
+             and q.shape[0] == 1
+             and q.shape[1] > 0
+@@ -140,6 +159,7 @@ def run(
+             and q.device == device
+             and q.is_contiguous()
+             and k.ndim == 4
++            and context_table_supported(table, k.shape[1], capability)
+             and (
+                 k.shape[1] >= SCALAR_MIN_PAGE_SIZE
+                 if not manifest_name
+@@ -174,3 +194,8 @@ def run(
+         return True
+ 
+     return run
++
++
++load_scalar_tail_attention.cache_clear = (  # type: ignore[attr-defined]
++    _load_scalar_tail_attention.cache_clear
++)
