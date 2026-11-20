@@ -150,6 +150,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_DUMP_TENSOR_MAX: str | None = None
     VLLM_SM70_QSA_GROUPED_PAD_FIX: str | None = None
     VLLM_SM70_QSA_GROUPED_PAGE4: str | None = None
+    VLLM_SM70_QSA_HOST_KV: bool = False
     VLLM_SM70_QSA_INDEXER_CUBLAS: str | None = None
     VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS: str | None = None
     VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS: str | None = None
@@ -160,6 +161,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS: str | None = None
     VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG: str | None = None
     VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD: str | None = None
+    VLLM_SM70_RANK_NUMA_BIND: str | None = None
     VLLM_SM70_SPEC_TARGET_FORWARD_NVTX: str | None = None
     VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP: str | None = None
     VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR: str | None = None
@@ -11089,6 +11091,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("MTP verifier",),
         user_visible=False,
     ),
+    "VLLM_SM70_RANK_NUMA_BIND": env_var(
+        lambda: os.getenv("VLLM_SM70_RANK_NUMA_BIND"),
+        description=(
+            "Per-rank NUMA binding for host-side pinned allocations, e.g. "
+            "'0-3:0;4-7:1' binds ranks 0-3 to node 0 and ranks 4-7 to node "
+            "1 (rank-range:node, semicolon-separated). Requires a guest "
+            "that exposes at least two NUMA nodes; unset disables binding."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     "VLLM_SM70_REJECTION_PROFILE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_REJECTION_PROFILE", "0"))),
         description=(
@@ -20522,6 +20539,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=False,
     ),
+    "VLLM_SM70_QSA_HOST_KV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_HOST_KV", "0"))),
+        description=(
+            "Set to 1 to admit QSA per-vector host-KV history storage when "
+            "the model and runtime qualify. The flag is applied to "
+            "kernel_config.qsa_host_kv before QSA history resolution, which "
+            "carries the remaining capability gates."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=("'1' at vllm/config/vllm.py:VllmConfig.__post_init__",),
+        acceleration_paths=("QSA host-KV history storage",),
+        user_visible=True,
+    ),
     "VLLM_SM70_QSA_INDEXER_CUBLAS": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS"),
         description=(
@@ -22045,6 +22077,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION",
+        "VLLM_SM70_RANK_NUMA_BIND",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",
