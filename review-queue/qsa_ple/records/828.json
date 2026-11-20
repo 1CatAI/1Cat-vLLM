@@ -1,0 +1,130 @@
+{
+  "initial_inventory": {
+    "number": 828,
+    "title": "[Perf][SM70] Use the grouped page4 route for QSA DCP prefill attention",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/828",
+    "isDraft": false,
+    "headRefOid": "431232b61c01b9f619241d24cb9935111d311b90",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 828,
+    "title": "[Perf][SM70] Use the grouped page4 route for QSA DCP prefill attention",
+    "body": "## Purpose\n\nRebased onto current main, which carries target-QSA DCP2 through #823. One commit.\n\nWith target-QSA DCP2, every rank attends the 12 gathered query heads over its compacted local selection and returns an LSE for the cross-rank merge. `qsa_sparse_paged_attention` skips the SM70 page4 CUDA routes whenever an LSE is requested, so DCP2 prefill runs the Triton split-K kernel. That kernel loads K/V once per query row.\n\nThe grouped page4 kernels already used by DCP1 prefill share K/V microblocks between eight consecutive rows and compute each row's max and sum. This PR uses them for DCP-local attention:\n- One plan for the local selection, then the six-head kernel for each half of the gathered heads.\n- Every query position and sequence length is set to the local capacity, so the planner reads every column. Localized IDs are causal by construction, but they have no positional order in the local token space.\n- The kernel's natural-log LSE is converted to base 2, and its empty-row sentinel to -inf, as the Triton route returns them. The merge (`dcp_combine`, base 2) is unchanged.\n- The packed page stride of DCP-sharded caches (two member layers per physical block) is accepted for this route only. Page4 microblock addressing already uses the cache's page stride.\n- The leading multiple of eight rows takes this route from 256 rows. Smaller batches, the remainder rows and every decode batch keep the Triton route. The planner helper is split out of the existing grouped route unchanged.\n\nNo native code changes.\n\n## Test Plan\n\n- New `tests/models/qwen4_exp/test_qsa_dcp_grouped_page4.py`:\n  - CPU: decode-sized batches return 0 rows and stay on Triton;\n  - V100, FP16 and E4M3 caches, plain and packed page layouts: for both DCP ranks of a model-format selection (score-ordered blocks plus the causal tail, two requests, an empty row, a five-row remainder), the grouped rows match the Triton LSE route (LSE atol 1e-3, output atol 3e-3).\n- Existing `test_qsa_dcp_attention.py`, `test_qsa_dcp_local_width.py`, `test_qsa_dcp_indices.py`, `test_qsa_ops.py`, `test_qsa_e4m3.py`.\n- End-to-end A/B on 4x V100 (below).\n\n```bash\npytest tests/models/qwen4_exp/test_qsa_dcp_grouped_page4.py tests/models/qwen4_exp/test_qsa_dcp_attention.py tests/models/qwen4_exp/test_qsa_ops.py\n```\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- **Default enabled or opt-in:** enabled by default for QSA DCP batches of at least 256 rows, behind the existing `VLLM_SM70_QSA_XQA_PAGE4` and `VLLM_SM70_QSA_GROUPED_PAGE4` switches.\n- **Required CLI options and environment switches:** none.\n- **KV cache dtype used for the benchmark:** `fp8_e4m3`, main and draft.\n- **Wheel SHA or source commit:** the A/B used native code from a wheel built from `bf5742e420` (main `cf2a1285e4` + #664/#696/#707 + build fixes), with Python from main `a41385b281` + #664/#696/#707 + #814, with and without this commit. The same patch (identical patch-id) on main `a692497bc9` was then built into a fresh wheel and passed our full serving gate (below).\n- **PYTHONPATH, source overlays, or external native libraries used:** a read-only Python overlay of the commits above on top of that wheel, first on `PYTHONPATH`.\n- **User-entry route-hit, speed, and output-quality evidence:**\n  - Route: the server logs `Using SM70 grouped QSA Flash-V100 page4 route for DCP-local attention`. In a torch profile of a cold 16K prompt (3 prefill steps), rank 0 runs 36 plans and 72 six-head grouped calls for the 12 target layers; `_qsa_sparse_paged_gqa_splitk_kernel` remains only for remainder rows and the decode step (21 calls, 1.1 ms in total).\n  - Speed and quality: below.\n- **Existing kernel/backend registry and capability-rejection reasons:** reuses `_qsa_grouped_page4_supported`, `is_device_capability(70)` and `_qsa_xqa_page4_shape_supported`; when any check fails, the batch runs on Triton as before.\n- **Per-engine configuration and deprecated-variable compatibility:** unchanged.\n- **New/changed environment metadata and generated reference check:** none.\n- **Route snapshot command and intentional changed rows:** none at configuration level.\n- **SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after:** unchanged.\n\n## Test Result\n\n**Operator (one V100, DCP rank 0, 12 heads, E4M3, 1,026 local columns, model-format selections):**\n\n| Rows | Triton LSE route | Grouped page4 | |\n|---:|---:|---:|---:|\n| 128 | 1.18 ms | 1.14–2.00 ms | 0.59–1.04x |\n| 256 | 2.2 ms | 1.2–2.0 ms | 1.07–1.85x |\n| 1,632 | 12.6 ms | 3.1–5.5 ms | 2.3–4.1x |\n| 8,160 | 59.6 ms | 13.0–23.5 ms | 2.5–4.6x |\n\nThe range is clustered vs scattered selected blocks. Both match a float32 reference (base-2 LSE within 3e-6, output within 3e-5).\n\n**End to end:** 4x V100 PCIe 32 GB, TP4 + target-QSA DCP2, Qwen3.8-Flash-Next AWQ W4A16 g32, E4M3 KV, native MTP4, prefix caching (align), 64 GiB CPU offload, `max_num_batched_tokens=8192`, `max_num_seqs=4`, 524,288 context. Fresh server per arm, frozen real-text prompts, unique `cache_salt`, medians of 3.\n\n| Workload | Without | With this PR |\n|---|---:|---:|\n| Cold prefill 8K / 32K / 128K (server tok/s) | 2986 / 3085 / 2630 | 3597 / 3470 / 2715 (+20% / +12% / +3%) |\n| 3 decode streams at 16K + one 64K prefill: TTFT of the 64K prompt | 22.3 s | 21.0–21.5 s |\n| Prefix hit (7.5K prompt, ~2.6K recomputed): TTFT | 513 ms | 465 ms |\n| Decode after 8K / 32K / 128K | 79 / 76 / 62 tok/s | 81 / 74 / 61 tok/s |\n\n- Profile of a cold 16K prompt: QSA attention kernel time per rank drops from 1.84 s to 0.87 s. Long contexts gain less because the indexer and the rest of the layer grow with context.\n- Quality: acceptance gate PASS (16 generations x 4 temperatures, no corruption; DCP2 boundary prompts 820–3,269 tokens give the same tokens as before; CPU-offload restore parity). The MTP quality-phase counters (drafts, draft tokens, accepted tokens) equal the earlier main-aligned run exactly.\n- Greedy A/B against the same build without this commit, five cold real-text prompts (1.2K, 4.4K, 2x 8.2K, 32.8K tokens), 128 tokens, two repeats each:\n  - both arms are deterministic (repeats identical);\n  - the 4.4K and 32.8K outputs are token-identical between arms; the other three diverge at near-ties (top-2 margins 0.02–0.20) after 23–87 identical tokens, and both continuations are correct;\n  - on the shared prefixes, chosen-token logprob deltas have median 0.0014, p90 0.07 and max 0.28; the largest deltas are at uncertain tokens (logprob -0.5 to -1.2).\n- 4-way long-prefill memory stress: PASS, same peak memory; GPU KV capacity unchanged (1,118,959 tokens).\n- On main `a692497bc9` (wheel build), the patch passed the V100 QSA/DCP/E4M3 suites and our full serving gate (memory and multimodal stress, acceptance, prefix-hit TTFT, 5-needle retrieval at 211K/497K/2x400K, 4-way 16K forced long decode, idle-session replay) and now serves our production. Two concurrent ~400K cold prompts: first token 171 / 345 s (our previous production, an older main without this patch or #814: 889 / 940 s; not a controlled A/B).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/828",
+    "isDraft": false,
+    "headRefName": "perf/qsa-dcp2-grouped-page4",
+    "headRefOid": "431232b61c01b9f619241d24cb9935111d311b90",
+    "baseRefName": "main",
+    "baseRefOid": "b2335687ecce6b1f973ef49b28431aa42d5d5847",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "Leonccaa/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "Leonccaa"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "Leonccaa"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 828,
+    "id": "PR_kwDORjYFXs8AAAABGZjVMQ",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "431232b61c01b9f619241d24cb9935111d311b90",
+    "title": "[Perf][SM70] Use the grouped page4 route for QSA DCP prefill attention",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/828",
+    "body": "## Purpose\n\nRebased onto current main, which carries target-QSA DCP2 through #823. One commit.\n\nWith target-QSA DCP2, every rank attends the 12 gathered query heads over its compacted local selection and returns an LSE for the cross-rank merge. `qsa_sparse_paged_attention` skips the SM70 page4 CUDA routes whenever an LSE is requested, so DCP2 prefill runs the Triton split-K kernel. That kernel loads K/V once per query row.\n\nThe grouped page4 kernels already used by DCP1 prefill share K/V microblocks between eight consecutive rows and compute each row's max and sum. This PR uses them for DCP-local attention:\n- One plan for the local selection, then the six-head kernel for each half of the gathered heads.\n- Every query position and sequence length is set to the local capacity, so the planner reads every column. Localized IDs are causal by construction, but they have no positional order in the local token space.\n- The kernel's natural-log LSE is converted to base 2, and its empty-row sentinel to -inf, as the Triton route returns them. The merge (`dcp_combine`, base 2) is unchanged.\n- The packed page stride of DCP-sharded caches (two member layers per physical block) is accepted for this route only. Page4 microblock addressing already uses the cache's page stride.\n- The leading multiple of eight rows takes this route from 256 rows. Smaller batches, the remainder rows and every decode batch keep the Triton route. The planner helper is split out of the existing grouped route unchanged.\n\nNo native code changes.\n\n## Test Plan\n\n- New `tests/models/qwen4_exp/test_qsa_dcp_grouped_page4.py`:\n  - CPU: decode-sized batches return 0 rows and stay on Triton;\n  - V100, FP16 and E4M3 caches, plain and packed page layouts: for both DCP ranks of a model-format selection (score-ordered blocks plus the causal tail, two requests, an empty row, a five-row remainder), the grouped rows match the Triton LSE route (LSE atol 1e-3, output atol 3e-3).\n- Existing `test_qsa_dcp_attention.py`, `test_qsa_dcp_local_width.py`, `test_qsa_dcp_indices.py`, `test_qsa_ops.py`, `test_qsa_e4m3.py`.\n- End-to-end A/B on 4x V100 (below).\n\n```bash\npytest tests/models/qwen4_exp/test_qsa_dcp_grouped_page4.py tests/models/qwen4_exp/test_qsa_dcp_attention.py tests/models/qwen4_exp/test_qsa_ops.py\n```\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- **Default enabled or opt-in:** enabled by default for QSA DCP batches of at least 256 rows, behind the existing `VLLM_SM70_QSA_XQA_PAGE4` and `VLLM_SM70_QSA_GROUPED_PAGE4` switches.\n- **Required CLI options and environment switches:** none.\n- **KV cache dtype used for the benchmark:** `fp8_e4m3`, main and draft.\n- **Wheel SHA or source commit:** the A/B used native code from a wheel built from `bf5742e420` (main `cf2a1285e4` + #664/#696/#707 + build fixes), with Python from main `a41385b281` + #664/#696/#707 + #814, with and without this commit. The same patch (identical patch-id) on main `a692497bc9` was then built into a fresh wheel and passed our full serving gate (below).\n- **PYTHONPATH, source overlays, or external native libraries used:** a read-only Python overlay of the commits above on top of that wheel, first on `PYTHONPATH`.\n- **User-entry route-hit, speed, and output-quality evidence:**\n  - Route: the server logs `Using SM70 grouped QSA Flash-V100 page4 route for DCP-local attention`. In a torch profile of a cold 16K prompt (3 prefill steps), rank 0 runs 36 plans and 72 six-head grouped calls for the 12 target layers; `_qsa_sparse_paged_gqa_splitk_kernel` remains only for remainder rows and the decode step (21 calls, 1.1 ms in total).\n  - Speed and quality: below.\n- **Existing kernel/backend registry and capability-rejection reasons:** reuses `_qsa_grouped_page4_supported`, `is_device_capability(70)` and `_qsa_xqa_page4_shape_supported`; when any check fails, the batch runs on Triton as before.\n- **Per-engine configuration and deprecated-variable compatibility:** unchanged.\n- **New/changed environment metadata and generated reference check:** none.\n- **Route snapshot command and intentional changed rows:** none at configuration level.\n- **SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after:** unchanged.\n\n## Test Result\n\n**Operator (one V100, DCP rank 0, 12 heads, E4M3, 1,026 local columns, model-format selections):**\n\n| Rows | Triton LSE route | Grouped page4 | |\n|---:|---:|---:|---:|\n| 128 | 1.18 ms | 1.14–2.00 ms | 0.59–1.04x |\n| 256 | 2.2 ms | 1.2–2.0 ms | 1.07–1.85x |\n| 1,632 | 12.6 ms | 3.1–5.5 ms | 2.3–4.1x |\n| 8,160 | 59.6 ms | 13.0–23.5 ms | 2.5–4.6x |\n\nThe range is clustered vs scattered selected blocks. Both match a float32 reference (base-2 LSE within 3e-6, output within 3e-5).\n\n**End to end:** 4x V100 PCIe 32 GB, TP4 + target-QSA DCP2, Qwen3.8-Flash-Next AWQ W4A16 g32, E4M3 KV, native MTP4, prefix caching (align), 64 GiB CPU offload, `max_num_batched_tokens=8192`, `max_num_seqs=4`, 524,288 context. Fresh server per arm, frozen real-text prompts, unique `cache_salt`, medians of 3.\n\n| Workload | Without | With this PR |\n|---|---:|---:|\n| Cold prefill 8K / 32K / 128K (server tok/s) | 2986 / 3085 / 2630 | 3597 / 3470 / 2715 (+20% / +12% / +3%) |\n| 3 decode streams at 16K + one 64K prefill: TTFT of the 64K prompt | 22.3 s | 21.0–21.5 s |\n| Prefix hit (7.5K prompt, ~2.6K recomputed): TTFT | 513 ms | 465 ms |\n| Decode after 8K / 32K / 128K | 79 / 76 / 62 tok/s | 81 / 74 / 61 tok/s |\n\n- Profile of a cold 16K prompt: QSA attention kernel time per rank drops from 1.84 s to 0.87 s. Long contexts gain less because the indexer and the rest of the layer grow with context.\n- Quality: acceptance gate PASS (16 generations x 4 temperatures, no corruption; DCP2 boundary prompts 820–3,269 tokens give the same tokens as before; CPU-offload restore parity). The MTP quality-phase counters (drafts, draft tokens, accepted tokens) equal the earlier main-aligned run exactly.\n- Greedy A/B against the same build without this commit, five cold real-text prompts (1.2K, 4.4K, 2x 8.2K, 32.8K tokens), 128 tokens, two repeats each:\n  - both arms are deterministic (repeats identical);\n  - the 4.4K and 32.8K outputs are token-identical between arms; the other three diverge at near-ties (top-2 margins 0.02–0.20) after 23–87 identical tokens, and both continuations are correct;\n  - on the shared prefixes, chosen-token logprob deltas have median 0.0014, p90 0.07 and max 0.28; the largest deltas are at uncertain tokens (logprob -0.5 to -1.2).\n- 4-way long-prefill memory stress: PASS, same peak memory; GPU KV capacity unchanged (1,118,959 tokens).\n- On main `a692497bc9` (wheel build), the patch passed the V100 QSA/DCP/E4M3 suites and our full serving gate (memory and multimodal stress, acceptance, prefix-hit TTFT, 5-needle retrieval at 211K/497K/2x400K, 4-way 16K forced long decode, idle-session replay) and now serves our production. Two concurrent ~400K cold prompts: first token 171 / 345 s (our previous production, an older main without this patch or #814: 889 / 940 s; not a controlled A/B).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "author": {
+      "login": "Leonccaa"
+    },
+    "headRepository": {
+      "nameWithOwner": "Leonccaa/1Cat-vLLM"
+    },
+    "headRefName": "perf/qsa-dcp2-grouped-page4",
+    "comments": {
+      "totalCount": 2,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWSwls4="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABZJlHxg",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "I have rebased this onto current main and added startup capability reporting for dtype, head grouping, native ABI, selection width and prefill budget. The existing loaded SM70 report now exposes rejection reasons; runtime row alignment and tensor-stride guards are preserved. CPU tests cover six, twelve and eighteen query heads without adding model, TP or speculative-width restrictions. All 129 CPU gate checks and scoped pre-commit pass, with 35 GPU-only cases skipped.\n\nOne numerical boundary remains to qualify: the grouped wrapper writes FP16 partial attention output before copying it into the FP32 DCP merge buffer, whereas the Triton route retains FP32 partial output. The original GPU/model comparisons remain recorded, but this additional intermediate rounding is relevant to admission. I will retain your signed commit and keep the integration as a draft while completing that validation.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/828#issuecomment-5982734278",
+          "createdAt": "2026-10-04T17:48:06Z",
+          "updatedAt": "2026-10-04T17:48:06Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABZLCWzg",
+          "author": {
+            "login": "Leonccaa"
+          },
+          "body": "Measured the FP16 partial-output rounding on a V100 to help qualify it.\n\nSetup: the geometry of `test_grouped_route_matches_triton_lse_route` at a larger size. 600 rows: 400 at positions 4000–4399 select 512 of about 1000 visible blocks, and 200 short rows select everything. 12 heads, dim 256, packed DCP pages, DCP2 with interleave 1, E4M3 and FP16 caches.\n\nFor each route, both ranks' partials are merged with their base-2 LSE as `dcp_combine` does, then rounded to FP16. The reference is the same computation in float64 from the dequantized cache and the local selections. A third route isolates the extra rounding: the Triton route with its FP32 partial rounded to FP16 before the merge, i.e. the same kernel plus the grouped wrapper's intermediate rounding.\n\nErrors are in units of the FP16 ulp at each reference value. Elements with |ref| ≥ 1e-3 are included: 1.77M elements, median |ref| 0.015.\n\n| E4M3 cache | p50 | p99 | max |\n|---|---:|---:|---:|\n| Triton route (FP32 partial) | 0.40 | 5.85 | 56 |\n| Triton route, partial rounded to FP16 before merge | 0.43 | 5.86 | 56 |\n| Grouped route | 0.43 | 5.86 | 49 |\n\n- The intermediate rounding by itself changes 10.8% of the final FP16 values: p50 0 ulp, p99 1 ulp, max 4 ulp. The FP16 cache gives the same picture (max 6 ulp). The few multi-ulp cases are where the two ranks' partials nearly cancel in the merge.\n- Both routes' p99 and max errors come from the kernels' own arithmetic (FP16 P·V, E4M3 dequantization). The intermediate rounding adds about 0.03 ulp at the median and nothing measurable at p99.\n\nIf an FP32 partial is preferred anyway, the grouped kernel would need an FP32 output variant; the wrapper cannot recover the precision after the kernel rounds. Script: `pr828_fp16_partial_check.py`, available on request.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/828#issuecomment-5984261838",
+          "createdAt": "2026-10-04T20:51:21Z",
+          "updatedAt": "2026-10-04T20:51:21Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 828,
+    "title": "[Perf][SM70] Use the grouped page4 route for QSA DCP prefill attention",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/828",
+    "isDraft": false,
+    "headRefOid": "431232b61c01b9f619241d24cb9935111d311b90",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/models/qwen4_exp/test_qsa_dcp_grouped_page4.py",
+      "vllm/models/qwen4_exp/nvidia/ops/qsa.py",
+      "vllm/models/qwen4_exp/nvidia/qsa.py"
+    ],
+    "diff_bytes": 22403,
+    "diff_sha256": "917877d8b478d0a1c7e1a9b4baaa5f700f639044144e323bb0146cc053605d80"
+  },
+  "full_tree_diff_proof": {
+    "number": 828,
+    "head": "431232b61c01b9f619241d24cb9935111d311b90",
+    "merge_base": "3f3a37068cc93230f38a62eabcd558d5f7b77230",
+    "api_file_count": 262,
+    "files": 3,
+    "old_changed_tree": "e58dbe8078672cce2bedec72f65969da819b5a3e",
+    "new_changed_tree": "83469d8e8a7e74b3357e5c04705cc2779dbd2429",
+    "diff_bytes": 22403,
+    "diff_sha256": "917877d8b478d0a1c7e1a9b4baaa5f700f639044144e323bb0146cc053605d80",
+    "replay_reproduces_head_files_and_modes": true,
+    "complete_tree_difference": true
+  }
+}
