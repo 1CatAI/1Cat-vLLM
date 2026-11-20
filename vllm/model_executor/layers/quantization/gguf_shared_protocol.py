@@ -278,6 +278,8 @@ def commit_local_routes(
     EVICT: tl.constexpr = False,
     skip_mask=None,
     SKIP: tl.constexpr = False,
+    homes=None,
+    KEEP: tl.constexpr = False,
 ):
     """Local commit (device memory reads only). In-place mode: the side-stream
     writeback publishes completion. Free mode: the victim lives at its save
@@ -311,6 +313,8 @@ def commit_local_routes(
     # have no incoming. An evicted expert's save lands asynchronously.
     vmask = valid & (victim >= 0)
     imask = valid & (lanes < copies) & (incoming >= 0)
+    if KEEP:  # VLLM_V41_KEEP_HOST: a victim's host home is permanent (no save)
+        recycled = tl.load(homes + base + victim.to(tl.int64), mask=vmask, other=-1)
     tl.store(table + base + victim, -1, mask=vmask)
     tl.store(table + base + incoming, slot, mask=imask)
     # In place: the victim now lives in the incoming expert's former allocation.

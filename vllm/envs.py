@@ -607,6 +607,7 @@ if TYPE_CHECKING:
     VLLM_V41_INDEX_TILE_MB: str = "64"
     VLLM_V41_INDEX_TOPK: str = "1"
     VLLM_V41_JOB_EVENTS: str | None = None
+    VLLM_V41_KEEP_HOST: str = "0"
     VLLM_V41_KV_HOT_POSITIONS: str = "32768"
     VLLM_V41_MAX_LEN: str = "16384"
     VLLM_V41_MISS_HIST: str = "0"
@@ -9044,6 +9045,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="None",
         effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_KEEP_HOST": env_var(
+        lambda: os.getenv("VLLM_V41_KEEP_HOST", "0"),
+        description=(
+            "DS-V4.1 shared expert cache (free-slot mode): keep a permanent host "
+            "copy of every routed expert so evictions never write back."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -21992,6 +22006,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_INDEX_TILE_MB",
         "VLLM_V41_INDEX_TOPK",
         "VLLM_V41_JOB_EVENTS",
+        "VLLM_V41_KEEP_HOST",
         "VLLM_V41_KV_HOT_POSITIONS",
         "VLLM_V41_MAX_LEN",
         "VLLM_V41_MISS_HIST",

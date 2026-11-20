@@ -263,7 +263,12 @@ class SharedOriginalExpertCache:
                         for line in memory
                         if line.startswith("MemAvailable:")
                     )
-                if available < self.budget.arena_bytes + 8 * 1024**3:
+                extra = (
+                    sum(s.resident * s.expert_bytes for s in specs)
+                    if envs.VLLM_V41_KEEP_HOST == "1"
+                    else 0
+                )
+                if available < self.budget.arena_bytes + extra + 8 * 1024**3:
                     raise MemoryError(
                         "Shared expert pool would breach 8 GiB host reserve"
                     )
@@ -374,21 +379,36 @@ class SharedOriginalExpertCache:
         ):
             raise ValueError("Shared GGUF source projection metadata mismatch")
         at = sum(spec.projection_bytes[:projection])
-        cold_start = sum(
-            (s.experts - s.resident) * s.expert_bytes for s in self.specs[:i]
-        )
+        # VLLM_V41_KEEP_HOST=1: every expert (resident too) is read once into
+        # its permanent host home; resident slots load from those homes.
+        keep = envs.VLLM_V41_KEEP_HOST == "1"
+        if keep:
+            cold_start = sum(s.experts * s.expert_bytes for s in self.specs[:i])
+            first_home = 0
+        else:
+            cold_start = sum(
+                (s.experts - s.resident) * s.expert_bytes for s in self.specs[:i]
+            )
+            first_home = spec.resident
         if self.rank == 0:
             self._read_projection(
                 tensor,
                 [
-                    (e, cold_start + (e - spec.resident) * spec.expert_bytes + at)
-                    for e in range(spec.resident, spec.experts)
+                    (e, cold_start + (e - first_home) * spec.expert_bytes + at)
+                    for e in range(first_home, spec.experts)
                 ],
             )
         for first in range(0, spec.resident, 8):
             count = min(8, spec.resident - first)
-            offsets = [self.exchange_offset + j * spec.expert_bytes for j in range(8)]
-            if self.rank == 0:
+            if keep:
+                offsets = [
+                    cold_start + (first + j) * spec.expert_bytes for j in range(8)
+                ]
+            else:
+                offsets = [
+                    self.exchange_offset + j * spec.expert_bytes for j in range(8)
+                ]
+            if self.rank == 0 and not keep:
                 self._read_projection(
                     tensor, [(first + j, offsets[j] + at) for j in range(count)]
                 )
