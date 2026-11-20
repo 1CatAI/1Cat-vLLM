@@ -1,0 +1,2564 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 62dbd358b8..a3138a240b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -408,6 +408,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_qpn_m1_sm70.cu"
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_grouped_decode_sm70.cu"
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_gdn_input_batch_sm70.cu"
++      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gdn_wy_sm70.cu"
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_local_top1_sm70.cu"
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_ple_spec_sm70.cu"
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/rmsnorm_gated_exact_sm70.cu"
+diff --git a/benchmarks/kernels/benchmark_sm70_gdn_wy_layer.py b/benchmarks/kernels/benchmark_sm70_gdn_wy_layer.py
+new file mode 100644
+index 0000000000..8d873cb5dd
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_sm70_gdn_wy_layer.py
+@@ -0,0 +1,426 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Cold-L2 real-weight GDN layer screen; unchanged TP collectives excluded.
++
++Measure rollback through its following projections, which can evict dirty state
++snapshots from L2. The isolated recurrent kernel can miss this deferred traffic.
++This does not change model dispatch or claim a serving latency.
++"""
++
++import argparse
++import json
++import runpy
++import statistics
++from pathlib import Path
++
++import torch
++from safetensors import safe_open
++
++from vllm import _sm70_ops as ops
++from vllm.model_executor.layers.fla.ops.fused_sigmoid_gating import (
++    fused_sigmoid_gating_delta_rule_update_mixed_qkv_out as reference,
++)
++from vllm.model_executor.layers.fla.ops.layernorm_guard import rmsnorm_fn
++from vllm.model_executor.layers.layernorm import (
++    _sm70_dflash2_gemma_fused_add_rms_norm as gemma_norm,
++)
++from vllm.model_executor.layers.mamba.gdn.sm70_preprocess import conv_gate_zero
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model", type=Path, required=True)
++    parser.add_argument("--out", type=Path, required=True)
++    parser.add_argument("--accepted", type=int, default=3, choices=range(1, 9))
++    parser.add_argument("--iters", type=int, default=100)
++    parser.add_argument("--variant", type=int, default=3, choices=range(5))
++    parser.add_argument(
++        "--research-extension",
++        type=Path,
++        help="Optional isolated source extension for microbenchmarks only",
++    )
++    args = parser.parse_args()
++    args.out.mkdir(parents=True, exist_ok=True)
++    if args.research_extension:
++        torch.ops.load_library(str(args.research_extension))
++    if not hasattr(torch.ops._C, "gdn_wy_verify_sm70_out"):
++        raise RuntimeError(
++            "Build the WY operators from this source before benchmarking"
++        )
++    torch.set_grad_enabled(False)
++    torch.manual_seed(123)
++    assert torch.cuda.get_device_capability() == (7, 0)
++    prefix = "model.language_model.layers.0."
++    with safe_open(args.model / "model.safetensors", framework="pt", device="cpu") as f:
++
++        def read(name):
++            return f.get_tensor(prefix + name)
++
++        rows = list(range(512)) + list(range(2048, 2560)) + list(range(4096, 5632))
++        codes = (
++            torch.cat(
++                (
++                    read("linear_attn.in_proj_qkv.weight").view(torch.uint8)[rows],
++                    read("linear_attn.in_proj_z.weight").view(torch.uint8)[:1536],
++                )
++            )
++            .view(torch.float8_e4m3fn)
++            .cuda()
++        )
++        scales = (
++            torch.cat(
++                (
++                    read("linear_attn.in_proj_qkv.weight_scale")[rows],
++                    read("linear_attn.in_proj_z.weight_scale")[:1536],
++                )
++            )
++            .float()
++            .cuda()
++        )
++        qcodes, qscales = ops.fp8_qpn8_prepare_sm70(codes, scales)
++        outcodes, outscales = ops.fp8_qpn8_prepare_sm70(
++            read("linear_attn.out_proj.weight")[:, :1536].contiguous().cuda(),
++            read("linear_attn.out_proj.weight_scale").float().cuda(),
++        )
++        baweight = (
++            torch.cat(
++                (
++                    read("linear_attn.in_proj_b.weight")[:12],
++                    read("linear_attn.in_proj_a.weight")[:12],
++                )
++            )
++            .half()
++            .cuda()
++        )
++        conv = read("linear_attn.conv1d.weight").view(10240, 4)[rows].half().cuda()
++        decay_log = read("linear_attn.A_log")[:12].float().cuda()
++        bias = read("linear_attn.dt_bias")[:12].half().cuda()
++        norm = read("linear_attn.norm.weight").half().cuda()
++        inputnorm = read("input_layernorm.weight").half().cuda()
++        postnorm = read("post_attention_layernorm.weight").half().cuda()
++    helpers = runpy.run_path(
++        str(Path(__file__).with_name("benchmark_sm70_nvfp4_qpn2.py"))
++    )
++    mlp = []
++    for projection in helpers["_load_projection_shards"](args.model, 0, 0, 4):
++        w, s = ops.nvfp4_qpn2_prepare_sm70(
++            projection.packed.cuda(), projection.scales.cuda()
++        )
++        mlp.append((w, s, projection.inverse_global_scale))
++    x = torch.randn(8, 5120, device="cuda", dtype=torch.float16) * 0.125
++    residual = torch.randn(8, 5120, device="cuda") * 0.125
++    q, z = x.new_empty(8, 2560), x.new_empty(8, 1536)
++    b, a = x.new_empty(8, 12), x.new_empty(8, 12)
++    scratch_q, scratch_b = x.new_empty(8, 4096), x.new_empty(8, 24)
++    core = x.new_empty(8, 12, 128)
++    projected, down = x.new_empty(8, 5120), x.new_empty(8, 5120)
++    up = x.new_empty(8, 4352)
++    history_storage_seed = (
++        torch.randn(1, 10, 2560, device="cuda", dtype=x.dtype) * 0.125
++    )
++    history_storage = history_storage_seed.clone()
++    history = history_storage.transpose(1, 2)
++    candidate_history_seed = history_storage_seed.clone()
++    candidate_history_seed[:, :3].copy_(
++        history_storage_seed[:, args.accepted - 1 : args.accepted + 2]
++    )
++    initial = torch.randn(1, 12, 128, 128, device="cuda") * 0.01
++    snapshots = initial.expand(8, -1, -1, -1).clone()
++    compact = initial.clone()
++    caches = [
++        torch.empty(1, 8, 12, 128, device="cuda"),
++        torch.empty(1, 8, 4, 128, device="cuda"),
++        torch.empty(1, 8, 12, device="cuda"),
++    ]
++    pending = torch.full((1,), -1, device="cuda", dtype=torch.int32)
++    no_previous = torch.zeros(1, device="cuda", dtype=torch.int32)
++    batch_mapping = torch.zeros(1, device="cuda", dtype=torch.int32)
++    descriptors = torch.tensor(
++        [
++            [
++                compact.data_ptr(),
++                compact.stride(0),
++                caches[0].data_ptr(),
++                caches[1].data_ptr(),
++                caches[2].data_ptr(),
++                pending.data_ptr(),
++                0,
++                1,
++                1,
++            ]
++        ],
++        device="cuda",
++        dtype=torch.int64,
++    )
++    conv_descriptors = torch.tensor(
++        [[history_storage.data_ptr(), history_storage.stride(0), 2560]],
++        device="cuda",
++        dtype=torch.int64,
++    )
++    table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
++    table_pointers = torch.tensor([table.data_ptr()], device="cuda", dtype=torch.int64)
++    computed = torch.full((1,), 1024 + args.accepted, device="cuda", dtype=torch.int32)
++    next_counts = torch.ones(1, device="cuda", dtype=torch.int32)
++    indices = torch.arange(8, device="cuda", dtype=torch.int32)[None]
++    compact_indices = torch.zeros_like(indices)
++    accepted = torch.tensor([args.accepted], device="cuda", dtype=torch.int32)
++    cu = torch.tensor([0, 8], device="cuda", dtype=torch.int32)
++    neutral = torch.ones_like(accepted)
++    conv_indices = torch.zeros(1, device="cuda", dtype=torch.int32)
++
++    def prepare(use_wy):
++        normalized, res = gemma_norm(x, residual, inputnorm, 1e-6)
++        ops.fp8_qpn8_dispatch_ba_split_sm70_out(
++            q, z, b, a, scratch_q, scratch_b, 0, normalized, qcodes, qscales, baweight
++        )
++        transformed, g, beta = conv_gate_zero(
++            q,
++            history,
++            conv,
++            conv_indices,
++            neutral if use_wy else accepted,
++            cu,
++            decay_log,
++            a,
++            b,
++            bias,
++            core,
++        )
++        return transformed, g.view(8, 12), beta.view(8, 12), res
++
++    def run(use_wy, publish=True):
++        mixed, g, beta, res = prepare(use_wy)
++        if use_wy:
++            qv, kv, vv = mixed.split([512, 512, 1536], dim=1)
++            torch.ops._C.gdn_wy_verify_sm70_out(
++                core.reshape(8, 1536),
++                compact,
++                *caches,
++                qv,
++                kv,
++                vv,
++                a,
++                b,
++                decay_log,
++                bias,
++                compact_indices,
++                conv_indices,
++                pending,
++                cu,
++                no_previous,
++                *caches,
++                128**-0.5,
++                args.variant,
++            )
++        else:
++            reference(
++                A_log=decay_log,
++                a=a,
++                b=b,
++                dt_bias=bias,
++                mixed_qkv=mixed,
++                num_q_heads=4,
++                num_v_heads=12,
++                head_k_dim=128,
++                head_v_dim=128,
++                scale=128**-0.5,
++                initial_state=snapshots,
++                out=core.unsqueeze(1),
++                cu_seqlens=cu,
++                ssm_state_indices=indices,
++                num_accepted_tokens=accepted,
++                use_qk_l2norm_in_kernel=True,
++                precomputed_g=g,
++                precomputed_beta=beta,
++                quantize_state_each_step=False,
++                match_recurrent_schedule=True,
++                match_recurrent_numerics=True,
++            )
++        normalized = rmsnorm_fn(
++            core.view(96, 128),
++            norm,
++            None,
++            z=z.reshape(96, 128),
++            eps=1e-6,
++            norm_before_gate=True,
++        ).view(8, 1536)
++        ops.fp8_qpn8_gemm_sm70_out(
++            projected, normalized, outcodes, outscales, 12, 2, True, False
++        )
++        post, _ = gemma_norm(projected, res, postnorm, 1e-6)
++        w, s, scale = mlp[0]
++        ops.nvfp4_qpn2_gated_sm70_out(up, post, w, s, scale, 8, 1)
++        w, s, scale = mlp[1]
++        ops.nvfp4_qpn2_gemm_sm70_out(down, up, w, s, scale, 16, 2)
++        if use_wy and publish:
++            torch.ops._C.gdn_wy_commit_group_v2_sm70(
++                [compact],
++                [pending],
++                descriptors,
++                table_pointers,
++                1,
++                accepted,
++                computed,
++                batch_mapping,
++                8192,
++            )
++            # No boundary is crossed in this microbenchmark. Publication still
++            # normalizes convolution history and includes that launch cost.
++            torch.ops._C.gdn_wy_finish_group_v2_sm70(
++                [pending],
++                [history_storage],
++                descriptors,
++                conv_descriptors,
++                table_pointers,
++                1,
++                accepted,
++                computed,
++                batch_mapping,
++                8192,
++                next_counts,
++            )
++
++    history_storage.copy_(history_storage_seed)
++    run(False)
++    expected = down.clone()
++    expected_state = snapshots[args.accepted - 1].clone()
++    history_storage.copy_(candidate_history_seed)
++    compact.copy_(initial)
++    run(True)
++    output_difference = (down - expected).abs().float()
++    state_difference = (compact[0] - expected_state).abs()
++    assert torch.isfinite(down).all() and torch.isfinite(compact).all()
++    eviction = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
++    graphs, samples = [], [[], [], []]
++    arms = [(False, False), (True, False), (True, True)]
++    for use_wy, publish in arms:
++        graph = torch.cuda.CUDAGraph()
++        start = torch.cuda.Event(enable_timing=True, external=True)
++        end = torch.cuda.Event(enable_timing=True, external=True)
++        with torch.cuda.graph(graph):
++            snapshots.copy_(initial.expand_as(snapshots))
++            compact.copy_(initial)
++            history_storage.copy_(
++                candidate_history_seed if use_wy else history_storage_seed
++            )
++            eviction.fill_(1)
++            start.record()
++            run(use_wy, publish)
++            end.record()
++        graphs.append((graph, start, end))
++    # Actual publication uses one launch for all layers, not two launches per
++    # layer. Keep its factor addresses distinct and measure it separately.
++    pub_states_storage = initial.expand(48, 1, 12, 128, 128).clone()
++    pub_states = list(pub_states_storage.unbind(0))
++    pub_u = caches[0].expand(48, 1, 8, 12, 128).clone()
++    pub_k = caches[1].expand(48, 1, 8, 4, 128).clone()
++    pub_G = caches[2].expand(48, 1, 8, 12).clone()
++    pub_pending_storage = torch.zeros(48, 1, device="cuda", dtype=torch.int32)
++    pub_pending = list(pub_pending_storage.unbind(0))
++    pub_history = history_storage_seed.expand(48, 1, 10, 2560).clone()
++    pub_conv = list(pub_history.unbind(0))
++    pub_desc = torch.tensor(
++        [
++            [
++                pub_states[i].data_ptr(),
++                pub_states[i].stride(0),
++                pub_u[i].data_ptr(),
++                pub_k[i].data_ptr(),
++                pub_G[i].data_ptr(),
++                pub_pending[i].data_ptr(),
++                0,
++                1,
++                1,
++            ]
++            for i in range(48)
++        ],
++        device="cuda",
++        dtype=torch.int64,
++    )
++    pub_conv_desc = torch.tensor(
++        [[t.data_ptr(), t.stride(0), 2560] for t in pub_conv],
++        device="cuda",
++        dtype=torch.int64,
++    )
++    pub_graph = torch.cuda.CUDAGraph()
++    pub_start = torch.cuda.Event(enable_timing=True, external=True)
++    pub_end = torch.cuda.Event(enable_timing=True, external=True)
++    with torch.cuda.graph(pub_graph):
++        pub_states_storage.copy_(initial.expand_as(pub_states_storage))
++        pub_history.copy_(history_storage_seed.expand_as(pub_history))
++        pub_pending_storage.zero_()
++        eviction.fill_(1)
++        pub_start.record()
++        torch.ops._C.gdn_wy_commit_group_v2_sm70(
++            pub_states,
++            pub_pending,
++            pub_desc,
++            table_pointers,
++            1,
++            accepted,
++            computed,
++            batch_mapping,
++            8192,
++        )
++        torch.ops._C.gdn_wy_finish_group_v2_sm70(
++            pub_pending,
++            pub_conv,
++            pub_desc,
++            pub_conv_desc,
++            table_pointers,
++            1,
++            accepted,
++            computed,
++            batch_mapping,
++            8192,
++            next_counts,
++        )
++        pub_end.record()
++    graphs.append((pub_graph, pub_start, pub_end))
++    samples.append([])
++    for _ in range(10):
++        for graph, _, end in graphs:
++            graph.replay()
++            end.synchronize()
++    for _ in range(args.iters):
++        for index, (graph, start, end) in enumerate(graphs):
++            graph.replay()
++            end.synchronize()
++            samples[index].append(start.elapsed_time(end) * 1000)
++    baseline_us, wy_layer_us, wy_with_publication_us, publication_48_us = (
++        statistics.fmean(s) for s in samples
++    )
++    result = dict(
++        baseline_layer_us=baseline_us,
++        wy_layer_us=wy_layer_us,
++        wy_layer_with_single_layer_publication_us=wy_with_publication_us,
++        estimated_48_layer_target_saving_ms=(baseline_us - wy_layer_us) * 48 / 1000,
++        publication_48_layers_us=publication_48_us,
++        estimated_48_layer_saving_ms=(
++            (baseline_us - wy_layer_us) * 48 - publication_48_us
++        )
++        / 1000,
++        publication_note=(
++            "Target-layer saving minus measured 48-layer publication; "
++            "TP collectives, head, and sampling remain excluded"
++        ),
++        accepted=args.accepted,
++        max_layer_output_difference=output_difference.max().item(),
++        mean_layer_output_difference=output_difference.mean().item(),
++        max_state_difference=state_difference.max().item(),
++        numerical_contract="Full-model teacher-forcing admission is separate",
++        publication_and_conv_continuation_included=True,
++        publication_batched_across_layers_in_production=True,
++        variant=args.variant,
++        layer=0,
++        checkpoint=str(args.model),
++        tp_shard=0,
++        unchanged_tp_collectives_excluded=True,
++        production_dispatch_changed=False,
++    )
++    (args.out / "layer-result.json").write_text(json.dumps(result, indent=2))
++    print(json.dumps(result), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/csrc/sm70_turbomind/ops/gdn_wy_sm70.cu b/csrc/sm70_turbomind/ops/gdn_wy_sm70.cu
+new file mode 100644
+index 0000000000..0218ad113d
+--- /dev/null
++++ b/csrc/sm70_turbomind/ops/gdn_wy_sm70.cu
+@@ -0,0 +1,876 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++// Snapshot-free chain-WY GDN verify step for SM70 (27B TP4 shapes: H=4, HV=12,
++// K=V=128, T=8).
++//
++// Per step and per value head:   S_t = e^{G_t} S0 + sum_{i<=t} e^{G_t-G_i} u_i
++// k_i^T
++//   u_t = beta_t (v_t - e^{G_t} S0 k_t - sum_{i<t} e^{G_t-G_i} (k_i.k_t) u_i)
++//   o_t = e^{G_t} S0 q_t + sum_{i<=t} e^{G_t-G_i} (k_i.q_t) u_i
++// Rows of S are independent given the shared 8x8 coefficients. The persistent
++// state slot holds the committed start state. Production publishes the accepted
++// prefix in a separate, batched commit after sampling. The verifier can also
++// commit the previous step's accepted prefix (a tokens) from a separate bank:
++//   S0 = e^{Gp_a} S_prev + sum_{i<a} e^{Gp_a-Gp_i} up_i kp_i^T
++// One state read during verify and one read/write during publication; FP32
++// throughout, without per-token state snapshots.
++#include <torch/types.h>
++#include <torch/library.h>
++#include <ATen/cuda/Exceptions.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <cuda_fp16.h>
++
++namespace {
++constexpr int T = 8, H = 4, HV = 12, K = 128, V = 128,
++              KS = 132;  // KS: padded smem stride
++
++// Transposed butterfly over the low log2(LANES) lane bits: reduce N partial
++// sums held by each lane. Afterwards the lane bit pattern selects which
++// complete sums it holds.
++template <int N, int LANES>
++__device__ __forceinline__ void transpose_reduce(float (&x)[N], int lane) {
++  int count = N;
++#pragma unroll
++  for (int off = LANES / 2; off >= 1; off >>= 1) {
++    if (count > 1) {
++      const int half = count / 2;
++      const bool up = lane & off;
++#pragma unroll
++      for (int j = 0; j < N / 2; ++j) {
++        if (j < half) {
++          const float send = up ? x[j] : x[j + half];
++          const float keep = up ? x[j + half] : x[j];
++          x[j] = keep + __shfl_xor_sync(0xffffffffu, send, off);
++        }
++      }
++      count = half;
++    } else {
++      x[0] += __shfl_xor_sync(0xffffffffu, x[0], off);
++    }
++  }
++}
++
++struct Smem {
++  float kn[T * KS], qn[T * KS], pk[T * KS];
++  float sq[4][2 * T], G[T];
++  float C[T][T], M[T][T], eG[T], bt[T], wp[T], eGa;
++};
++
++// Shared per-head prologue (all 128 threads): normalize k/q, previous k,
++// gating, 8x8 coefficient matrices.
++__device__ __forceinline__ void prologue(
++    Smem& sm, const half* __restrict__ q, const half* __restrict__ k,
++    const half* __restrict__ a_in, const half* __restrict__ b_in,
++    const float* A_log, const void* dt_bias, bool bias_fp32, int q_stride,
++    int k_stride, int ab_stride, int nt, float scale,
++    const float* __restrict__ prev_k, const float* __restrict__ prev_G, int a,
++    int hv, float* __restrict__ new_k, float* __restrict__ new_G) {
++  const int ih = hv / (HV / H), tid = threadIdx.x, warp = tid >> 5,
++            lane = tid & 31;
++  float gl = 0.f, bl = 0.f, pg = 0.f, pga = 0.f;
++  if (tid < T) {
++    if (tid < nt) {
++      const float z =
++          __half2float(a_in[tid * ab_stride + hv]) +
++          (bias_fp32
++               ? reinterpret_cast<const float*>(dt_bias)[hv]
++               : __half2float(reinterpret_cast<const half*>(dt_bias)[hv]));
++      const float softplus = z > 20.f ? z : log1pf(__expf(z));
++      gl = -__expf(A_log[hv]) * softplus;
++      bl = 1.f / (1.f + __expf(-__half2float(b_in[tid * ab_stride + hv])));
++    }
++    if (a > 0) {
++      pg = prev_G[tid * HV + hv];
++      pga = prev_G[(a - 1) * HV + hv];
++    }
++  }
++  float kr[T], qr[T], ss[2 * T];
++#pragma unroll
++  for (int t = 0; t < T; ++t) {
++    kr[t] = (t < nt ? __half2float(k[t * k_stride + ih * K + tid]) : 0.f);
++    qr[t] = (t < nt ? __half2float(q[t * q_stride + ih * K + tid]) : 0.f);
++    ss[t] = kr[t] * kr[t];
++    ss[T + t] = qr[t] * qr[t];
++    sm.pk[t * KS + tid] = t < a ? prev_k[(t * H + ih) * K + tid] : 0.f;
++  }
++  transpose_reduce<2 * T, 32>(ss, lane);  // lane holds sum (lane>>1)&15
++  if ((lane & 1) == 0) sm.sq[warp][(lane >> 1) & 15] = ss[0];
++  if (warp == 0) {
++    float G = gl;  // inclusive scan over T tokens
++#pragma unroll
++    for (int off = 1; off < T; off <<= 1) {
++      const float y = __shfl_up_sync(0xffffffffu, G, off);
++      if (lane >= off) G += y;
++    }
++    if (lane < T) {
++      sm.eG[lane] = __expf(G);
++      sm.bt[lane] = bl;
++      sm.G[lane] = G;
++      sm.wp[lane] = (a > 0 && lane < a) ? __expf(pga - pg) : 0.f;
++      if (lane == 0) sm.eGa = a > 0 ? __expf(pga) : 1.f;
++    }
++  }
++  __syncthreads();
++#pragma unroll
++  for (int t = 0; t < T; ++t) {
++    const float nk =
++        rsqrtf(sm.sq[0][t] + sm.sq[1][t] + sm.sq[2][t] + sm.sq[3][t] + 1e-6f);
++    const float nq = rsqrtf(sm.sq[0][T + t] + sm.sq[1][T + t] +
++                            sm.sq[2][T + t] + sm.sq[3][T + t] + 1e-6f);
++    sm.kn[t * KS + tid] = kr[t] * nk;
++    sm.qn[t * KS + tid] = qr[t] * nq * scale;
++  }
++  __syncthreads();
++  {  // warp w: which = w>>1 (KK / KQ), i in [(w&1)*4, +4), t in [0,T)
++    const int which = warp >> 1, i0 = (warp & 1) * 4;
++    const float* yb = which ? sm.qn : sm.kn;
++    float4 xi[4], yt[T];
++#pragma unroll
++    for (int ii = 0; ii < 4; ++ii)
++      xi[ii] = reinterpret_cast<const float4*>(sm.kn + (i0 + ii) * KS)[lane];
++#pragma unroll
++    for (int t = 0; t < T; ++t)
++      yt[t] = reinterpret_cast<const float4*>(yb + t * KS)[lane];
++    float p[32];
++#pragma unroll
++    for (int ii = 0; ii < 4; ++ii)
++#pragma unroll
++      for (int t = 0; t < T; ++t)
++        p[ii * T + t] = xi[ii].x * yt[t].x + xi[ii].y * yt[t].y +
++                        xi[ii].z * yt[t].z + xi[ii].w * yt[t].w;
++    transpose_reduce<32, 32>(p, lane);  // lane holds dot index lane
++    const int i = i0 + lane / T, t = lane % T;
++    const float d = __expf(sm.G[t] - sm.G[i]);
++    if (which == 0)
++      sm.C[t][i] = i < t ? sm.bt[t] * d * p[0] : 0.f;
++    else
++      sm.M[t][i] = i <= t ? d * p[0] : 0.f;
++  }
++  if (blockIdx.x ==
++      0) {  // save this step's normalized k and G for the next commit
++    if (hv % (HV / H) == 0)
++      for (int t = 0; t < T; ++t)
++        new_k[(t * H + ih) * K + tid] = sm.kn[t * KS + tid];
++    if (tid < T) new_G[tid * HV + hv] = sm.G[tid];
++  }
++  __syncthreads();
++}
++
++// LPR lanes per row (32: one row per warp-pass; 8: four rows per warp-pass),
++// ITER passes.
++template <int LPR, int ITER>
++__global__ void __launch_bounds__(128)
++    gdn_wy_kernel(const half* __restrict__ q, const half* __restrict__ k,
++                  const half* __restrict__ v, const half* __restrict__ a_in,
++                  const half* __restrict__ b_in, const float* A_log,
++                  const void* dt_bias, bool bias_fp32, float scale,
++                  const int* indices, int index_stride,
++                  const int* factor_indices, int factor_stride,
++                  int factor_slots, int* pending, const int* cu_seqlens,
++                  int q_stride, int k_stride, int v_stride, int ab_stride,
++                  int out_stride, int n_slots, int64_t state_stride,
++                  int64_t u_stride, int64_t k_cache_stride, int64_t G_stride,
++                  float* __restrict__ state, const float* __restrict__ prev_u,
++                  const float* __restrict__ prev_k,
++                  const float* __restrict__ prev_G,
++                  const int* __restrict__ n_accept_prev, half* __restrict__ o,
++                  float* __restrict__ new_u, float* __restrict__ new_k,
++                  float* __restrict__ new_G) {
++  constexpr int GROUPS = 32 / LPR,
++                CH = 32 / LPR;  // rows per pass, float4 chunks per lane
++  constexpr int ROWS_PER_WARP = GROUPS * ITER;
++  __shared__ Smem sm;
++  const int seq = blockIdx.z;
++  const int slot = indices[seq * index_stride];
++  const int bos = cu_seqlens[seq], nt = cu_seqlens[seq + 1] - bos;
++  if (slot < 0 || slot >= n_slots || nt <= 0 || nt > T) return;
++  int factor_slot = -1;
++  if (factor_stride < 0) {
++    const bool* mask = reinterpret_cast<const bool*>(factor_indices);
++    int ordinal = 0;
++    for (int req = 0; req < -factor_stride; ++req) {
++      if (mask[req]) {
++        if (ordinal == seq) {
++          factor_slot = req;
++          break;
++        }
++        ++ordinal;
++      }
++    }
++  } else {
++    factor_slot = factor_indices[seq * factor_stride];
++  }
++  if (factor_slot < 0 || factor_slot >= factor_slots) return;
++  if (pending && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
++    pending[factor_slot] = slot;
++  q += static_cast<int64_t>(bos) * q_stride;
++  k += static_cast<int64_t>(bos) * k_stride;
++  v += static_cast<int64_t>(bos) * v_stride;
++  a_in += static_cast<int64_t>(bos) * ab_stride;
++  b_in += static_cast<int64_t>(bos) * ab_stride;
++  o += static_cast<int64_t>(bos) * out_stride;
++  state += static_cast<int64_t>(slot) * state_stride;
++  prev_u += static_cast<int64_t>(factor_slot) * u_stride;
++  new_u += static_cast<int64_t>(factor_slot) * u_stride;
++  prev_k += static_cast<int64_t>(factor_slot) * k_cache_stride;
++  new_k += static_cast<int64_t>(factor_slot) * k_cache_stride;
++  prev_G += static_cast<int64_t>(factor_slot) * G_stride;
++  new_G += static_cast<int64_t>(factor_slot) * G_stride;
++  const int hv = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++  const int grp = lane / LPR, gl = lane % LPR, base = grp * LPR;
++  const int row0 = (blockIdx.x * 4 + warp) * ROWS_PER_WARP;
++  const int a = min(T, max(0, n_accept_prev[seq]));
++
++  // issue all global loads for owned rows before the prologue
++  float4 s[ITER][CH];
++  float pu[ITER], vvr[ITER];
++#pragma unroll
++  for (int it = 0; it < ITER; ++it) {
++    const int vr = row0 + it * GROUPS + grp;
++#pragma unroll
++    for (int j = 0; j < CH; ++j)
++      s[it][j] = reinterpret_cast<const float4*>(state + ((size_t)hv * V + vr) *
++                                                             K)[gl + LPR * j];
++    pu[it] = (gl < T && gl < a) ? prev_u[(gl * HV + hv) * V + vr] : 0.f;
++    vvr[it] = gl < nt ? __half2float(v[gl * v_stride + hv * V + vr]) : 0.f;
++  }
++  prologue(sm, q, k, a_in, b_in, A_log, dt_bias, bias_fp32, q_stride, k_stride,
++           ab_stride, nt, scale, prev_k, prev_G, a, hv, new_k, new_G);
++
++#pragma unroll
++  for (int it = 0; it < ITER; ++it) {
++    const int vr = row0 + it * GROUPS + grp;
++    float4 x[CH];
++#pragma unroll
++    for (int j = 0; j < CH; ++j) x[j] = s[it][j];
++    if (a > 0) {  // commit previous step's accepted prefix
++#pragma unroll
++      for (int j = 0; j < CH; ++j) {
++        x[j].x *= sm.eGa;
++        x[j].y *= sm.eGa;
++        x[j].z *= sm.eGa;
++        x[j].w *= sm.eGa;
++      }
++      for (int i = 0; i < a; ++i) {
++        const float c = sm.wp[i] * __shfl_sync(0xffffffffu, pu[it], base + i);
++#pragma unroll
++        for (int j = 0; j < CH; ++j) {
++          const float4 kk =
++              reinterpret_cast<const float4*>(sm.pk + i * KS)[gl + LPR * j];
++          x[j].x = fmaf(c, kk.x, x[j].x);
++          x[j].y = fmaf(c, kk.y, x[j].y);
++          x[j].z = fmaf(c, kk.z, x[j].z);
++          x[j].w = fmaf(c, kk.w, x[j].w);
++        }
++      }
++#pragma unroll
++      for (int j = 0; j < CH; ++j)
++        reinterpret_cast<float4*>(state + ((size_t)hv * V + vr) *
++                                              K)[gl + LPR * j] = x[j];
++    }
++    float d[2 * T];
++#pragma unroll
++    for (int t = 0; t < 2 * T; ++t) d[t] = 0.f;
++#pragma unroll
++    for (int j = 0; j < CH; ++j) {
++#pragma unroll
++      for (int t = 0; t < T; ++t) {
++        const float4 kk =
++            reinterpret_cast<const float4*>(sm.kn + t * KS)[gl + LPR * j];
++        const float4 qq =
++            reinterpret_cast<const float4*>(sm.qn + t * KS)[gl + LPR * j];
++        d[t] += x[j].x * kk.x + x[j].y * kk.y + x[j].z * kk.z + x[j].w * kk.w;
++        d[T + t] +=
++            x[j].x * qq.x + x[j].y * qq.y + x[j].z * qq.z + x[j].w * qq.w;
++      }
++    }
++    transpose_reduce<2 * T, LPR>(d, lane);
++    // LPR=32: lane holds sum (lane>>1)&15 in d[0].  LPR=16: sums 2*... ; LPR=8:
++    // lane holds sums 2*gl, 2*gl+1 in d[0], d[1].  Generic: sums held =
++    // 2*T/LPR*... handled below.
++    constexpr int HELD = (2 * T >= LPR) ? (2 * T / LPR) : 1;
++    float r[HELD];
++#pragma unroll
++    for (int h = 0; h < HELD; ++h) r[h] = d[h];
++#pragma unroll
++    for (int jj = 0; jj < 2 * T; ++jj) {
++      if (LPR == 32)
++        d[jj] = __shfl_sync(0xffffffffu, r[0], 2 * jj);
++      else
++        d[jj] = __shfl_sync(0xffffffffu, r[jj % HELD], base + jj / HELD);
++    }
++    float u[T], my_u = 0.f, my_o = 0.f;
++#pragma unroll
++    for (int t = 0; t < T; ++t) {
++      float acc = sm.bt[t] * (__shfl_sync(0xffffffffu, vvr[it], base + t) -
++                              sm.eG[t] * d[t]);
++#pragma unroll
++      for (int i = 0; i < t; ++i) acc = fmaf(-sm.C[t][i], u[i], acc);
++      u[t] = acc;
++      float output_value = sm.eG[t] * d[T + t];
++#pragma unroll
++      for (int i = 0; i <= t; ++i)
++        output_value = fmaf(sm.M[t][i], u[i], output_value);
++      if (gl == t) {
++        my_u = acc;
++        my_o = output_value;
++      }
++    }
++    if (gl < nt) {
++      o[gl * out_stride + hv * V + vr] = __float2half_rn(my_o);
++      new_u[(gl * HV + hv) * V + vr] = my_u;
++    }
++  }
++}
++
++// Materialize an arbitrary accepted prefix. This kernel never changes metadata:
++// all CTAs must see the same source bank until the launch has completed.
++__global__ void __launch_bounds__(128)
++    commit_kernel(float* state, int64_t state_stride, int slots, const float* u,
++                  int64_t u_stride, const float* k, int64_t k_stride,
++                  const float* G, int64_t G_stride, const int* src,
++                  const int* dst, const int* accepted, int src_stride,
++                  int dst_stride, const int* factors, int factor_stride,
++                  int factor_slots) {
++  const int seq = blockIdx.z;
++  const int si = src[seq * src_stride], di = dst[seq * dst_stride];
++  const int fi = factors[seq * factor_stride];
++  if (si < 0 || si >= slots || di < 0 || di >= slots || fi < 0 ||
++      fi >= factor_slots)
++    return;
++  const int a = min(T, max(0, accepted[seq]));
++  if (a == 0 && si == di) return;
++  const int hv = blockIdx.y, ih = hv / (HV / H);
++  // Four rows per warp, four adjacent float4 columns per lane.
++  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++  const int vr = blockIdx.x * 16 + warp * 4 + lane / 8;
++  const float ga = a > 0 ? G[fi * G_stride + (a - 1) * HV + hv] : 0.f;
++  const float decay = __expf(ga);
++#pragma unroll
++  for (int chunk = 0; chunk < 4; ++chunk) {
++    const int kc = ((lane & 7) + chunk * 8) * 4;
++    float4 x = *reinterpret_cast<const float4*>(state + si * state_stride +
++                                                (hv * V + vr) * K + kc);
++    x.x *= decay;
++    x.y *= decay;
++    x.z *= decay;
++    x.w *= decay;
++    for (int i = 0; i < a; ++i) {
++      const float c = __expf(ga - G[fi * G_stride + i * HV + hv]) *
++                      u[fi * u_stride + (i * HV + hv) * V + vr];
++      const float4 kk = *reinterpret_cast<const float4*>(k + fi * k_stride +
++                                                         (i * H + ih) * K + kc);
++      x.x = fmaf(c, kk.x, x.x);
++      x.y = fmaf(c, kk.y, x.y);
++      x.z = fmaf(c, kk.z, x.z);
++      x.w = fmaf(c, kk.w, x.w);
++    }
++    *reinterpret_cast<float4*>(state + di * state_stride + (hv * V + vr) * K +
++                               kc) = x;
++  }
++}
++
++void check_tensor(const torch::Tensor& t, const torch::Tensor& reference,
++                  at::ScalarType dtype) {
++  TORCH_CHECK(
++      t.is_cuda() && t.device() == reference.device() &&
++          t.scalar_type() == dtype,
++      "WY tensors must share a CUDA device and have the declared dtype");
++}
++void check_state(const torch::Tensor& state) {
++  TORCH_CHECK(state.is_cuda() && state.scalar_type() == at::kFloat &&
++                  state.dim() == 4 && state.size(1) == HV &&
++                  state.size(2) == V && state.size(3) == K &&
++                  state.stride(3) == 1 && state.stride(2) == K &&
++                  state.stride(1) == V * K && state.stride(0) % 4 == 0,
++              "WY requires FP32 [slots,12,128,128] state with contiguous inner "
++              "dimensions");
++}
++void check_cache(const torch::Tensor& u, const torch::Tensor& k,
++                 const torch::Tensor& G, const torch::Tensor& state) {
++  for (const auto& t : {u, k, G}) check_tensor(t, state, at::kFloat);
++  TORCH_CHECK(u.dim() == 4 && u.size(0) > 0 && u.size(1) == T &&
++                  u.size(2) == HV && u.size(3) == V && u.stride(1) == HV * V &&
++                  u.stride(2) == V && u.stride(3) == 1 && k.dim() == 4 &&
++                  k.size(0) == u.size(0) && k.size(1) == T && k.size(2) == H &&
++                  k.size(3) == K && k.stride(1) == H * K && k.stride(2) == K &&
++                  k.stride(3) == 1 && G.dim() == 3 && G.size(0) == u.size(0) &&
++                  G.size(1) == T && G.size(2) == HV && G.stride(1) == HV &&
++                  G.stride(2) == 1,
++              "invalid WY factor-cache dimensions or strides");
++}
++int check_indices(const torch::Tensor& ids, const torch::Tensor& state) {
++  check_tensor(ids, state, at::kInt);
++  TORCH_CHECK(
++      (ids.dim() == 1 || ids.dim() == 2) &&
++          (ids.stride(ids.dim() - 1) == 1 || ids.stride(ids.dim() - 1) == 0),
++      "state indices must be an int32 vector or table with contiguous or "
++      "repeated columns");
++  return ids.stride(0);
++}
++void wy_verify(torch::Tensor out, torch::Tensor state, torch::Tensor new_u,
++               torch::Tensor new_k, torch::Tensor new_G, torch::Tensor q,
++               torch::Tensor k, torch::Tensor v, torch::Tensor a,
++               torch::Tensor b, torch::Tensor A_log, torch::Tensor dt_bias,
++               torch::Tensor indices, torch::Tensor factor_indices,
++               std::optional<torch::Tensor> pending, torch::Tensor cu_seqlens,
++               torch::Tensor accepted, torch::Tensor prev_u,
++               torch::Tensor prev_k, torch::Tensor prev_G, double scale,
++               int64_t variant) {
++  const c10::cuda::CUDAGuard guard(state.device());
++  check_state(state);
++  check_cache(prev_u, prev_k, prev_G, state);
++  check_cache(new_u, new_k, new_G, state);
++  TORCH_CHECK(new_u.size(0) == prev_u.size(0) &&
++                  new_u.stride(0) == prev_u.stride(0) &&
++                  new_k.stride(0) == prev_k.stride(0) &&
++                  new_G.stride(0) == prev_G.stride(0),
++              "WY banks must have identical strides");
++  for (const auto& t : {q, k, v, a, b, out}) {
++    check_tensor(t, state, at::kHalf);
++    TORCH_CHECK(t.dim() == 2 && t.stride(1) == 1 && t.size(0) == q.size(0),
++                "WY token inputs must be row-major matrices");
++  }
++  TORCH_CHECK(q.size(1) == H * K && k.size(1) == H * K && v.size(1) == HV * V &&
++                  out.size(1) == HV * V && a.size(1) == HV && b.size(1) == HV &&
++                  a.stride(0) == b.stride(0),
++              "invalid WY projection dimensions");
++  for (const auto& t : {A_log, dt_bias}) {
++    TORCH_CHECK(t.scalar_type() == at::kFloat ||
++                    (t.is_same(dt_bias) && t.scalar_type() == at::kHalf),
++                "unsupported WY gate dtype");
++    check_tensor(t, state, t.scalar_type());
++    TORCH_CHECK(t.numel() == HV && t.is_contiguous(),
++                "WY gate parameters must be FP32 vectors");
++  }
++  const int is = check_indices(indices, state), n = indices.size(0);
++  int fs;
++  if (factor_indices.scalar_type() == at::kBool) {
++    check_tensor(factor_indices, state, at::kBool);
++    TORCH_CHECK(factor_indices.dim() == 1 && factor_indices.is_contiguous(),
++                "invalid WY request mask");
++    fs = -factor_indices.numel();
++  } else {
++    fs = check_indices(factor_indices, state);
++    TORCH_CHECK(factor_indices.size(0) == n, "inconsistent WY factor count");
++  }
++  if (pending) {
++    check_tensor(*pending, state, at::kInt);
++    TORCH_CHECK(pending->dim() == 1 && pending->numel() == prev_u.size(0) &&
++                    pending->is_contiguous(),
++                "invalid WY pending-state vector");
++  }
++  for (const auto& t : {cu_seqlens, accepted}) {
++    check_tensor(t, state, at::kInt);
++    TORCH_CHECK(t.dim() == 1 && t.is_contiguous(),
++                "WY sequence metadata must be int32 vectors");
++  }
++  TORCH_CHECK(cu_seqlens.numel() == n + 1 && accepted.numel() == n,
++              "inconsistent WY sequence counts");
++  TORCH_CHECK(variant >= 0 && variant <= 4, "invalid WY row variant");
++  if (n == 0) return;
++  auto stream = at::cuda::getCurrentCUDAStream();
++#define LAUNCH(LPR, IT)                                                      \
++  gdn_wy_kernel<LPR, IT>                                                     \
++      <<<dim3(V / (4 * (32 / LPR) * IT), HV, n), 128, 0, stream>>>(          \
++          (const half*)q.data_ptr(), (const half*)k.data_ptr(),              \
++          (const half*)v.data_ptr(), (const half*)a.data_ptr(),              \
++          (const half*)b.data_ptr(), A_log.data_ptr<float>(),                \
++          dt_bias.data_ptr(), dt_bias.scalar_type() == at::kFloat,           \
++          (float)scale, indices.data_ptr<int>(), is,                         \
++          reinterpret_cast<const int*>(factor_indices.data_ptr()), fs,       \
++          prev_u.size(0), pending ? pending->data_ptr<int>() : nullptr,      \
++          cu_seqlens.data_ptr<int>(), q.stride(0), k.stride(0), v.stride(0), \
++          a.stride(0), out.stride(0), state.size(0), state.stride(0),        \
++          prev_u.stride(0), prev_k.stride(0), prev_G.stride(0),              \
++          state.data_ptr<float>(), prev_u.data_ptr<float>(),                 \
++          prev_k.data_ptr<float>(), prev_G.data_ptr<float>(),                \
++          accepted.data_ptr<int>(), (half*)out.data_ptr(),                   \
++          new_u.data_ptr<float>(), new_k.data_ptr<float>(),                  \
++          new_G.data_ptr<float>())
++  switch (variant) {
++    case 0:
++      LAUNCH(32, 1);
++      break;
++    case 1:
++      LAUNCH(32, 2);
++      break;
++    case 2:
++      LAUNCH(16, 1);
++      break;
++    case 3:
++      LAUNCH(8, 1);
++      break;
++    case 4:
++      LAUNCH(8, 2);
++      break;
++  }
++#undef LAUNCH
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++void wy_commit(torch::Tensor state, torch::Tensor u, torch::Tensor k,
++               torch::Tensor G, torch::Tensor src, torch::Tensor dst,
++               torch::Tensor accepted, torch::Tensor factor_indices) {
++  const c10::cuda::CUDAGuard guard(state.device());
++  check_state(state);
++  check_cache(u, k, G, state);
++  const int ss = check_indices(src, state), ds = check_indices(dst, state),
++            fs = check_indices(factor_indices, state), n = src.size(0);
++  check_tensor(accepted, state, at::kInt);
++  TORCH_CHECK(dst.size(0) == n && factor_indices.size(0) == n &&
++                  accepted.dim() == 1 && accepted.numel() == n &&
++                  accepted.is_contiguous(),
++              "inconsistent WY commit sequence counts");
++  if (n == 0) return;
++  commit_kernel<<<dim3(V / 16, HV, n), 128, 0,
++                  at::cuda::getCurrentCUDAStream()>>>(
++      state.data_ptr<float>(), state.stride(0), state.size(0),
++      u.data_ptr<float>(), u.stride(0), k.data_ptr<float>(), k.stride(0),
++      G.data_ptr<float>(), G.stride(0), src.data_ptr<int>(),
++      dst.data_ptr<int>(), accepted.data_ptr<int>(), ss, ds,
++      factor_indices.data_ptr<int>(), fs, u.size(0));
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// Descriptor columns: state address/stride, u/k/G addresses, pending address,
++// block-table group, physical slot count, factor capacity. All strides are in
++// FP32 elements; factor buffers are contiguous [request,T,...].
++__global__ void __launch_bounds__(128)
++    group_commit_kernel(const int64_t* descriptors, const int64_t* block_tables,
++                        int64_t table_stride, const int* accepted,
++                        const int* scheduled, const int* computed,
++                        const int* draft, int block_size,
++                        const int* idx_mapping, bool mrv2) {
++  const int req = blockIdx.y, layer = blockIdx.z;
++  const int64_t* d = descriptors + layer * 9;
++  auto state = reinterpret_cast<float*>(d[0]);
++  const int64_t state_stride = d[1];
++  const auto u = reinterpret_cast<const float*>(d[2]);
++  const auto k = reinterpret_cast<const float*>(d[3]);
++  const auto G = reinterpret_cast<const float*>(d[4]);
++  const auto pending = reinterpret_cast<const int*>(d[5]);
++  if (req >= d[8]) return;
++  const int si = pending[req];
++  if (si < 0 || si >= d[7]) return;
++  const int ri = mrv2 ? idx_mapping[req] : req;
++  if (ri < 0) return;
++  const int a = min(T, max(0, accepted[ri]));
++  const int running =
++      mrv2 ? computed[ri] - a + 1 : computed[req] + scheduled[req] - draft[req];
++  const int end = running + a - 1;
++  const int boundary = (end / block_size) * block_size;
++  const bool save = a > 0 && boundary >= running;
++  int di = -1, prefix = 0;
++  if (save) {
++    const auto table = reinterpret_cast<const int*>(block_tables[d[6]]);
++    di = table[req * table_stride + boundary / block_size - 1];
++    prefix = boundary - running + 1;
++  }
++  const int hv = blockIdx.x / (V / 16), ih = hv / (HV / H);
++  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++  const int vr = (blockIdx.x % (V / 16)) * 16 + warp * 4 + lane / 8;
++  const int64_t ub = static_cast<int64_t>(req) * T * HV * V;
++  const int64_t kb = static_cast<int64_t>(req) * T * H * K;
++  const int64_t gb = static_cast<int64_t>(req) * T * HV;
++  const float ga = a > 0 ? G[gb + (a - 1) * HV + hv] : 0.f;
++  const float gp = prefix > 0 ? G[gb + (prefix - 1) * HV + hv] : 0.f;
++#pragma unroll
++  for (int chunk = 0; chunk < 4; ++chunk) {
++    const int kc = ((lane & 7) + chunk * 8) * 4;
++    const int64_t offset = (hv * V + vr) * K + kc;
++    const float4 base =
++        *reinterpret_cast<const float4*>(state + si * state_stride + offset);
++    float4 x = base, xp = base;
++    const float decay = __expf(ga), dp = __expf(gp);
++    x.x *= decay;
++    x.y *= decay;
++    x.z *= decay;
++    x.w *= decay;
++    xp.x *= dp;
++    xp.y *= dp;
++    xp.z *= dp;
++    xp.w *= dp;
++    for (int i = 0; i < a; ++i) {
++      const float gi = G[gb + i * HV + hv], ui = u[ub + (i * HV + hv) * V + vr];
++      const float4 kk =
++          *reinterpret_cast<const float4*>(k + kb + (i * H + ih) * K + kc);
++      const float c = __expf(ga - gi) * ui;
++      x.x = fmaf(c, kk.x, x.x);
++      x.y = fmaf(c, kk.y, x.y);
++      x.z = fmaf(c, kk.z, x.z);
++      x.w = fmaf(c, kk.w, x.w);
++      if (save && i < prefix && di != si) {
++        const float cp = __expf(gp - gi) * ui;
++        xp.x = fmaf(cp, kk.x, xp.x);
++        xp.y = fmaf(cp, kk.y, xp.y);
++        xp.z = fmaf(cp, kk.z, xp.z);
++        xp.w = fmaf(cp, kk.w, xp.w);
++      }
++    }
++    if (save && di >= 0 && di < d[7] && di != si)
++      *reinterpret_cast<float4*>(state + di * state_stride + offset) = xp;
++    *reinterpret_cast<float4*>(state + si * state_stride + offset) = x;
++  }
++}
++__global__ void clear_pending_kernel(const int64_t* descriptors, int layers,
++                                     int reqs) {
++  const int i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i >= layers * reqs) return;
++  const int layer = i / reqs, req = i % reqs;
++  const int64_t* d = descriptors + layer * 9;
++  if (req < d[8]) reinterpret_cast<int*>(d[5])[req] = -1;
++}
++void wy_group_commit(std::vector<torch::Tensor> states,
++                     std::vector<torch::Tensor> pending,
++                     torch::Tensor descriptors, torch::Tensor tables,
++                     int64_t table_stride, torch::Tensor accepted,
++                     torch::Tensor scheduled, torch::Tensor computed,
++                     torch::Tensor draft, int64_t block_size,
++                     bool clear_metadata) {
++  TORCH_CHECK(!states.empty() && pending.size() == states.size(),
++              "invalid WY layer group");
++  const c10::cuda::CUDAGuard guard(states[0].device());
++  for (const auto& state : states) check_state(state);
++  for (const auto& t : {accepted, scheduled, computed, draft}) {
++    check_tensor(t, states[0], at::kInt);
++    TORCH_CHECK(
++        t.dim() == 1 && t.is_contiguous() && t.numel() >= accepted.numel(),
++        "invalid WY commit metadata");
++  }
++  for (const auto& t : {descriptors, tables}) {
++    check_tensor(t, states[0], at::kLong);
++    TORCH_CHECK(t.is_contiguous(), "WY pointer tables must be contiguous");
++  }
++  TORCH_CHECK(descriptors.dim() == 2 && descriptors.size(0) == states.size() &&
++                  descriptors.size(1) == 9 && tables.dim() == 1 &&
++                  tables.numel() > 0 && table_stride > 0 && block_size > 0,
++              "invalid WY group layout");
++  const int reqs = accepted.numel(), layers = states.size();
++  for (const auto& t : pending) {
++    check_tensor(t, states[0], at::kInt);
++    TORCH_CHECK(t.is_contiguous() && t.numel() >= reqs,
++                "invalid WY pending storage");
++  }
++  if (!reqs) return;
++  auto stream = at::cuda::getCurrentCUDAStream();
++  group_commit_kernel<<<dim3(HV * V / 16, reqs, layers), 128, 0, stream>>>(
++      descriptors.data_ptr<int64_t>(), tables.data_ptr<int64_t>(), table_stride,
++      accepted.data_ptr<int>(), scheduled.data_ptr<int>(),
++      computed.data_ptr<int>(), draft.data_ptr<int>(), block_size, nullptr,
++      false);
++  if (clear_metadata)
++    clear_pending_kernel<<<(layers * reqs + 127) / 128, 128, 0, stream>>>(
++        descriptors.data_ptr<int64_t>(), layers, reqs);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// Publish accepted convolution history only after boundary-state copies have
++// consumed the speculative window. One CTA owns a request/layer and its pending
++// flag, so clearing that flag cannot race a reader in another CTA.
++__global__ void finish_group_kernel(
++    const int64_t* desc, const int64_t* conv_desc, const int64_t* tables,
++    int64_t table_stride, const int* accepted, const int* scheduled,
++    const int* computed, const int* draft, int block_size, int* next_counts,
++    int* next_selectors, const int* idx_mapping, bool mrv2) {
++  const int layer = blockIdx.x, req = blockIdx.y;
++  const int64_t* d = desc + layer * 9;
++  const int64_t* cd = conv_desc + layer * 3;
++  if (req >= d[8]) return;
++  auto pending = reinterpret_cast<int*>(d[5]);
++  __shared__ int si_shared;
++  if (threadIdx.x == 0) si_shared = pending[req];
++  __syncthreads();
++  const int si = si_shared;
++  if (si < 0 || si >= d[7]) return;
++  const int ri = mrv2 ? idx_mapping[req] : req;
++  if (ri < 0) return;
++  const int a = min(T, max(0, accepted[ri]));
++  const int running =
++      mrv2 ? computed[ri] - a + 1 : computed[req] + scheduled[req] - draft[req];
++  const int boundary = ((running + a - 1) / block_size) * block_size;
++  int offset = max(0, a - 1);
++  if (a > 0 && boundary >= running) {
++    const auto table = reinterpret_cast<const int*>(tables[d[6]]);
++    const int di = table[req * table_stride + boundary / block_size - 1];
++    if (di == si) offset = 0;  // generic postprocess already shifted this block
++  }
++  auto conv = reinterpret_cast<half*>(cd[0]) + si * cd[1];
++  const int channels = cd[2];
++  for (int channel = threadIdx.x; channel < channels; channel += blockDim.x) {
++    const half h0 = conv[offset * channels + channel];
++    const half h1 = conv[(offset + 1) * channels + channel];
++    const half h2 = conv[(offset + 2) * channels + channel];
++    conv[channel] = h0;
++    conv[channels + channel] = h1;
++    conv[2 * channels + channel] = h2;
++  }
++  if (threadIdx.x == 0) {
++    pending[req] = -1;
++    if (layer == 0) {
++      next_counts[ri] = 1;
++      next_selectors[ri] = 1;
++    }
++  }
++}
++void wy_finish_group(std::vector<torch::Tensor> pending,
++                     std::vector<torch::Tensor> conv, torch::Tensor desc,
++                     torch::Tensor conv_desc, torch::Tensor tables,
++                     int64_t table_stride, torch::Tensor accepted,
++                     torch::Tensor scheduled, torch::Tensor computed,
++                     torch::Tensor draft, int64_t block_size,
++                     torch::Tensor next_counts, torch::Tensor next_selectors) {
++  TORCH_CHECK(!conv.empty() && pending.size() == conv.size(),
++              "invalid WY finish group");
++  const c10::cuda::CUDAGuard guard(conv[0].device());
++  for (const auto& t : conv) {
++    check_tensor(t, conv[0], at::kHalf);
++    TORCH_CHECK(t.dim() == 3 && t.size(1) == 10 && t.size(2) == 2560 &&
++                    t.stride(2) == 1 && t.stride(1) == 2560,
++                "WY publication requires width-first FP16 convolution history");
++  }
++  for (const auto& t : pending) check_tensor(t, conv[0], at::kInt);
++  for (const auto& t :
++       {accepted, scheduled, computed, draft, next_counts, next_selectors}) {
++    check_tensor(t, conv[0], at::kInt);
++    TORCH_CHECK(
++        t.dim() == 1 && t.is_contiguous() && t.numel() >= accepted.numel(),
++        "invalid WY finish metadata");
++  }
++  for (const auto& t : {desc, conv_desc, tables}) {
++    check_tensor(t, conv[0], at::kLong);
++    TORCH_CHECK(t.is_contiguous(), "invalid WY finish pointer table");
++  }
++  TORCH_CHECK(desc.dim() == 2 && desc.size(0) == conv.size() &&
++                  desc.size(1) == 9 && conv_desc.dim() == 2 &&
++                  conv_desc.size(0) == conv.size() && conv_desc.size(1) == 3 &&
++                  tables.dim() == 1 && tables.numel() > 0 && block_size > 0 &&
++                  table_stride > 0,
++              "invalid WY finish descriptors");
++  if (!accepted.numel()) return;
++  finish_group_kernel<<<dim3(conv.size(), accepted.numel()), 128, 0,
++                        at::cuda::getCurrentCUDAStream()>>>(
++      desc.data_ptr<int64_t>(), conv_desc.data_ptr<int64_t>(),
++      tables.data_ptr<int64_t>(), table_stride, accepted.data_ptr<int>(),
++      scheduled.data_ptr<int>(), computed.data_ptr<int>(),
++      draft.data_ptr<int>(), block_size, next_counts.data_ptr<int>(),
++      next_selectors.data_ptr<int>(), nullptr, false);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void wy_commit_group_v2(std::vector<torch::Tensor> states,
++                        std::vector<torch::Tensor> pending, torch::Tensor desc,
++                        torch::Tensor tables, int64_t table_stride,
++                        torch::Tensor accepted, torch::Tensor computed,
++                        torch::Tensor mapping, int64_t block_size) {
++  TORCH_CHECK(!states.empty() && states.size() == pending.size(),
++              "invalid WY MRV2 group");
++  const c10::cuda::CUDAGuard guard(states[0].device());
++  for (const auto& t : states) check_state(t);
++  for (const auto& t : pending) check_tensor(t, states[0], at::kInt);
++  for (const auto& t : {accepted, computed, mapping}) {
++    check_tensor(t, states[0], at::kInt);
++    TORCH_CHECK(t.dim() == 1 && t.is_contiguous(),
++                "invalid WY MRV2 sequence metadata");
++  }
++  for (const auto& t : {desc, tables}) {
++    check_tensor(t, states[0], at::kLong);
++    TORCH_CHECK(t.is_contiguous(), "invalid WY MRV2 pointer table");
++  }
++  TORCH_CHECK(desc.dim() == 2 && desc.size(0) == states.size() &&
++                  desc.size(1) == 9 && tables.dim() == 1 &&
++                  tables.numel() > 0 && table_stride > 0 && block_size > 0 &&
++                  computed.numel() == accepted.numel(),
++              "invalid WY MRV2 layout");
++  if (!mapping.numel()) return;
++  group_commit_kernel<<<dim3(HV * V / 16, mapping.numel(), states.size()), 128,
++                        0, at::cuda::getCurrentCUDAStream()>>>(
++      desc.data_ptr<int64_t>(), tables.data_ptr<int64_t>(), table_stride,
++      accepted.data_ptr<int>(), nullptr, computed.data_ptr<int>(), nullptr,
++      block_size, mapping.data_ptr<int>(), true);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++void wy_finish_group_v2(std::vector<torch::Tensor> pending,
++                        std::vector<torch::Tensor> conv, torch::Tensor desc,
++                        torch::Tensor conv_desc, torch::Tensor tables,
++                        int64_t table_stride, torch::Tensor accepted_snapshot,
++                        torch::Tensor computed, torch::Tensor mapping,
++                        int64_t block_size, torch::Tensor next_counts) {
++  TORCH_CHECK(!conv.empty() && conv.size() == pending.size(),
++              "invalid WY MRV2 finish group");
++  const c10::cuda::CUDAGuard guard(conv[0].device());
++  for (const auto& t : conv) {
++    check_tensor(t, conv[0], at::kHalf);
++    TORCH_CHECK(t.dim() == 3 && t.size(1) == 10 && t.size(2) == 2560 &&
++                    t.stride(2) == 1 && t.stride(1) == 2560,
++                "WY requires width-first FP16 convolution history");
++  }
++  for (const auto& t : pending) check_tensor(t, conv[0], at::kInt);
++  for (const auto& t : {accepted_snapshot, computed, mapping, next_counts}) {
++    check_tensor(t, conv[0], at::kInt);
++    TORCH_CHECK(t.dim() == 1 && t.is_contiguous(),
++                "invalid WY MRV2 finish metadata");
++  }
++  for (const auto& t : {desc, conv_desc, tables}) {
++    check_tensor(t, conv[0], at::kLong);
++    TORCH_CHECK(t.is_contiguous(), "invalid WY MRV2 finish pointers");
++  }
++  TORCH_CHECK(desc.dim() == 2 && desc.size(0) == conv.size() &&
++                  desc.size(1) == 9 && conv_desc.dim() == 2 &&
++                  conv_desc.size(0) == conv.size() && conv_desc.size(1) == 3 &&
++                  tables.dim() == 1 && tables.numel() > 0 && table_stride > 0 &&
++                  block_size > 0 &&
++                  computed.numel() == accepted_snapshot.numel() &&
++                  next_counts.numel() == computed.numel(),
++              "invalid WY MRV2 finish layout");
++  if (!mapping.numel()) return;
++  finish_group_kernel<<<dim3(conv.size(), mapping.numel()), 128, 0,
++                        at::cuda::getCurrentCUDAStream()>>>(
++      desc.data_ptr<int64_t>(), conv_desc.data_ptr<int64_t>(),
++      tables.data_ptr<int64_t>(), table_stride,
++      accepted_snapshot.data_ptr<int>(), nullptr, computed.data_ptr<int>(),
++      nullptr, block_size, next_counts.data_ptr<int>(),
++      next_counts.data_ptr<int>(), mapping.data_ptr<int>(), true);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace
++TORCH_LIBRARY_FRAGMENT(_C, m) {
++  m.def(
++      "gdn_wy_commit_group_v2_sm70(Tensor(a!)[] states, Tensor(b!)[] pending, "
++      "Tensor desc, Tensor tables, int table_stride, Tensor accepted, Tensor "
++      "computed, Tensor mapping, int block_size) -> ()");
++  m.def(
++      "gdn_wy_finish_group_v2_sm70(Tensor(a!)[] pending, Tensor(b!)[] conv, "
++      "Tensor desc, Tensor conv_desc, Tensor tables, int table_stride, Tensor "
++      "accepted_snapshot, Tensor computed, Tensor mapping, int block_size, "
++      "Tensor(c!) next_counts) -> ()");
++  m.def(
++      "gdn_wy_finish_group_sm70(Tensor(a!)[] pending, Tensor(b!)[] conv, "
++      "Tensor desc, Tensor conv_desc, Tensor tables, int table_stride, Tensor "
++      "accepted, Tensor scheduled, Tensor computed, Tensor draft, int "
++      "block_size, Tensor(c!) next_counts, Tensor(d!) next_selectors) -> ()");
++  m.def(
++      "gdn_wy_commit_group_sm70(Tensor(a!)[] states, Tensor(b!)[] pending, "
++      "Tensor descriptors, Tensor tables, int table_stride, Tensor accepted, "
++      "Tensor scheduled, Tensor computed, Tensor draft, int block_size, bool "
++      "clear_metadata=True) -> ()");
++  m.def(
++      "gdn_wy_verify_sm70_out(Tensor(a!) out, Tensor(b!) state, Tensor(c!) "
++      "new_u, Tensor(d!) new_k, Tensor(e!) new_G, Tensor q, Tensor k, Tensor "
++      "v, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor indices, "
++      "Tensor factor_indices, Tensor(f!)? pending, Tensor cu_seqlens, Tensor "
++      "accepted, Tensor prev_u, Tensor prev_k, Tensor prev_G, float scale, int "
++      "variant) -> ()");
++  m.def(
++      "gdn_wy_commit_sm70(Tensor(a!) state, Tensor u, Tensor k, Tensor G, "
++      "Tensor src, Tensor dst, Tensor accepted, Tensor factor_indices) -> ()");
++}
++TORCH_LIBRARY_IMPL(_C, CUDA, m) {
++  m.impl("gdn_wy_commit_group_v2_sm70", &wy_commit_group_v2);
++  m.impl("gdn_wy_finish_group_v2_sm70", &wy_finish_group_v2);
++  m.impl("gdn_wy_finish_group_sm70", &wy_finish_group);
++  m.impl("gdn_wy_commit_group_sm70", &wy_group_commit);
++  m.impl("gdn_wy_verify_sm70_out", &wy_verify);
++  m.impl("gdn_wy_commit_sm70", &wy_commit);
++}
+diff --git a/tests/kernels/mamba/test_gdn_wy_sm70.py b/tests/kernels/mamba/test_gdn_wy_sm70.py
+new file mode 100644
+index 0000000000..5515be80ac
+--- /dev/null
++++ b/tests/kernels/mamba/test_gdn_wy_sm70.py
+@@ -0,0 +1,496 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Indexed WY verification against a dense FP64 recurrence.
++
++Tests use the shipped operator. Research runs may explicitly load an extension
++built from this same source before invoking pytest; no runtime depends on it.
++"""
++
++import runpy
++from pathlib import Path
++
++import pytest
++import torch
++
++T, H, HV, K, V = 8, 4, 12, 128, 128
++
++
++def dense(q, k, v, a, b, A_log, dt_bias, state, scale):
++    q, k, v = q.double(), k.double(), v.double()
++    q *= torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6) * scale
++    k *= torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
++    q, k = q.repeat_interleave(3, 1), k.repeat_interleave(3, 1)
++    g = -A_log.double().exp() * torch.nn.functional.softplus(
++        a.double() + dt_bias.double()
++    )
++    beta = b.double().sigmoid()
++    state = state.double().clone()
++    outputs, states = [], []
++    for i in range(q.size(0)):
++        state *= g[i].exp()[:, None, None]
++        residual = beta[i, :, None] * (v[i] - torch.einsum("hvk,hk->hv", state, k[i]))
++        state += residual[:, :, None] * k[i, :, None, :]
++        outputs.append(torch.einsum("hvk,hk->hv", state, q[i]))
++        states.append(state.clone())
++    return torch.stack(outputs).half(), states
++
++
++def require_op():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("requires SM70")
++    if not hasattr(torch.ops._C, "gdn_wy_verify_sm70_out"):
++        pytest.skip("requires source-built WY operators")
++
++
++@pytest.mark.parametrize("nseq", [1, 4, 8])
++@pytest.mark.parametrize("variant", range(5))
++def test_chained_reorder_prefix_commit(nseq, variant):
++    require_op()
++    torch.manual_seed(37)
++    slots = 2 * nseq + 3
++    # Match padded Mamba pages rather than assuming tightly packed states.
++    state_storage = torch.randn(slots, HV * V * K + 64, device="cuda") * 0.03
++    state = state_storage[:, : HV * V * K].view(slots, HV, V, K)
++    initial = state.clone()
++    u = torch.zeros(slots, 2, T, HV, V, device="cuda")
++    kc = torch.zeros(slots, 2, T, H, K, device="cuda")
++    G = torch.zeros(slots, 2, T, HV, device="cuda")
++    A_log = torch.randn(HV, device="cuda") * 0.2 - 2
++    dt_bias = torch.randn(HV, device="cuda") * 0.2
++    selected = [1 + 2 * i for i in range(nseq)]
++    active = {slot: initial[slot].double() for slot in selected}
++    previous: dict[int, list[torch.Tensor]] = {}
++    bank = 0
++    for step in range(4):
++        ordered = selected if step % 2 == 0 else selected[::-1]
++        lengths = [1 + ((j * 3 + step) % T) for j in range(nseq)]
++        # Include an empty padded request whose invalid slot must never be read.
++        ids = torch.full((nseq + 1, T), -1, device="cuda", dtype=torch.int32)
++        ids[:nseq, 0] = torch.tensor(ordered, device="cuda", dtype=torch.int32)
++        offsets = [0]
++        for length in lengths:
++            offsets.append(offsets[-1] + length)
++        offsets.append(offsets[-1])
++        cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
++        acc = [
++            0 if step == 0 else (j + step) % (len(previous[slot]) + 1)
++            for j, slot in enumerate(ordered)
++        ]
++        accepted = torch.tensor(acc + [0], device="cuda", dtype=torch.int32)
++        nt = offsets[-1]
++        mixed = (
++            torch.randn(nt, 2 * H * K + HV * V, device="cuda", dtype=torch.float16)
++            * 0.3
++        )
++        q, k, v = mixed.split([H * K, H * K, HV * V], dim=1)
++        a = torch.randn(nt, HV, device="cuda", dtype=torch.float16)
++        b = torch.randn_like(a)
++        out = torch.empty(nt, HV * V, device="cuda", dtype=torch.float16)
++        expected = []
++        next_previous = {}
++        for j, slot in enumerate(ordered):
++            if step and acc[j]:
++                active[slot] = previous[slot][acc[j] - 1]
++            lo, hi = offsets[j : j + 2]
++            ref, states = dense(
++                q[lo:hi].view(-1, H, K),
++                k[lo:hi].view(-1, H, K),
++                v[lo:hi].view(-1, HV, V),
++                a[lo:hi],
++                b[lo:hi],
++                A_log,
++                dt_bias,
++                active[slot],
++                K**-0.5,
++            )
++            expected.append(ref.reshape(-1, HV * V))
++            next_previous[slot] = states
++        torch.ops._C.gdn_wy_verify_sm70_out(
++            out,
++            state,
++            u[:, 1 - bank],
++            kc[:, 1 - bank],
++            G[:, 1 - bank],
++            q,
++            k,
++            v,
++            a,
++            b,
++            A_log,
++            dt_bias,
++            ids,
++            ids,
++            None,
++            cu,
++            accepted,
++            u[:, bank],
++            kc[:, bank],
++            G[:, bank],
++            K**-0.5,
++            variant,
++        )
++        torch.testing.assert_close(out, torch.cat(expected), atol=1e-4, rtol=2e-3)
++        for slot in ordered:
++            torch.testing.assert_close(
++                state[slot].double(), active[slot], atol=2e-6, rtol=2e-5
++            )
++        previous = next_previous
++        bank = 1 - bank
++        # Save an interior prefix to independent physical blocks. Running state
++        # and factors remain intact, so the next verify can accept another prefix.
++        dest = torch.tensor(
++            [slot + 1 for slot in ordered], device="cuda", dtype=torch.int32
++        )
++        counts = [max(1, length // 2) for length in lengths]
++        prefix = torch.tensor(counts, device="cuda", dtype=torch.int32)
++        torch.ops._C.gdn_wy_commit_sm70(
++            state,
++            u[:, bank],
++            kc[:, bank],
++            G[:, bank],
++            ids[:nseq],
++            dest,
++            prefix,
++            ids[:nseq],
++        )
++        for j, slot in enumerate(ordered):
++            torch.testing.assert_close(
++                state[slot + 1].double(),
++                previous[slot][counts[j] - 1],
++                atol=2e-6,
++                rtol=2e-5,
++            )
++    # Exit speculation: materialize the final accepted state in place.
++    src = torch.tensor(ordered, device="cuda", dtype=torch.int32)
++    counts = torch.tensor(lengths, device="cuda", dtype=torch.int32)
++    torch.ops._C.gdn_wy_commit_sm70(
++        state, u[:, bank], kc[:, bank], G[:, bank], src, src, counts, src
++    )
++    for slot in ordered:
++        torch.testing.assert_close(
++            state[slot].double(), previous[slot][-1], atol=2e-6, rtol=2e-5
++        )
++    torch.testing.assert_close(state[0], initial[0], rtol=0, atol=0)
++
++
++def test_commit_zero_copy_and_graph():
++    require_op()
++    state = torch.randn(3, HV, V, K, device="cuda")
++    original = state.clone()
++    u = torch.zeros(3, T, HV, V, device="cuda")
++    k = torch.zeros(3, T, H, K, device="cuda")
++    G = torch.zeros(3, T, HV, device="cuda")
++    src = torch.tensor([0, -1], device="cuda", dtype=torch.int32)
++    dst = torch.tensor([1, -1], device="cuda", dtype=torch.int32)
++    acc = torch.zeros(2, device="cuda", dtype=torch.int32)
++    stream = torch.cuda.Stream()
++    with torch.cuda.stream(stream):
++        torch.ops._C.gdn_wy_commit_sm70(state, u, k, G, src, dst, acc, src)
++    torch.accelerator.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        torch.ops._C.gdn_wy_commit_sm70(state, u, k, G, src, dst, acc, src)
++    graph.replay()
++    torch.testing.assert_close(state[1], original[0], atol=0, rtol=0)
++    torch.testing.assert_close(state[2], original[2], atol=0, rtol=0)
++
++
++@pytest.mark.parametrize("runner", ["v1", "v2", "v2_triton"])
++@pytest.mark.parametrize("same_block", [False, True])
++def test_batched_commit_saves_boundary_and_running_state(runner, same_block):
++    require_op()
++    torch.manual_seed(91)
++    nreq, nlayers, slots = 8, 3, 19
++    states, factors, pending, descriptors, conv, conv_desc = [], [], [], [], [], []
++    expected, conv_expected = [], []
++    source = torch.tensor(
++        [1 + 2 * i for i in range(nreq)], device="cuda", dtype=torch.int32
++    )
++    dest = source + 1
++    tables = torch.stack([dest, source], dim=1).contiguous()
++    batch_accepted = torch.tensor(
++        [8, 7, 6, 5, 4, 3, 2, 3], device="cuda", dtype=torch.int32
++    )
++    base_computed = 504 if same_block else 249
++    computed = torch.full((nreq,), base_computed, device="cuda", dtype=torch.int32)
++    scheduled = torch.full_like(computed, 8)
++    draft = torch.full_like(computed, 7)
++    mapping = torch.tensor([6, 1, 5, 0, 4, 3, 2, 7], device="cuda", dtype=torch.int32)
++    accepted = torch.empty_like(batch_accepted)
++    updated_computed = torch.empty_like(computed)
++    accepted[mapping.long()] = batch_accepted
++    updated_computed[mapping.long()] = computed + batch_accepted
++    snapshot = accepted.clone()
++    next_counts = (
++        accepted.clone() if runner.startswith("v2") else batch_accepted.clone()
++    )
++    next_selectors = next_counts.clone()
++    for layer in range(nlayers):
++        state = torch.randn(slots, HV, V, K, device="cuda") * 0.03
++        u = torch.randn(nreq, T, HV, V, device="cuda") * 0.05
++        k = torch.randn(nreq, T, H, K, device="cuda") * 0.04
++        G = (-torch.rand(nreq, T, HV, device="cuda") * 0.1).cumsum(1)
++        live = source.clone()
++        live[-1] = -1  # plain decode/prefill has no deferred WY update
++        states.append(state)
++        factors.append((u, k, G))
++        pending.append(live)
++        descriptors.append(
++            [
++                state.data_ptr(),
++                state.stride(0),
++                u.data_ptr(),
++                k.data_ptr(),
++                G.data_ptr(),
++                live.data_ptr(),
++                0,
++                slots,
++                nreq,
++            ]
++        )
++        history = torch.randn(slots, 10, 2560, device="cuda", dtype=torch.float16)
++        conv.append(history)
++        conv_desc.append([history.data_ptr(), history.stride(0), history.size(2)])
++        conv_expected.append(
++            [
++                history[
++                    source[i], int(batch_accepted[i]) - 1 : int(batch_accepted[i]) + 2
++                ].clone()
++                if i < nreq - 1
++                else history[source[i], :3].clone()
++                for i in range(nreq)
++            ]
++        )
++        refs = []
++        for req in range(nreq):
++
++            def materialize(count, G=G, req=req, state=state, u=u, k=k):
++                g = G[req, count - 1].double()
++                result = state[source[req]].double() * g.exp()[:, None, None]
++                for i in range(count):
++                    coef = (g - G[req, i].double()).exp()[:, None] * u[req, i].double()
++                    kk = k[req, i].double().repeat_interleave(3, 0)
++                    result += coef[:, :, None] * kk[:, None, :]
++                return result
++
++            refs.append(
++                (
++                    materialize(int(batch_accepted[req])),
++                    materialize(7),
++                    state[source[req]].clone(),
++                    state[dest[req]].clone(),
++                )
++            )
++        expected.append(refs)
++    desc = torch.tensor(descriptors, device="cuda", dtype=torch.int64)
++    cd = torch.tensor(conv_desc, device="cuda", dtype=torch.int64)
++    table_ptrs = torch.tensor([tables.data_ptr()], device="cuda", dtype=torch.int64)
++    if runner.startswith("v2"):
++        torch.ops._C.gdn_wy_commit_group_v2_sm70(
++            states,
++            pending,
++            desc,
++            table_ptrs,
++            tables.stride(0),
++            accepted,
++            updated_computed,
++            mapping,
++            256,
++        )
++    else:
++        torch.ops._C.gdn_wy_commit_group_sm70(
++            states,
++            pending,
++            desc,
++            table_ptrs,
++            tables.stride(0),
++            batch_accepted,
++            scheduled,
++            computed,
++            draft,
++            256,
++            False,
++        )
++    # Existing postprocess consumes convolution prefixes before finish shifts
++    # the running window. Exercise both same-block and distinct destinations.
++    if runner == "v2_triton":
++        # Exercise the production copy kernel, including overlapping SD-layout
++        # convolution copies and the collapsed temporal-state copy guard.
++        module = runpy.run_path(
++            str(
++                Path(__file__).resolve().parents[3]
++                / "vllm/v1/worker/gpu/mamba_align.py"
++            )
++        )
++        tensors = [tensor for pair in zip(conv, states) for tensor in pair]
++
++        def metadata(values, dtype):
++            return torch.tensor(values, device="cuda", dtype=dtype)
++
++        kernel = module["_postprocess_mamba_align_kernel"]
++        kernel[(nreq, len(tensors), 16)](
++            snapshot,
++            next_counts,
++            torch.ones(nreq, device="cuda", dtype=torch.int32),
++            updated_computed,
++            table_ptrs,
++            tables.stride(0),
++            metadata([t.data_ptr() for t in tensors], torch.int64),
++            metadata([t.stride(0) * t.element_size() for t in tensors], torch.int64),
++            metadata([t.element_size() for t in tensors], torch.int32),
++            metadata([2560, HV * V * K] * nlayers, torch.int64),
++            metadata([10, 0] * nlayers, torch.int32),
++            metadata([0] * len(tensors), torch.int32),
++            metadata([False, True] * nlayers, torch.bool),
++            mapping,
++            nreq,
++            MAMBA_BLOCK_SIZE=256,
++            COPY_BLOCK_SIZE=1024,
++            TEMPORAL_TILES=16,
++        )
++    else:
++        for history in conv:
++            if same_block:
++                history[source[0], :3].copy_(history[source[0], 7:10].clone())
++            else:
++                for req in (0, 1):
++                    history[dest[req], :4].copy_(history[source[req], 6:10])
++    if runner.startswith("v2"):
++        torch.ops._C.gdn_wy_finish_group_v2_sm70(
++            pending,
++            conv,
++            desc,
++            cd,
++            table_ptrs,
++            tables.stride(0),
++            snapshot,
++            updated_computed,
++            mapping,
++            256,
++            next_counts,
++        )
++    else:
++        torch.ops._C.gdn_wy_finish_group_sm70(
++            pending,
++            conv,
++            desc,
++            cd,
++            table_ptrs,
++            tables.stride(0),
++            batch_accepted,
++            scheduled,
++            computed,
++            draft,
++            256,
++            next_counts,
++            next_selectors,
++        )
++    for layer in range(nlayers):
++        for req in range(nreq):
++            full, prefix, oldsource, olddest = expected[layer][req]
++            if req == nreq - 1:
++                torch.testing.assert_close(
++                    states[layer][source[req]], oldsource, rtol=0, atol=0
++                )
++            else:
++                torch.testing.assert_close(
++                    states[layer][source[req]].double(), full, rtol=2e-5, atol=2e-6
++                )
++            if not same_block and req <= 1:
++                torch.testing.assert_close(
++                    states[layer][dest[req]].double(), prefix, rtol=2e-5, atol=2e-6
++                )
++            else:
++                torch.testing.assert_close(
++                    states[layer][dest[req]], olddest, rtol=0, atol=0
++                )
++            torch.testing.assert_close(
++                conv[layer][source[req], :3], conv_expected[layer][req], rtol=0, atol=0
++            )
++        assert torch.equal(pending[layer], torch.full_like(pending[layer], -1))
++    expected_counts = torch.ones_like(next_counts)
++    expected_counts[int(mapping[-1]) if runner.startswith("v2") else nreq - 1] = 3
++    torch.testing.assert_close(next_counts, expected_counts, rtol=0, atol=0)
++
++
++def test_single_bank_scattered_request_mask_and_padded_rows():
++    require_op()
++    torch.manual_seed(13)
++    state = torch.randn(20, HV, V, K, device="cuda") * 0.03
++    active = state.double().clone()
++    u = torch.empty(8, T, HV, V, device="cuda")
++    kcache = torch.empty(8, T, H, K, device="cuda")
++    G = torch.empty(8, T, HV, device="cuda")
++    pending = torch.full((8,), -1, device="cuda", dtype=torch.int32)
++    masks = torch.tensor(
++        [False, True, False, True, True, False, True, False], device="cuda"
++    )
++    physical = [17, 3, 8, 12]
++    factors = torch.tensor([1, 3, 4, 6], device="cuda", dtype=torch.int32)
++    ids = torch.tensor(physical + [-1, -1, -1, -1], device="cuda", dtype=torch.int32)
++    cu = torch.tensor(
++        [0, 8, 16, 24, 32, 32, 32, 32, 32], device="cuda", dtype=torch.int32
++    )
++    zero = torch.zeros(8, device="cuda", dtype=torch.int32)
++    A_log = torch.randn(HV, device="cuda") * 0.1 - 2
++    dt_bias = torch.randn(HV, device="cuda", dtype=torch.float16) * 0.1
++    for step in range(3):
++        mixed = torch.randn(32, 2560, device="cuda", dtype=torch.float16) * 0.25
++        q, k, v = mixed.split([512, 512, 1536], dim=1)
++        a = torch.randn(32, HV, device="cuda", dtype=torch.float16)
++        b = torch.randn_like(a)
++        out = torch.empty(32, 1536, device="cuda", dtype=torch.float16)
++        refs = []
++        accepted = [1 + ((step + j * 3) % 8) for j in range(4)]
++        for j, slot in enumerate(physical):
++            region = slice(j * 8, (j + 1) * 8)
++            ref, states = dense(
++                q[region].view(8, H, K),
++                k[region].view(8, H, K),
++                v[region].view(8, HV, V),
++                a[region],
++                b[region],
++                A_log,
++                dt_bias,
++                active[slot],
++                K**-0.5,
++            )
++            refs.append(ref.reshape(8, 1536))
++            active[slot] = states[accepted[j] - 1]
++        # Same factor tensors are legal here: previous acceptance is zero,
++        # and state was published by the preceding iteration's commit.
++        torch.ops._C.gdn_wy_verify_sm70_out(
++            out,
++            state,
++            u,
++            kcache,
++            G,
++            q,
++            k,
++            v,
++            a,
++            b,
++            A_log,
++            dt_bias,
++            ids,
++            masks,
++            pending,
++            cu,
++            zero,
++            u,
++            kcache,
++            G,
++            K**-0.5,
++            3,
++        )
++        torch.testing.assert_close(out, torch.cat(refs), atol=1e-4, rtol=2e-3)
++        torch.testing.assert_close(pending[factors], ids[:4], atol=0, rtol=0)
++        counts = torch.tensor(accepted, device="cuda", dtype=torch.int32)
++        torch.ops._C.gdn_wy_commit_sm70(
++            state, u, kcache, G, ids[:4], ids[:4], counts, factors
++        )
++        for slot in physical:
++            torch.testing.assert_close(
++                state[slot].double(), active[slot], atol=2e-6, rtol=2e-5
++            )
++        pending.fill_(-1)
+diff --git a/tests/v1/worker/test_gdn_wy_cache.py b/tests/v1/worker/test_gdn_wy_cache.py
+new file mode 100644
+index 0000000000..6642d39056
+--- /dev/null
++++ b/tests/v1/worker/test_gdn_wy_cache.py
+@@ -0,0 +1,77 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from dataclasses import replace
++from types import SimpleNamespace
++
++import numpy as np
++import torch
++
++from vllm.model_executor.layers.mamba.mamba_utils import (
++    get_conv_copy_spec,
++    get_temporal_copy_spec,
++)
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
++from vllm.v1.worker.mamba_utils import MambaCopyBuffers, collect_mamba_copy_meta
++
++
++def test_preprocess_uses_published_state_but_shifts_conv_history():
++    conv = torch.arange(4 * 10 * 16, dtype=torch.float32).view(4, 10, 16)
++    state = torch.arange(4 * 64, dtype=torch.float32).view(4, 64)
++    spec = MambaSpec(
++        block_size=256,
++        shapes=((10, 16), (64,)),
++        dtypes=(torch.float32, torch.float32),
++        mamba_cache_mode="align",
++        gdn_wy=True,
++        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
++    )
++    config = KVCacheConfig(
++        num_blocks=4,
++        kv_cache_tensors=[],
++        kv_cache_groups=[KVCacheGroupSpec(layer_names=["gdn"], kv_cache_spec=spec)],
++    )
++
++    def buffer(n, dtype):
++        arr = np.zeros(n, dtype=np.int64 if dtype == torch.int64 else np.int32)
++        return SimpleNamespace(np=arr, cpu=torch.from_numpy(arr))
++
++    functions = (get_conv_copy_spec, get_temporal_copy_spec)
++    copies = MambaCopyBuffers.create(1, config, functions, buffer)
++    collect_mamba_copy_meta(
++        copies,
++        config,
++        functions,
++        [0],
++        0,
++        1,
++        3,
++        SimpleNamespace(block_ids=[[0, 1, 2, 3]]),
++        {"gdn": SimpleNamespace(kv_cache=(conv, state))},
++        3,
++    )
++    assert copies.offset == 2
++    assert copies.src_ptrs.np[0] == conv[0, 3:].data_ptr()
++    assert copies.src_ptrs.np[1] == state[0].data_ptr()
++    assert copies.dst_ptrs.np[1] == state[1].data_ptr()
++    assert copies.sizes.np[0] == conv[0, 3:].numel() * conv.element_size()
++    assert copies.sizes.np[1] == state[0].numel() * state.element_size()
++
++
++def test_memory_admission_removes_seven_running_pages():
++    spec = MambaSpec(
++        block_size=256,
++        shapes=((10, 2560), (12, 128, 128)),
++        dtypes=(torch.float16, torch.float32),
++        mamba_cache_mode="align",
++        num_speculative_blocks=7,
++    )
++    collapsed = replace(spec, gdn_wy=True, num_speculative_blocks=0)
++    cfg = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="align"))
++    assert (
++        spec.max_memory_usage_bytes(cfg) - collapsed.max_memory_usage_bytes(cfg)
++        == 7 * spec.page_size_bytes
++    )
++    assert (
++        collapsed.shapes == spec.shapes
++    )  # prefill and convolution layouts remain valid
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 063582e6b0..4fa533293f 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -2290,6 +2290,12 @@ def forward_cutedsl(
+ 
+ @PluggableLayer.register("qwen_gated_delta_net_attention")
+ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
++    def get_kv_cache_spec(self, vllm_config):
++        spec = super().get_kv_cache_spec(vllm_config)
++        if self.gdn_wy_cache is not None:
++            return self.gdn_wy_cache.cache_spec(spec)
++        return spec
++
+     def get_state_shape(
+         self,
+     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+@@ -2314,6 +2320,7 @@ def __init__(
+         # Runtime forward/capture need not retain the initialization config.
+         # Capture LoRA exclusion while the owning configuration is available.
+         self.enable_sm70_gdn_ba_verify = vllm_config.lora_config is None
++        self.gdn_wy_cache = None
+ 
+         self.num_k_heads = config.linear_num_key_heads
+         self.num_v_heads = config.linear_num_value_heads
+@@ -2323,6 +2330,16 @@ def __init__(
+         self.key_dim = self.head_k_dim * self.num_k_heads
+         self.value_dim = self.head_v_dim * self.num_v_heads
+         self.gqa_interleaved_layout = gqa_interleaved_layout
++        from vllm.model_executor.layers.mamba.gdn.sm70_wy import (
++            WYStateCache,
++            admits_wy_cache,
++        )
++
++        if admits_wy_cache(vllm_config, self):
++            self.gdn_wy_cache = WYStateCache(
++                vllm_config.scheduler_config.max_num_seqs,
++                current_platform.current_device(),
++            )
+         if current_platform.is_xpu():
+             self._forward_method = self.forward_xpu
+         elif current_platform.is_cpu():
+@@ -5315,7 +5332,7 @@ def _can_use_dflash2_packed_gdn_verify(
+         ssm_state: torch.Tensor,
+         attn_metadata: GDNAttentionMetadata,
+     ) -> bool:
+-        return bool(
++        eligible = bool(
+             self.enable_sm70_dflash2_fused_gdn_verify
+             and mixed_qkv is not None
+             and attn_metadata.spec_sequence_masks is not None
+@@ -5344,6 +5361,17 @@ def _can_use_dflash2_packed_gdn_verify(
+             and core_attn_out.is_contiguous()
+         )
+ 
++        if (
++            self.gdn_wy_cache is not None
++            and attn_metadata.num_spec_decodes > 0
++            and not eligible
++        ):
++            raise RuntimeError(
++                "Snapshot-free GDN cache requires the indexed WY verifier; "
++                "cannot fall back to a snapshot writer on collapsed state pages."
++            )
++        return eligible
++
+     def _can_use_sm70_gdn_preprocess(self, mixed_qkv, a, b, conv_state, metadata):
+         # Restrict the first admission to a complete single-request verifier.
+         # Mixed batches, padding with fewer actual tokens, and trees retain the
+@@ -5434,6 +5462,27 @@ def _forward_dflash2_packed_gdn_verify(
+     ) -> torch.Tensor:
+         num_tokens = mixed_qkv.shape[0]
+         out = core_attn_out[:num_tokens].unsqueeze(1)
++        if self.gdn_wy_cache is not None:
++            metadata_raw = get_forward_context().attn_metadata
++            assert isinstance(metadata_raw, dict)
++            metadata = metadata_raw[self.prefix]
++            assert isinstance(metadata, GDNAttentionMetadata)
++            self.gdn_wy_cache.verify(
++                self,
++                mixed_qkv,
++                a,
++                b,
++                out,
++                ssm_state,
++                spec_query_start_loc,
++                spec_state_indices_tensor,
++                metadata.spec_sequence_masks,
++                num_spec_decodes,
++            )
++            _log_runtime_route_once(
++                "SM70 indexed snapshot-free WY GDN verify route hit."
++            )
++            return out.transpose(0, 1)
+         # Match the ordinary speculative verifier's FP32 beta materialization.
+         # The gating helper otherwise defaults to the FP16 dtype of b.
+         if precomputed_gating is None:
+diff --git a/vllm/model_executor/layers/mamba/gdn/sm70_wy.py b/vllm/model_executor/layers/mamba/gdn/sm70_wy.py
+new file mode 100644
+index 0000000000..949f9db8ca
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/gdn/sm70_wy.py
+@@ -0,0 +1,220 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Snapshot-free, indexed FP32 GDN verification and state publication.
++
++Factors only live between the verifier and post-sampling state publication.
++The running state is always materialized before returning control to the
++scheduler, so preemption, prefix reuse, prefill, and plain decode never inherit
++an uncommitted factor bank. Publication batches all layers into one launch.
++"""
++
++from dataclasses import replace
++
++import torch
++
++from vllm import envs
++from vllm.config.sm70_dflash2 import capture_sm70_dflash2_config
++from vllm.platforms import current_platform
++
++_NATIVE_OPS = (
++    "gdn_wy_verify_sm70_out",
++    "gdn_wy_commit_sm70",
++    "gdn_wy_commit_group_sm70",
++    "gdn_wy_finish_group_sm70",
++    "gdn_wy_commit_group_v2_sm70",
++    "gdn_wy_finish_group_v2_sm70",
++)
++
++for _name in _NATIVE_OPS:
++    if hasattr(torch.ops._C, _name):
++        torch.library.register_fake(f"_C::{_name}")(lambda *args, **kwargs: None)
++
++
++def admits_wy_cache(config, layer) -> bool:
++    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
++
++    spec = config.speculative_config
++    policy = capture_sm70_dflash2_config(config)
++    return bool(
++        current_platform.is_cuda()
++        and current_platform.is_device_capability(70)
++        and policy is not None
++        and policy.qualified
++        and policy.fused_gdn_verify
++        and spec is not None
++        and spec.method == "dflash"
++        and spec.num_speculative_tokens == 7
++        and not spec.ngram_assist
++        and config.lora_config is None
++        and config.parallel_config.pipeline_parallel_size == 1
++        and not config.parallel_config.enable_dbo
++        and config.cache_config.mamba_cache_mode == "align"
++        and not envs.VLLM_MAMBA_ALIGN_CPU_POSTPROCESS
++        and layer.model_config.dtype == torch.float16
++        and layer.get_state_dtype()[1] == torch.float32
++        and layer.get_state_dtype()[0] == torch.float16
++        and not is_conv_state_dim_first()
++        and layer.tp_size == 4
++        and layer.hidden_size == 5120
++        and layer.num_k_heads == 16
++        and layer.num_v_heads == 48
++        and layer.head_k_dim == layer.head_v_dim == 128
++        and layer.conv_kernel_size == 4
++        and not layer.gqa_interleaved_layout
++        and all(hasattr(torch.ops._C, name) for name in _NATIVE_OPS)
++    )
++
++
++class WYStateCache:
++    def __init__(self, capacity: int, device):
++        self.u = torch.empty(capacity, 8, 12, 128, dtype=torch.float32, device=device)
++        self.k = torch.empty(capacity, 8, 4, 128, dtype=torch.float32, device=device)
++        self.G = torch.empty(capacity, 8, 12, dtype=torch.float32, device=device)
++        self.pending = torch.full((capacity,), -1, dtype=torch.int32, device=device)
++        # Graph padding may expose up to eight empty metadata rows per request.
++        self.no_previous = torch.zeros(capacity * 8, dtype=torch.int32, device=device)
++
++    @property
++    def size_bytes(self):
++        return sum(
++            t.numel() * t.element_size()
++            for t in (self.u, self.k, self.G, self.pending, self.no_previous)
++        )
++
++    @staticmethod
++    def cache_spec(spec):
++        return replace(spec, num_speculative_blocks=0, gdn_wy=True)
++
++    def verify(self, layer, mixed, a, b, out, state, cu, indices, masks, nseq):
++        # Opaque graph metadata can pad sequence rows to the token count.
++        # Live requests never exceed the scheduler's request capacity.
++        nseq = min(nseq, self.pending.numel())
++        assert masks is not None and nseq <= self.no_previous.numel()
++        q, k, v = mixed.split([512, 512, 1536], dim=1)
++        torch.ops._C.gdn_wy_verify_sm70_out(
++            out.reshape(-1, 1536),
++            state,
++            self.u,
++            self.k,
++            self.G,
++            q,
++            k,
++            v,
++            a,
++            b,
++            layer.A_log,
++            layer.dt_bias,
++            indices[:nseq],
++            masks,
++            self.pending,
++            cu[: nseq + 1],
++            self.no_previous[:nseq],
++            self.u,
++            self.k,
++            self.G,
++            128**-0.5,
++            3,
++        )
++
++
++class WYCommitGroup:
++    """Bind persistent layer/workspace pointers after KV allocation."""
++
++    def __init__(self, kv_config, forward_context, group_ids, device):
++        self.states, self.pending, self.conv = [], [], []
++        desc, conv_desc = [], []
++        for group_index, gid in enumerate(group_ids):
++            group = kv_config.kv_cache_groups[gid]
++            if not group.kv_cache_spec.gdn_wy:
++                continue
++            for name in group.layer_names:
++                layer = forward_context[name]
++                state = layer.kv_cache[1]
++                cache = layer.gdn_wy_cache
++                assert cache is not None
++                self.states.append(state)
++                self.pending.append(cache.pending)
++                conv = layer.kv_cache[0]
++                self.conv.append(conv)
++                conv_desc.append([conv.data_ptr(), conv.stride(0), conv.size(2)])
++                desc.append(
++                    [
++                        state.data_ptr(),
++                        state.stride(0),
++                        cache.u.data_ptr(),
++                        cache.k.data_ptr(),
++                        cache.G.data_ptr(),
++                        cache.pending.data_ptr(),
++                        group_index,
++                        state.size(0),
++                        cache.pending.numel(),
++                    ]
++                )
++        self.descriptors = torch.tensor(desc, dtype=torch.int64, device=device)
++        self.conv_descriptors = torch.tensor(
++            conv_desc, dtype=torch.int64, device=device
++        )
++
++    def commit(self, ctx, num_reqs, accepted):
++        if not self.states or not num_reqs:
++            return
++        torch.ops._C.gdn_wy_commit_group_sm70(
++            self.states,
++            self.pending,
++            self.descriptors,
++            ctx.block_table_ptrs,
++            ctx.block_table_stride_req,
++            accepted[:num_reqs],
++            ctx.num_scheduled_tokens_buf.gpu[:num_reqs],
++            ctx.num_computed_tokens_buf.gpu[:num_reqs],
++            ctx.num_draft_tokens_buf.gpu[:num_reqs],
++            ctx.block_size,
++            False,
++        )
++
++    def finish(self, ctx, num_reqs, accepted):
++        if not self.states or not num_reqs:
++            return
++        torch.ops._C.gdn_wy_finish_group_sm70(
++            self.pending,
++            self.conv,
++            self.descriptors,
++            self.conv_descriptors,
++            ctx.block_table_ptrs,
++            ctx.block_table_stride_req,
++            accepted[:num_reqs],
++            ctx.num_scheduled_tokens_buf.gpu[:num_reqs],
++            ctx.num_computed_tokens_buf.gpu[:num_reqs],
++            ctx.num_draft_tokens_buf.gpu[:num_reqs],
++            ctx.block_size,
++            ctx.num_accepted_tokens_out,
++            ctx.spec_state_slot_selectors_out,
++        )
++
++    def commit_v2(self, ctx, mapping, accepted, computed):
++        torch.ops._C.gdn_wy_commit_group_v2_sm70(
++            self.states,
++            self.pending,
++            self.descriptors,
++            ctx.block_table_ptrs,
++            ctx.block_table_stride_req,
++            accepted,
++            computed,
++            mapping,
++            ctx.block_size,
++        )
++
++    def finish_v2(self, ctx, mapping, accepted, computed):
++        torch.ops._C.gdn_wy_finish_group_v2_sm70(
++            self.pending,
++            self.conv,
++            self.descriptors,
++            self.conv_descriptors,
++            ctx.block_table_ptrs,
++            ctx.block_table_stride_req,
++            ctx.num_accepted_tokens_out,
++            computed,
++            mapping,
++            ctx.block_size,
++            accepted,
++        )
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index ddeebd3857..47be221c50 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -199,6 +199,7 @@ def _dflash2_gdn_group_metadata_kernel(
+     USE_STATE_START: tl.constexpr,
+     USE_SEQ_LEN_START: tl.constexpr,
+     MAMBA_BLOCK_SIZE: tl.constexpr,
++    WY_STATE: tl.constexpr,
+ ):
+     """Write every GDN group's state IDs and the shared graph metadata."""
+     group_id = tl.program_id(0)
+@@ -212,6 +213,8 @@ def _dflash2_gdn_group_metadata_kernel(
+     output_mask = offsets < batch_size * WIDTH
+     live_state_mask = output_mask & (rows < num_spec_decodes)
+     state_columns = columns
++    if WY_STATE:
++        state_columns = tl.full((BLOCK,), 0, tl.int32)
+     if USE_STATE_START:
+         req_indices = tl.load(
+             req_index_mapping + rows,
+@@ -224,11 +227,11 @@ def _dflash2_gdn_group_metadata_kernel(
+             mask=live_state_mask,
+             other=-1,
+         )
+-        state_columns = columns + state_starts
++        state_columns = state_columns + state_starts
+         live_state_mask &= (state_starts >= 0) & (state_columns < block_table_stride)
+     if USE_SEQ_LEN_START:
+         seq_len = tl.load(seq_lens + rows, mask=live_state_mask, other=0)
+-        state_columns = columns + tl.maximum((seq_len - 1) // MAMBA_BLOCK_SIZE, 0)
++        state_columns = state_columns + tl.maximum((seq_len - 1) // MAMBA_BLOCK_SIZE, 0)
+         live_state_mask &= state_columns < block_table_stride
+     state_ids = tl.load(
+         block_table + rows * block_table_stride + state_columns,
+@@ -2473,6 +2476,7 @@ def prepare_dflash2_gdn_group_metadata(
+     block = triton.next_power_of_2(
+         max(num_actual_tokens * width, num_actual_tokens + 1)
+     )
++    assert isinstance(first_builder.kv_cache_spec, MambaSpec)
+     _dflash2_gdn_group_metadata_kernel[(len(input_tables),)](
+         descriptor.block_table_ptrs,
+         descriptor.state_output_ptrs,
+@@ -2495,6 +2499,7 @@ def prepare_dflash2_gdn_group_metadata(
+         USE_STATE_START=use_state_start,
+         USE_SEQ_LEN_START=use_seq_len_start,
+         MAMBA_BLOCK_SIZE=first_builder.kv_cache_spec.block_size,
++        WY_STATE=first_builder.kv_cache_spec.gdn_wy,
+         num_warps=1,
+     )
+     common_buffers.initialized_key = (
+diff --git a/vllm/v1/attention/backends/utils.py b/vllm/v1/attention/backends/utils.py
+index c36cde3805..192282761b 100644
+--- a/vllm/v1/attention/backends/utils.py
++++ b/vllm/v1/attention/backends/utils.py
+@@ -937,4 +937,9 @@ def mamba_get_block_table_tensor(
+             dtype=torch.int32,
+         )
+         indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
+-        return torch.gather(block_table, 1, indices_to_gather)
++        result = torch.gather(block_table, 1, indices_to_gather)
++        if kv_cache_spec.gdn_wy:
++            # Convolution retains its speculative history, but all SSM token
++            # selectors refer to the same published running state page.
++            return result.expand(-1, 8)
++        return result
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 31474cb7a4..9b5432563e 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -690,6 +690,9 @@ class MambaSpec(KVCacheSpec):
+     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
+     mamba_cache_mode: str = "none"
+     num_speculative_blocks: int = 0
++    # GDN verification stores FP32 factors in a per-request workspace and
++    # publishes accepted state before scheduler/cache operations.
++    gdn_wy: bool = False
+     # PLE short-conv state is replicated; GDN state is TP-sharded.
+     tp_replicated: bool = False
+ 
+diff --git a/vllm/v1/worker/gpu/mamba_align.py b/vllm/v1/worker/gpu/mamba_align.py
+index 4966dcf257..155e98ebe3 100644
+--- a/vllm/v1/worker/gpu/mamba_align.py
++++ b/vllm/v1/worker/gpu/mamba_align.py
+@@ -32,9 +32,11 @@ def _copy_mamba_state_block(
+     state_inner_sizes_ptr,
+     state_conv_widths_ptr,
+     state_group_indices_ptr,
++    state_wy_ptr,
+     tile_idx,
+     COPY_BLOCK_SIZE: tl.constexpr,
+     TEMPORAL_TILES: tl.constexpr,
++    POSTPROCESS: tl.constexpr,
+ ):
+     """Copy one SD-layout conv or temporal state using V1 align semantics."""
+     state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
+@@ -42,6 +44,9 @@ def _copy_mamba_state_block(
+     state_elem_size = tl.load(state_elem_sizes_ptr + state_idx).to(tl.int64)
+     state_inner_size = tl.load(state_inner_sizes_ptr + state_idx).to(tl.int64)
+     conv_width = tl.load(state_conv_widths_ptr + state_idx)
++    published_wy = tl.load(state_wy_ptr + state_idx)
++    if POSTPROCESS and conv_width == 0 and published_wy:
++        return
+ 
+     group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
+     group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
+@@ -71,7 +76,8 @@ def _copy_mamba_state_block(
+         is_left_overlap = (dst_addr < src_addr) & (dst_addr + copy_size > src_addr)
+     else:
+         # Temporal state chooses the accepted speculative column.
+-        src_block_id = tl.load(block_table + src_col + token_bias).to(tl.int64)
++        temporal_bias = tl.where(published_wy, 0, token_bias)
++        src_block_id = tl.load(block_table + src_col + temporal_bias).to(tl.int64)
+         src_addr = state_base_addr + src_block_id * state_block_stride
+         copy_size = state_inner_size * state_elem_size
+         bytes_per_tile = (copy_size + TEMPORAL_TILES - 1) // TEMPORAL_TILES
+@@ -152,6 +158,7 @@ def _precopy_mamba_align_kernel(
+     state_inner_sizes_ptr,
+     state_conv_widths_ptr,
+     state_group_indices_ptr,
++    state_wy_ptr,
+     idx_mapping_ptr,
+     query_start_loc_ptr,
+     num_reqs,
+@@ -189,9 +196,11 @@ def _precopy_mamba_align_kernel(
+         state_inner_sizes_ptr,
+         state_conv_widths_ptr,
+         state_group_indices_ptr,
++        state_wy_ptr,
+         tile_idx,
+         COPY_BLOCK_SIZE,
+         TEMPORAL_TILES,
++        False,
+     )
+ 
+ 
+@@ -209,6 +218,7 @@ def _postprocess_mamba_align_kernel(
+     state_inner_sizes_ptr,
+     state_conv_widths_ptr,
+     state_group_indices_ptr,
++    state_wy_ptr,
+     idx_mapping_ptr,
+     num_reqs,
+     MAMBA_BLOCK_SIZE: tl.constexpr,
+@@ -253,9 +263,11 @@ def _postprocess_mamba_align_kernel(
+         state_inner_sizes_ptr,
+         state_conv_widths_ptr,
+         state_group_indices_ptr,
++        state_wy_ptr,
+         tile_idx,
+         COPY_BLOCK_SIZE,
+         TEMPORAL_TILES,
++        True,
+     )
+ 
+ 
+@@ -283,6 +295,7 @@ def run_mamba_align_precopy(
+         ctx.state_inner_sizes,
+         ctx.state_conv_widths,
+         ctx.state_group_indices,
++        ctx.state_wy,
+         idx_mapping,
+         query_start_loc,
+         num_reqs,
+@@ -301,6 +314,13 @@ def run_mamba_align_postprocess(
+ ) -> None:
+     if num_reqs == 0 or not ctx.is_initialized:
+         return
++    if ctx.wy_commit_group is not None:
++        ctx.wy_commit_group.commit_v2(
++            ctx,
++            idx_mapping,
++            num_accepted_tokens,
++            new_num_computed_tokens,
++        )
+     # Snapshot the decision array because one program may reset a request's
+     # output count while programs copying other state tensors still read it.
+     snapshot = ctx.num_accepted_tokens_out
+@@ -319,9 +339,17 @@ def run_mamba_align_postprocess(
+         ctx.state_inner_sizes,
+         ctx.state_conv_widths,
+         ctx.state_group_indices,
++        ctx.state_wy,
+         idx_mapping,
+         num_reqs,
+         MAMBA_BLOCK_SIZE=ctx.block_size,
+         COPY_BLOCK_SIZE=1024,
+         TEMPORAL_TILES=_TEMPORAL_TILES,
+     )
++    if ctx.wy_commit_group is not None:
++        ctx.wy_commit_group.finish_v2(
++            ctx,
++            idx_mapping,
++            num_accepted_tokens,
++            new_num_computed_tokens,
++        )
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index ef363d610a..626c785c5a 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -86,6 +86,7 @@ def postprocess_mamba_fused_kernel(
+     state_inner_sizes_ptr,  # number of elements in inner dimensions
+     state_conv_widths_ptr,  # conv width for conv states (0 for temporal)
+     state_group_indices_ptr,  # maps state_idx to group index in block table
++    state_wy_ptr,  # temporal states already published by WY group commit
+     # Output: num_accepted_tokens update (for src==dst case)
+     num_accepted_tokens_out_ptr,
+     spec_state_slot_selectors_out_ptr,
+@@ -158,6 +159,8 @@ def postprocess_mamba_fused_kernel(
+     state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
+     state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
+     conv_width = tl.load(state_conv_widths_ptr + state_idx)
++    if conv_width == 0 and tl.load(state_wy_ptr + state_idx):
++        return
+ 
+     # Load the group index for this state, then index into the correct
+     # group's block table. Each mamba group has independently allocated
+@@ -424,6 +427,7 @@ class MambaSpecDecodeGPUContext:
+     state_inner_sizes: torch.Tensor  # int64: elements in inner dimensions
+     state_conv_widths: torch.Tensor  # int32: conv width (0 for temporal states)
+     state_group_indices: torch.Tensor  # int32: maps state_idx to group index
++    state_wy: torch.Tensor  # bool: skip snapshot copies after WY publication
+ 
+     # Configuration
+     block_size: int
+@@ -453,6 +457,7 @@ class MambaSpecDecodeGPUContext:
+ 
+     # Flag to track if metadata has been populated
+     is_initialized: bool = False
++    wy_commit_group: Any = None
+ 
+     @classmethod
+     def create(
+@@ -490,6 +495,7 @@ def create(
+             state_group_indices=torch.zeros(
+                 num_states, dtype=torch.int32, device=device
+             ),
++            state_wy=torch.zeros(num_states, dtype=torch.bool, device=device),
+             block_size=mamba_spec.block_size,
+             num_layers=num_layers,
+             num_states=num_states,
+@@ -611,6 +617,11 @@ def initialize_from_forward_context(
+                         # state tensor is as_strided with padded page strides
+                         # (state_block_stride would be the page size, too big).
+                         self.state_conv_widths[idx] = 0
++                        spec = kv_cache_config.kv_cache_groups[
++                            mamba_group_id
++                        ].kv_cache_spec
++                        assert isinstance(spec, MambaSpec)
++                        self.state_wy[idx] = spec.gdn_wy
+                         self.state_inner_sizes[idx] = (
+                             state[0].numel() if state.dim() > 1 else 1
+                         )
+@@ -638,6 +649,21 @@ def initialize_from_forward_context(
+             self.block_table_ptrs[i] = bt.data_ptr()
+ 
+         self.is_initialized = True
++        if any(
++            isinstance(kv_cache_config.kv_cache_groups[gid].kv_cache_spec, MambaSpec)
++            and getattr(
++                kv_cache_config.kv_cache_groups[gid].kv_cache_spec, "gdn_wy", False
++            )
++            for gid in self.mamba_group_ids
++        ):
++            from vllm.model_executor.layers.mamba.gdn.sm70_wy import WYCommitGroup
++
++            self.wy_commit_group = WYCommitGroup(
++                kv_cache_config,
++                forward_context,
++                self.mamba_group_ids,
++                self.state_base_addrs.device,
++            )
+         _debug_mamba_align(
+             "postprocess_init",
+             num_groups=self.num_groups,
+@@ -706,6 +732,7 @@ def run_fused_postprocess(
+             self.state_inner_sizes,
+             self.state_conv_widths,
+             self.state_group_indices,
++            self.state_wy,
+             self.num_accepted_tokens_out,
+             self.spec_state_slot_selectors_out,
+             num_reqs,
+@@ -760,6 +787,7 @@ def warmup_fused_postprocess(self) -> bool:
+                 self.state_inner_sizes,
+                 self.state_conv_widths,
+                 self.state_group_indices,
++                self.state_wy,
+                 self.num_accepted_tokens_out,
+                 self.spec_state_slot_selectors_out,
+                 num_reqs,
+@@ -851,7 +879,13 @@ def collect_mamba_copy_meta(
+             for state, state_copy_func in zip(kv_caches, group_copy_funcs):
+                 copy_src_block_idx = src_block_idx
+                 copy_num_accepted_tokens = accept_token_bias + 1
+-                if state_slot_bias != accept_token_bias:
++                spec = kv_cache_config.kv_cache_groups[mamba_group_id].kv_cache_spec
++                assert isinstance(spec, MambaSpec)
++                if spec.gdn_wy and state_copy_func is get_temporal_copy_spec:
++                    # Accepted SSM state was published during post-sampling.
++                    # Convolution still uses its accepted-history offset.
++                    copy_num_accepted_tokens = 1
++                elif state_slot_bias != accept_token_bias:
+                     copy_src_block_idx = src_block_idx + state_slot_bias
+                     copy_num_accepted_tokens = 1
+                 copy_spec = state_copy_func(
+@@ -1187,6 +1221,11 @@ def postprocess_mamba_align_gpu(
+         num_states=ctx.num_states,
+         block_size=ctx.block_size,
+     )
++    if ctx.wy_commit_group is not None:
++        # Save boundary prefixes before generic convolution copies, then publish
++        # accepted running state and clear factors before the scheduler can
++        # reorder, preempt, reuse a prefix, or continue prefill.
++        ctx.wy_commit_group.commit(ctx, num_reqs, num_accepted_tokens_gpu)
+     ctx.run_fused_postprocess(
+         num_reqs=num_reqs,
+         num_accepted_tokens_gpu=num_accepted_tokens_gpu,
+@@ -1197,6 +1236,11 @@ def postprocess_mamba_align_gpu(
+         num_draft_tokens_gpu=ctx.num_draft_tokens_buf.gpu,
+         ddtree_accepted_node_indices=ddtree_accepted_node_indices,
+     )
++    if ctx.wy_commit_group is not None:
++        # Normalize the running convolution window after prefix copies finish.
++        # The next recurrent call (including plain decode/prefill) now starts
++        # from slot zero with an accepted-history selector of one.
++        ctx.wy_commit_group.finish(ctx, num_reqs, num_accepted_tokens_gpu)
+     if _ddtree_trace_path():
+         _write_ddtree_trace_event(
+             "mamba_postprocess_gpu",

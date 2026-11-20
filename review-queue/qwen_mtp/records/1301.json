@@ -1,0 +1,98 @@
+{
+  "initial_inventory": {
+    "number": 1301,
+    "title": "[Spec Decode] DFlash2: optionally shard the selector codebooks by vocabulary",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1301",
+    "isDraft": false,
+    "headRefOid": "d8ed559e21705566f983c58dc5de0f361b63f3ac",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1301,
+    "title": "[Spec Decode] DFlash2: optionally shard the selector codebooks by vocabulary",
+    "body": "\n## Purpose\n\nThe DFlash2 candidate selector keeps two vocabulary x rank codebooks as plain parameters, so every TP rank holds a full copy. For Qwen3.8 (248,320 x 256 FP16) that is 242 MiB per GPU.\n\nThis adds `speculative_config.sm70_dflash2.sharded_selector_codebook` (default off, configuration only, no environment alias). When on, each rank keeps a contiguous 1/TP of the rows. A lookup reads the rows the rank owns, writes exact zeros for the rest and all-reduces, so every rank gets the owner's rows: finite nonzero values come back bitwise, a zero may change sign. At TP4 this saves 182 MiB per GPU for two small all-reduces per draft step. The loader checks the full checkpoint shape before slicing and keeps valid tail padding, including empty shards when the vocabulary is smaller than TP.\n\nThe field enters the DFlash2 graph options only when on, so existing compile keys are unchanged. With the default, behaviour is identical to `main`.\n\nPorted from the ReVolta fork, where it has been the default for Qwen3.8 Flash-Next DFlash2 since its 0.1.3 release (reference commits [f4e892cb59](https://github.com/Leonccaa/ReVolta/commit/f4e892cb59), [d8d28ee34d](https://github.com/Leonccaa/ReVolta/commit/d8d28ee34d), [e9173e94d1](https://github.com/Leonccaa/ReVolta/commit/e9173e94d1)). Here it is opt-in; turning it on by default can follow once it is measured on `main`.\n\n## Test Plan\n\n```bash\npython -m pytest -q tests/v1/spec_decode/test_dflash2.py\n```\n\nNew CPU tests: nonzero bits of sharded lookups and selector scores match the full table (several vocabularies and dtypes, including signed zeros), the loader takes the right rows for each TP rank and rejects malformed shapes before writing, and the option is off and out of the compile key by default.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| DFlash2 candidate selector | FP16 codebooks | TP > 1, option on | sharded rows + all-reduce | executed (CPU unit tests); measured on the reference tree (TP4 V100, Qwen3.8 Flash-Next) | not run on V100 with this `main` |\n| DFlash2 candidate selector | any | option off (default) or TP = 1 | full table, unchanged | executed (CPU unit tests, compile-key test) | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in.\n- Required CLI options and environment switches: `--speculative-config '{..., \"sm70_dflash2\": {\"sharded_selector_codebook\": true}}'`; no environment variable.\n- KV cache dtype used for the benchmark: N/A on this tree (memory-only change); reference tree used FP8 E4M3 target KV.\n- Wheel SHA or source commit: this branch.\n- PYTHONPATH, source overlays, or external native libraries used: none.\n- User-entry route-hit, speed, and output-quality evidence: reference tree only (greedy outputs identical, speed unchanged, 182 MiB per GPU saved at TP4). Not yet measured on `main`.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: new typed field on `Sm70DFlash2Config`; no alias.\n- New/changed environment metadata and generated reference check: no environment metadata; `docs/design/architecture/runtime_reference.md` regenerated.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: unchanged.\n\n## Test Result\n\n`tests/v1/spec_decode/test_dflash2.py` on CPU: 174 passed, 13 skipped, 6 failed. The same 6 fail on `main` without this change (158 passed): stale `SimpleNamespace` fixtures missing `_contract_validator`, `_new_verification_executor` and `disable_eagle_block_drop`, and `test_selector_alignment_shadow_is_explicit_and_keeps_full_lattice`.\n\n`pre-commit` passes except `check-layering`, which also fails on `main` (`moe_runner.py: platform coupling 37 -> 39`); this PR does not touch that file.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1301",
+    "isDraft": false,
+    "headRefName": "perf/dflash2-sharded-selector",
+    "headRefOid": "d8ed559e21705566f983c58dc5de0f361b63f3ac",
+    "baseRefName": "main",
+    "baseRefOid": "4d57473db67eb77a13018d179e4d95169e82044f",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "Leonccaa/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "Leonccaa"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "Leonccaa"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1301,
+    "id": "PR_kwDORjYFXs8AAAABLYW6aQ",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "d8ed559e21705566f983c58dc5de0f361b63f3ac",
+    "title": "[Spec Decode] DFlash2: optionally shard the selector codebooks by vocabulary",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1301",
+    "body": "\n## Purpose\n\nThe DFlash2 candidate selector keeps two vocabulary x rank codebooks as plain parameters, so every TP rank holds a full copy. For Qwen3.8 (248,320 x 256 FP16) that is 242 MiB per GPU.\n\nThis adds `speculative_config.sm70_dflash2.sharded_selector_codebook` (default off, configuration only, no environment alias). When on, each rank keeps a contiguous 1/TP of the rows. A lookup reads the rows the rank owns, writes exact zeros for the rest and all-reduces, so every rank gets the owner's rows: finite nonzero values come back bitwise, a zero may change sign. At TP4 this saves 182 MiB per GPU for two small all-reduces per draft step. The loader checks the full checkpoint shape before slicing and keeps valid tail padding, including empty shards when the vocabulary is smaller than TP.\n\nThe field enters the DFlash2 graph options only when on, so existing compile keys are unchanged. With the default, behaviour is identical to `main`.\n\nPorted from the ReVolta fork, where it has been the default for Qwen3.8 Flash-Next DFlash2 since its 0.1.3 release (reference commits [f4e892cb59](https://github.com/Leonccaa/ReVolta/commit/f4e892cb59), [d8d28ee34d](https://github.com/Leonccaa/ReVolta/commit/d8d28ee34d), [e9173e94d1](https://github.com/Leonccaa/ReVolta/commit/e9173e94d1)). Here it is opt-in; turning it on by default can follow once it is measured on `main`.\n\n## Test Plan\n\n```bash\npython -m pytest -q tests/v1/spec_decode/test_dflash2.py\n```\n\nNew CPU tests: nonzero bits of sharded lookups and selector scores match the full table (several vocabularies and dtypes, including signed zeros), the loader takes the right rows for each TP rank and rejects malformed shapes before writing, and the option is off and out of the compile key by default.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| DFlash2 candidate selector | FP16 codebooks | TP > 1, option on | sharded rows + all-reduce | executed (CPU unit tests); measured on the reference tree (TP4 V100, Qwen3.8 Flash-Next) | not run on V100 with this `main` |\n| DFlash2 candidate selector | any | option off (default) or TP = 1 | full table, unchanged | executed (CPU unit tests, compile-key test) | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in.\n- Required CLI options and environment switches: `--speculative-config '{..., \"sm70_dflash2\": {\"sharded_selector_codebook\": true}}'`; no environment variable.\n- KV cache dtype used for the benchmark: N/A on this tree (memory-only change); reference tree used FP8 E4M3 target KV.\n- Wheel SHA or source commit: this branch.\n- PYTHONPATH, source overlays, or external native libraries used: none.\n- User-entry route-hit, speed, and output-quality evidence: reference tree only (greedy outputs identical, speed unchanged, 182 MiB per GPU saved at TP4). Not yet measured on `main`.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: new typed field on `Sm70DFlash2Config`; no alias.\n- New/changed environment metadata and generated reference check: no environment metadata; `docs/design/architecture/runtime_reference.md` regenerated.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: unchanged.\n\n## Test Result\n\n`tests/v1/spec_decode/test_dflash2.py` on CPU: 174 passed, 13 skipped, 6 failed. The same 6 fail on `main` without this change (158 passed): stale `SimpleNamespace` fixtures missing `_contract_validator`, `_new_verification_executor` and `disable_eagle_block_drop`, and `test_selector_alignment_shadow_is_explicit_and_keeps_full_lattice`.\n\n`pre-commit` passes except `check-layering`, which also fails on `main` (`moe_runner.py: platform coupling 37 -> 39`); this PR does not touch that file.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "author": {
+      "login": "Leonccaa"
+    },
+    "headRepository": {
+      "nameWithOwner": "Leonccaa/1Cat-vLLM"
+    },
+    "headRefName": "perf/dflash2-sharded-selector",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1301,
+    "title": "[Spec Decode] DFlash2: optionally shard the selector codebooks by vocabulary",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1301",
+    "isDraft": false,
+    "headRefOid": "d8ed559e21705566f983c58dc5de0f361b63f3ac",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "docs/design/architecture/runtime_reference.md",
+      "tests/v1/spec_decode/test_dflash2.py",
+      "vllm/config/sm70_dflash2.py",
+      "vllm/model_executor/models/qwen3_dflash2.py"
+    ],
+    "diff_bytes": 18191,
+    "diff_sha256": "096ace98d9cd8cb8b0864c89c03a59dea013dfba3688036fa1d3e1cb5eeeda4f"
+  },
+  "full_tree_diff_proof": null
+}

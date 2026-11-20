@@ -1,0 +1,147 @@
+{
+  "initial_inventory": {
+    "number": 953,
+    "title": "[Model] Extend DFlash2 QPN8 candidate heads to concurrent verification",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/953",
+    "isDraft": true,
+    "headRefOid": "5a7c65327c5e5166155e6af18c8dddaaf45d7f03",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 953,
+    "title": "[Model] Extend DFlash2 QPN8 candidate heads to concurrent verification",
+    "body": "## Purpose\n\nExtend QPN8 candidate-head capacity to concurrent DFlash2 verification, retaining original-weight FP32 scores and the existing C1 route. Batched top-64 probes retain an on-demand dense reference callback.\n\n## Test Plan\n\nCompare the complete sampling path, including reference guards, against FP32 dense logits on identical real hidden states. Measure complete verify rounds, acceptance and natural completions with a clean source-built wheel.\n\n## Test Result\n\n- 44 focused tests and wheel release/dependency checks passed.\n- GPU guard replay over8056 real target positions confirms zero effective sampling-support misses. Mean/p99/max filtered KL are4.88e-10/3.88e-9/1.05e-8, top-1 agreement100%, maximum retained-logit error0.000816. This is filtered sampling validation, not full-vocabulary teacher-forcing KL.\n- Same-wheel target-only8K comparison: C1 14.835→14.832ms, C2 20.366→20.054ms, C4 27.973→27.739ms, C8 45.869→46.100ms. Draft graph capture was fixed across arms.\n- Fresh32K comparison with the same KV budget: C2 23.334→22.757ms, C4 32.938→32.698ms.\n- Keep in Draft pending the remaining numerical gates and resolution or exclusion of the slower C8 target route.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/953",
+    "isDraft": true,
+    "headRefName": "codex/v100-qwen38-concurrent-head-20261005-024723",
+    "headRefOid": "5a7c65327c5e5166155e6af18c8dddaaf45d7f03",
+    "baseRefName": "main",
+    "baseRefOid": "d06f9751b6d38da2d7182522af8c427ca1f0d2a2",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 953,
+    "id": "PR_kwDORjYFXs8AAAABGoMP3w",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "5a7c65327c5e5166155e6af18c8dddaaf45d7f03",
+    "title": "[Model] Extend DFlash2 QPN8 candidate heads to concurrent verification",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/953",
+    "body": "## Purpose\n\nExtend QPN8 candidate-head capacity to concurrent DFlash2 verification, retaining original-weight FP32 scores and the existing C1 route. Batched top-64 probes retain an on-demand dense reference callback.\n\n## Test Plan\n\nCompare the complete sampling path, including reference guards, against FP32 dense logits on identical real hidden states. Measure complete verify rounds, acceptance and natural completions with a clean source-built wheel.\n\n## Test Result\n\n- 44 focused tests and wheel release/dependency checks passed.\n- GPU guard replay over8056 real target positions confirms zero effective sampling-support misses. Mean/p99/max filtered KL are4.88e-10/3.88e-9/1.05e-8, top-1 agreement100%, maximum retained-logit error0.000816. This is filtered sampling validation, not full-vocabulary teacher-forcing KL.\n- Same-wheel target-only8K comparison: C1 14.835→14.832ms, C2 20.366→20.054ms, C4 27.973→27.739ms, C8 45.869→46.100ms. Draft graph capture was fixed across arms.\n- Fresh32K comparison with the same KV budget: C2 23.334→22.757ms, C4 32.938→32.698ms.\n- Keep in Draft pending the remaining numerical gates and resolution or exclusion of the slower C8 target route.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/v100-qwen38-concurrent-head-20261005-024723",
+    "comments": {
+      "totalCount": 2,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAXuO-Iw="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABe4t1aA",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "## Correction after real-machine evidence (54633, 4×V100-32G)\n\nI ran the released profile `qwen38_27b_nvfp4_dflash2` (4 seqs × 7 drafts) end to end and instrumented `_maybe_sm70_dflash2_qpn8_rerank` with a file-writing probe at every guard (`ENTER`, `G1_not_requested`, `G2_not_prepared`, `G3_selector_k`, `G5_dtype`, `G6_cap`, `HIT`, `BYPASS`).\n\nResult: **8 `IMPORT` lines (overlay confirmed active in all 4 workers) but zero `ENTER` lines**, across 4 concurrent 256-token requests that all completed successfully.\n\n### Why the candidate head is not reached\n\nThe bypass is one level earlier than the row cap.\n\n1. `vllm/model_executor/models/qwen3_dflash2.py:531` sets\n   `unquantized_head = isinstance(self.lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod))`.\n2. `Qwen3.8-27B-NVFP4/config.json` has 303 entries in `quantization_config.ignore` and **`lm_head` is not among them**, so the target LM head is quantized.\n3. Therefore `unquantized_head` is `False`, and `compute_candidates` takes the `quant_lm_head=1` branch — the dense-logit fallback — and never calls `maybe_get_sm70_dflash2_top20` (`qwen3_dflash2.py:551`, `logits_processor.py:588`).\n\nSo `_SM70_DFLASH2_QPN8_MAX_ROWS = 8` is not what bypasses the head in this deployment: the head is never invoked. Raising the cap alone would not change anything for the shipped profile.\n\n### What this changes about the PR\n\n- The row cap is still a real limit for an *unquantized* target head (the case this kernel was written for), and the 4 × (7 + 1) = 32-row arithmetic in the description is correct for that configuration.\n- But \"the released profile silently bypasses the candidate head because of the 8-row cap\" is not accurate, and the C2/C4 numbers here cannot be attributed to lifting that cap in the shipped profile.\n\n### Evidence retained\n\n- Startup: `max_num_seqs': 4`, `num_speculative_tokens': 7`, `Capturing SM70 DFlash2 target tail query lengths (8, 7, 6, 5, 4, 3, 2, 1)`.\n- Probe log: 8 × `IMPORT overlay-active`, no `ENTER`.\n- 4 × `usage.completion_tokens = 256`.\n\nKeeping this open as a kernel capability PR for unquantized heads; the \"default deployment is bypassed\" framing should be dropped.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/953#issuecomment-6367704424",
+          "createdAt": "2026-10-23T14:51:11Z",
+          "updatedAt": "2026-10-23T14:51:11Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABe474jA",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "## Follow-up: the gate is in two places, and both require an unquantized FP16 head\n\nI patched `qwen3_dflash2.py:531` to call the candidate path whenever `qpn8_rerank` is enabled, ignoring `unquantized_head`, and instrumented both the gate and the kernel entry. Ran the same released profile (4 seqs × 7 drafts, 4 × 256-token requests).\n\n```\n40 GATE unquantized=False qpn8=True\n 8 IMPORT overlay-active\n 0 ENTER\n```\n\nThe gate fired 40 times, the candidate call was made, and `_maybe_sm70_dflash2_qpn8_rerank` still never ran. The second gate is one level down:\n\n```python\n# vllm/model_executor/layers/vocab_parallel_embedding.py:88\ndef _maybe_sm70_dflash2_qpn8_rerank(layer, x, selector_k, bias=None):\n    state = _prepared_sm70_lm_head_state(layer)\n    if state is None:\n        return None\n    result = lm_head_provider._maybe_sm70_dflash2_qpn8_rerank(state, x, selector_k, bias)\n\n# :69\ndef _prepared_sm70_lm_head_state(layer):\n    state = getattr(layer, \"_sm70_lm_head_state\", None)\n    return state if state is not None and state.weight is layer.weight else None\n```\n\n`_sm70_lm_head_state` is only created by `maybe_prepare_sm70_lm_head_top1` (`:60`), i.e. by the FP16 top-1 path, and `_prepare_sm70_dflash2_qpn8_rerank` is reached from that prepared state. A quantized target head never gets one, so the wrapper returns `None` before the provider is called.\n\n### Conclusion for this PR\n\nThe QPN8 candidate head is wired for **unquantized FP16 target LM heads only**, gated at two levels (`qwen3_dflash2.py:531` and `vocab_parallel_embedding.py:69`). `Qwen3.8-27B-NVFP4` has a quantized `lm_head` (303 entries in `quantization_config.ignore`, `lm_head` not among them), so **this optimization cannot apply to the shipped NVFP4 profile**, with or without a row-cap change.\n\nThe row cap is still a genuine limit for the FP16-head case this kernel targets, and the 4 × (7 + 1) = 32 arithmetic holds there. But the PR should not claim a shipped-profile win; making it work for quantized heads would need the state/prepare path extended, which is a separate design change.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/953#issuecomment-6367934604",
+          "createdAt": "2026-10-23T15:02:49Z",
+          "updatedAt": "2026-10-23T15:02:49Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 953,
+    "title": "[Model] Extend DFlash2 QPN8 candidate heads to concurrent verification",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/953",
+    "isDraft": true,
+    "headRefOid": "5a7c65327c5e5166155e6af18c8dddaaf45d7f03",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "CMakeLists.txt",
+      "benchmarks/benchmark_sm70_qwen38_distribution.py",
+      "benchmarks/benchmark_sm70_qwen38_quality.py",
+      "benchmarks/qwen38_ple_phase_probe.py",
+      "csrc/ops.h",
+      "csrc/ple_disk_rows.cpp",
+      "csrc/torch_bindings.cpp",
+      "docs/design/gguf_iq3xxs_joint_experts.md",
+      "docs/design/gguf_mixed_projection_output.md",
+      "docs/design/ple_mapped_row_gather.md",
+      "docs/design/sm70_qwen38_distribution_acceptance.md",
+      "docs/design/sm70_v100_migration_control.md",
+      "tests/benchmarks/test_qwen38_distribution_probe.py",
+      "tests/benchmarks/test_qwen38_endpoint_preflight.py",
+      "tests/benchmarks/test_qwen38_quality_health.py",
+      "tests/kernels/quantization/test_gguf_expert_gate_up_dispatch.py",
+      "tests/kernels/quantization/test_gguf_expert_gate_up_graph.py",
+      "tests/kernels/quantization/test_gguf_mixed_direct_output.py",
+      "tests/kernels/quantization/test_gguf_mixed_output_fallback.py",
+      "tests/kernels/test_ple_disk_rows.py",
+      "tests/model_executor/layers/test_sm70_lm_head.py",
+      "tests/v1/sample/test_dflash2_logits_reuse.py",
+      "vllm/config/kernel.py",
+      "vllm/model_executor/kernels/ple/disk_rows.py",
+      "vllm/model_executor/layers/logits_processor.py",
+      "vllm/model_executor/layers/quantization/gguf.py",
+      "vllm/model_executor/layers/quantization/gguf_turbomind.py",
+      "vllm/model_executor/layers/quantization/gguf_turbomind_moe.py",
+      "vllm/model_executor/layers/vocab_parallel_embedding.py",
+      "vllm/models/qwen4_exp/nvidia/ple_layer.py",
+      "vllm/v1/ple_offload/worker.py",
+      "vllm/v1/worker/gpu_worker.py"
+    ],
+    "diff_bytes": 119477,
+    "diff_sha256": "58956311b71bc834dec5a239a47d50ccdd1075ecc074b3d6acc4c1686f253c05"
+  },
+  "full_tree_diff_proof": null
+}
