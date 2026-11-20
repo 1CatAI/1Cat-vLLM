@@ -1,0 +1,83 @@
+diff --git a/tests/sm70_profiles/test_sm70_acceleration_report.py b/tests/sm70_profiles/test_sm70_acceleration_report.py
+new file mode 100644
+index 0000000000..1187665236
+--- /dev/null
++++ b/tests/sm70_profiles/test_sm70_acceleration_report.py
+@@ -0,0 +1,35 @@
++# SPDX-License-Identifier: Apache-2.0
++"""The kernel-policy report must survive set-valued fields on resolved policies."""
++
++from dataclasses import dataclass, field
++
++from vllm.sm70_profiles.acceleration import linear_policy_report
++
++
++@dataclass
++class _Filters:
++    layers: frozenset = field(default_factory=lambda: frozenset((0, 1)))
++    shapes: frozenset | None = None
++    probes: tuple = (1, 2)
++
++
++@dataclass
++class _Policy:
++    enabled: bool = True
++    filters: _Filters = field(default_factory=_Filters)
++
++
++@dataclass
++class _KernelConfig:
++    sm70_dump: _Policy = field(default_factory=_Policy)
++    other: int = 3
++
++
++def test_linear_policy_report_serializes_sets():
++    report = linear_policy_report(_KernelConfig())
++    assert set(report) == {"sm70_dump"}
++    cfg = report["sm70_dump"]["configuration"]
++    assert cfg["filters"]["layers"] == [0, 1]
++    assert cfg["filters"]["shapes"] is None
++    assert cfg["filters"]["probes"] == [1, 2]
++    assert cfg["enabled"] is True
+diff --git a/vllm/sm70_profiles/acceleration.py b/vllm/sm70_profiles/acceleration.py
+index b5b6650459..4f4409ebce 100644
+--- a/vllm/sm70_profiles/acceleration.py
++++ b/vllm/sm70_profiles/acceleration.py
+@@ -21,13 +21,25 @@
+ logger = init_logger(__name__)
+ 
+ 
++def _json_policy_default(value: Any) -> Any:
++    """Resolved policies carry set-valued filters (e.g. tensor-dump layer and
++    shape filters are ``frozenset``); report them as sorted lists."""
++    if isinstance(value, (set, frozenset)):
++        return sorted(value, key=repr)
++    if isinstance(value, (tuple, list)):
++        return list(value)
++    return repr(value)
++
++
+ def linear_policy_report(kernel_config) -> dict[str, Any]:
+     """Discover migrated policies from KernelConfig, without a parallel registry."""
+     return {
+         field.name: {
+             "scope": "configured_policy",
+             "status": "runtime_guarded",
+-            "configuration": json.loads(json.dumps(asdict(value))),
++            "configuration": json.loads(
++                json.dumps(asdict(value), default=_json_policy_default)
++            ),
+         }
+         for field in fields(kernel_config)
+         if field.name.startswith("sm70_")
+@@ -629,7 +641,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
+         report["linear_kernel_policy"] = {
+             "scope": "ct_nvfp4_linear",
+             "status": "runtime_guarded",
+-            "configuration": json.loads(json.dumps(asdict(policy))),
++            "configuration": json.loads(
++                json.dumps(asdict(policy), default=_json_policy_default)
++            ),
+             "qpn2_reason": (
+                 "configuration_not_resolved"
+                 if not policy.resolved

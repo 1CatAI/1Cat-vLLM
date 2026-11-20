@@ -1,0 +1,684 @@
+diff --git a/docs/design/sm70_linear_kernel_integration.md b/docs/design/sm70_linear_kernel_integration.md
+index 1a413e88f..e940af435 100644
+--- a/docs/design/sm70_linear_kernel_integration.md
++++ b/docs/design/sm70_linear_kernel_integration.md
+@@ -106,6 +106,44 @@ The rest of SM70 still has legacy environment policies. This first migration
+ isolates QPN2 policy; it does not claim complete multi-engine isolation for
+ unmigrated attention, GEMM tuning or collective routes.
+ 
++## Automatic QPN4 temporary dense workspace
++
++The default `qpn4_lazy_dense_workspace: null` (auto) uses temporary native
++scratch only for already-qualified QPN4 linears in an `enforce_eager` engine
++with automatic KV memory profiling (`kv_cache_memory_bytes is None`).
++Graph-enabled engines and explicit fixed KV budgets retain resident scratch
++in auto mode. This reduces persistent storage, not guaranteed peak prefill
++storage or latency; it does not broaden QPN4's model/shape/state qualification.
++
++Explicit `false` forces resident scratch. Explicit `true` forces temporary
++scratch, including with graphs or fixed KV budgets:
++
++```bash
++vllm serve MODEL \
++  --kernel-config '{"sm70_nvfp4":{"qpn4_lazy_dense_workspace":true}}'
++```
++
++Both paths retain load-time admission using the existing bounded FP16
++workspace size (at least `5120 * 8704` elements, growing with the local weight).
++Temporary mode drops its uncached allocation probe before preparing weights:
++no tensor is retained by the layer or workspace pool. Admission OOM leaves
++checkpoint parameters intact and takes the existing TurboMind fallback.
++This is an admission check, not a reservation against subsequent memory use.
++
++M=1 native dispatch ignores scratch; M>1 allocates an operator-local `K * N`
++FP16 tensor. Normal automatic KV sizing measures the real profiling forward's
++torch allocation peak, including that temporary, before assigning KV memory.
++An explicit KV byte budget bypasses that measured-peak deduction; forcing
++temporary mode there requires the user to budget its runtime demand. The
++initial probe cannot guarantee later allocations against fragmentation or
++other processes. No per-request retry or duplicate weight fallback is added.
++
++Forced temporary mode with M>1 CUDA graphs can retain scratch in their private
++pool, so auto deliberately keeps the resident graph contract. The resolved
++workspace choice participates in active graph identity; auto/explicit source
++provenance does not. Native ABI, arithmetic and other workspace policies are
++unchanged. Policy resolution happens once per engine, not per invocation.
++
+ ## Route regression command
+ 
+ Run from a checkout with the normal Python dependencies installed:
+diff --git a/tests/kernels/quantization/test_sm70_nvfp4_small_prefill.py b/tests/kernels/quantization/test_sm70_nvfp4_small_prefill.py
+index cb50dcca4..996de1662 100644
+--- a/tests/kernels/quantization/test_sm70_nvfp4_small_prefill.py
++++ b/tests/kernels/quantization/test_sm70_nvfp4_small_prefill.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Small-prefill stores preserve weights in both resident packed layouts."""
+ 
++import weakref
++
+ import pytest
+ import torch
+ 
+@@ -83,3 +85,278 @@ def test_small_prefill_matches_scalar_dequantized_basis(m, k, n, shared, gated):
+     else:
+         torch.testing.assert_close(output, expected, rtol=0, atol=0)
+     assert output.isfinite().all()
++
++
++@pytest.fixture(
++    params=["auto_eager", "auto_graph", "auto_fixed_kv", "resident", "lazy"]
++)
++def workspace_mode(request):
++    return request.param
++
++
++@pytest.fixture
++def qpn4_lazy_linear(request, workspace_mode, monkeypatch):
++    """Prepare real checkpoint weights through each workspace policy."""
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("requires SM70")
++    import vllm._C  # noqa: F401
++
++    from vllm.config import (
++        DeviceConfig,
++        KernelConfig,
++        VllmConfig,
++        set_current_vllm_config,
++    )
++    from vllm.config.kernel import Sm70NvFp4Config
++    from vllm.model_executor.kernels.linear.qpn.nvfp4 import (
++        Qpn4NvFp4LinearKernel,
++        Sm70NvFp4LinearLayerConfig,
++    )
++    from vllm.model_executor.layers.quantization import sm70_turbomind as tm
++    from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces
++
++    gated = request.param
++    # Regular dispatch uses split-K=17; gated dispatch uses split-K=8.
++    k, n = 2176, 64
++    torch.manual_seed(321)
++    q = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.uint8)
++    packed = (q[:, ::2] | (q[:, 1::2] << 4)).contiguous()
++    scales = (
++        2.0 ** torch.randint(-2, 2, (n, k // 16), device="cuda").float()
++    ).to(torch.float8_e4m3fn)
++    global_scale = torch.tensor(0.125, device="cuda")
++    # Prefix-bound resident workspaces must survive opaque graph dispatch.
++    layer = torch.nn.Module()
++    layer.prefix = "model.layers.0.mlp.down_proj"
++    layer.weight = torch.nn.Parameter(packed, requires_grad=False)
++    layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
++    layer.weight_global_scale = torch.nn.Parameter(global_scale, requires_grad=False)
++    override = {"resident": False, "lazy": True}.get(workspace_mode)
++    policy = Sm70NvFp4Config(qpn4_lazy_dense_workspace=override)
++    policy.resolve(
++        qualified=False,
++        enforce_eager=workspace_mode in ("auto_eager", "auto_fixed_kv", "resident"),
++        kv_cache_memory_bytes=1024**3 if workspace_mode == "auto_fixed_kv" else None,
++    )
++    expected_lazy = workspace_mode in ("auto_eager", "lazy")
++    engine = VllmConfig(
++        device_config=DeviceConfig(device="cuda"),
++        kernel_config=KernelConfig(sm70_nvfp4=policy),
++    )
++    original_empty = torch.empty
++    probes = []
++
++    def track_workspace(*args, **kwargs):
++        allocation = original_empty(*args, **kwargs)
++        shape = args[0] if args else kwargs.get("size")
++        if shape == (tm.NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS,):
++            probes.append(weakref.ref(allocation))
++        return allocation
++
++    monkeypatch.setattr(torch, "empty", track_workspace)
++    kernel = Qpn4NvFp4LinearKernel(
++        Sm70NvFp4LinearLayerConfig(
++            input_size=k,
++            output_size=n,
++            weight_shape=packed.shape,
++            policy=policy,
++            qpn2_qualified=False,
++            qpn4_qualified=True,
++            gated_silu=gated,
++            dense_gated_silu=gated,
++        )
++    )
++    with set_current_vllm_config(engine):
++        assert kernel.try_process_weights(layer)
++        state = getattr(layer, tm.STATE_ATTR)
++        assert state.qpn4_lazy_dense_workspace is expected_lazy
++        pool = sm70_layer_workspaces.workspace_pool(
++            "_nvfp4_qpn4_dense_workspaces", tm._nvfp4_qpn4_dense_workspaces
++        )
++        assert bool(pool) is not expected_lazy
++        assert len(probes) == 1
++        assert (probes[0]() is None) is expected_lazy
++    # Independent NVFP4 reference; power-of-two scales avoid differences in
++    # scale conversion rounding while exercising nonuniform per-block scales.
++    lut = torch.tensor(
++        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
++        device="cuda",
++    )
++    weight = (
++        lut[q.long()] * scales.float().repeat_interleave(16, dim=1) * global_scale
++    ).T.contiguous()
++
++    class Projection(torch.nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.layer = layer
++
++        def forward(self, x):
++            if gated:
++                return kernel.apply_fused_silu_and_mul(self.layer, x)
++            return kernel.apply_weights(self.layer, x)
++
++    with set_current_vllm_config(engine):
++        yield Projection(), weight, gated
++        # Execution never repeats Python admission or registers temporary scratch.
++        assert len(probes) == 1
++        assert bool(pool) is not expected_lazy
++        sm70_layer_workspaces.clear_layer_workspaces()
++
++
++@pytest.mark.parametrize("qpn4_lazy_linear", [False, True], indirect=True)
++@pytest.mark.parametrize("m", [1, 2, 17, 1024, 1025])
++@pytest.mark.parametrize("execution", ["eager", "cudagraph"])
++def test_qpn4_lazy_workspace_numeric_parity(qpn4_lazy_linear, m, execution):
++    """Decode and both native prefill GEMMs retain real numerical behavior."""
++    from vllm.model_executor.layers.quantization import sm70_turbomind as tm
++
++    projection, weight, gated = qpn4_lazy_linear
++    k, n = weight.shape
++    x = torch.randn(m, k, device="cuda", dtype=torch.float16) / k**0.5
++    if execution == "cudagraph":
++        stream = torch.cuda.Stream()
++        stream.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(stream):
++            for _ in range(3):
++                projection(x)
++        torch.cuda.current_stream().wait_stream(stream)
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            actual = projection(x)
++        # Replay after changing the input: a captured M>1 temporary must remain
++        # valid, while an M=1 graph must not require dense scratch at all.
++        x.neg_()
++        graph.replay()
++    else:
++        actual = projection(x)
++    state = getattr(projection.layer, tm.STATE_ATTR)
++    scratch = torch.empty(k, n, device="cuda", dtype=torch.float16)
++    resident_output = torch.empty(
++        m, n // 2 if gated else n, device="cuda", dtype=torch.float16
++    )
++    # Compare against the unchanged resident-pointer contract as well as the
++    # independent FP32 reference below. Neither path substitutes a fake kernel.
++    state.native_ops.nvfp4_qpn4_dispatch_sm70_out(
++        resident_output,
++        scratch.data_ptr(),
++        x,
++        state.weight,
++        state.scales,
++        state.global_scale,
++        state.use_scale_code,
++        gated,
++    )
++    torch.testing.assert_close(actual, resident_output, rtol=0, atol=0)
++    expected = x.float() @ weight
++    if gated:
++        gate, up = expected.chunk(2, dim=1)
++        expected = torch.nn.functional.silu(gate) * up
++    torch.testing.assert_close(actual.float(), expected, rtol=3e-3, atol=2e-3)
++    assert actual.isfinite().all()
++
++
++@pytest.mark.parametrize("workspace_mode", ["auto_eager"])
++@pytest.mark.parametrize("qpn4_lazy_linear", [False, True], indirect=True)
++def test_qpn4_auto_eager_profile_includes_temporary_scratch(qpn4_lazy_linear):
++    """The real native allocation contributes to the worker's torch peak."""
++    projection, weight, _ = qpn4_lazy_linear
++    x = torch.randn(17, weight.shape[0], device="cuda", dtype=torch.float16)
++    projection(x)
++    torch.cuda.synchronize()
++    before = torch.cuda.memory_allocated()
++    torch.cuda.reset_peak_memory_stats()
++    output = projection(x)
++    torch.cuda.synchronize()
++    peak = torch.cuda.max_memory_allocated()
++    assert peak >= before + weight.numel() * torch.float16.itemsize
++    # The operator-local dense tensor must not become model-resident storage.
++    assert torch.cuda.memory_allocated() <= before + output.nbytes + 1024
++
++
++@pytest.mark.parametrize("override", [None, False, True])
++def test_qpn4_admission_oom_retains_real_turbomind_fallback(monkeypatch, override):
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("requires SM70")
++    import vllm._C  # noqa: F401
++
++    from vllm.config import (
++        DeviceConfig,
++        KernelConfig,
++        SchedulerConfig,
++        VllmConfig,
++        set_current_vllm_config,
++    )
++    from vllm.config.kernel import Sm70NvFp4Config
++    from vllm.model_executor.kernels.linear.qpn.nvfp4 import (
++        Qpn4NvFp4LinearKernel,
++        TurboMindNvFp4LinearKernel,
++    )
++    from vllm.model_executor.layers.quantization import sm70_turbomind as tm
++    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (  # noqa: E501
++        CompressedTensorsW4A4Fp4,
++    )
++
++    # A genuinely qualified down projection exercises the CT consumer's load
++    # fallback, not a substituted preparation/provider implementation.
++    k, n = 128, 5120
++    q = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.uint8)
++    packed = (q[:, ::2] | (q[:, 1::2] << 4)).contiguous()
++    layer = torch.nn.Module()
++    layer.prefix = "model.layers.0.mlp.down_proj"
++    layer.input_size_per_partition = k
++    layer.output_size_per_partition = n
++    layer.weight_packed = torch.nn.Parameter(packed, requires_grad=False)
++    layer.weight_scale = torch.nn.Parameter(
++        torch.ones(n, k // 16, device="cuda").to(torch.float8_e4m3fn),
++        requires_grad=False,
++    )
++    layer.weight_global_scale = torch.nn.Parameter(
++        torch.tensor([8.0], device="cuda"), requires_grad=False
++    )
++    layer.input_global_scale = torch.nn.Parameter(
++        torch.ones(1, device="cuda"), requires_grad=False
++    )
++    policy = Sm70NvFp4Config(
++        enabled=True, qpn4=True, qpn2=False, qpn4_lazy_dense_workspace=override
++    )
++    policy.resolve(qualified=False, enforce_eager=True)
++    engine = VllmConfig(
++        device_config=DeviceConfig(device="cuda"),
++        kernel_config=KernelConfig(sm70_nvfp4=policy),
++        scheduler_config=SchedulerConfig(
++            is_encoder_decoder=False,
++            max_model_len=64,
++            max_num_seqs=1,
++            max_num_batched_tokens=64,
++        ),
++    )
++    original_empty = torch.empty
++    failures = []
++
++    def fail_admission(*args, **kwargs):
++        shape = args[0] if args else kwargs.get("size")
++        if shape == (tm.NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS,):
++            assert layer.weight.data_ptr() == packed.data_ptr()
++            failures.append(shape)
++            raise torch.OutOfMemoryError("injected bounded workspace admission OOM")
++        return original_empty(*args, **kwargs)
++
++    monkeypatch.setattr(torch, "empty", fail_admission)
++    with set_current_vllm_config(engine):
++        scheme = CompressedTensorsW4A4Fp4()
++        scheme.process_weights_after_loading(layer)
++        assert len(failures) == 1
++        assert isinstance(scheme.kernel, TurboMindNvFp4LinearKernel)
++        assert not isinstance(scheme.kernel, Qpn4NvFp4LinearKernel)
++        assert getattr(layer, tm.STATE_ATTR).op_kind == "nvfp4"
++        x = torch.zeros(2, k, device="cuda", dtype=torch.float16)
++        x[0, 0] = 1
++        x[1, 17] = 1
++        actual = scheme.apply_weights(layer, x)
++    lut = torch.tensor(
++        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
++        device="cuda",
++    )
++    expected = lut[q[:, [0, 17]].long()].T * 0.125
++    torch.testing.assert_close(actual.float(), expected, rtol=2e-3, atol=1e-3)
+diff --git a/tests/quantization/test_sm70_nvfp4_kernel_selection.py b/tests/quantization/test_sm70_nvfp4_kernel_selection.py
+index 8dfc68fc0..565963457 100644
+--- a/tests/quantization/test_sm70_nvfp4_kernel_selection.py
++++ b/tests/quantization/test_sm70_nvfp4_kernel_selection.py
+@@ -122,6 +122,78 @@ def test_two_engine_policies_remain_isolated_after_environment_change(monkeypatc
+     assert first.compute_hash() != second.compute_hash()
+ 
+ 
++@pytest.mark.parametrize("enforce_eager", [False, True])
++@pytest.mark.parametrize("kv_bytes", [None, 0, 1024**3])
++@pytest.mark.parametrize("override", [None, False, True])
++def test_qpn4_workspace_policy_engine_lifecycle(
++    tmp_path, enforce_eager, kv_bytes, override
++):
++    from transformers import Qwen3Config
++
++    from vllm.config import CacheConfig, DeviceConfig, ModelConfig, VllmConfig
++
++    Qwen3Config(
++        architectures=["Qwen3ForCausalLM"],
++        num_hidden_layers=2,
++        hidden_size=32,
++        intermediate_size=64,
++        num_attention_heads=4,
++        num_key_value_heads=4,
++        max_position_embeddings=64,
++        vocab_size=64,
++    ).save_pretrained(tmp_path)
++    model = ModelConfig(
++        model=str(tmp_path),
++        tokenizer=str(tmp_path),
++        dtype="half",
++        skip_tokenizer_init=True,
++        enforce_eager=enforce_eager,
++        max_model_len=64,
++    )
++    engine = VllmConfig(
++        model_config=model,
++        device_config=DeviceConfig(device="cpu"),
++        cache_config=CacheConfig(kv_cache_memory_bytes=kv_bytes),
++        kernel_config=KernelConfig(
++            sm70_nvfp4=Sm70NvFp4Config(qpn4_lazy_dense_workspace=override)
++        ),
++    )
++    policy = engine.kernel_config.sm70_nvfp4
++    expected = override if override is not None else enforce_eager and kv_bytes is None
++    assert policy.qpn4_lazy_dense_workspace is expected
++    assert policy.sources["qpn4_lazy_dense_workspace"] == (
++        "configuration"
++        if override is not None
++        else "auto:eager-profile"
++        if expected
++        else "auto:resident"
++    )
++    # Loader activation must not resolve again using its default arguments.
++    policy.resolve(qualified=False)
++    assert policy.qpn4_lazy_dense_workspace is expected
++
++
++def test_qpn4_workspace_effective_graph_identity_and_provenance():
++    auto_resident, resident, auto_lazy, lazy = [
++        KernelConfig(sm70_nvfp4=Sm70NvFp4Config(qpn4_lazy_dense_workspace=value))
++        for value in (None, False, None, True)
++    ]
++    for kernel, eager in zip(
++        (auto_resident, resident, auto_lazy, lazy), (False, True, True, False)
++    ):
++        kernel.sm70_nvfp4.resolve(qualified=False, active=False, enforce_eager=eager)
++    hashes = {
++        kernel.compute_hash()
++        for kernel in (auto_resident, resident, auto_lazy, lazy)
++    }
++    assert len(hashes) == 1
++    for kernel in (auto_resident, resident, auto_lazy, lazy):
++        kernel.sm70_nvfp4.active = True
++    assert auto_resident.compute_hash() == resident.compute_hash()
++    assert auto_lazy.compute_hash() == lazy.compute_hash()
++    assert resident.compute_hash() != lazy.compute_hash()
++
++
+ def test_model_policy_retains_state_contract_but_not_tp_kv_concurrency():
+     for tp, kv, concurrency in [(2, "fp8_e5m2", 8), (4, "float16", 1)]:
+         cfg = make_config("dflash", tp, concurrency, kv, 4096)
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index fa6e979a2..de6a57ed2 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -254,6 +254,12 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
+     """Captured native selectors/tuning; unused formats do not affect graph keys."""
+     qpn4: bool | None = None
+     """Retain the shape/model-qualified QPN4 provider."""
++    qpn4_lazy_dense_workspace: bool | None = None
++    """Auto uses native temporary scratch for eager, automatically profiled KV.
++
++    True forces temporary scratch; False forces the resident workspace.
++    Both paths retain load-time workspace admission and QPN4 qualification.
++    """
+     dense_qpn2: bool = True
+     """Allow native QPN2 with FP16 dense prefill on supported Turing workers."""
+     qpn2: bool | None = None
+@@ -274,13 +280,34 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
+     loader_aliases: ClassVar[dict[str, str]] = SM70_LOADER_ALIASES["nvfp4"]
+     input_aliases: ClassVar[tuple[str, ...]] = (*SM70_NVFP4_LINEAR_ALIASES.values(),)
+ 
+-    def resolve(self, *, qualified: bool, active: bool = True) -> None:
++    def resolve(
++        self,
++        *,
++        qualified: bool,
++        active: bool = True,
++        enforce_eager: bool = False,
++        kv_cache_memory_bytes: int | None = None,
++    ) -> None:
+         self.capture_inputs()
+ 
+         self.active = self.active or active
+         if self.resolved:
+             return
+         self.qualified = qualified
++        workspace_field = "qpn4_lazy_dense_workspace"
++        self.sources[workspace_field] = (
++            "configuration"
++            if self.qpn4_lazy_dense_workspace is not None
++            else "auto:eager-profile"
++            if enforce_eager and kv_cache_memory_bytes is None
++            else "auto:resident"
++        )
++        if self.qpn4_lazy_dense_workspace is None:
++            # Fixed KV budgets skip peak-memory deduction. Graph pools can
++            # retain temporary scratch, so auto keeps their resident contract.
++            self.qpn4_lazy_dense_workspace = (
++                enforce_eager and kv_cache_memory_bytes is None
++            )
+         defaults = {
+             "qpn2": qualified,
+             "prefill": qualified,
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 23ccd0b38..0d62f004e 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1187,7 +1187,12 @@ class VllmConfig:
+         )
+         self.kernel_config.capture_provider_inputs()
+         self.kernel_config.sm70_nvfp4.resolve(
+-            qualified=sm70_dflash2_nvfp4_qualified(self), active=False
++            qualified=sm70_dflash2_nvfp4_qualified(self),
++            active=False,
++            enforce_eager=(
++                self.model_config is not None and self.model_config.enforce_eager
++            ),
++            kv_cache_memory_bytes=self.cache_config.kv_cache_memory_bytes,
+         )
+         if self.model_config is not None and self.model_config.quantization == "awq":
+             self.kernel_config.sm70_awq.resolve()
+diff --git a/vllm/model_executor/kernels/linear/qpn/nvfp4.py b/vllm/model_executor/kernels/linear/qpn/nvfp4.py
+index c50c3c58b..e5f19d89f 100644
+--- a/vllm/model_executor/kernels/linear/qpn/nvfp4.py
++++ b/vllm/model_executor/kernels/linear/qpn/nvfp4.py
+@@ -469,19 +469,36 @@ class Qpn4NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
+ 
+     def try_process_weights(self, layer):
+         # Capability and qualification were checked by the common selector.
+-        workspace = sm70_tm.get_nvfp4_qpn4_dense_workspace(layer.weight)
++        lazy_workspace = self.config.policy.qpn4_lazy_dense_workspace
++        if lazy_workspace:
++            workspace = sm70_tm.get_nvfp4_qpn4_dense_workspace(
++                layer.weight, temporary=True
++            )
++        else:
++            workspace = sm70_tm.get_nvfp4_qpn4_dense_workspace(layer.weight)
+         if workspace is None:
+             logger.warning_once(
+                 "Insufficient memory for the bounded SM70 NVFP4 QPN4 "
+                 "prefill workspace; retaining TurboMind."
+             )
+             return False
++        if lazy_workspace:
++            # Admission must precede conversion/fallback, but the probe must
++            # not become a resident tensor or a registered graph address.
++            del workspace
++            workspace = None
+         sm70_tm.prepare_nvfp4_qpn4_linear(
+             layer, workspace, gated_silu=self.config.dense_gated_silu
+         )
+         self._release_checkpoint_parameters(layer)
+-        logger.info_once(
+-            "Memory-neutral SM70 NVFP4 QPN4 M=1 decode "
+-            "path enabled with bounded FP16 prefill workspace."
+-        )
++        if workspace is None:
++            logger.info_once(
++                "SM70 NVFP4 QPN4 enabled with native temporary FP16 prefill "
++                "workspace; M=1 decode needs no dense workspace."
++            )
++        else:
++            logger.info_once(
++                "Memory-neutral SM70 NVFP4 QPN4 M=1 decode "
++                "path enabled with bounded FP16 prefill workspace."
++            )
+         return True
+diff --git a/vllm/model_executor/kernels/linear/sm70_provider.py b/vllm/model_executor/kernels/linear/sm70_provider.py
+index a058dc850..ce14ce01c 100644
+--- a/vllm/model_executor/kernels/linear/sm70_provider.py
++++ b/vllm/model_executor/kernels/linear/sm70_provider.py
+@@ -59,6 +59,22 @@ def _qpn4(state, x, out, prefix, *, gated=False):
+     return out
+ 
+ 
++def _qpn4_native_workspace(state, x, out, prefix, *, gated=False):
++    # Native dispatch ignores the pointer for M=1 and owns temporary dense
++    # scratch for M>1. No Python allocation or process-local address is traced.
++    state.native_ops.nvfp4_qpn4_dispatch_sm70_out(
++        out,
++        0,
++        x,
++        state.weight,
++        state.scales,
++        state.global_scale,
++        state.use_scale_code,
++        gated,
++    )
++    return out
++
++
+ def _qpn2_dense(state, x, out, prefix, *, gated=False):
+     from vllm.model_executor.kernels.linear.qpn import nvfp4_dequant
+ 
+@@ -92,10 +108,11 @@ def bind_prepared_provider(state: Any) -> PreparedLinearProvider:
+     """Resolve once after the existing preparation selected the layout."""
+     kind = state.op_kind
+     if kind == "nvfp4_qpn4":
++        run = _qpn4_native_workspace if state.qpn4_lazy_dense_workspace else _qpn4
+         return PreparedLinearProvider(
+             "nvfp4_qpn4",
+-            _qpn4,
+-            _qpn4,
++            run,
++            run,
+             True,
+             "SM70 NVFP4 QPN4 requires float16 activations, got {dtype}.",
+         )
+diff --git a/vllm/model_executor/layers/quantization/sm70_turbomind.py b/vllm/model_executor/layers/quantization/sm70_turbomind.py
+index f2cc6f303..71bd0dd25 100644
+--- a/vllm/model_executor/layers/quantization/sm70_turbomind.py
++++ b/vllm/model_executor/layers/quantization/sm70_turbomind.py
+@@ -47,6 +47,7 @@ class SM70TurboMindLinearState:
+     # QPN2 launch configuration (split-K, independent accumulator chains).
+     split_k: int = 0
+     accumulator_chains: int = 0
++    qpn4_lazy_dense_workspace: bool = False
+     native_ops: "NativeBindings" = field(init=False, repr=False, compare=False)
+     provider: "PreparedLinearProvider" = field(init=False, repr=False, compare=False)
+ 
+@@ -354,6 +355,7 @@ def _store_state(
+     prescaled_scales: bool = False,
+     split_k: int = 0,
+     accumulator_chains: int = 0,
++    qpn4_lazy_dense_workspace: bool = False,
+ ) -> None:
+     state = SM70TurboMindLinearState(
+         weight=weight,
+@@ -370,6 +372,7 @@ def _store_state(
+         prescaled_scales=prescaled_scales,
+         split_k=split_k,
+         accumulator_chains=accumulator_chains,
++        qpn4_lazy_dense_workspace=qpn4_lazy_dense_workspace,
+     )
+     setattr(layer, STATE_ATTR, state)
+ 
+@@ -760,17 +763,26 @@ def apply_prepared_fp8_qpn8_linear(
+     return out.reshape(x.shape[:-1] + (state.output_size,))
+ 
+ 
+-def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
+-    device_index = weight.device.index
+-    if device_index is None:
+-        device_index = torch.accelerator.current_device_index()
++def get_nvfp4_qpn4_dense_workspace(
++    weight: torch.Tensor, *, temporary: bool = False
++) -> torch.Tensor | None:
++    """Admit the bounded workspace, optionally without retaining an allocation.
++
++    Temporary admission uses the same bound as resident admission. The caller
++    must drop the probe before preparing weights; neither pool nor layer owns it.
++    """
+     elements = max(NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS, weight.numel() * 2)
+-    cache_key = (device_index, torch.float16, elements)
+-    workspace = workspace_pool(
+-        "_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces
+-    ).get(cache_key)
+-    if workspace is not None:
+-        return workspace
++    if not temporary:
++        device_index = weight.device.index
++        if device_index is None:
++            device_index = torch.accelerator.current_device_index()
++        cache_key = (device_index, torch.float16, elements)
++        pool = workspace_pool(
++            "_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces
++        )
++        workspace = pool.get(cache_key)
++        if workspace is not None:
++            return workspace
+     try:
+         workspace = torch.empty(
+             (elements,),
+@@ -779,15 +791,14 @@ def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
+         )
+     except torch.OutOfMemoryError:
+         return None
+-    workspace_pool("_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces)[
+-        cache_key
+-    ] = workspace
++    if not temporary:
++        pool[cache_key] = workspace
+     return workspace
+ 
+ 
+ def prepare_nvfp4_qpn4_linear(
+     layer: torch.nn.Module,
+-    workspace: torch.Tensor,
++    workspace: torch.Tensor | None,
+     gated_silu: bool,
+ ) -> None:
+     """Replace one accepted NVFP4 dense weight with memory-neutral QPN4."""
+@@ -814,7 +825,8 @@ def prepare_nvfp4_qpn4_linear(
+         packed_weight, packed_scales = sm70_ops.nvfp4_qpn4_prepare_sm70(
+             qweight, fp16_scales
+         )
+-    register_layer_workspace(layer, workspace, family="nvfp4")
++    if workspace is not None:
++        register_layer_workspace(layer, workspace, family="nvfp4")
+     _store_state(
+         layer,
+         packed_weight,
+@@ -826,6 +838,7 @@ def prepare_nvfp4_qpn4_linear(
+         gated_silu=gated_silu,
+         global_scale=global_scale,
+         use_scale_code=use_scale_code,
++        qpn4_lazy_dense_workspace=workspace is None,
+     )
+ 
+ 

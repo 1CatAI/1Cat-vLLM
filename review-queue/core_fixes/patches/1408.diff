@@ -1,0 +1,657 @@
+diff --git a/docs/design/architecture/runtime_reference.md b/docs/design/architecture/runtime_reference.md
+index b8d02cc31..0c47c7cfd 100644
+--- a/docs/design/architecture/runtime_reference.md
++++ b/docs/design/architecture/runtime_reference.md
+@@ -83,7 +83,7 @@ identify initialization/hash code; they do not evaluate its semantics.
+ | `vllm.config.sm70_runtime.StepProfilerConfig` | observability_config.step_profiler | __post_init__: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L145); compile_ignored_aliases: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L151) | [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L130) |
+ | `vllm.config.sm70_sparse.Sm70SparseConfig` | kernel_config.sm70_sparse | compute_hash: [vllm/config/sm70_sparse.py](../../../vllm/config/sm70_sparse.py#L170); resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L57); value: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L69) | [vllm/config/sm70_sparse.py](../../../vllm/config/sm70_sparse.py#L51) |
+ | `vllm.config.sm70_triton_attention.Sm70TritonAttentionPolicy` | attention_config.sm70_triton | resolve: [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L73); compute_hash: [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L110); value: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L69) | [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L36) |
+-| `vllm.config.speculative.SpeculativeConfig` | speculative_config | compute_hash: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L432); __post_init__: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L774) | [vllm/config/speculative.py](../../../vllm/config/speculative.py#L157) |
++| `vllm.config.speculative.SpeculativeConfig` | speculative_config | compute_hash: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L432); __post_init__: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L776) | [vllm/config/speculative.py](../../../vllm/config/speculative.py#L157) |
+ | `vllm.config.speculative_sampling.SpeculativeSamplingPolicy` | speculative_config.sampling_policy | resolve_fields: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L109); resolve: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L142); compute_hash: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L181) | [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L16) |
+ | `vllm.config.structured_outputs.StructuredOutputsConfig` | structured_outputs_config | compute_hash: [vllm/config/structured_outputs.py](../../../vllm/config/structured_outputs.py#L44) | [vllm/config/structured_outputs.py](../../../vllm/config/structured_outputs.py#L18) |
+ | `vllm.config.turboquant_runtime.TurboQuantDiagnostics` | observability_config.runtime_trace.turboquant | compile_ignored_aliases: [vllm/config/turboquant_runtime.py](../../../vllm/config/turboquant_runtime.py#L106); resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L29); compute_hash: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L37) | [vllm/config/turboquant_runtime.py](../../../vllm/config/turboquant_runtime.py#L72) |
+diff --git a/tests/compile/test_compiler_interface.py b/tests/compile/test_compiler_interface.py
+new file mode 100644
+index 000000000..a54f2a105
+--- /dev/null
++++ b/tests/compile/test_compiler_interface.py
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from vllm.compilation.compiler_interface import InductorStandaloneAdaptor
++
++
++@pytest.mark.parametrize("save_format", ["binary", "unpacked"])
++def test_inductor_standalone_load_uses_current_cache_dir(
++    tmp_path: Path,
++    save_format: str,
++):
++    old_cache_dir = tmp_path / "old"
++    new_cache_dir = tmp_path / "new"
++    key = "artifact_shape_None_subgraph_0"
++
++    adaptor = InductorStandaloneAdaptor(save_format=save_format)
++    adaptor.initialize_cache(str(new_cache_dir))
++
++    # Simulate a handle persisted before the cache directory was relocated.
++    handle = (key, str(old_cache_dir / key))
++
++    with (
++        patch(
++            "torch._inductor.CompiledArtifact.load",
++            return_value=MagicMock(),
++        ) as load_mock,
++        patch(
++            "torch._inductor.compile_fx.graph_returns_tuple",
++            return_value=True,
++        ),
++    ):
++        adaptor.load(
++            handle=handle,
++            graph=MagicMock(),
++            example_inputs=[],
++            graph_index=0,
++            compile_range=MagicMock(),
++        )
++
++    load_mock.assert_called_once_with(
++        path=str(new_cache_dir / key),
++        format=save_format,
++    )
+diff --git a/tests/distributed/test_shm_broadcast.py b/tests/distributed/test_shm_broadcast.py
+index 9c975658d..643c87935 100644
+--- a/tests/distributed/test_shm_broadcast.py
++++ b/tests/distributed/test_shm_broadcast.py
+@@ -349,6 +349,136 @@ def test_message_queue_busy_to_idle():
+     distributed_run(worker_fn_test_busy_to_idle, 4)
+ 
+ 
++@pytest.mark.parametrize("should_warn", [False, True])
++def test_reader_timeout_caps_indefinite_waits(should_warn):
++    with (
++        mock.patch(
++            "vllm.distributed.device_communicators.shm_broadcast."
++            "SHM_READER_RECHECK_INTERVAL_MS",
++            new=7,
++        ),
++        mock.patch(
++            "vllm.distributed.device_communicators.shm_broadcast."
++            "VLLM_RINGBUFFER_WARNING_INTERVAL",
++            new=60,
++        ),
++    ):
++        timeout = MessageQueue.ReadTimeoutWithWarnings(
++            timeout=None, should_warn=should_warn
++        )
++        assert timeout.timeout_ms() == 7
++
++
++def test_reader_rechecks_shm_after_idle_wait_timeout_without_notify():
++    writer = MessageQueue(
++        n_reader=1,
++        n_local_reader=1,
++        max_chunk_bytes=1024 * 1024,
++        max_chunks=1,
++    )
++    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
++    payload = 123
++    poll_started = threading.Event()
++    allow_timeout = threading.Event()
++    result = {}
++
++    def acquire_read_in_thread():
++        try:
++            with reader.acquire_read(indefinite=True) as buf:
++                result["value"] = buf[0]
++        except Exception as exc:
++            result["exc"] = exc
++
++    def poll_timeout(*, timeout: int | None = None):
++        poll_started.set()
++        assert allow_timeout.wait(timeout=5)
++        return []
++
++    try:
++        writer.wait_until_ready()
++        reader.wait_until_ready()
++        reader._spin_condition.last_read = 0
++        reader._spin_condition.busy_loop_s = 0
++
++        with (
++            mock.patch(
++                "vllm.distributed.device_communicators.shm_broadcast."
++                "SHM_READER_RECHECK_INTERVAL_MS",
++                new=50,
++            ),
++            mock.patch(
++                "vllm.distributed.device_communicators.shm_broadcast."
++                "VLLM_RINGBUFFER_WARNING_INTERVAL",
++                new=60,
++            ),
++            mock.patch.object(
++                reader._spin_condition.poller,
++                "poll",
++                side_effect=poll_timeout,
++            ) as poll,
++        ):
++            read_thread = threading.Thread(target=acquire_read_in_thread, daemon=True)
++            read_thread.start()
++            assert poll_started.wait(timeout=5)
++            with writer.acquire_write(timeout=0.1) as buf:
++                buf[0] = payload
++            allow_timeout.set()
++            read_thread.join(timeout=5)
++
++            assert not read_thread.is_alive()
++            poll.assert_called_once_with(timeout=50)
++
++        if "exc" in result:
++            raise result["exc"]
++        assert result["value"] == payload
++        with writer.buffer.get_metadata(0) as metadata_buffer:
++            assert metadata_buffer[0] == 1
++            assert metadata_buffer[1] == 1
++    finally:
++        writer.shutdown()
++        reader.shutdown()
++        for socket in (
++            writer.local_socket,
++            writer._spin_condition.local_notify_socket,
++            reader.local_socket,
++            reader._spin_condition.local_notify_socket,
++            reader._spin_condition.read_cancel_socket,
++            reader._spin_condition.write_cancel_socket,
++        ):
++            socket.close(linger=0)
++
++
++def test_acquire_read_releases_slot_when_reader_raises():
++    writer = MessageQueue(
++        n_reader=1,
++        n_local_reader=1,
++        max_chunk_bytes=1024 * 1024,
++        max_chunks=1,
++    )
++    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
++    try:
++        writer.wait_until_ready()
++        reader.wait_until_ready()
++
++        writer.enqueue({"payload": "first"})
++
++        with (
++            pytest.raises(RuntimeError, match="reader failed"),
++            reader.acquire_read(timeout=0.1),
++        ):
++            raise RuntimeError("reader failed")
++
++        with writer.buffer.get_metadata(0) as metadata_buffer:
++            assert metadata_buffer[0] == 1
++            assert metadata_buffer[1] == 1
++
++        with writer.acquire_write(timeout=0.1) as buf:
++            buf[0] = 0
++    finally:
++        writer.shutdown()
++        reader.shutdown()
++
++
+ def test_warning_logs(caplog_vllm):
+     """
+     Test that warning logs are emitted at VLLM_RINGBUFFER_WARNING_INTERVAL intervals
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index 908975d87..57a797e1c 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -731,6 +731,37 @@ def test_request_block_hasher(hash_fn):
+     assert block_hashes[1] == hash_fn((block_hashes[0], (3, 4, 5), (("hash2", 0),)))
+ 
+ 
++@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
++def test_request_block_hasher_incremental_append_with_multiple_mm_features(hash_fn):
++    mm_positions = [
++        PlaceholderRange(offset=4, length=2),
++        PlaceholderRange(offset=6, length=1),
++    ]
++    incremental = make_request(
++        request_id="incremental",
++        prompt_token_ids=list(range(7)),
++        block_size=4,
++        hash_fn=hash_fn,
++        mm_positions=mm_positions,
++        mm_hashes=["A", "B"],
++    )
++    incremental.append_output_token_ids(7)
++    fresh = make_request(
++        request_id="fresh",
++        prompt_token_ids=list(range(8)),
++        block_size=4,
++        hash_fn=hash_fn,
++        mm_positions=mm_positions,
++        mm_hashes=["A", "B"],
++    )
++
++    expected_second_hash = hash_fn(
++        (incremental.block_hashes[0], (4, 5, 6, 7), (("A", 0), ("B", 2)))
++    )
++    assert incremental.block_hashes[1] == expected_second_hash
++    assert incremental.block_hashes == fresh.block_hashes
++
++
+ @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
+ def test_hash_tokens_different_mm_input(hash_fn):
+     request1 = make_request(
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 92a932eef..a0c2bea5d 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -4505,3 +4505,20 @@ def test_kv_connector_honors_skip_reading_prefix_cache(is_async):
+         assert output.num_scheduled_tokens[plain.request_id] == BLOCK_SIZE * 2
+     assert output.num_scheduled_tokens[scoring.request_id] == BLOCK_SIZE * 4
+     assert scoring.status == RequestStatus.RUNNING
++
++
++def test_new_block_ids_drained_without_kv_cache_zeroing():
++    """Without Mamba layers nothing zeroes new blocks, but the managers still
++    record them; the scheduler must drain the list every step or it grows for
++    the lifetime of the engine (vllm-project/vllm#44490)."""
++    scheduler = create_scheduler(max_num_batched_tokens=64)
++    assert not scheduler.needs_kv_cache_zeroing
++    (request,) = create_requests(num_requests=1, num_tokens=100)
++    scheduler.add_request(request)
++
++    # Two prefill chunks, each allocating blocks.
++    for _ in range(2):
++        output = scheduler.schedule()
++        assert output.new_block_ids_to_zero is None
++        managers = scheduler.kv_cache_manager.coordinator.single_type_managers
++        assert all(not manager.new_block_ids for manager in managers)
+diff --git a/tests/v1/spec_decode/test_dspark.py b/tests/v1/spec_decode/test_dspark.py
+index e99c31572..df7c08a91 100644
+--- a/tests/v1/spec_decode/test_dspark.py
++++ b/tests/v1/spec_decode/test_dspark.py
+@@ -347,3 +347,16 @@ def test_alignment_output_contract_is_hashed(tmp_path, monkeypatch):
+     spec.dspark_confidence_threshold = 0.5
+     spec.bind_diagnostic_output(False)
+     assert spec.compute_hash() == alignment
++
++
++def test_draft_model_config_is_hashed(tmp_path, monkeypatch):
++    # The drafter compiles into the target's cache directory, so a drafter
++    # with other weights (here: quantized) must not hit the old artifacts
++    # (vllm-project/vllm#47911).
++    _, spec = _make_dspark_speculative_config(
++        tmp_path, monkeypatch, pp_size=1, tp_size=1
++    )
++    assert spec.draft_model_config is not None
++    before = spec.compute_hash()
++    spec.draft_model_config.quantization = "fp8"
++    assert spec.compute_hash() != before
+diff --git a/tests/v1/worker/test_gpu_model_runner_pp.py b/tests/v1/worker/test_gpu_model_runner_pp.py
+index 6a1a771d6..5b3c0d297 100644
+--- a/tests/v1/worker/test_gpu_model_runner_pp.py
++++ b/tests/v1/worker/test_gpu_model_runner_pp.py
+@@ -60,33 +60,6 @@ def test_pp_packet_rejects_tokens_wider_than_receive_buffer() -> None:
+         )
+ 
+ 
+-@pytest.mark.parametrize(
+-    ("old_computed", "scheduled", "prefill_len", "max_seq_len", "expected"),
+-    [
+-        (0, 4, 8, 32, None),
+-        (0, 8, 8, 32, [True]),
+-        (31, 1, 8, 32, None),
+-    ],
+-)
+-def test_compute_need_sampled_mask(
+-    old_computed, scheduled, prefill_len, max_seq_len, expected
+-) -> None:
+-    batch = SimpleNamespace(
+-        num_computed_tokens_np=np.array([old_computed], dtype=np.int32),
+-        num_scheduled_tokens=np.array([scheduled], dtype=np.int32),
+-        prefill_len_np=np.array([prefill_len], dtype=np.int32),
+-        max_seq_len_np=np.array([max_seq_len], dtype=np.int32),
+-    )
+-
+-    result = pp_utils.compute_need_sampled_mask(batch)
+-
+-    if expected is None:
+-        assert result is None
+-    else:
+-        assert result is not None
+-        assert result.tolist() == expected
+-
+-
+ def test_pp_slot_ring_filters_reused_request_indices() -> None:
+     waited: list[object] = []
+     slot = pp_utils.PendingRecv(
+diff --git a/tests/v1/worker/test_pp_utils.py b/tests/v1/worker/test_pp_utils.py
+new file mode 100644
+index 000000000..cfc92479f
+--- /dev/null
++++ b/tests/v1/worker/test_pp_utils.py
+@@ -0,0 +1,83 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Which rows the PP sampled-token broadcast must carry."""
++
++from unittest.mock import Mock
++
++import numpy as np
++
++from vllm.v1.worker.gpu import pp_utils
++
++
++def _batch(num_computed, prefill_len, num_scheduled):
++    return Mock(
++        num_reqs=len(num_computed),
++        num_computed_tokens_np=np.array(num_computed, dtype=np.int32),
++        prefill_len_np=np.array(prefill_len, dtype=np.int32),
++        num_scheduled_tokens=np.array(num_scheduled, dtype=np.int32),
++    )
++
++
++def test_excludes_non_final_prefill_chunks():
++    """Unchanged behaviour: a chunk that does not finish its prefill is skipped."""
++    # Row 0 is a middle prefill chunk and produces no sample; row 1 finishes its
++    # prefill this step and therefore does.
++    batch = _batch(
++        num_computed=[512, 1000],
++        prefill_len=[4096, 1004],
++        num_scheduled=[448, 4],
++    )
++
++    mask = pp_utils.compute_need_sampled_mask(batch)
++
++    assert mask is not None
++    assert mask.tolist() == [False, True]
++
++
++def test_none_when_no_row_samples():
++    """Unchanged behaviour: an all-prefill batch needs no broadcast at all."""
++    batch = _batch(
++        num_computed=[0, 512],
++        prefill_len=[4096, 4096],
++        num_scheduled=[448, 448],
++    )
++
++    assert pp_utils.compute_need_sampled_mask(batch) is None
++
++
++def test_keeps_decoding_request_past_its_length_cap():
++    """A decoding request must never be dropped from the broadcast.
++
++    Speculative decoding advances `num_computed_tokens` several tokens per step,
++    so it can overrun `prompt_len + max_tokens` while the scheduler is still
++    running the request. Predicting "this one is finishing" and skipping its
++    broadcast freezes the earlier pipeline stages' `last_sampled_tokens` and
++    `draft_tokens` while the last rank keeps advancing its own, and the stages
++    then diverge permanently.
++    """
++    batch = _batch(
++        # 14176 computed tokens is already past this request's own
++        # prompt_len + max_tokens; the scheduler is still running it.
++        num_computed=[14176],
++        prefill_len=[12175],
++        num_scheduled=[8],
++    )
++
++    mask = pp_utils.compute_need_sampled_mask(batch)
++
++    assert mask is not None
++    assert mask.tolist() == [True]
++
++
++def test_decode_row_ahead_of_a_prefill_chunk():
++    """Row order does not matter: only whether the row finishes its prefill."""
++    batch = _batch(
++        num_computed=[10, 512],
++        prefill_len=[8, 4096],
++        num_scheduled=[1, 448],
++    )
++
++    mask = pp_utils.compute_need_sampled_mask(batch)
++
++    assert mask is not None
++    assert mask.tolist() == [True, False]
+diff --git a/vllm/compilation/compiler_interface.py b/vllm/compilation/compiler_interface.py
+index f320cb9ec..9e93a0205 100644
+--- a/vllm/compilation/compiler_interface.py
++++ b/vllm/compilation/compiler_interface.py
+@@ -425,7 +425,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
+         assert isinstance(handle, tuple)
+         assert isinstance(handle[0], str)
+         assert isinstance(handle[1], str)
+-        path = handle[1]
++        path = os.path.join(self.cache_dir, handle[0])
+         inductor_compiled_graph = torch._inductor.CompiledArtifact.load(
+             path=path, format=self.save_format
+         )
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index a6e9f0865..09a99071d 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -482,8 +482,10 @@ class SpeculativeConfig:
+         if self.method == "mtp":
+             factors.append(("mtp_expert_quantization", self.mtp_expert_quantization))
+ 
+-        # The specific layers used also affect the computation graph
+         if uses_aux_hidden_states and self.draft_model_config is not None:
++            factors.append(self.draft_model_config.compute_hash())
++
++            # The specific layers used also affect the computation graph.
+             layer_ids = getattr(
+                 self.draft_model_config.hf_config,
+                 "eagle_aux_hidden_state_layer_ids",
+diff --git a/vllm/distributed/device_communicators/shm_broadcast.py b/vllm/distributed/device_communicators/shm_broadcast.py
+index e78f92cd6..04b8fbf0d 100644
+--- a/vllm/distributed/device_communicators/shm_broadcast.py
++++ b/vllm/distributed/device_communicators/shm_broadcast.py
+@@ -47,6 +47,11 @@ if TYPE_CHECKING:
+     from _typeshed import SizedBuffer
+ 
+ VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
++# Cap on how long an idle reader parks before re-reading the authoritative SHM
++# written-flag. Bounds lost-notify recovery latency to ~5s while the periodic
++# wakeup stays negligible (one flag check per reader every 5s).
++SHM_READER_RECHECK_INTERVAL_MS = 5000
++
+ 
+ # How often a busy reader polls its notify socket. CONFLATE keeps one message,
+ # but libzmq still queues an internal command per notification until the socket
+@@ -644,25 +649,22 @@ class MessageQueue:
+             self.n_warning = 1
+             self.timeout = timeout
+ 
+-        def timeout_ms(self) -> int | None:
+-            """Returns a timeout that is:
++        def timeout_ms(self) -> int:
++            """Returns a timeout, capped at the recheck interval, that is:
+             - min(time to deadline, time to next warning) if we're logging warnings
+             - time to deadline, if we're not logging warnings
+-            - None if the timeout is None and we're not logging warnings
++            - recheck interval if the timeout is None and we're not logging warnings
+             - raise TimeoutError if we are past the deadline
+             """
+-            warning_wait_time = self.warning_wait_time_ms
++            wait_ms = SHM_READER_RECHECK_INTERVAL_MS
++            if self.warning_wait_time_ms is not None:
++                wait_ms = min(wait_ms, self.warning_wait_time_ms)
+             if self.timeout is None:
+-                return warning_wait_time
+-
++                return wait_ms
+             time_left_ms = int((self.deadline - time.monotonic()) * 1000)
+             if time_left_ms <= 0:
+                 raise TimeoutError
+-
+-            if warning_wait_time and warning_wait_time < time_left_ms:
+-                return warning_wait_time
+-
+-            return time_left_ms
++            return min(wait_ms, time_left_ms)
+ 
+         def should_warn(self) -> bool:
+             """Returns true if it's time to log a warning for a timeout that is not
+@@ -723,18 +725,18 @@ class MessageQueue:
+                 # found a block that is not read by this reader
+                 # let caller read from the buffer
+                 with self.buffer.get_data(self.current_idx) as buf:
+-                    yield buf
+-
+-                # caller has read from the buffer
+-                # set the read flag
+-                metadata_buffer[self.local_reader_rank + 1] = 1
+-                # Memory fence ensures the read flag is visible to the writer.
+-                # Without this, writer may not see our read completion and
+-                # could wait indefinitely for all readers to finish.
+-                memory_fence()
+-                self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
+-
+-                self._spin_condition.record_read()
++                    try:
++                        yield buf
++                    finally:
++                        # caller has read from the buffer; set the read flag.
++                        metadata_buffer[self.local_reader_rank + 1] = 1
++                        # Memory fence ensures the read flag is visible to the writer.
++                        # Without this, writer may not see our read completion and
++                        # could wait indefinitely for all readers to finish.
++                        memory_fence()
++                        next_idx = self.current_idx + 1
++                        self.current_idx = next_idx % self.buffer.max_chunks
++                        self._spin_condition.record_read()
+                 break
+ 
+     def enqueue(self, obj, timeout: float | None = None):
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index eef76511d..046bea0a3 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -689,13 +689,10 @@ def get_request_block_hasher(
+             # Early stop when there no new full blocks created.
+             return []
+ 
++        # Start at the first mm input also when continuing: a block completed
++        # with generated tokens can still hold several mm inputs. Passed inputs
++        # are skipped, and blocks after the last one return early.
+         curr_mm_idx = 0
+-        if start_token_idx > 0:
+-            # Set curr_mm_idx = -1 to indicate the last mm input.
+-            # Note that since we reach to this branch only when the block is
+-            # completed with generated tokens, we only need to consider the
+-            # last mm input.
+-            curr_mm_idx = -1
+ 
+         prev_block_hash_value = (
+             request.block_hashes[-1] if request.block_hashes else None
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index f7e6c59e0..65859c941 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1325,10 +1325,11 @@ class Scheduler(SchedulerInterface):
+         self.prev_step_scheduled_req_ids.clear()
+         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+ 
++        # Drain new attention block ids every step so the manager-side list
++        # does not grow unbounded; only kv-cache zeroing consumes them.
++        new_attn_block_ids = self.kv_cache_manager.take_new_block_ids()
+         new_block_ids_to_zero = (
+-            (self.kv_cache_manager.take_new_block_ids() or None)
+-            if self.needs_kv_cache_zeroing
+-            else None
++            (new_attn_block_ids or None) if self.needs_kv_cache_zeroing else None
+         )
+         # A Mamba ``align`` table is not append-only. Drain exact committed
+         # boundary-state block IDs before the connector builds store jobs.
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index b4310bd22..d62b76c58 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -73,8 +73,6 @@ class InputBatch:
+     num_computed_prefill_tokens_np: np.ndarray
+     # [num_reqs] CPU bool array.
+     is_prefilling_np: np.ndarray
+-    # [num_reqs] populated only for pipeline parallel execution.
+-    max_seq_len_np: np.ndarray | None
+ 
+     # [num_tokens_after_padding]
+     input_ids: torch.Tensor
+@@ -168,7 +166,6 @@ class InputBatch:
+             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
+             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
+             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
+-            max_seq_len_np=None,
+             input_ids=input_ids,
+             positions=positions,
+             logits_indices=logits_indices,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index e77043f16..89993adf7 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1238,9 +1238,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if num_reqs_padded > num_reqs:
+                 prefix_anchor_lens[num_reqs:].zero_()
+ 
+-        max_seq_len_np = (
+-            self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None
+-        )
+         return InputBatch(
+             req_ids=req_ids,
+             num_reqs=num_reqs,
+@@ -1263,7 +1260,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             prefill_len_np=prefill_len_np,
+             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
+             is_prefilling_np=is_prefilling_np,
+-            max_seq_len_np=max_seq_len_np,
+             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
+             positions=self.input_buffers.positions[:num_tokens_after_padding],
+             logits_indices=logits_indices,
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index c76024a6c..462c86643 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -30,16 +30,16 @@ class PendingRecv:
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+-    """Return rows whose sampled output can feed a later decode step."""
++    """Return a bool array of shape `[input_batch.num_reqs]` marking requests
++    that produce a sampled token this step, and therefore must have that token
++    (and the draft block proposed from it) propagated to the earlier PP stages.
++    Returns None if no request in the batch produces a sample."""
++
+     old_computed = input_batch.num_computed_tokens_np
+     prefill_len = input_batch.prefill_len_np
+-    max_seq_len = input_batch.max_seq_len_np
+-    assert max_seq_len is not None
+-
++    # Exclude non-final prefill chunks (they don't produce a sample).
+     produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+-    not_finishing = np.maximum(old_computed, prefill_len) + 1 < max_seq_len
+-    need_sampled_mask = produces_sample & not_finishing
+-    return need_sampled_mask if need_sampled_mask.any() else None
++    return produces_sample if produces_sample.any() else None
+ 
+ 
+ def _pack_token_packet(
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index 02a25b284..74d900b76 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -1117,5 +1117,8 @@ def rejection_sample(
+         expanded_idx_mapping,
+         temperature,
+         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
++        # The kernel reads and updates num_sampled in place. Multiple warps can
++        # observe the increment before loading the original resampling index.
++        num_warps=1,
+     )
+     return sampled, num_sampled

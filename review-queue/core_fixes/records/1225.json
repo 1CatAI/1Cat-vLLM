@@ -1,0 +1,99 @@
+{
+  "initial_inventory": {
+    "number": 1225,
+    "title": "[Bugfix][MRv2] Bound prompt logprobs memory with small chunks and request limits",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1225",
+    "isDraft": false,
+    "headRefOid": "f9d1134a6413c49a9d4ab1890ee42ef3b9add80a",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1225,
+    "title": "[Bugfix][MRv2] Bound prompt logprobs memory with small chunks and request limits",
+    "body": "## Purpose\n\nRequests that ask for `prompt_logprobs` on long prompts can crash the engine with a CUDA OOM on the MRv2 path. On a 4x V100-32GB TP4 deployment of Qwen3.8-Flash-Next at `gpu_memory_utilization=0.94`, a single 8,192-token prompt with `prompt_logprobs` was enough; four concurrent long prompts failed the same way. All TP ranks fail together in the logits all-gather:\n\n```\nvllm/v1/worker/gpu/sample/prompt_logprob.py  compute_prompt_logprobs_with_chunking\nvllm/model_executor/layers/logits_processor.py  _get_logits -> _gather_logits\nvllm/distributed/device_communicators/base_device_communicator.py  all_gather\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 486.00 MiB. ... 474.25 MiB is free.\n```\n\n**Root cause.** `compute_prompt_logprobs_with_chunking` materializes full-vocabulary logits for `CHUNK_SIZE = 1024` rows at a time. With a 248,320-token vocabulary at TP4, each chunk needs on every rank the local `[1024, V/4]` logits (121 MiB), the all-gather receive buffer (485 MiB) and a second 485 MiB copy from the `movedim`/`reshape` layout change; the previous chunk's 485 MiB logits are still referenced while the next `logits_fn` runs. That is about 1.54 GiB per rank of explicit tensors, none of it covered by the startup memory profile: the dummy sampler run scores one row per request, and the sampler warmup with `prompt_logprobs=1` runs after the KV budget is fixed and uses only a few dozen rows. A `-1` (full-vocabulary) request is larger still, and it also widened every other request in the same batch to full width.\n\n**Changes** (4 runtime files, +100/-37, plus a CPU test):\n\n- `vllm/v1/worker/gpu/sample/prompt_logprob.py`: default chunk of 32 rows (`VLLM_PROMPT_LOGPROBS_CHUNK_SIZE`, 1..1024, must be equal on all TP ranks). Each chunk's IDs, logprobs and ranks are copied to the CPU and the chunk's logits are released before the next all-gather. Each request is scored at its own width, so a `-1` request no longer widens other requests or decode rows.\n- `vllm/v1/prompt_logprobs_limits.py`, `vllm/v1/engine/input_processor.py`: before a request enters EngineCore, reject `prompt_logprobs` output above `VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES` (default 64 MiB per request) and partial top-k between 129 and V-2, which would expand the inherited Triton kernel to `next_power_of_2(k+1)` lanes. The existing `max_logprobs` check still runs first. The error is a `VLLMValidationError` on `prompt_logprobs` (HTTP 400).\n- `vllm/envs.py`: the two variables, registered with complete metadata.\n\nUnchanged: model code, the shared sampler, the logprob math kernels, profiling and the KV budget. Requests without `prompt_logprobs` return at the same early exit as before.\n\nThe same fixed `CHUNK_SIZE = 1024` is still in vLLM main (checked at `ce49c47cbb`).\n\n## Test Plan\n\n- CPU: `python -m pytest --confcutdir=tests/v1/worker tests/v1/worker/test_prompt_logprobs_memory_cpu.py -q`. The test loads the modified functions from source and compares them with the old 1024-row loop bit for bit (IDs, FP32 logprobs, ranks) over chunk sizes 1/7/32/64/1024, k = 0/1/20/128/V-1/V/-1, FP16 and FP32, ties and `-inf`, mixed full/small/decode batches, multi-step prefill, preempted and removed requests; it also checks that the previous chunk's logits are released and that `process_inputs` rejects oversized requests before building an `EngineCoreRequest`.\n- `pre-commit run` on the changed files.\n- GPU (4x V100-PCIE-32GB, TP4 + DCP2, MTP 4 tokens, FP8 E4M3 KV, `max_num_seqs=8`, `gpu_memory_utilization=0.94`, Qwen3.8-Flash-Next AWQ g32): the same patch on our branch, full candidate gate plus the prompt-logprobs cases below.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| MRv2 `PromptLogprobsWorker.compute_prompt_logprobs` | FP16 logits, TP all-gather | TP4 (+DCP2), SM70, prompts 8K / 32K / 128K, k = 1 / 20 | Always chunked at 32 rows; results on CPU per chunk | Executed on V100; CPU bitwise tests | Other TP sizes and non-SM70 GPUs; k > 20 on GPU (our server keeps `max_logprobs=20`) |\n| `InputProcessor.process_inputs` admission | — | MRv2 only, `prompt_logprobs` set | Reject > 64 MiB output or 128 < k < V-1 with HTTP 400 | CPU tests executed; on GPU, `-1` and 21 were rejected by the existing `max_logprobs` check and the engine stayed healthy | `-1` with a raised `max_logprobs` not exercised on GPU |\n| Requests without `prompt_logprobs` | — | Greedy, seeded sampling, MTP, 1–8 concurrent | Unchanged early return | Executed: greedy outputs and logprobs bitwise identical to the previous build; seeded C1 sampling 8/8 | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\nThis is a memory/stability fix, not a performance change.\n\n- Default enabled or opt-in: enabled by default (chunk 32, 64 MiB limit).\n- Required CLI options and environment switches: none; optional `VLLM_PROMPT_LOGPROBS_CHUNK_SIZE`, `VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES`.\n- KV cache dtype used for the benchmark: `fp8_e4m3`.\n- Wheel SHA or source commit: this patch on our branch over a 1Cat-derived build; this PR is the same change rebased on `6f3557c973`.\n- PYTHONPATH, source overlays, or external native libraries used: a Python source overlay over the deployed 1Cat build; no native changes.\n- User-entry route-hit, speed, and output-quality evidence: see Test Result.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no deprecated variables.\n- New/changed environment metadata and generated reference check: two variables with complete metadata; the \"Require complete environment registration metadata\" and \"Prevent unregistered 'VLLM_*' environment reads\" hooks pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: no SM70-specific variables added (the two new variables are generic).\n\n## Test Result\n\n- CPU: `95 passed`.\n- GPU, prompt-logprobs requests, `max_tokens=1` (before this change, 8K already crashed the engine):\n\n  | Prompt | No prompt_logprobs | k = 1 | k = 20 |\n  | --- | ---: | ---: | ---: |\n  | 8,192 | 2.3 s | 3.2 s | 5.9 s |\n  | 32,768 | 10.0 s | 14.0 s | 26.3 s |\n  | 131,072 | 46.2 s | 61.6 s | 104.9 s |\n\n  Four concurrent 32K requests with k = 20 alongside two 1,024-token decodes: all succeeded. GPU memory peak during these cases was unchanged from normal full load (32,482 MiB per GPU). Every request returned all positions, with `None` first.\n- Numerics: on 66 scored records (39,101 positions, ≤ 4K tokens each), target-token logprobs and top-20 IDs/values are bitwise identical to the previous 1024-row code.\n- Requests without `prompt_logprobs`: greedy outputs bitwise identical to the previous build on 1K–32K prompts; seeded sampling C1 8/8; 4- and 8-way stress, multimodal and long-context needle checks pass.\n- Cost: smaller chunks add all-gathers and synchronous copies; with k = 20 the total is about 2.3x prefill alone. Possible follow-ups are an adaptive chunk size or vocab-parallel scoring that gathers only per-rank logsumexp and top-k (vLLM #57934 has building blocks).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---\n<details>\n<summary> Essential Elements of an Effective PR Description Checklist </summary>\n\n- [x] The purpose of the PR, such as \"Fix some issue (link existing issues this PR will resolve)\".\n- [x] The test plan, such as providing test command.\n- [x] The test results, such as pasting the results comparison before and after, or e2e results\n- [ ] (Optional) The necessary documentation update, such as updating `supported_models.md` and `examples` for a new model.\n\n</details>\n\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1225",
+    "isDraft": false,
+    "headRefName": "fix/mrv2-prompt-logprobs-memory",
+    "headRefOid": "f9d1134a6413c49a9d4ab1890ee42ef3b9add80a",
+    "baseRefName": "main",
+    "baseRefOid": "6f3557c973b4602905037e086fd4acba9b0d867f",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "Leonccaa/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "Leonccaa"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "Leonccaa"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1225,
+    "id": "PR_kwDORjYFXs8AAAABJEJaQA",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "f9d1134a6413c49a9d4ab1890ee42ef3b9add80a",
+    "title": "[Bugfix][MRv2] Bound prompt logprobs memory with small chunks and request limits",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1225",
+    "body": "## Purpose\n\nRequests that ask for `prompt_logprobs` on long prompts can crash the engine with a CUDA OOM on the MRv2 path. On a 4x V100-32GB TP4 deployment of Qwen3.8-Flash-Next at `gpu_memory_utilization=0.94`, a single 8,192-token prompt with `prompt_logprobs` was enough; four concurrent long prompts failed the same way. All TP ranks fail together in the logits all-gather:\n\n```\nvllm/v1/worker/gpu/sample/prompt_logprob.py  compute_prompt_logprobs_with_chunking\nvllm/model_executor/layers/logits_processor.py  _get_logits -> _gather_logits\nvllm/distributed/device_communicators/base_device_communicator.py  all_gather\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 486.00 MiB. ... 474.25 MiB is free.\n```\n\n**Root cause.** `compute_prompt_logprobs_with_chunking` materializes full-vocabulary logits for `CHUNK_SIZE = 1024` rows at a time. With a 248,320-token vocabulary at TP4, each chunk needs on every rank the local `[1024, V/4]` logits (121 MiB), the all-gather receive buffer (485 MiB) and a second 485 MiB copy from the `movedim`/`reshape` layout change; the previous chunk's 485 MiB logits are still referenced while the next `logits_fn` runs. That is about 1.54 GiB per rank of explicit tensors, none of it covered by the startup memory profile: the dummy sampler run scores one row per request, and the sampler warmup with `prompt_logprobs=1` runs after the KV budget is fixed and uses only a few dozen rows. A `-1` (full-vocabulary) request is larger still, and it also widened every other request in the same batch to full width.\n\n**Changes** (4 runtime files, +100/-37, plus a CPU test):\n\n- `vllm/v1/worker/gpu/sample/prompt_logprob.py`: default chunk of 32 rows (`VLLM_PROMPT_LOGPROBS_CHUNK_SIZE`, 1..1024, must be equal on all TP ranks). Each chunk's IDs, logprobs and ranks are copied to the CPU and the chunk's logits are released before the next all-gather. Each request is scored at its own width, so a `-1` request no longer widens other requests or decode rows.\n- `vllm/v1/prompt_logprobs_limits.py`, `vllm/v1/engine/input_processor.py`: before a request enters EngineCore, reject `prompt_logprobs` output above `VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES` (default 64 MiB per request) and partial top-k between 129 and V-2, which would expand the inherited Triton kernel to `next_power_of_2(k+1)` lanes. The existing `max_logprobs` check still runs first. The error is a `VLLMValidationError` on `prompt_logprobs` (HTTP 400).\n- `vllm/envs.py`: the two variables, registered with complete metadata.\n\nUnchanged: model code, the shared sampler, the logprob math kernels, profiling and the KV budget. Requests without `prompt_logprobs` return at the same early exit as before.\n\nThe same fixed `CHUNK_SIZE = 1024` is still in vLLM main (checked at `ce49c47cbb`).\n\n## Test Plan\n\n- CPU: `python -m pytest --confcutdir=tests/v1/worker tests/v1/worker/test_prompt_logprobs_memory_cpu.py -q`. The test loads the modified functions from source and compares them with the old 1024-row loop bit for bit (IDs, FP32 logprobs, ranks) over chunk sizes 1/7/32/64/1024, k = 0/1/20/128/V-1/V/-1, FP16 and FP32, ties and `-inf`, mixed full/small/decode batches, multi-step prefill, preempted and removed requests; it also checks that the previous chunk's logits are released and that `process_inputs` rejects oversized requests before building an `EngineCoreRequest`.\n- `pre-commit run` on the changed files.\n- GPU (4x V100-PCIE-32GB, TP4 + DCP2, MTP 4 tokens, FP8 E4M3 KV, `max_num_seqs=8`, `gpu_memory_utilization=0.94`, Qwen3.8-Flash-Next AWQ g32): the same patch on our branch, full candidate gate plus the prompt-logprobs cases below.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| MRv2 `PromptLogprobsWorker.compute_prompt_logprobs` | FP16 logits, TP all-gather | TP4 (+DCP2), SM70, prompts 8K / 32K / 128K, k = 1 / 20 | Always chunked at 32 rows; results on CPU per chunk | Executed on V100; CPU bitwise tests | Other TP sizes and non-SM70 GPUs; k > 20 on GPU (our server keeps `max_logprobs=20`) |\n| `InputProcessor.process_inputs` admission | — | MRv2 only, `prompt_logprobs` set | Reject > 64 MiB output or 128 < k < V-1 with HTTP 400 | CPU tests executed; on GPU, `-1` and 21 were rejected by the existing `max_logprobs` check and the engine stayed healthy | `-1` with a raised `max_logprobs` not exercised on GPU |\n| Requests without `prompt_logprobs` | — | Greedy, seeded sampling, MTP, 1–8 concurrent | Unchanged early return | Executed: greedy outputs and logprobs bitwise identical to the previous build; seeded C1 sampling 8/8 | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\nThis is a memory/stability fix, not a performance change.\n\n- Default enabled or opt-in: enabled by default (chunk 32, 64 MiB limit).\n- Required CLI options and environment switches: none; optional `VLLM_PROMPT_LOGPROBS_CHUNK_SIZE`, `VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES`.\n- KV cache dtype used for the benchmark: `fp8_e4m3`.\n- Wheel SHA or source commit: this patch on our branch over a 1Cat-derived build; this PR is the same change rebased on `6f3557c973`.\n- PYTHONPATH, source overlays, or external native libraries used: a Python source overlay over the deployed 1Cat build; no native changes.\n- User-entry route-hit, speed, and output-quality evidence: see Test Result.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no deprecated variables.\n- New/changed environment metadata and generated reference check: two variables with complete metadata; the \"Require complete environment registration metadata\" and \"Prevent unregistered 'VLLM_*' environment reads\" hooks pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: no SM70-specific variables added (the two new variables are generic).\n\n## Test Result\n\n- CPU: `95 passed`.\n- GPU, prompt-logprobs requests, `max_tokens=1` (before this change, 8K already crashed the engine):\n\n  | Prompt | No prompt_logprobs | k = 1 | k = 20 |\n  | --- | ---: | ---: | ---: |\n  | 8,192 | 2.3 s | 3.2 s | 5.9 s |\n  | 32,768 | 10.0 s | 14.0 s | 26.3 s |\n  | 131,072 | 46.2 s | 61.6 s | 104.9 s |\n\n  Four concurrent 32K requests with k = 20 alongside two 1,024-token decodes: all succeeded. GPU memory peak during these cases was unchanged from normal full load (32,482 MiB per GPU). Every request returned all positions, with `None` first.\n- Numerics: on 66 scored records (39,101 positions, ≤ 4K tokens each), target-token logprobs and top-20 IDs/values are bitwise identical to the previous 1024-row code.\n- Requests without `prompt_logprobs`: greedy outputs bitwise identical to the previous build on 1K–32K prompts; seeded sampling C1 8/8; 4- and 8-way stress, multimodal and long-context needle checks pass.\n- Cost: smaller chunks add all-gathers and synchronous copies; with k = 20 the total is about 2.3x prefill alone. Possible follow-ups are an adaptive chunk size or vocab-parallel scoring that gathers only per-rank logsumexp and top-k (vLLM #57934 has building blocks).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---\n<details>\n<summary> Essential Elements of an Effective PR Description Checklist </summary>\n\n- [x] The purpose of the PR, such as \"Fix some issue (link existing issues this PR will resolve)\".\n- [x] The test plan, such as providing test command.\n- [x] The test results, such as pasting the results comparison before and after, or e2e results\n- [ ] (Optional) The necessary documentation update, such as updating `supported_models.md` and `examples` for a new model.\n\n</details>\n\n",
+    "author": {
+      "login": "Leonccaa"
+    },
+    "headRepository": {
+      "nameWithOwner": "Leonccaa/1Cat-vLLM"
+    },
+    "headRefName": "fix/mrv2-prompt-logprobs-memory",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1225,
+    "title": "[Bugfix][MRv2] Bound prompt logprobs memory with small chunks and request limits",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1225",
+    "isDraft": false,
+    "headRefOid": "f9d1134a6413c49a9d4ab1890ee42ef3b9add80a",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/v1/worker/test_prompt_logprobs_memory_cpu.py",
+      "vllm/envs.py",
+      "vllm/v1/engine/input_processor.py",
+      "vllm/v1/prompt_logprobs_limits.py",
+      "vllm/v1/worker/gpu/sample/prompt_logprob.py"
+    ],
+    "diff_bytes": 24704,
+    "diff_sha256": "1190b0ebbae938363f3a76e19c5834b36efa154b4dc15c86e5cc605e7af5fcdb"
+  },
+  "full_tree_diff_proof": null
+}

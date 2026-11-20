@@ -1,0 +1,103 @@
+{
+  "initial_inventory": {
+    "number": 1371,
+    "title": "[Bugfix][V1][PP] Preserve synchronous speculative step ownership",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1371",
+    "isDraft": false,
+    "headRefOid": "0bd5c7954cc585fa30bd41fbe2c6483e79057c00",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1371,
+    "title": "[Bugfix][V1][PP] Preserve synchronous speculative step ownership",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code) and reviewed in three rounds before opening.\n\n**Relation to #1370.** #1370 (DeepSeek-V4.1 PP2 x TP4) also edits `vllm/v1/engine/core.py`, `vllm/v1/core/sched/scheduler.py` and `vllm/v1/worker/gpu_model_runner.py`, and the two do not merge cleanly. This PR is the model-independent version of the step-ownership fix; whichever lands first, we will rebase the other.\n\n## Purpose\n\nSynchronous speculative decoding with overlapping pipeline steps can schedule negative token counts, lose proposals, or reconstruct a non-last stage's accepted tokens incorrectly. Return each completed step's draft snapshot in its own ModelRunnerOutput and apply it immediately after that step's sampled output. Refuse missing snapshots and inconsistent supplied history. Preserve the existing asynchronous ownership path.\n\nThe engine change requires synchronous PP producers in both runners to attach the snapshot; V1 also needs the in-flight scheduling guard and accepted-prefix reconstruction. This is separate from the optional persistent-row performance change. #1263 addresses V2 history resends, rather than these synchronous speculative-step correctness defects.\n\n## Test Plan\n\n```bash\npython -m tools.generate_architecture_reference --check\npython -m tools.generate_env_reference --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.config_inventory --check\npython tools/pre_commit/check_layering.py\npython -m pytest -q --confcutdir=tests/tools tests/tools/test_architecture_reference.py tests/tools/test_architecture_doc_urls.py tests/tools/test_architecture_check_scope.py\npython -m pytest -q --confcutdir=tests/v1 tests/v1/engine/test_pp_spec_decode_cadence.py tests/v1/core/test_pp_spec_decode_inflight.py tests/v1/worker/test_pp_spec_decode_history.py\n```\n\nThe cadence driver calls the real EngineCore queue loop with scripted scheduling and in-flight futures; it is a CPU regression test, not a serving test. It covers interleaved request groups, one remaining request, empty steps, async ownership, post_step, missing payload refusal, and serialization after later worker mutation. Real Scheduler cases use one, two and three requests. Real CPU InputBatch/runner state cases cover two and three requests; bypassing reconstruction makes both fail. History cases verify distinct requests' accepted prefixes and reject a short supplied history even when old drafts are available.\n\nGPU qualification remains required. Select a public target/drafter pair already admitted by the PP model path, and set TARGET_CHECKPOINT and DRAFT_CHECKPOINT to those identifiers. Start with V1, then repeat with V2 where that pair is admitted:\n\n```bash\nVLLM_USE_V2_MODEL_RUNNER=0 vllm serve \"$TARGET_CHECKPOINT\" \\\n  --tensor-parallel-size 1 --pipeline-parallel-size 2 \\\n  --max-num-seqs 4 --max-model-len 2048 --no-async-scheduling \\\n  --speculative-config \"{\\\"model\\\":\\\"$DRAFT_CHECKPOINT\\\",\\\"num_speculative_tokens\\\":3}\"\n```\n\nSend at least two greedy requests with staggered arrivals, allow one to finish while the other continues, then repeat with three requests and seeded sampling. Compare per-request token histories and IDs against serial execution; confirm every producing step's proposals are applied before its request is scheduled again. Include graph replay, cancellation, preemption and structured outputs. The supplied CPU driver does not execute worker GPU production, process transport, or deferred structured-output serving.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Synchronous PP queue | CPU draft lists and optional tree payloads | Overlapping token-bearing steps; one or several request groups | Snapshot attached to its own output, applied after sampled output | Executed real engine-loop CPU regression | GPU producers, transport and serving |\n| V1 scheduler / non-last stage | Request token histories | In-flight verification; accepted draft prefix followed by bonus token | Wait without negative counts; reconstruct exact accepted tokens | Executed real scheduler and history unit tests | Full GPU runner state and non-prefix verification |\n| Empty / async / non-PP | Existing formats | Empty steps, async ownership or no queue | Empty outputs need no snapshot; async unchanged; no-queue post_step retained | Executed CPU control cases | GPU regression matrix |\n| Invalid synchronous output | Missing payload or inconsistent full history | Token-bearing step / supplied short history | Loud refusal; no shared-latest-slot substitution | Executed rejection and serialization tests | External executor compatibility |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: Correctness fixes apply to synchronous PP speculation; no performance knob added.\n- Required CLI options and environment switches: Pipeline parallelism above one with synchronous speculative decoding; no new switch.\n- KV cache dtype used for the benchmark: N/A — no benchmark claim; existing model cache format retained.\n- Wheel SHA or source commit: Rebased onto `main` `3c051b52e`; no GPU run on this branch.\n- PYTHONPATH, source overlays, or external native libraries used (write \"none\" if absent): None added.\n- User-entry route-hit, speed, and output-quality evidence: CPU regression evidence only; GPU serving untested and no speed claim.\n- Existing kernel/backend registry and capability-rejection reasons: No kernel selection change; missing synchronous payload or contradictory history refuses.\n- Per-engine configuration and deprecated-variable compatibility: Existing scheduling and speculative configuration; no new parameter.\n- New/changed environment metadata and generated reference check: No new environment setting; five registration/reference/ownership gates pass.\n- Route snapshot command and intentional changed rows (write \"none\" for refactors): python -m tools.sm70_route_snapshot --category moe --output /dev/stdout; none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: Unchanged.\n\n## Test Result\n\nRe-run on `main` for this PR, 2026-11-05, CPU only (no visible GPU), branch rebased onto `3c051b52e`:\n\n- Red first on unmodified `main`: with only this PR's tests copied onto `main`, 21 of 23 fail. The behavioral failures are the in-flight scheduler cases, where `main` schedules -3, -6 and -9 tokens for one, two and three in-flight speculative requests (`assert -3 == 0`, `-6`, `-9`); the others fail because the per-step draft snapshot and the accepted-prefix reconstruction do not exist on `main`.\n- On this branch: the three focused files and the three architecture test files, 40 passed.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check` on the 9 changed files: pass.\n- `check_layering.py`: exits 1 with output identical to unmodified `main` (the existing `fused_moe.py` 25 -> 32 and `moe_runner.py` 37 -> 39 platform-coupling findings); nothing new.\n\nNot run: any GPU serving test. GPU producer execution, process transport, graph lifecycle, structured-output serving and output-quality qualification remain untested; the serving plan above is the qualification still needed.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1371",
+    "isDraft": false,
+    "headRefName": "pli/pp-spec-decode-fixes",
+    "headRefOid": "0bd5c7954cc585fa30bd41fbe2c6483e79057c00",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1371,
+    "id": "PR_kwDORjYFXs8AAAABNILCYw",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "0bd5c7954cc585fa30bd41fbe2c6483e79057c00",
+    "title": "[Bugfix][V1][PP] Preserve synchronous speculative step ownership",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1371",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code) and reviewed in three rounds before opening.\n\n**Relation to #1370.** #1370 (DeepSeek-V4.1 PP2 x TP4) also edits `vllm/v1/engine/core.py`, `vllm/v1/core/sched/scheduler.py` and `vllm/v1/worker/gpu_model_runner.py`, and the two do not merge cleanly. This PR is the model-independent version of the step-ownership fix; whichever lands first, we will rebase the other.\n\n## Purpose\n\nSynchronous speculative decoding with overlapping pipeline steps can schedule negative token counts, lose proposals, or reconstruct a non-last stage's accepted tokens incorrectly. Return each completed step's draft snapshot in its own ModelRunnerOutput and apply it immediately after that step's sampled output. Refuse missing snapshots and inconsistent supplied history. Preserve the existing asynchronous ownership path.\n\nThe engine change requires synchronous PP producers in both runners to attach the snapshot; V1 also needs the in-flight scheduling guard and accepted-prefix reconstruction. This is separate from the optional persistent-row performance change. #1263 addresses V2 history resends, rather than these synchronous speculative-step correctness defects.\n\n## Test Plan\n\n```bash\npython -m tools.generate_architecture_reference --check\npython -m tools.generate_env_reference --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.config_inventory --check\npython tools/pre_commit/check_layering.py\npython -m pytest -q --confcutdir=tests/tools tests/tools/test_architecture_reference.py tests/tools/test_architecture_doc_urls.py tests/tools/test_architecture_check_scope.py\npython -m pytest -q --confcutdir=tests/v1 tests/v1/engine/test_pp_spec_decode_cadence.py tests/v1/core/test_pp_spec_decode_inflight.py tests/v1/worker/test_pp_spec_decode_history.py\n```\n\nThe cadence driver calls the real EngineCore queue loop with scripted scheduling and in-flight futures; it is a CPU regression test, not a serving test. It covers interleaved request groups, one remaining request, empty steps, async ownership, post_step, missing payload refusal, and serialization after later worker mutation. Real Scheduler cases use one, two and three requests. Real CPU InputBatch/runner state cases cover two and three requests; bypassing reconstruction makes both fail. History cases verify distinct requests' accepted prefixes and reject a short supplied history even when old drafts are available.\n\nGPU qualification remains required. Select a public target/drafter pair already admitted by the PP model path, and set TARGET_CHECKPOINT and DRAFT_CHECKPOINT to those identifiers. Start with V1, then repeat with V2 where that pair is admitted:\n\n```bash\nVLLM_USE_V2_MODEL_RUNNER=0 vllm serve \"$TARGET_CHECKPOINT\" \\\n  --tensor-parallel-size 1 --pipeline-parallel-size 2 \\\n  --max-num-seqs 4 --max-model-len 2048 --no-async-scheduling \\\n  --speculative-config \"{\\\"model\\\":\\\"$DRAFT_CHECKPOINT\\\",\\\"num_speculative_tokens\\\":3}\"\n```\n\nSend at least two greedy requests with staggered arrivals, allow one to finish while the other continues, then repeat with three requests and seeded sampling. Compare per-request token histories and IDs against serial execution; confirm every producing step's proposals are applied before its request is scheduled again. Include graph replay, cancellation, preemption and structured outputs. The supplied CPU driver does not execute worker GPU production, process transport, or deferred structured-output serving.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Synchronous PP queue | CPU draft lists and optional tree payloads | Overlapping token-bearing steps; one or several request groups | Snapshot attached to its own output, applied after sampled output | Executed real engine-loop CPU regression | GPU producers, transport and serving |\n| V1 scheduler / non-last stage | Request token histories | In-flight verification; accepted draft prefix followed by bonus token | Wait without negative counts; reconstruct exact accepted tokens | Executed real scheduler and history unit tests | Full GPU runner state and non-prefix verification |\n| Empty / async / non-PP | Existing formats | Empty steps, async ownership or no queue | Empty outputs need no snapshot; async unchanged; no-queue post_step retained | Executed CPU control cases | GPU regression matrix |\n| Invalid synchronous output | Missing payload or inconsistent full history | Token-bearing step / supplied short history | Loud refusal; no shared-latest-slot substitution | Executed rejection and serialization tests | External executor compatibility |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: Correctness fixes apply to synchronous PP speculation; no performance knob added.\n- Required CLI options and environment switches: Pipeline parallelism above one with synchronous speculative decoding; no new switch.\n- KV cache dtype used for the benchmark: N/A — no benchmark claim; existing model cache format retained.\n- Wheel SHA or source commit: Rebased onto `main` `3c051b52e`; no GPU run on this branch.\n- PYTHONPATH, source overlays, or external native libraries used (write \"none\" if absent): None added.\n- User-entry route-hit, speed, and output-quality evidence: CPU regression evidence only; GPU serving untested and no speed claim.\n- Existing kernel/backend registry and capability-rejection reasons: No kernel selection change; missing synchronous payload or contradictory history refuses.\n- Per-engine configuration and deprecated-variable compatibility: Existing scheduling and speculative configuration; no new parameter.\n- New/changed environment metadata and generated reference check: No new environment setting; five registration/reference/ownership gates pass.\n- Route snapshot command and intentional changed rows (write \"none\" for refactors): python -m tools.sm70_route_snapshot --category moe --output /dev/stdout; none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: Unchanged.\n\n## Test Result\n\nRe-run on `main` for this PR, 2026-11-05, CPU only (no visible GPU), branch rebased onto `3c051b52e`:\n\n- Red first on unmodified `main`: with only this PR's tests copied onto `main`, 21 of 23 fail. The behavioral failures are the in-flight scheduler cases, where `main` schedules -3, -6 and -9 tokens for one, two and three in-flight speculative requests (`assert -3 == 0`, `-6`, `-9`); the others fail because the per-step draft snapshot and the accepted-prefix reconstruction do not exist on `main`.\n- On this branch: the three focused files and the three architecture test files, 40 passed.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass.\n- ruff 0.14.0 `check` and `format --check` on the 9 changed files: pass.\n- `check_layering.py`: exits 1 with output identical to unmodified `main` (the existing `fused_moe.py` 25 -> 32 and `moe_runner.py` 37 -> 39 platform-coupling findings); nothing new.\n\nNot run: any GPU serving test. GPU producer execution, process transport, graph lifecycle, structured-output serving and output-quality qualification remain untested; the serving plan above is the qualification still needed.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/pp-spec-decode-fixes",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1371,
+    "title": "[Bugfix][V1][PP] Preserve synchronous speculative step ownership",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1371",
+    "isDraft": false,
+    "headRefOid": "0bd5c7954cc585fa30bd41fbe2c6483e79057c00",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/v1/core/test_pp_spec_decode_inflight.py",
+      "tests/v1/core/utils.py",
+      "tests/v1/engine/test_pp_spec_decode_cadence.py",
+      "tests/v1/worker/test_pp_spec_decode_history.py",
+      "vllm/v1/core/sched/scheduler.py",
+      "vllm/v1/engine/core.py",
+      "vllm/v1/outputs.py",
+      "vllm/v1/worker/gpu/model_runner.py",
+      "vllm/v1/worker/gpu_model_runner.py"
+    ],
+    "diff_bytes": 27412,
+    "diff_sha256": "3c263c54ee3c0bbd6d5584109363e4905b2daeed38c0ca6bdd2a43fdc187b66b"
+  },
+  "full_tree_diff_proof": null
+}
