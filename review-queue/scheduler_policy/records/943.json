@@ -1,0 +1,110 @@
+{
+  "initial_inventory": {
+    "number": 943,
+    "title": "[Scheduler] Add a floor and state-block rounding to the mixed-prefill budget",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/943",
+    "isDraft": false,
+    "headRefOid": "83701788a2467aa37e07a6c77bce3365ec8af16e",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 943,
+    "title": "[Scheduler] Add a floor and state-block rounding to the mixed-prefill budget",
+    "body": "## Purpose\n\nImplements the proposal in #880. The mixed-prefill latency control from #860 converges to the budget at which a mixed step takes the target time. When a prefill step has a large fixed cost, that budget falls to a few hundred tokens or to the 16-token quantum. In that case, a prompt that arrives while other requests keep decoding takes many times longer to reach its first token. On 4x V100 with Qwen3.8-Flash-Next, a 64K prompt took ~287 s instead of ~27 s.\n\n## Changes\n\n- `--mixed-prefill-min-tokens` (default 0, which keeps the current behaviour) sets a lower bound on the adaptive budget. The controller state is clamped to the floor as well, so when steps get faster the budget grows from the floor instead of climbing back from the quantum.\n- Under Mamba align mode, the scheduler passes the recurrent-state block size to the budget. Once the budget covers at least one block, the effective budget is rounded down to whole state blocks, so mixed chunks stay on the state-block grid. The controller keeps the unrounded value, so the rounding does not stop it from growing.\n- Tests in `tests/v1/core/test_mixed_prefill_budget.py` cover the floor, the clamp and the rounding.\n\n## Test plan and results\n\nCPU, in the CT252 build image with the forced CPU platform:\n- `tests/v1/core/test_mixed_prefill_budget.py` and related mixed-prefill tests: 57 passed.\n- `tests/v1/core/test_scheduler.py` together with the Mamba align and budget suites: 135 passed. The 29 failures are CPU multimodal and encoder-connector fixtures (`LlavaForConditionalGeneration` inspection) and fail identically on main.\n\nGPU setup:\n- Hardware and model: 4x V100 32 GB, Qwen3.8-Flash-Next AWQ.\n- Parallelism and decoding: TP4 + QSA DCP2, MTP4, E4M3 KV.\n- Context and scheduling: 524K context, state block 1632, `long_prefill_token_threshold` 4896.\n- Both arms use the same build, two runs each.\n\n| | #860 at 250 ms + floor 1632 | fixed 1632 budget, #860 off |\n|---|---|---|\n| 64K prompt arriving during 3 decoders: TTFT | 26.99 / 26.74 s | 26.78 / 26.68 s |\n| step interval p95 during that prefill | 0.696 / 0.693 s | 0.693 / 0.692 s |\n| aggregate decode of the 3 users during it | 24.5 / 24.7 tok/s | 24.6 / 24.2 tok/s |\n| cold 262K prompt, TTFT | 106.3 / 106.6 s | 106.6 / 106.2 s |\n| cold 32K arriving 20 s later, TTFT | 28.4 / 28.2 s | 28.5 / 28.2 s |\n| decode of that 32K during the 262K prefill | 4.45 / 3.67 tok/s | 3.86 / 3.86 tok/s |\n\nFor reference, the same test without a floor (#860 at 250 ms) gave a 64K TTFT of ~287 s (#880). With the floor, the adaptive control reproduces the fixed budget we had been carrying as a local patch, so we can drop that patch once this is merged. Neither arm logged an error.\n\nWith 3 decoders and a 250 ms target, the floor binds, and the floor equals one state block. The rounding is therefore covered only by the unit tests in this run, not by the GPU measurement.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/943",
+    "isDraft": false,
+    "headRefName": "perf/mixed-prefill-floor-block",
+    "headRefOid": "83701788a2467aa37e07a6c77bce3365ec8af16e",
+    "baseRefName": "main",
+    "baseRefOid": "fb52756f4d7a759828c8665552d50a0602c8ce59",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "Leonccaa/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "Leonccaa"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "Leonccaa"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 943,
+    "id": "PR_kwDORjYFXs8AAAABGm0gJQ",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "83701788a2467aa37e07a6c77bce3365ec8af16e",
+    "title": "[Scheduler] Add a floor and state-block rounding to the mixed-prefill budget",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/943",
+    "body": "## Purpose\n\nImplements the proposal in #880. The mixed-prefill latency control from #860 converges to the budget at which a mixed step takes the target time. When a prefill step has a large fixed cost, that budget falls to a few hundred tokens or to the 16-token quantum. In that case, a prompt that arrives while other requests keep decoding takes many times longer to reach its first token. On 4x V100 with Qwen3.8-Flash-Next, a 64K prompt took ~287 s instead of ~27 s.\n\n## Changes\n\n- `--mixed-prefill-min-tokens` (default 0, which keeps the current behaviour) sets a lower bound on the adaptive budget. The controller state is clamped to the floor as well, so when steps get faster the budget grows from the floor instead of climbing back from the quantum.\n- Under Mamba align mode, the scheduler passes the recurrent-state block size to the budget. Once the budget covers at least one block, the effective budget is rounded down to whole state blocks, so mixed chunks stay on the state-block grid. The controller keeps the unrounded value, so the rounding does not stop it from growing.\n- Tests in `tests/v1/core/test_mixed_prefill_budget.py` cover the floor, the clamp and the rounding.\n\n## Test plan and results\n\nCPU, in the CT252 build image with the forced CPU platform:\n- `tests/v1/core/test_mixed_prefill_budget.py` and related mixed-prefill tests: 57 passed.\n- `tests/v1/core/test_scheduler.py` together with the Mamba align and budget suites: 135 passed. The 29 failures are CPU multimodal and encoder-connector fixtures (`LlavaForConditionalGeneration` inspection) and fail identically on main.\n\nGPU setup:\n- Hardware and model: 4x V100 32 GB, Qwen3.8-Flash-Next AWQ.\n- Parallelism and decoding: TP4 + QSA DCP2, MTP4, E4M3 KV.\n- Context and scheduling: 524K context, state block 1632, `long_prefill_token_threshold` 4896.\n- Both arms use the same build, two runs each.\n\n| | #860 at 250 ms + floor 1632 | fixed 1632 budget, #860 off |\n|---|---|---|\n| 64K prompt arriving during 3 decoders: TTFT | 26.99 / 26.74 s | 26.78 / 26.68 s |\n| step interval p95 during that prefill | 0.696 / 0.693 s | 0.693 / 0.692 s |\n| aggregate decode of the 3 users during it | 24.5 / 24.7 tok/s | 24.6 / 24.2 tok/s |\n| cold 262K prompt, TTFT | 106.3 / 106.6 s | 106.6 / 106.2 s |\n| cold 32K arriving 20 s later, TTFT | 28.4 / 28.2 s | 28.5 / 28.2 s |\n| decode of that 32K during the 262K prefill | 4.45 / 3.67 tok/s | 3.86 / 3.86 tok/s |\n\nFor reference, the same test without a floor (#860 at 250 ms) gave a 64K TTFT of ~287 s (#880). With the floor, the adaptive control reproduces the fixed budget we had been carrying as a local patch, so we can drop that patch once this is merged. Neither arm logged an error.\n\nWith 3 decoders and a 250 ms target, the floor binds, and the floor equals one state block. The rounding is therefore covered only by the unit tests in this run, not by the GPU measurement.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "author": {
+      "login": "Leonccaa"
+    },
+    "headRepository": {
+      "nameWithOwner": "Leonccaa/1Cat-vLLM"
+    },
+    "headRefName": "perf/mixed-prefill-floor-block",
+    "comments": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWn3YwQ="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABafdjBA",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "I extracted and integrated the independent configured-floor portion in https://github.com/1CatAI/1Cat-vLLM/pull/1122. The default remains zero and existing chunk/state-block alignment is unchanged. The current-main gate passed 73 startup/profile and 11 mixed-prefill CPU checks plus scoped pre-commit; 720 original/new controller states match at the default floor, and the graph hash is unchanged. Original author attribution is retained. I will continue the state-block rounding portion separately because it changes the default effective budget and the original GPU measurements did not exercise that rounding. No new GPU or full-model speed result is claimed. AI-assisted by OpenAI Codex.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/943#issuecomment-6072787716",
+          "createdAt": "2026-10-09T02:07:12Z",
+          "updatedAt": "2026-10-09T02:07:12Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 943,
+    "title": "[Scheduler] Add a floor and state-block rounding to the mixed-prefill budget",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/943",
+    "isDraft": false,
+    "headRefOid": "83701788a2467aa37e07a6c77bce3365ec8af16e",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/v1/core/test_mixed_prefill_budget.py",
+      "vllm/config/scheduler.py",
+      "vllm/engine/arg_utils.py",
+      "vllm/v1/core/sched/mixed_prefill.py",
+      "vllm/v1/core/sched/scheduler.py"
+    ],
+    "diff_bytes": 8948,
+    "diff_sha256": "31b2e9054803cce892abc195ab031141b5e296ef098b26c6a1a2459e669ab3fa"
+  },
+  "full_tree_diff_proof": null
+}
