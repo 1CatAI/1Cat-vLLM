@@ -1,0 +1,98 @@
+{
+  "initial_inventory": {
+    "number": 963,
+    "title": "[Kernel] Extend captured SM70 TP4 push all-reduce through M64",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/963",
+    "isDraft": true,
+    "headRefOid": "c0c25bd70ecd64f1af41ab1ac9a1cba5a567cc75",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 963,
+    "title": "[Kernel] Extend captured SM70 TP4 push all-reduce through M64",
+    "body": "## Purpose\n\nCaptured TP4 verification batches above 32 rows fall back to the slower two-stage collective on fully interconnected V100 GPUs. Extend the existing FP16 push protocol through 64 rows at hidden size 5120 and use 256 threads for these larger messages. Smaller batches, eager execution, other dtypes, and unsupported topologies retain their existing dispatch.\n\n## Test Plan\n\nValidate mixed message lengths, repeated graph replay, rank skew, cancellation, and output guards against the previous dispatch. Build a complete SM70 wheel and compare full verification rounds at 8K C1/C4/C8 and the largest fitting 32K concurrency before promotion.\n\n## Test Result\n\nA preliminary cold-L2 graph microbenchmark on four fully interconnected V100-SXM2-16GB GPUs at 300 W reduced a 64-row collective from 58.98 to 20.16 microseconds, with bitwise-identical outputs on all ranks. The measurement uses an untimed GPU collective to align rank start times. Full-model validation is pending; this is not an end-to-end speed claim.\n\nThe IPC allocation increases by approximately 2.6 MiB per rank. No new runtime option or external kernel library is required.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/963",
+    "isDraft": true,
+    "headRefName": "codex/v100-qwen38-m64-push-20261005-060613",
+    "headRefOid": "c0c25bd70ecd64f1af41ab1ac9a1cba5a567cc75",
+    "baseRefName": "main",
+    "baseRefOid": "7371b2e74814bade6f4ed10f2dddd5b6c4b268ae",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 963,
+    "id": "PR_kwDORjYFXs8AAAABGpWoyA",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "c0c25bd70ecd64f1af41ab1ac9a1cba5a567cc75",
+    "title": "[Kernel] Extend captured SM70 TP4 push all-reduce through M64",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/963",
+    "body": "## Purpose\n\nCaptured TP4 verification batches above 32 rows fall back to the slower two-stage collective on fully interconnected V100 GPUs. Extend the existing FP16 push protocol through 64 rows at hidden size 5120 and use 256 threads for these larger messages. Smaller batches, eager execution, other dtypes, and unsupported topologies retain their existing dispatch.\n\n## Test Plan\n\nValidate mixed message lengths, repeated graph replay, rank skew, cancellation, and output guards against the previous dispatch. Build a complete SM70 wheel and compare full verification rounds at 8K C1/C4/C8 and the largest fitting 32K concurrency before promotion.\n\n## Test Result\n\nA preliminary cold-L2 graph microbenchmark on four fully interconnected V100-SXM2-16GB GPUs at 300 W reduced a 64-row collective from 58.98 to 20.16 microseconds, with bitwise-identical outputs on all ranks. The measurement uses an untimed GPU collective to align rank start times. Full-model validation is pending; this is not an end-to-end speed claim.\n\nThe IPC allocation increases by approximately 2.6 MiB per rank. No new runtime option or external kernel library is required.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/v100-qwen38-m64-push-20261005-060613",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 963,
+    "title": "[Kernel] Extend captured SM70 TP4 push all-reduce through M64",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/963",
+    "isDraft": true,
+    "headRefOid": "c0c25bd70ecd64f1af41ab1ac9a1cba5a567cc75",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "csrc/custom_all_reduce.cuh",
+      "docs/design/sm70_tp4_large_verify_allreduce.md",
+      "tests/distributed/test_sm70_large_push_all_reduce.py",
+      "vllm/distributed/device_communicators/custom_all_reduce.py"
+    ],
+    "diff_bytes": 9608,
+    "diff_sha256": "0ee143fd0ca6a16ee5922c9c1f8f5b4950f1e46c1ee6c5926f8ae5b71f95335b"
+  },
+  "full_tree_diff_proof": null
+}
