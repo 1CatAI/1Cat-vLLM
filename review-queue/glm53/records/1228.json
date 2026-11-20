@@ -1,0 +1,109 @@
+{
+  "initial_inventory": {
+    "number": 1228,
+    "title": "[Perf][GDN] Run the FlashQLA TileLang prefill kernel on Turing",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1228",
+    "isDraft": false,
+    "headRefOid": "593fd096604900f59cc09a0279d5101dbfc570f7",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1228,
+    "title": "[Perf][GDN] Run the FlashQLA TileLang prefill kernel on Turing",
+    "body": "## Purpose\n\nOn Turing the GDN prefill runs the Triton/FLA chunk chain, because `tilelang_fused_chunk_gdr_fwd_sm70` needs 86,016 B of dynamic shared memory per block and sm_75 allows at most 65,536 B (`shared_memory_per_block_optin` of a Quadro RTX 8000). Volta runs the fused TileLang kernel. For Qwen3.8-27B TP2 on two Quadro RTX 8000 and the RTX 8000 stages of Qwen3.8-Flash-Next, the Triton chain is the slow part of the GDN prefill.\n\nThis PR adds an sm_75 variant of the fused kernel that fits:\n\n1. The transposed copy of k is dropped; the last GEMM reads `k_shared` with `transpose_A`.\n2. The P tile reuses the A buffer.\n3. A barrier at the end of the chunk loop protects the reused tiles before the next chunk overwrites them.\n\nThe sm70 kernel source is left unchanged (its compiled kernels stay valid in the TileLang cache). `fused_gdr_fwd` picks the variant from the shared memory limit of the device it runs on, and the GDN prefill selector now admits sm75 for fp16 models; other dtypes keep the Triton/FLA chain as before.\n\nNot a duplicate: gh pr list --repo 1CatAI/1Cat-vLLM --state all --search \"TileLang Turing\", \"FlashQLA\", \"GDN Turing\", \"sm75 GDN\" and \"fused_gdr_fwd\" find no PR that runs the FlashQLA kernel on Turing; #1163 (merged) shares the GDN operand preparation and is part of main. No open PR touches the files of this PR, and it adds no merge conflict to any open PR (git merge-tree against each PR head).\n\nAI assistance was used for this change. I reviewed every line and ran the tests and measurements below.\n\n## Test Plan\n\n```bash\npytest tests/kernels/test_flashqla_turing_fused_fwd.py tests/config/test_flashqla_policy_lifecycle.py tests/kernels/core/test_sm70_flashqla_runtime_compiler.py tests/kernels/mamba/test_flashqla_bound_policy.py tests/kernels/mamba/test_sm70_flashqla_extension.py tests/kernels/test_gdn_prefill_stages.py tests/kernels/test_gdn_execution_stages.py tests/kernels/test_sm70_gdn_mixed_spec_verify.py tests/model_executor/layers/test_gdn_execution_plan.py tests/model_executor/layers/test_gdn_prefill_backend_resolve.py tests/model_executor/layers/test_gdn_stage_lifecycle.py\npre-commit run --from-ref origin/main --to-ref HEAD\npre-commit run mypy-3.10 --hook-stage manual --from-ref origin/main --to-ref HEAD\n```\n\nNew test (`tests/kernels/test_flashqla_turing_fused_fwd.py`): the sm_75 kernel against the Triton/FLA chain for 8/24 and 16/48 key/value heads and one, two and three sequences (lengths 2048; 17+2031; 63+1+1984), output and final state within 2e-3. It skips on devices that fit the sm70 kernel. `test_gdn_prefill_backend_resolve.py` now expects TileLang on Turing for fp16.\n\nKernel benchmark on a Quadro RTX 8000 (fp16, head dim 128): `chunk_gated_delta_rule_fwd` of this tree (the Triton/FLA chain, as main runs it on Turing) against `chunk_gated_delta_rule_fwd_sm70_tilelang` (the sm_75 variant), median of 20 calls.\n\nServing on our fork (main 6f3557c97 plus our commits). Arms: fix (fork commit ee261cc74 = this change and #1229 on top of the base) against base (fork commit 9a41a8e67), boots fix cold, base, fix, base, fix; the cold boot and the first long request after each boot are not counted. Per boot: three greedy reference prompts, four ~29k-token prompts, short greedy prompts, eight quality prompts and a long-context probe (184,134 and 249,950 tokens from repository documents, greedy, 400 output tokens). Qwen3.8-27B has no QSA layers, so its numbers show this PR alone; on Qwen3.8-Flash-Next both PRs act on the RTX 8000 stages.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| GDN prefill, FlashQLA fused TileLang kernel | fp16 model, head dim 128 | sm_75 (opt-in shared memory below 86,016 B) | sm_75 variant; devices with at least 86,016 B keep the sm70 kernel; non-fp16 models keep Triton/FLA | executed + measured (kernel benchmark and serving on Quadro RTX 8000); unit tests on RTX 8000 and V100 | other head dims, bf16 (kept on Triton/FLA) |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: default on sm_75 for fp16 models.\n- Required CLI options and environment switches: none.\n- KV cache dtype used for the benchmark: auto (fp16).\n- Wheel SHA or source commit: fork commit ee261cc74 against 9a41a8e67 (both main 6f3557c97 plus our commits).\n- PYTHONPATH, source overlays, or external native libraries used: fix arm PYTHONPATH on the fork tree with its own compile cache; same native build in both arms (this PR changes Python and the TileLang source only).\n- User-entry route-hit, speed, and output-quality evidence: see Test Result.\n- Existing kernel/backend registry and capability-rejection reasons: the GDN prefill selector no longer rejects sm75 fp16 for FlashQLA.\n- Per-engine configuration and deprecated-variable compatibility: no new fields.\n- New/changed environment metadata and generated reference check: none.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: unchanged.\n\n## Test Result\n\n- On a Quadro RTX 8000 (main 6f3557c97 plus this PR): 78 passed, 56 skipped. Main without this PR: 71 passed, 56 skipped (the difference is the six cases of the new test and one more case in test_gdn_prefill_backend_resolve.py). On a Tesla V100: 128 passed, 1 skipped against 127 passed on main (the new test module skips on devices that fit the sm70 kernel). pre-commit and mypy-3.10 pass.\n\n- Kernel benchmark, ms per call, Triton/FLA chain as on main -> sm_75 TileLang kernel: 8/24 key/value heads, 2,048 tokens 9.688 -> 1.143; 17+2,031 tokens 9.959 -> 1.116; 16/48 heads, 1,500+548 tokens 22.077 -> 1.472; 63+1+1,984 tokens 21.684 -> 1.605; 8,192 tokens 82.423 -> 5.175. Maximum relative difference of output and final state 1.02e-3.\n\n- Qwen3.8-27B TP2 on two Quadro RTX 8000 (this PR alone), time to first token in s, fix (two boots) against base (two boots): ~29k tokens 35.3-35.4 against 38.5-38.6, 184,134 tokens 358.6 against 378.7-378.8, 249,950 tokens 565.1-565.2 against 592.6. Decode unchanged (~29k 38-39 ms, 184,134 tokens 55.3 ms, 249,950 tokens 63.2 ms per step in both arms). The three greedy reference prompts are identical in all five boots and the eight quality prompts are word-identical to the base.\n- Qwen3.8-Flash-Next-180B-A4B (with #1229): TP2xPP2 (RTX 8000 pair and V100 pair) ~29k tokens 14.8 s against 17.6-17.7 s, 184,134 tokens 126.3-129.2 s against 178.9-194.1 s, 249,950 tokens 157.0-162.4 s against 253.3-275.7 s; PP4 ~29k tokens 10.2-10.6 s against 11.6 s (its long-context times vary with the page cache of the PLE disk tier in both arms). Decode step time in the long-context probe (TP2xPP2): 54.1-55.4 ms against 53.4-53.6 ms at 184,134 tokens, 58.6-60.5 ms against 58.0-59.0 ms at 249,950 tokens. A separate decode A/B with 20 sampled code answers per boot (two boots per arm, TP2xPP2) gave 77.3 and 76.9 tok/s against 77.0 and 76.9 tok/s, 51.0 ms median step time in all four boots, acceptance length 3.93 against 3.91.\n- Flash-Next outputs: greedy text differs between boots in both arms, as it does on main with fresh compile caches. A hallucination probe (a non-existent person, temperature 1.0, 20 draws per arm) was handled equally often correctly with and without the two PRs (PP4 13 and 14 of 20, TP2xPP2 18 and 19 of 20).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01GJxVXkjSHhfq2D71DoYSK7\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1228",
+    "isDraft": false,
+    "headRefName": "pr-gdn-tilelang-turing",
+    "headRefOid": "593fd096604900f59cc09a0279d5101dbfc570f7",
+    "baseRefName": "main",
+    "baseRefOid": "6f3557c973b4602905037e086fd4acba9b0d867f",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "Peuqui/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "Peuqui"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "Peuqui"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1228,
+    "id": "PR_kwDORjYFXs8AAAABJEmDag",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "593fd096604900f59cc09a0279d5101dbfc570f7",
+    "title": "[Perf][GDN] Run the FlashQLA TileLang prefill kernel on Turing",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1228",
+    "body": "## Purpose\n\nOn Turing the GDN prefill runs the Triton/FLA chunk chain, because `tilelang_fused_chunk_gdr_fwd_sm70` needs 86,016 B of dynamic shared memory per block and sm_75 allows at most 65,536 B (`shared_memory_per_block_optin` of a Quadro RTX 8000). Volta runs the fused TileLang kernel. For Qwen3.8-27B TP2 on two Quadro RTX 8000 and the RTX 8000 stages of Qwen3.8-Flash-Next, the Triton chain is the slow part of the GDN prefill.\n\nThis PR adds an sm_75 variant of the fused kernel that fits:\n\n1. The transposed copy of k is dropped; the last GEMM reads `k_shared` with `transpose_A`.\n2. The P tile reuses the A buffer.\n3. A barrier at the end of the chunk loop protects the reused tiles before the next chunk overwrites them.\n\nThe sm70 kernel source is left unchanged (its compiled kernels stay valid in the TileLang cache). `fused_gdr_fwd` picks the variant from the shared memory limit of the device it runs on, and the GDN prefill selector now admits sm75 for fp16 models; other dtypes keep the Triton/FLA chain as before.\n\nNot a duplicate: gh pr list --repo 1CatAI/1Cat-vLLM --state all --search \"TileLang Turing\", \"FlashQLA\", \"GDN Turing\", \"sm75 GDN\" and \"fused_gdr_fwd\" find no PR that runs the FlashQLA kernel on Turing; #1163 (merged) shares the GDN operand preparation and is part of main. No open PR touches the files of this PR, and it adds no merge conflict to any open PR (git merge-tree against each PR head).\n\nAI assistance was used for this change. I reviewed every line and ran the tests and measurements below.\n\n## Test Plan\n\n```bash\npytest tests/kernels/test_flashqla_turing_fused_fwd.py tests/config/test_flashqla_policy_lifecycle.py tests/kernels/core/test_sm70_flashqla_runtime_compiler.py tests/kernels/mamba/test_flashqla_bound_policy.py tests/kernels/mamba/test_sm70_flashqla_extension.py tests/kernels/test_gdn_prefill_stages.py tests/kernels/test_gdn_execution_stages.py tests/kernels/test_sm70_gdn_mixed_spec_verify.py tests/model_executor/layers/test_gdn_execution_plan.py tests/model_executor/layers/test_gdn_prefill_backend_resolve.py tests/model_executor/layers/test_gdn_stage_lifecycle.py\npre-commit run --from-ref origin/main --to-ref HEAD\npre-commit run mypy-3.10 --hook-stage manual --from-ref origin/main --to-ref HEAD\n```\n\nNew test (`tests/kernels/test_flashqla_turing_fused_fwd.py`): the sm_75 kernel against the Triton/FLA chain for 8/24 and 16/48 key/value heads and one, two and three sequences (lengths 2048; 17+2031; 63+1+1984), output and final state within 2e-3. It skips on devices that fit the sm70 kernel. `test_gdn_prefill_backend_resolve.py` now expects TileLang on Turing for fp16.\n\nKernel benchmark on a Quadro RTX 8000 (fp16, head dim 128): `chunk_gated_delta_rule_fwd` of this tree (the Triton/FLA chain, as main runs it on Turing) against `chunk_gated_delta_rule_fwd_sm70_tilelang` (the sm_75 variant), median of 20 calls.\n\nServing on our fork (main 6f3557c97 plus our commits). Arms: fix (fork commit ee261cc74 = this change and #1229 on top of the base) against base (fork commit 9a41a8e67), boots fix cold, base, fix, base, fix; the cold boot and the first long request after each boot are not counted. Per boot: three greedy reference prompts, four ~29k-token prompts, short greedy prompts, eight quality prompts and a long-context probe (184,134 and 249,950 tokens from repository documents, greedy, 400 output tokens). Qwen3.8-27B has no QSA layers, so its numbers show this PR alone; on Qwen3.8-Flash-Next both PRs act on the RTX 8000 stages.\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| GDN prefill, FlashQLA fused TileLang kernel | fp16 model, head dim 128 | sm_75 (opt-in shared memory below 86,016 B) | sm_75 variant; devices with at least 86,016 B keep the sm70 kernel; non-fp16 models keep Triton/FLA | executed + measured (kernel benchmark and serving on Quadro RTX 8000); unit tests on RTX 8000 and V100 | other head dims, bf16 (kept on Triton/FLA) |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: default on sm_75 for fp16 models.\n- Required CLI options and environment switches: none.\n- KV cache dtype used for the benchmark: auto (fp16).\n- Wheel SHA or source commit: fork commit ee261cc74 against 9a41a8e67 (both main 6f3557c97 plus our commits).\n- PYTHONPATH, source overlays, or external native libraries used: fix arm PYTHONPATH on the fork tree with its own compile cache; same native build in both arms (this PR changes Python and the TileLang source only).\n- User-entry route-hit, speed, and output-quality evidence: see Test Result.\n- Existing kernel/backend registry and capability-rejection reasons: the GDN prefill selector no longer rejects sm75 fp16 for FlashQLA.\n- Per-engine configuration and deprecated-variable compatibility: no new fields.\n- New/changed environment metadata and generated reference check: none.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: unchanged.\n\n## Test Result\n\n- On a Quadro RTX 8000 (main 6f3557c97 plus this PR): 78 passed, 56 skipped. Main without this PR: 71 passed, 56 skipped (the difference is the six cases of the new test and one more case in test_gdn_prefill_backend_resolve.py). On a Tesla V100: 128 passed, 1 skipped against 127 passed on main (the new test module skips on devices that fit the sm70 kernel). pre-commit and mypy-3.10 pass.\n\n- Kernel benchmark, ms per call, Triton/FLA chain as on main -> sm_75 TileLang kernel: 8/24 key/value heads, 2,048 tokens 9.688 -> 1.143; 17+2,031 tokens 9.959 -> 1.116; 16/48 heads, 1,500+548 tokens 22.077 -> 1.472; 63+1+1,984 tokens 21.684 -> 1.605; 8,192 tokens 82.423 -> 5.175. Maximum relative difference of output and final state 1.02e-3.\n\n- Qwen3.8-27B TP2 on two Quadro RTX 8000 (this PR alone), time to first token in s, fix (two boots) against base (two boots): ~29k tokens 35.3-35.4 against 38.5-38.6, 184,134 tokens 358.6 against 378.7-378.8, 249,950 tokens 565.1-565.2 against 592.6. Decode unchanged (~29k 38-39 ms, 184,134 tokens 55.3 ms, 249,950 tokens 63.2 ms per step in both arms). The three greedy reference prompts are identical in all five boots and the eight quality prompts are word-identical to the base.\n- Qwen3.8-Flash-Next-180B-A4B (with #1229): TP2xPP2 (RTX 8000 pair and V100 pair) ~29k tokens 14.8 s against 17.6-17.7 s, 184,134 tokens 126.3-129.2 s against 178.9-194.1 s, 249,950 tokens 157.0-162.4 s against 253.3-275.7 s; PP4 ~29k tokens 10.2-10.6 s against 11.6 s (its long-context times vary with the page cache of the PLE disk tier in both arms). Decode step time in the long-context probe (TP2xPP2): 54.1-55.4 ms against 53.4-53.6 ms at 184,134 tokens, 58.6-60.5 ms against 58.0-59.0 ms at 249,950 tokens. A separate decode A/B with 20 sampled code answers per boot (two boots per arm, TP2xPP2) gave 77.3 and 76.9 tok/s against 77.0 and 76.9 tok/s, 51.0 ms median step time in all four boots, acceptance length 3.93 against 3.91.\n- Flash-Next outputs: greedy text differs between boots in both arms, as it does on main with fresh compile caches. A hallucination probe (a non-existent person, temperature 1.0, 20 draws per arm) was handled equally often correctly with and without the two PRs (PP4 13 and 14 of 20, TP2xPP2 18 and 19 of 20).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01GJxVXkjSHhfq2D71DoYSK7\n",
+    "author": {
+      "login": "Peuqui"
+    },
+    "headRepository": {
+      "nameWithOwner": "Peuqui/1Cat-vLLM"
+    },
+    "headRefName": "pr-gdn-tilelang-turing",
+    "comments": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAX5F2Gc="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABfkXYZw",
+          "author": {
+            "login": "Peuqui"
+          },
+          "body": "Added a commit for an interaction with current main. Since 8a3c030b6, main gives tilelang_fused_chunk_gdr_fwd_sm70 a threads argument (128 or 256), and fused_gdr_fwd passes it to whichever original kernel it selects. With this PR merged into main 6a143197e, that is the sm75 variant on Turing, which did not accept the argument, so every original FlashQLA GDN prefill on Turing failed with \"unexpected keyword argument 'threads'\". GitHub still reports the PR as mergeable because the conflict is not textual. The sm75 kernel now takes the same argument and launches with it. main's thread selection returns 256 only on device capability 7.0, so Turing keeps 128.\n\nTests on a Quadro RTX 8000: in our integration branch, whose flash_qla package and test file are identical to this branch merged into main 6a143197e, tests/kernels/test_flashqla_turing_fused_fwd.py went from 6 failed to 6 passed, and tests/config/test_gdn_original_threads.py passed 18. On this branch itself, test_flashqla_turing_fused_fwd.py passed 6 and tests/model_executor/layers/test_gdn_prefill_backend_resolve.py passed 5.\n\nAI assistance was used to find and fix this.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1228#issuecomment-6413473895",
+          "createdAt": "2026-10-26T10:11:42Z",
+          "updatedAt": "2026-10-26T10:11:42Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1228,
+    "title": "[Perf][GDN] Run the FlashQLA TileLang prefill kernel on Turing",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1228",
+    "isDraft": false,
+    "headRefOid": "593fd096604900f59cc09a0279d5101dbfc570f7",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "flash_qla/ops/gated_delta_rule/chunk/hopper/fused_fwd.py",
+      "tests/kernels/test_flashqla_turing_fused_fwd.py",
+      "tests/model_executor/layers/test_gdn_prefill_backend_resolve.py",
+      "vllm/model_executor/layers/fla/ops/gdn_selector.py"
+    ],
+    "diff_bytes": 24523,
+    "diff_sha256": "307a9942913494a7c12579a50f6de9ab2d34d521729b97dbf1f8fea30c48c944"
+  },
+  "full_tree_diff_proof": null
+}

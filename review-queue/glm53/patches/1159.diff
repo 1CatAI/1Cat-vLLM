@@ -1,0 +1,320 @@
+diff --git a/tests/kernels/test_mhc_sm70_fp16.py b/tests/kernels/test_mhc_sm70_fp16.py
+index 8866050555..328f3ce3ea 100644
+--- a/tests/kernels/test_mhc_sm70_fp16.py
++++ b/tests/kernels/test_mhc_sm70_fp16.py
+@@ -256,7 +256,7 @@ def test_mhc_sm70_fallback_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+     ),
+     reason="native NVIDIA V100/SM70 mHC CUDA op required",
+ )
+-@pytest.mark.parametrize("num_tokens", [1, 8])
++@pytest.mark.parametrize("num_tokens", [1, 2, 4, 5, 8])
+ def test_mhc_sm70_native_final_stage_graph_matches_eager_bitwise(
+     monkeypatch: pytest.MonkeyPatch,
+     num_tokens: int,
+@@ -753,3 +753,192 @@ def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise(
+     torch.testing.assert_close(candidate_residual, baseline_residual, rtol=0, atol=0)
+     torch.testing.assert_close(candidate_gemm, baseline_gemm, rtol=0, atol=0)
+     torch.testing.assert_close(candidate_sqrsum, baseline_sqrsum, rtol=0, atol=0)
++
++
++def _mhc_final_stage_inputs(num_tokens: int, n_splits: int, device, seed: int = 0):
++    g = torch.Generator(device=device).manual_seed(seed)
++    f32 = dict(device=device, dtype=torch.float32)
++    return dict(
++        gemm_out_mul=torch.randn((n_splits, num_tokens, 24), generator=g, **f32) * 0.1,
++        gemm_out_sqrsum=torch.rand((n_splits, num_tokens), generator=g, **f32) * 1000
++        + 100,
++        hc_scale=torch.tensor([0.1, 0.1, 0.1], **f32),
++        hc_base=torch.randn((24,), generator=g, **f32) * 0.1,
++        residual=(torch.randn((num_tokens, 4, 4096), generator=g, **f32) * 0.5).half(),
++        norm_weight=(1 + 0.1 * torch.randn((4096,), generator=g, **f32)).half(),
++    )
++
++
++def _patch_policy(
++    monkeypatch: pytest.MonkeyPatch, native, threads, source: str
++) -> None:
++    """layer_policy() builds a fresh object per call; replace the factory the
++    dispatcher imported with one returning a fixed policy of known provenance."""
++    import importlib
++    from types import SimpleNamespace
++
++    mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
++    policy = SimpleNamespace(
++        mhc_native_verify=native,
++        mhc_pre_threads=threads,
++        sources={"mhc_native_verify": source, "mhc_pre_threads": source},
++    )
++    monkeypatch.setattr(mhc_triton, "layer_policy", lambda cfg=None: policy)
++
++
++def _run_final_stage(native: bool, inputs: dict, monkeypatch: pytest.MonkeyPatch):
++    """Run sm70_mhc_pre_norm_from_staging on the native or the Triton path."""
++    num_tokens = inputs["residual"].shape[0]
++    device = inputs["residual"].device
++    post_mix = torch.empty((num_tokens, 4), device=device, dtype=torch.float32)
++    comb_mix = torch.empty((num_tokens, 4, 4), device=device, dtype=torch.float32)
++    layer_input = torch.empty((num_tokens, 4096), device=device, dtype=torch.float16)
++    _patch_policy(monkeypatch, native, 1024 if native else 256, "typed")
++    sm70_mhc_pre_norm_from_staging(
++        inputs["gemm_out_mul"],
++        inputs["gemm_out_sqrsum"],
++        inputs["hc_scale"],
++        inputs["hc_base"],
++        inputs["residual"],
++        post_mix,
++        comb_mix,
++        layer_input,
++        inputs["norm_weight"],
++        1e-6,
++        1e-6,
++        1e-6,
++        1.0,
++        2,
++        1e-6,
++    )
++    torch.cuda.synchronize()
++    return post_mix, comb_mix, layer_input
++
++
++@pytest.mark.skipif(
++    not (
++        torch.cuda.is_available() and hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out")
++    ),
++    reason="native NVIDIA V100/SM70 mHC CUDA op required",
++)
++@pytest.mark.parametrize("num_tokens", [2, 3, 4, 6, 8])
++def test_mhc_sm70_native_final_stage_matches_triton(
++    num_tokens: int, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """The native final stage, now the default for 2..8 tokens, agrees with the
++    Triton program it replaces to FP16 output rounding of the normalized
++    activations, and bitwise on the mixes it stores in FP32."""
++    device = torch.device("cuda")
++    inputs = _mhc_final_stage_inputs(num_tokens, n_splits=8, device=device)
++    native = _run_final_stage(True, inputs, monkeypatch)
++    triton = _run_final_stage(False, inputs, monkeypatch)
++    torch.testing.assert_close(native[0], triton[0], rtol=1e-6, atol=1e-6)
++    torch.testing.assert_close(native[1], triton[1], rtol=1e-6, atol=1e-6)
++    diff = (native[2].float() - triton[2].float()).abs()
++    scale = triton[2].float().abs().max().item()
++    assert diff.max().item() <= 2.0**-10 * scale + 1e-3, diff.max().item()
++    # mutation guard: a perturbed norm weight is detected by the same bound
++    bad = dict(inputs, norm_weight=inputs["norm_weight"] * 1.01)
++    perturbed = _run_final_stage(True, bad, monkeypatch)
++    assert (
++        perturbed[2].float() - triton[2].float()
++    ).abs().max().item() > 2.0**-10 * scale + 1e-3
++
++
++def test_mhc_sm70_native_final_stage_is_default_for_verify_rows(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """With the policy field unset, 2..8 tokens route to the native op."""
++    from vllm import _sm70_ops as sm70_ops
++
++    calls: list[int] = []
++    monkeypatch.setattr(
++        torch.ops._C, "sm70_glm_mhc_pre_norm_out", lambda *a, **k: None, raising=False
++    )
++    monkeypatch.setattr(
++        sm70_ops,
++        "sm70_glm_mhc_pre_norm_out",
++        lambda gemm_mul, *a, **k: calls.append(
++            (int(gemm_mul.shape[1]), int(k.get("threads", -1)))
++        ),
++    )
++    # environment defaults (off, 256 threads) with "default" provenance
++    _patch_policy(monkeypatch, False, 256, "default")
++    for num_tokens in (1, 2, 4, 8):
++        inputs = _mhc_final_stage_inputs(
++            num_tokens, n_splits=8, device=torch.device("cpu")
++        )
++        sm70_mhc_pre_norm_from_staging(
++            inputs["gemm_out_mul"],
++            inputs["gemm_out_sqrsum"],
++            inputs["hc_scale"],
++            inputs["hc_base"],
++            inputs["residual"],
++            torch.empty((num_tokens, 4)),
++            torch.empty((num_tokens, 4, 4)),
++            torch.empty((num_tokens, 4096), dtype=torch.float16),
++            inputs["norm_weight"],
++            1e-6,
++            1e-6,
++            1e-6,
++            1.0,
++            2,
++            1e-6,
++        )
++    assert calls == [(1, 128), (2, 1024), (4, 1024), (8, 1024)]
++
++
++def test_mhc_sm70_native_final_stage_respects_explicit_policy(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """An explicit setting still forces the Triton program for 2-8 tokens."""
++    import importlib
++
++    mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
++    calls: list[int] = []
++    monkeypatch.setattr(
++        torch.ops._C, "sm70_glm_mhc_pre_norm_out", lambda *a, **k: None, raising=False
++    )
++    monkeypatch.setattr(
++        mhc_triton.sm70_ops,
++        "sm70_glm_mhc_pre_norm_out",
++        lambda gemm_mul, *a, **k: calls.append(int(gemm_mul.shape[1])),
++    )
++    monkeypatch.setattr(
++        mhc_triton,
++        "_sm70_mhc_pre_norm_kernel",
++        SimpleNamespaceKernel(calls),
++    )
++    _patch_policy(monkeypatch, False, 256, "typed")
++    inputs = _mhc_final_stage_inputs(4, n_splits=8, device=torch.device("cpu"))
++    sm70_mhc_pre_norm_from_staging(
++        inputs["gemm_out_mul"],
++        inputs["gemm_out_sqrsum"],
++        inputs["hc_scale"],
++        inputs["hc_base"],
++        inputs["residual"],
++        torch.empty((4, 4)),
++        torch.empty((4, 4, 4)),
++        torch.empty((4, 4096), dtype=torch.float16),
++        inputs["norm_weight"],
++        1e-6,
++        1e-6,
++        1e-6,
++        1.0,
++        2,
++        1e-6,
++    )
++    assert calls == ["triton"]
++
++
++class SimpleNamespaceKernel:
++    """Stands in for the Triton kernel object: records a launch, runs nothing."""
++
++    def __init__(self, calls):
++        self.calls = calls
++
++    def __getitem__(self, grid):
++        def launch(*args, **kwargs):
++            self.calls.append("triton")
++
++        return launch
+diff --git a/tests/models/glm5next/test_sm70_kda.py b/tests/models/glm5next/test_sm70_kda.py
+index d457c617ab..785bb514f3 100644
+--- a/tests/models/glm5next/test_sm70_kda.py
++++ b/tests/models/glm5next/test_sm70_kda.py
+@@ -338,3 +338,15 @@ def run() -> torch.Tensor:
+     torch.accelerator.synchronize()
+     assert torch.isfinite(graph_output).all()
+     assert torch.equal(graph_output, normalized)
++
++
++def test_sm70_exact_kda_gemv_is_single_token_only() -> None:
++    """The exact native projection is taken for one token only; verify rows use
++    the standard projection (cuBLAS is ~2x faster there on V100)."""
++    import inspect
++
++    from vllm.models.glm5next.nvidia import kda as kda_module
++
++    src = inspect.getsource(kda_module)
++    assert "and num_tokens == 1\n" in src
++    assert "and 1 <= num_tokens <= 8\n" not in src
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 09c771ee49..80c429c850 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -6399,8 +6399,10 @@ def _resolve_rust_frontend_path() -> str | None:
+     "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY": env_var(
+         lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MHC_NATIVE_VERIFY", "0"))),
+         description=(
+-            "Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited "
+-            "model and topology contracts enable it while the global default "
++            "Native SM70 final stage for the GLM-5.3 mHC verifier. Unset, the "
++            "GLM-5.3 route uses it for 2-8 tokens; set 0 to force the Triton "
++            "program there. Audited model and topology contracts enable the "
++            "eight-token q8 path while the global default "
+             "remains off."
+         ),
+         category="configuration",
+@@ -6509,7 +6511,8 @@ def _resolve_rust_frontend_path() -> str | None:
+     "VLLM_SM70_GLM_MHC_PRE_THREADS": env_var(
+         lambda: int(os.getenv("VLLM_SM70_GLM_MHC_PRE_THREADS", "256")),
+         description=(
+-            "SM70: glm mhc pre threads. The consumer locations and unset "
++            "SM70: glm mhc pre threads. Unset, the GLM-5.3 route uses 1024 "
++            "above one token (128 at one). The consumer locations and unset "
+             "defaults are listed below."
+         ),
+         category="tuning",
+diff --git a/vllm/model_executor/kernels/mhc/triton.py b/vllm/model_executor/kernels/mhc/triton.py
+index 2971bc2282..8d62bad30a 100644
+--- a/vllm/model_executor/kernels/mhc/triton.py
++++ b/vllm/model_executor/kernels/mhc/triton.py
+@@ -399,7 +399,18 @@ def sm70_mhc_pre_norm_from_staging(
+         raise TypeError("SM70 mHC staging kernel requires FP16 norm weights")
+ 
+     policy = layer_policy()
+-    use_native_verify = num_tokens == 8 and policy.mhc_native_verify
++    # The native final stage handles any token count with one CTA per token. On
++    # V100 it runs the 2..8-token verify batch in 6.8-8.4 us against 35 us for
++    # the Triton program (3,600 calls per decode step at MTP k=3 on GLM-5.3-Flash
++    # TP4: -1.4 ms of a 38 ms step). Default on for that range; the policy field
++    # still forces it either way.
++    # The policy resolves an unset field to the environment default (off, 256
++    # threads) and records that provenance; only an explicit setting overrides.
++    sources = getattr(policy, "sources", {})
++    native_verify = policy.mhc_native_verify
++    if sources.get("mhc_native_verify", "default") == "default":
++        native_verify = True
++    use_native_verify = 2 <= num_tokens <= 8 and bool(native_verify)
+     if num_tokens == 1 or use_native_verify:
+         if not hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
+             raise RuntimeError(
+@@ -407,7 +418,9 @@ def sm70_mhc_pre_norm_from_staging(
+                 "Rebuild vLLM from source with CUDA arch 7.0."
+             )
+         if use_native_verify:
+-            logger.info_once("SM70 GLM mHC native CUDA q8 final stage enabled.")
++            logger.info_once(
++                "SM70 GLM mHC native CUDA final stage enabled for 2-8 tokens."
++            )
+         else:
+             logger.info_once("SM70 GLM mHC native CUDA decode final stage enabled.")
+         sm70_ops.sm70_glm_mhc_pre_norm_out(
+@@ -426,7 +439,11 @@ def sm70_mhc_pre_norm_from_staging(
+             hc_post_mult_value,
+             sinkhorn_repeat,
+             norm_eps,
+-            threads=policy.mhc_pre_threads,
++            # 1024 threads measured fastest for 2..8 tokens (6.8 us vs 8.4 us at
++            # 256); the kernel keeps 128 for a single token.
++            threads=policy.mhc_pre_threads
++            if sources.get("mhc_pre_threads", "default") != "default"
++            else (1024 if num_tokens > 1 else 128),
+         )
+         return
+ 
+diff --git a/vllm/models/glm5next/nvidia/kda.py b/vllm/models/glm5next/nvidia/kda.py
+index 90fb2c73a6..fb0f4e42d1 100644
+--- a/vllm/models/glm5next/nvidia/kda.py
++++ b/vllm/models/glm5next/nvidia/kda.py
+@@ -512,9 +512,13 @@ def forward(
+         num_tokens = hidden_states.size(0)
+         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
+         weight = self.in_proj_qkvbfg_a.weight
++        # The exact native GEMV only beats cuBLAS at a single token (736 vs
++        # 629 GB/s on V100). At the 2..8-token verify batch cuBLAS is ~2x faster
++        # (74 vs 143 us per call, 34 calls per step), so those rows take the
++        # standard projection; both accumulate in FP32.
+         use_sm70_exact_gemv = (
+             self._use_sm70_exact_kda_gemv
+-            and 1 <= num_tokens <= 8
++            and num_tokens == 1
+             and hidden_states.dtype == torch.float16
+             and weight.dtype == torch.float16
+             and hidden_states.is_contiguous()

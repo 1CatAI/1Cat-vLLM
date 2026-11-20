@@ -1,0 +1,118 @@
+{
+  "initial_inventory": {
+    "number": 1166,
+    "title": "[Perf][SM70] GLM-5.3: fused native mHC post+dot for 1-8 tokens",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1166",
+    "isDraft": true,
+    "headRefOid": "74d2cf6da8412fa0a6bc98da0c02b36686be2b84",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1166,
+    "title": "[Perf][SM70] GLM-5.3: fused native mHC post+dot for 1-8 tokens",
+    "body": "## Purpose\n\nGLM-5.3-Flash decode on 4x V100-SXM2 (TP4, MTP k=3, FP8 KV, CUDA graphs) runs the hyperconnection post-mapping and the following logits dot product as two TileLang kernels with an FP32 `[tokens, 4, 4096]` intermediate between them, on every one of the 45 layers of every verify (4-token) and draft (1-token) step. A fused native op for that pair already exists (`sm70_glm_mhc_post_dot_q8_out`) but is compiled for the fixed 8-token shape only, and it is off unless the DFlash2 verifier defaults set `VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8`, so the MTP path never reaches it.\n\n## Change\n\n`csrc/sm70_turbomind/ops/awq_sm70_gemm.cu`: `sm70_glm_mhc_post_dot_q8_kernel` takes the token count at run time (it only entered the staging strides) and the split count as a template parameter (4, as before, or 8, the count the FP32-stage path uses below 8 tokens); the wrapper derives both from the tensors and checks every shape against them. The per-output accumulation order is unchanged, so the existing 8-token bitwise test against the FP32 stage still passes.\n\n`vllm/model_executor/kernels/mhc/tilelang.py`: the fused op is taken for 1-8 tokens when the policy field `mhc_fused_post_dot` is unset (provenance `default`); an explicit setting, from the environment variable or a kernel config, still decides either way. Nothing changes above 8 tokens or for models other than the 4096 x 4 GLM-5.3 shape.\n\nNo new environment variables, no new ops, no generic module touched.\n\n## Not a duplicate\n\nNo open or closed PR changes the fused post+dot op's shape or its dispatch (searched \"post_dot\", \"fused post\", \"mhc q8\", \"glm53 mhc\").\n\n## Test Plan\n\n- `tests/kernels/test_mhc_sm70_fp16.py`:\n  - `test_mhc_sm70_native_post_dot_matches_fp64_for_1_to_8_tokens`: FP64 oracle for 1/2/4/7 tokens with 8 splits and 8 tokens with 4 splits, at tile widths 6 and 12; the FP16 residual output is exact, the split-K logits and square sums within FP32 tolerance; mutation check: the staging written by the old fixed 8-token stride does not match.\n  - `test_mhc_sm70_fused_post_dot_default_dispatch`: with the policy unset, 1/4/8 tokens call the fused op once (8 splits below 8 tokens, 4 at 8) and match the torch reference; with the field explicitly False the two-kernel path runs and matches the same reference.\n  - The existing `test_mhc_sm70_fused_fast_paths_match_torch` at 1 and 4 tokens now exercises the fused op by default.\n- In-graph microbench of the fused op against the two TileLang kernels at 1, 4 and 8 tokens.\n- E2E on 4x V100-SXM2-32GB: decode tok/s over 512-token greedy responses and greedy output on a 7-prompt set, same build with the policy field forced off as the control.\n- ruff and clang-format (pre-commit versions) on the changed files.\n\n## Test Result\n\n- In-graph microbench (V100): two TileLang kernels 5.5 us at 1 token / 8.7 us at 4 / 12.7 us at 8; fused op (tile_n=6) 4.0 / 6.0 / 10.1 us.\n- Unit tests: `tests/kernels/test_mhc_sm70_fp16.py` 71 passed, 1 skipped (10 new parametrizations of the FP64-oracle test, 3 of the dispatch test; the existing 8-token bitwise test against the FP32 stage still passes) on a full SM70 CMake build of `main` 4e5357b59 + #1159 + this change.\n- E2E (4x V100-SXM2-32GB, GLM-5.3-Flash EXL3 via #1102, TP4, MTP k=3, FP8 KV, 131K, CUDA graphs, the model card's serve command; stack `main` ec60883ad + #1125 + #1159 + #1161 + #1102 + the KDA norm change of #1165, same build): decode 90.6-90.9 -> 91.5 tok/s with the fused op (policy unset) vs forced off (`VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8=0`), 3 runs each. Greedy output on a 7-prompt set identical on 7/7 between the two.\n- pre-commit: ruff 0.14.0 and clang-format 21.1.2 clean on the changed files.\n\nGates before review:\n\n- [x] Kernel tests against an independent oracle, failing under mutation\n- [x] ruff / clang-format on the changed files\n- [x] Full wheel build (CMake path) and the test file above on it\n- [x] E2E on 4x V100, CUDA graphs on: load, greedy comparison, decode speed",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1166",
+    "isDraft": true,
+    "headRefName": "sm70-glm53-mhc-fused-post-dot",
+    "headRefOid": "74d2cf6da8412fa0a6bc98da0c02b36686be2b84",
+    "baseRefName": "main",
+    "baseRefOid": "44276e9719831955f1d6c11679669940a0409ad1",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "rivetphilbot"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1166,
+    "id": "PR_kwDORjYFXs8AAAABHroq6w",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "74d2cf6da8412fa0a6bc98da0c02b36686be2b84",
+    "title": "[Perf][SM70] GLM-5.3: fused native mHC post+dot for 1-8 tokens",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1166",
+    "body": "## Purpose\n\nGLM-5.3-Flash decode on 4x V100-SXM2 (TP4, MTP k=3, FP8 KV, CUDA graphs) runs the hyperconnection post-mapping and the following logits dot product as two TileLang kernels with an FP32 `[tokens, 4, 4096]` intermediate between them, on every one of the 45 layers of every verify (4-token) and draft (1-token) step. A fused native op for that pair already exists (`sm70_glm_mhc_post_dot_q8_out`) but is compiled for the fixed 8-token shape only, and it is off unless the DFlash2 verifier defaults set `VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8`, so the MTP path never reaches it.\n\n## Change\n\n`csrc/sm70_turbomind/ops/awq_sm70_gemm.cu`: `sm70_glm_mhc_post_dot_q8_kernel` takes the token count at run time (it only entered the staging strides) and the split count as a template parameter (4, as before, or 8, the count the FP32-stage path uses below 8 tokens); the wrapper derives both from the tensors and checks every shape against them. The per-output accumulation order is unchanged, so the existing 8-token bitwise test against the FP32 stage still passes.\n\n`vllm/model_executor/kernels/mhc/tilelang.py`: the fused op is taken for 1-8 tokens when the policy field `mhc_fused_post_dot` is unset (provenance `default`); an explicit setting, from the environment variable or a kernel config, still decides either way. Nothing changes above 8 tokens or for models other than the 4096 x 4 GLM-5.3 shape.\n\nNo new environment variables, no new ops, no generic module touched.\n\n## Not a duplicate\n\nNo open or closed PR changes the fused post+dot op's shape or its dispatch (searched \"post_dot\", \"fused post\", \"mhc q8\", \"glm53 mhc\").\n\n## Test Plan\n\n- `tests/kernels/test_mhc_sm70_fp16.py`:\n  - `test_mhc_sm70_native_post_dot_matches_fp64_for_1_to_8_tokens`: FP64 oracle for 1/2/4/7 tokens with 8 splits and 8 tokens with 4 splits, at tile widths 6 and 12; the FP16 residual output is exact, the split-K logits and square sums within FP32 tolerance; mutation check: the staging written by the old fixed 8-token stride does not match.\n  - `test_mhc_sm70_fused_post_dot_default_dispatch`: with the policy unset, 1/4/8 tokens call the fused op once (8 splits below 8 tokens, 4 at 8) and match the torch reference; with the field explicitly False the two-kernel path runs and matches the same reference.\n  - The existing `test_mhc_sm70_fused_fast_paths_match_torch` at 1 and 4 tokens now exercises the fused op by default.\n- In-graph microbench of the fused op against the two TileLang kernels at 1, 4 and 8 tokens.\n- E2E on 4x V100-SXM2-32GB: decode tok/s over 512-token greedy responses and greedy output on a 7-prompt set, same build with the policy field forced off as the control.\n- ruff and clang-format (pre-commit versions) on the changed files.\n\n## Test Result\n\n- In-graph microbench (V100): two TileLang kernels 5.5 us at 1 token / 8.7 us at 4 / 12.7 us at 8; fused op (tile_n=6) 4.0 / 6.0 / 10.1 us.\n- Unit tests: `tests/kernels/test_mhc_sm70_fp16.py` 71 passed, 1 skipped (10 new parametrizations of the FP64-oracle test, 3 of the dispatch test; the existing 8-token bitwise test against the FP32 stage still passes) on a full SM70 CMake build of `main` 4e5357b59 + #1159 + this change.\n- E2E (4x V100-SXM2-32GB, GLM-5.3-Flash EXL3 via #1102, TP4, MTP k=3, FP8 KV, 131K, CUDA graphs, the model card's serve command; stack `main` ec60883ad + #1125 + #1159 + #1161 + #1102 + the KDA norm change of #1165, same build): decode 90.6-90.9 -> 91.5 tok/s with the fused op (policy unset) vs forced off (`VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8=0`), 3 runs each. Greedy output on a 7-prompt set identical on 7/7 between the two.\n- pre-commit: ruff 0.14.0 and clang-format 21.1.2 clean on the changed files.\n\nGates before review:\n\n- [x] Kernel tests against an independent oracle, failing under mutation\n- [x] ruff / clang-format on the changed files\n- [x] Full wheel build (CMake path) and the test file above on it\n- [x] E2E on 4x V100, CUDA graphs on: load, greedy comparison, decode speed",
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRefName": "sm70-glm53-mhc-fused-post-dot",
+    "comments": {
+      "totalCount": 2,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWvH5O0="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABa3G8Lg",
+          "author": {
+            "login": "rivetphilbot"
+          },
+          "body": "Per-pass measurement (same build, same generated text across configurations: 1,440 forward passes, 2.78 accepted tokens per pass, five varied 400-token prompts x2, counters from `/metrics`):\n\n| configuration | ms per forward pass |\n|---|---:|\n| #1165 + #1166 (defaults) | 32.81 |\n| #1165 with `VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8=0` | 32.97 |\n\nSo #1166 is worth about 0.16 ms per pass (0.5%) at the kernel level; the larger tok/s swing in the earlier A/B included a change in the generated text of the speed prompt (draft acceptance), which is why the greedy outputs were reported alongside. #1165's effect is in GPU kernel time: the profile's elementwise bucket dropped by about 1.3 ms per pass (4%). Under MTP, compare builds by milliseconds per pass rather than by one prompt's tok/s.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1166#issuecomment-6097583150",
+          "createdAt": "2026-10-10T12:39:37Z",
+          "updatedAt": "2026-10-10T12:39:37Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABa8fk7Q",
+          "author": {
+            "login": "rivetphilbot"
+          },
+          "body": "Correction to the per-pass numbers above: the build they were measured on also had an unpublished kernel (a small-N GEMV for the router and shared expert) active in both rows; its disable switch did not take effect, which we found afterwards. Re-measured on exactly the PR stack (`main` ec60883ad with #1125, #1159, #1161, #1166, #1165 cherry-picked and #1102 merged), built from a clean clone, same method (five varied 400-token prompts x2, 1,432 forward passes, identical generated text in both rows, 2.79 accepted tokens per pass):\n\n| Configuration | ms per pass |\n|---|---:|\n| #1165 + #1166 (defaults) | 32.47 |\n| #1165 with `VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8=0` | 32.57 |\n\nSo #1166 is worth about 0.10 ms per pass (0.3%), not 0.16 ms. The #1165 figure (elementwise time down about 1.3 ms per pass) came from a profile taken before that kernel was added and stands. The full stack decodes at 91.4-91.9 tok/s single-user on the speed prompt.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1166#issuecomment-6103229677",
+          "createdAt": "2026-10-10T23:16:45Z",
+          "updatedAt": "2026-10-10T23:16:45Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1166,
+    "title": "[Perf][SM70] GLM-5.3: fused native mHC post+dot for 1-8 tokens",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1166",
+    "isDraft": true,
+    "headRefOid": "74d2cf6da8412fa0a6bc98da0c02b36686be2b84",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "csrc/sm70_turbomind/ops/awq_sm70_gemm.cu",
+      "tests/kernels/test_mhc_sm70_fp16.py",
+      "vllm/model_executor/kernels/mhc/tilelang.py"
+    ],
+    "diff_bytes": 15890,
+    "diff_sha256": "467ee392afbec84c4259985d3b9e258486333b1e1dc9ac32e1c5682368e5e14f"
+  },
+  "full_tree_diff_proof": null
+}

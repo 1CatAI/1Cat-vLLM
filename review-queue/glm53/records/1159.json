@@ -1,0 +1,99 @@
+{
+  "initial_inventory": {
+    "number": 1159,
+    "title": "[Perf][SM70] GLM-5.3: native mHC final stage for 2-8 tokens, cuBLAS KDA projection above one token",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1159",
+    "isDraft": true,
+    "headRefOid": "44d292046a7b206fe3504315fd1de505aea89c3c",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1159,
+    "title": "[Perf][SM70] GLM-5.3: native mHC final stage for 2-8 tokens, cuBLAS KDA projection above one token",
+    "body": "## Purpose\n\nGLM-5.3-Flash decode on 4x V100-SXM2 (TP4, MTP k=3, FP8 KV, CUDA graphs) spends its 38 ms step almost entirely in kernels (GPU 97% busy). A torch-profiler capture of 40 verify steps (4 tokens each) put two avoidable items on the list:\n\n- the hyperconnection final stage (sigmoid/Sinkhorn mixes and RMSNorm) ran the Triton program for 2-8 tokens, one program per token: 35 us per call, 90 calls per step, 3.2 ms;\n- the KDA input projection (6416 x 4096) took the exact native FP16 GEMV at every token count: 128 us per call at 4 tokens, 34 calls per step, 4.3 ms, where cuBLAS does the same GEMM in 74 us.\n\n## Change\n\n`vllm/model_executor/kernels/mhc/triton.py`: `sm70_mhc_pre_norm_from_staging` routes 2-8 tokens to `sm70_glm_mhc_pre_norm_out` by default (the op already handles any token count with one CTA per token) and asks for 1024 threads above one token. With the two policy fields unset (provenance `default`) the route takes the native op and 1024 threads; an explicit `mhc_native_verify` / `mhc_pre_threads` setting (environment or kernel config) still forces either choice. Nothing changes for one token or for more than eight. The two environment-variable descriptions are updated to say so.\n\n`vllm/models/glm5next/nvidia/kda.py`: the exact native GEMV is taken for one token only; 2-8 tokens use the layer's standard projection (cuBLAS, FP32 accumulate).\n\nNo new environment variables, no new ops, no generic module touched.\n\n## Not a duplicate\n\nNo open or closed PR changes the GLM-5.3 mHC final-stage dispatch above one token or the KDA projection's token-count gate (searched \"mhc native\", \"pre_norm\", \"exact KDA\", \"glm53 decode\").\n\n## Test Plan\n\n- `tests/kernels/test_mhc_sm70_fp16.py`: graph replay vs eager bitwise for 1/2/4/5/8 tokens (was 1/8); native vs Triton final stage for 2/3/4/6/8 tokens, FP32 mixes bitwise and normalized activations within FP16 rounding, with a perturbation guard; dispatch picks the native op for 1-8 tokens with the policy unset.\n- `tests/models/glm5next/test_sm70_kda.py`: the exact-GEMV gate is single-token.\n- Microbench of the native final stage in a CUDA graph at 4 tokens: 128/256/512/1024 threads.\n- E2E A/B on 4x V100-SXM2-32GB, same build and checkpoint (GLM-5.3-Flash EXL3 via #1102, TP4, MTP k=3, FP8 KV, 131K context): decode tok/s over 512-token greedy responses, and greedy output on a 7-prompt set incl. a 150-token prompt.\n- ruff / pre-commit on the changed files.\n\n## Test Result\n\n- Native final stage in-graph, 4 tokens: 11.1 us (128 thr), 8.4 (256), 7.3 (512), 6.8 (1024); the Triton program averages 35 us in the same step.\n- E2E decode (1 user): 82.4 tok/s with this PR vs 77.3 without, on the same tree (and 85.8 with #1102's updated expert kernel on top). Greedy output: 4 of 7 prompts identical, the rest diverge after 250+ characters, which is the pattern the previous build already shows against its predecessor (reordered FP32 accumulation under greedy decoding).\n- Full-stack validation: `main` ec60883ad + #1125 (rebased) + this branch + #1161 + #1102, full CMake build: 147 tests pass across the five SM70 test files; E2E with the model card's serve command: 85.7 tok/s decode, 1 user.\n- Unit tests: 66 passed, 1 skipped (`tests/kernels/test_mhc_sm70_fp16.py` + `tests/models/glm5next/test_sm70_kda.py`) on a full SM70 CMake build of `main` 4e5357b59 plus this commit, V100-SXM2-32GB.\n- pre-commit: ruff 0.14.0 format and check clean on the changed files.\n\nGates before review:\n\n- [x] Kernel tests against an independent oracle, failing under mutation (native vs Triton final stage with a perturbation guard; dispatch tests for default-on and explicit-off)\n- [x] ruff on the changed files (no generic module touched, so the layering ratchet is unaffected)\n- [x] Full wheel build (CMake path) and the test files above on it\n- [x] E2E on 4x V100, CUDA graphs on: load, greedy comparison, decode speed (on the #1102 + #1125 integration tree, these two changes enabled through the policy fields, which is the same code path the unset default now takes)\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1159",
+    "isDraft": true,
+    "headRefName": "sm70-glm53-decode-fastpaths",
+    "headRefOid": "44d292046a7b206fe3504315fd1de505aea89c3c",
+    "baseRefName": "main",
+    "baseRefOid": "16628e2f0a70761ba6525bf46e5e844c04b3e66f",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "rivetphilbot"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1159,
+    "id": "PR_kwDORjYFXs8AAAABHqoHXA",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "44d292046a7b206fe3504315fd1de505aea89c3c",
+    "title": "[Perf][SM70] GLM-5.3: native mHC final stage for 2-8 tokens, cuBLAS KDA projection above one token",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1159",
+    "body": "## Purpose\n\nGLM-5.3-Flash decode on 4x V100-SXM2 (TP4, MTP k=3, FP8 KV, CUDA graphs) spends its 38 ms step almost entirely in kernels (GPU 97% busy). A torch-profiler capture of 40 verify steps (4 tokens each) put two avoidable items on the list:\n\n- the hyperconnection final stage (sigmoid/Sinkhorn mixes and RMSNorm) ran the Triton program for 2-8 tokens, one program per token: 35 us per call, 90 calls per step, 3.2 ms;\n- the KDA input projection (6416 x 4096) took the exact native FP16 GEMV at every token count: 128 us per call at 4 tokens, 34 calls per step, 4.3 ms, where cuBLAS does the same GEMM in 74 us.\n\n## Change\n\n`vllm/model_executor/kernels/mhc/triton.py`: `sm70_mhc_pre_norm_from_staging` routes 2-8 tokens to `sm70_glm_mhc_pre_norm_out` by default (the op already handles any token count with one CTA per token) and asks for 1024 threads above one token. With the two policy fields unset (provenance `default`) the route takes the native op and 1024 threads; an explicit `mhc_native_verify` / `mhc_pre_threads` setting (environment or kernel config) still forces either choice. Nothing changes for one token or for more than eight. The two environment-variable descriptions are updated to say so.\n\n`vllm/models/glm5next/nvidia/kda.py`: the exact native GEMV is taken for one token only; 2-8 tokens use the layer's standard projection (cuBLAS, FP32 accumulate).\n\nNo new environment variables, no new ops, no generic module touched.\n\n## Not a duplicate\n\nNo open or closed PR changes the GLM-5.3 mHC final-stage dispatch above one token or the KDA projection's token-count gate (searched \"mhc native\", \"pre_norm\", \"exact KDA\", \"glm53 decode\").\n\n## Test Plan\n\n- `tests/kernels/test_mhc_sm70_fp16.py`: graph replay vs eager bitwise for 1/2/4/5/8 tokens (was 1/8); native vs Triton final stage for 2/3/4/6/8 tokens, FP32 mixes bitwise and normalized activations within FP16 rounding, with a perturbation guard; dispatch picks the native op for 1-8 tokens with the policy unset.\n- `tests/models/glm5next/test_sm70_kda.py`: the exact-GEMV gate is single-token.\n- Microbench of the native final stage in a CUDA graph at 4 tokens: 128/256/512/1024 threads.\n- E2E A/B on 4x V100-SXM2-32GB, same build and checkpoint (GLM-5.3-Flash EXL3 via #1102, TP4, MTP k=3, FP8 KV, 131K context): decode tok/s over 512-token greedy responses, and greedy output on a 7-prompt set incl. a 150-token prompt.\n- ruff / pre-commit on the changed files.\n\n## Test Result\n\n- Native final stage in-graph, 4 tokens: 11.1 us (128 thr), 8.4 (256), 7.3 (512), 6.8 (1024); the Triton program averages 35 us in the same step.\n- E2E decode (1 user): 82.4 tok/s with this PR vs 77.3 without, on the same tree (and 85.8 with #1102's updated expert kernel on top). Greedy output: 4 of 7 prompts identical, the rest diverge after 250+ characters, which is the pattern the previous build already shows against its predecessor (reordered FP32 accumulation under greedy decoding).\n- Full-stack validation: `main` ec60883ad + #1125 (rebased) + this branch + #1161 + #1102, full CMake build: 147 tests pass across the five SM70 test files; E2E with the model card's serve command: 85.7 tok/s decode, 1 user.\n- Unit tests: 66 passed, 1 skipped (`tests/kernels/test_mhc_sm70_fp16.py` + `tests/models/glm5next/test_sm70_kda.py`) on a full SM70 CMake build of `main` 4e5357b59 plus this commit, V100-SXM2-32GB.\n- pre-commit: ruff 0.14.0 format and check clean on the changed files.\n\nGates before review:\n\n- [x] Kernel tests against an independent oracle, failing under mutation (native vs Triton final stage with a perturbation guard; dispatch tests for default-on and explicit-off)\n- [x] ruff on the changed files (no generic module touched, so the layering ratchet is unaffected)\n- [x] Full wheel build (CMake path) and the test files above on it\n- [x] E2E on 4x V100, CUDA graphs on: load, greedy comparison, decode speed (on the #1102 + #1125 integration tree, these two changes enabled through the policy fields, which is the same code path the unset default now takes)\n",
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRefName": "sm70-glm53-decode-fastpaths",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1159,
+    "title": "[Perf][SM70] GLM-5.3: native mHC final stage for 2-8 tokens, cuBLAS KDA projection above one token",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1159",
+    "isDraft": true,
+    "headRefOid": "44d292046a7b206fe3504315fd1de505aea89c3c",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/kernels/test_mhc_sm70_fp16.py",
+      "tests/models/glm5next/test_sm70_kda.py",
+      "vllm/envs.py",
+      "vllm/model_executor/kernels/mhc/triton.py",
+      "vllm/models/glm5next/nvidia/kda.py"
+    ],
+    "diff_bytes": 13672,
+    "diff_sha256": "316f05ed9d0c10c5dd673aed57dcf4b7393886823ce5ae09b28c4521c169ccde"
+  },
+  "full_tree_diff_proof": null
+}

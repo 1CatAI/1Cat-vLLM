@@ -1,0 +1,113 @@
+{
+  "initial_inventory": {
+    "number": 1125,
+    "title": "[Perf][SM70] GLM-5.3: FP32 tensor-core sparse MLA for FP8-KV prefill",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1125",
+    "isDraft": true,
+    "headRefOid": "da13d2d9ca4bba2cf7757442afde63c38b407d78",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1125,
+    "title": "[Perf][SM70] GLM-5.3: FP32 tensor-core sparse MLA for FP8-KV prefill",
+    "body": "**Stacked on #1092.** This branch carries #1092's commit plus one more. Please review only the last commit, da13d2d9c (rebased on `main` 4e5357b59 on 10 Oct; the previous head was 524289242).\n\n## Purpose\n\nGLM-5.3-Flash prefill over the packed E4M3 KV cache is dominated by sparse MLA. A torch-profiler capture of a 29.4K-token prefill on 4x V100-SXM2 (TP4) put 76.0 s of rank 0's 93.4 s of GPU kernel time in one kernel, `_sm70_glm5_sparse_paged_fp8_kernel`: 82%, against 10% for the routed experts. At 1.15K tokens it was 61%.\n\nThat Triton kernel handles every FP8-KV call over 8 tokens. It launches one program per query token per 8 heads, so with 16 heads per rank each token's up-to-2048 selected keys are dequantized twice. It walks them in 16-key tiles.\n\n## Change\n\n`Glm5NextSM70SparseImpl` routes FP8-KV attention at every token count through `sm70_glm53_sparse_mla_fp8_out`, the tensor-core kernel with FP32 scores and softmax that #1092 adds for decode and verify. That means decode, verify and prefill alike.\n- Its workspace is sized for `max_num_batched_tokens`. The split heuristic already picks one split per row once the token count fills the GPU, so the extra `o_part` at 4096 tokens is 4096 × 16 × 512 × 4 B = 134 MB per rank.\n- The Triton prefill route and the fp16-score GEMM routes stay as the fallback for head counts the kernel cannot tile.\n\nThe current prefill route already keeps its softmax state in FP32, so the case here is speed, plus one kernel and one precision contract for all token counts.\n\n## Not a duplicate\n\nNo open or closed PR changes the GLM-5.3 FP8-KV prefill route (searched \"sparse prefill\", \"GLM prefill\", \"sparse_paged_fp8\", \"glm5 sparse\", \"MLA prefill sm70\"). #716, closed, was an opt-in gather + batched-matmul route for DeepSeek-V4.\n\n## Test Plan\n\n- `tests/models/glm5next/test_sm70_sparse.py` adds:\n  - the kernel at prefill token counts (T = 64, 300, with the backend's split heuristic) against the FP64 reference over an independently dequantized cache\n  - agreement with the Triton route it replaces, at T = 300\n- Microbench of both kernels at prefill shapes: 16 heads, 2048 random selected keys, 2304-token cache blocks.\n- E2E A/B on 4x V100-SXM2-32GB: TP4, CUDA graphs, FP8 E4M3 KV, GLM-5.3-Flash EXL3, MTP k=3, 131K context. Same build, routing change on and off:\n  - unique-prompt prefill at ~1K and ~29K tokens\n  - decode speed\n  - 84K needle\n  - greedy comparison\n- Quality: teacher-forced check of both sides' greedy output, each scored by both routes, plus the gsm8k / factual / confabulation battery.\n- `pre-commit run` on the changed files.\n\n## Test Result\n\n- `pytest tests/models/glm5next/test_sm70_sparse.py`: 39 passed (36 existing + 3 new) on V100-SXM2-32GB.\n- Microbench per token, Triton route vs this route (relative difference 1.3e-4):\n\n  | T | Triton | this route | |\n  |---:|---:|---:|---:|\n  | 256 | 274 µs | 15.0 µs | 18x |\n  | 1024 | 261 µs | 12.4 µs | 21x |\n  | 4096 | 261 µs | 12.2 µs | 21x |\n\n- E2E A/B, same build:\n\n  | | Triton prefill route | this route |\n  |---|---:|---:|\n  | ~1.15K-token prefill | ~645 tok/s (1.77 s) | ~1,475 tok/s (0.78 s) |\n  | ~29.4K-token prefill | ~314 tok/s (94 s) | ~1,389 tok/s (21.2 s) |\n  | 70.8K-token needle | 266 s* | 55 s, pass |\n  | decode, MTP k=3 | 74.6 tok/s | 76.3 tok/s |\n\n  *From an earlier run on the same build and config. Both sides use the same decode/verify kernel, so the decode difference is run-to-run noise.\n\n- Greedy: 1/8 prompts token-identical between the two routes. The kernels differ by ~1e-4 relative. GLM-5.3 greedy output has many near-ties: an earlier teacher-forced check found ~1% of tokens within a 0.14-nat median margin. The quality check below is meant to show the divergences come only from such ties.\n- pre-commit: all hooks pass.\n- Quality, same build and config:\n\n  | | Triton prefill route | this route |\n  |---|---:|---:|\n  | gsm8k-200 strict | 0.985 | 0.99 |\n  | factual accuracy (75) | 1.0 | 1.0 |\n  | confabulation rate (75) | 0.013 | 0.013 |\n\n- Teacher-forced 2x2. Each route's greedy token ids (MTP k=3, 8 prompts) were scored with `prompt_logprobs` on a no-spec server of each route. Counts are tokens that weren't the scorer's argmax:\n\n  | | scored by Triton route | scored by this route |\n  |---|---:|---:|\n  | Triton route's output | 22/1754 (1.25%) | 26/1754 (1.48%) |\n  | this route's output | 23/1760 (1.31%) | 16/1760 (0.91%) |\n\n  The median margin at those tokens is 0.11-0.14 nats in every cell. Each scorer agrees slightly more with its own route, and neither route's output scores worse under the other. So the greedy differences are near-ties, not lost accuracy. The largest single margin is 1.75 nats, one token of this route's output under the Triton scorer. Under its own scorer the largest is 0.69.\n\nGates before review:\n\n- [x] Kernel tests at prefill token counts (FP64 reference, Triton route agreement)\n- [x] E2E prefill speed A/B, needle\n- [x] Quality: teacher-forced 2x2 scoring of both routes' greedy output, gsm8k / factual / confabulation on this route\n- [ ] Rebase onto #1092's final head and re-measure\n\n## AI assistance\n\nThis change was developed with AI assistance (Claude). The submitting human (@philbert440) is accountable for it and reviews every changed line before this leaves draft.\n\n@philbert440\n\n\n\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1125",
+    "isDraft": true,
+    "headRefName": "sm70-glm53-sparse-mla-prefill",
+    "headRefOid": "da13d2d9ca4bba2cf7757442afde63c38b407d78",
+    "baseRefName": "main",
+    "baseRefOid": "16628e2f0a70761ba6525bf46e5e844c04b3e66f",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "rivetphilbot"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1125,
+    "id": "PR_kwDORjYFXs8AAAABHdf6WQ",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "da13d2d9ca4bba2cf7757442afde63c38b407d78",
+    "title": "[Perf][SM70] GLM-5.3: FP32 tensor-core sparse MLA for FP8-KV prefill",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1125",
+    "body": "**Stacked on #1092.** This branch carries #1092's commit plus one more. Please review only the last commit, da13d2d9c (rebased on `main` 4e5357b59 on 10 Oct; the previous head was 524289242).\n\n## Purpose\n\nGLM-5.3-Flash prefill over the packed E4M3 KV cache is dominated by sparse MLA. A torch-profiler capture of a 29.4K-token prefill on 4x V100-SXM2 (TP4) put 76.0 s of rank 0's 93.4 s of GPU kernel time in one kernel, `_sm70_glm5_sparse_paged_fp8_kernel`: 82%, against 10% for the routed experts. At 1.15K tokens it was 61%.\n\nThat Triton kernel handles every FP8-KV call over 8 tokens. It launches one program per query token per 8 heads, so with 16 heads per rank each token's up-to-2048 selected keys are dequantized twice. It walks them in 16-key tiles.\n\n## Change\n\n`Glm5NextSM70SparseImpl` routes FP8-KV attention at every token count through `sm70_glm53_sparse_mla_fp8_out`, the tensor-core kernel with FP32 scores and softmax that #1092 adds for decode and verify. That means decode, verify and prefill alike.\n- Its workspace is sized for `max_num_batched_tokens`. The split heuristic already picks one split per row once the token count fills the GPU, so the extra `o_part` at 4096 tokens is 4096 × 16 × 512 × 4 B = 134 MB per rank.\n- The Triton prefill route and the fp16-score GEMM routes stay as the fallback for head counts the kernel cannot tile.\n\nThe current prefill route already keeps its softmax state in FP32, so the case here is speed, plus one kernel and one precision contract for all token counts.\n\n## Not a duplicate\n\nNo open or closed PR changes the GLM-5.3 FP8-KV prefill route (searched \"sparse prefill\", \"GLM prefill\", \"sparse_paged_fp8\", \"glm5 sparse\", \"MLA prefill sm70\"). #716, closed, was an opt-in gather + batched-matmul route for DeepSeek-V4.\n\n## Test Plan\n\n- `tests/models/glm5next/test_sm70_sparse.py` adds:\n  - the kernel at prefill token counts (T = 64, 300, with the backend's split heuristic) against the FP64 reference over an independently dequantized cache\n  - agreement with the Triton route it replaces, at T = 300\n- Microbench of both kernels at prefill shapes: 16 heads, 2048 random selected keys, 2304-token cache blocks.\n- E2E A/B on 4x V100-SXM2-32GB: TP4, CUDA graphs, FP8 E4M3 KV, GLM-5.3-Flash EXL3, MTP k=3, 131K context. Same build, routing change on and off:\n  - unique-prompt prefill at ~1K and ~29K tokens\n  - decode speed\n  - 84K needle\n  - greedy comparison\n- Quality: teacher-forced check of both sides' greedy output, each scored by both routes, plus the gsm8k / factual / confabulation battery.\n- `pre-commit run` on the changed files.\n\n## Test Result\n\n- `pytest tests/models/glm5next/test_sm70_sparse.py`: 39 passed (36 existing + 3 new) on V100-SXM2-32GB.\n- Microbench per token, Triton route vs this route (relative difference 1.3e-4):\n\n  | T | Triton | this route | |\n  |---:|---:|---:|---:|\n  | 256 | 274 µs | 15.0 µs | 18x |\n  | 1024 | 261 µs | 12.4 µs | 21x |\n  | 4096 | 261 µs | 12.2 µs | 21x |\n\n- E2E A/B, same build:\n\n  | | Triton prefill route | this route |\n  |---|---:|---:|\n  | ~1.15K-token prefill | ~645 tok/s (1.77 s) | ~1,475 tok/s (0.78 s) |\n  | ~29.4K-token prefill | ~314 tok/s (94 s) | ~1,389 tok/s (21.2 s) |\n  | 70.8K-token needle | 266 s* | 55 s, pass |\n  | decode, MTP k=3 | 74.6 tok/s | 76.3 tok/s |\n\n  *From an earlier run on the same build and config. Both sides use the same decode/verify kernel, so the decode difference is run-to-run noise.\n\n- Greedy: 1/8 prompts token-identical between the two routes. The kernels differ by ~1e-4 relative. GLM-5.3 greedy output has many near-ties: an earlier teacher-forced check found ~1% of tokens within a 0.14-nat median margin. The quality check below is meant to show the divergences come only from such ties.\n- pre-commit: all hooks pass.\n- Quality, same build and config:\n\n  | | Triton prefill route | this route |\n  |---|---:|---:|\n  | gsm8k-200 strict | 0.985 | 0.99 |\n  | factual accuracy (75) | 1.0 | 1.0 |\n  | confabulation rate (75) | 0.013 | 0.013 |\n\n- Teacher-forced 2x2. Each route's greedy token ids (MTP k=3, 8 prompts) were scored with `prompt_logprobs` on a no-spec server of each route. Counts are tokens that weren't the scorer's argmax:\n\n  | | scored by Triton route | scored by this route |\n  |---|---:|---:|\n  | Triton route's output | 22/1754 (1.25%) | 26/1754 (1.48%) |\n  | this route's output | 23/1760 (1.31%) | 16/1760 (0.91%) |\n\n  The median margin at those tokens is 0.11-0.14 nats in every cell. Each scorer agrees slightly more with its own route, and neither route's output scores worse under the other. So the greedy differences are near-ties, not lost accuracy. The largest single margin is 1.75 nats, one token of this route's output under the Triton scorer. Under its own scorer the largest is 0.69.\n\nGates before review:\n\n- [x] Kernel tests at prefill token counts (FP64 reference, Triton route agreement)\n- [x] E2E prefill speed A/B, needle\n- [x] Quality: teacher-forced 2x2 scoring of both routes' greedy output, gsm8k / factual / confabulation on this route\n- [ ] Rebase onto #1092's final head and re-measure\n\n## AI assistance\n\nThis change was developed with AI assistance (Claude). The submitting human (@philbert440) is accountable for it and reviews every changed line before this leaves draft.\n\n@philbert440\n\n\n\n",
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRefName": "sm70-glm53-sparse-mla-prefill",
+    "comments": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWtYh9k="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABa1iH2Q",
+          "author": {
+            "login": "rivetphilbot"
+          },
+          "body": "### Rebased on current `main` (4e5357b59)\n\n`main` reorganized `vllm/_sm70_ops.py` into a re-export shim over `vllm/_sm70/*` (c9d825d5c), which made this branch stop merging. Both commits are replayed on top of that: the `sm70_glm53_sparse_mla_fp8_out` wrapper and its fake now live in `vllm/_sm70/auxiliary.py` and are exported from the shim; nothing else changed. The branch is now `587fac6eb` (#1092's kernel) + `da13d2d9c` (this PR's prefill route). Please review only the last commit, `da13d2d9c`.\n\nValidation of the rebased stack `main` + this branch + #1159 + #1161 + #1102 on 4x V100-SXM2-32GB (full CMake build), with `main` at ec60883ad (the last commit before the 10 Oct provider-lifecycle series; see the note on #1161): 147 unit tests pass (`test_exl3_moe`, `test_sm70_sparse`, `test_mhc_sm70_fp16`, `test_sm70_kda`, `test_sm70_acceleration_report`); E2E with the model card's serve command (TP4, MTP k=3, FP8 KV, 131K, CUDA graphs, exllamav3 output dir loaded directly): 85.7 tok/s decode, greedy output on a 7-prompt set matching the integration tree on 3 prompts and diverging late on the rest, the usual reordered-FP32 pattern.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1125#issuecomment-6095931353",
+          "createdAt": "2026-10-10T09:02:47Z",
+          "updatedAt": "2026-10-10T09:03:12Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1125,
+    "title": "[Perf][SM70] GLM-5.3: FP32 tensor-core sparse MLA for FP8-KV prefill",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1125",
+    "isDraft": true,
+    "headRefOid": "da13d2d9ca4bba2cf7757442afde63c38b407d78",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "CMakeLists.txt",
+      "csrc/ops.h",
+      "csrc/sm70_turbomind/ops/glm53_sparse_mla_fp8_sm70.cu",
+      "csrc/torch_bindings.cpp",
+      "tests/models/glm5next/test_sm70_sparse.py",
+      "vllm/_sm70/auxiliary.py",
+      "vllm/_sm70_ops.py",
+      "vllm/models/glm5next/sm70/sparse.py"
+    ],
+    "diff_bytes": 35321,
+    "diff_sha256": "1224c8aebaa3990aab97fe73159639aad56efc22bab59dbac62499b5fb2c8f2a"
+  },
+  "full_tree_diff_proof": null
+}
