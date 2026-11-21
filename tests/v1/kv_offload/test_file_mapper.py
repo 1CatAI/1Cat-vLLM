@@ -127,6 +127,25 @@ def test_get_config_file_path():
     assert config_path == f"{fm.base_path}/config.json"
 
 
+def test_lookahead_archive_uses_separate_namespace():
+    spec = MagicMock(spec=OffloadingSpec)
+    spec.vllm_config = _MOCK_VLLM_CONFIG
+    spec.kv_cache_config = _MOCK_KV_CACHE_CONFIG
+    spec.persistent_layout = {"version": "grouped-host-v1"}
+    spec.use_lookahead_block_hashes = False
+    legacy = FileMapper.from_offloading_spec("/tmp/cache", spec)
+
+    spec.use_lookahead_block_hashes = True
+    lookahead = FileMapper.from_offloading_spec("/tmp/cache", spec)
+    key = make_offload_key(b"same-prefix", 2)
+    assert legacy.get_file_name(key) != lookahead.get_file_name(key)
+    assert lookahead.get_run_config()["persistent_layout"] == {
+        "version": "grouped-host-v1",
+        "prefix_hash_scheme": "1cat-lookahead-v1",
+    }
+    assert spec.persistent_layout == {"version": "grouped-host-v1"}
+
+
 def test_persistent_layout_isolates_physical_bytes():
     from copy import deepcopy
 
