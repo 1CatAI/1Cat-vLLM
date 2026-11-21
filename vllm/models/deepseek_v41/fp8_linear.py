@@ -236,37 +236,53 @@ def q8_rows_config(m, n, k):
 
 
 def q8_rows(x, packed, half_scales, n, tickets=None):
-    """x [M, K] (or grouped [M, G, K]) @ W^T for 8 < M <= 64."""
+    """x [M, K] (or grouped [M, G, K]) @ W^T for batched decode (chunked by 64)."""
     m, k = x.shape[0], x.shape[-1]
+    xc = x.contiguous()
     if tickets is None:
         tickets = _ROWS_TICKETS.get(packed.data_ptr())
         if tickets is None:
             tickets = _ROWS_TICKETS[packed.data_ptr()] = torch.zeros(
                 n // 32, dtype=torch.int32, device=x.device
             )
-    warps, parts, row_tiles = q8_rows_config(m, n, k)
     out = torch.empty(m, n, dtype=torch.float16, device=x.device)
-    torch.ops.v41q8.gemm_rows(
-        out, x.contiguous(), packed, half_scales, tickets, warps, parts, row_tiles
-    )
+    for s in range(0, m, 64):
+        e = min(s + 64, m)
+        cm = e - s
+        warps, parts, row_tiles = q8_rows_config(cm, n, k)
+        torch.ops.v41q8.gemm_rows(
+            out[s:e], xc[s:e], packed, half_scales, tickets, warps, parts, row_tiles
+        )
     return out
 
 
 def q8_rows2(x, packed, half_scales, n_a, n_b):
-    """Two-output fused QPN8 GEMM for 8 < M <= 64 without split copies."""
+    """Two-output fused QPN8 GEMM for batched decode without split copies."""
     m, k = x.shape[0], x.shape[-1]
+    xc = x.contiguous()
     n = n_a + n_b
     tickets = _ROWS_TICKETS.get(packed.data_ptr())
     if tickets is None:
         tickets = _ROWS_TICKETS[packed.data_ptr()] = torch.zeros(
             n // 32, dtype=torch.int32, device=x.device
         )
-    warps, parts, row_tiles = q8_rows_config(m, n, k)
     a = torch.empty(m, n_a, dtype=torch.float16, device=x.device)
     b = torch.empty(m, n_b, dtype=torch.float16, device=x.device)
-    torch.ops.v41q8.gemm2_rows(
-        a, b, x.contiguous(), packed, half_scales, tickets, warps, parts, row_tiles
-    )
+    for s in range(0, m, 64):
+        e = min(s + 64, m)
+        cm = e - s
+        warps, parts, row_tiles = q8_rows_config(cm, n, k)
+        torch.ops.v41q8.gemm2_rows(
+            a[s:e],
+            b[s:e],
+            xc[s:e],
+            packed,
+            half_scales,
+            tickets,
+            warps,
+            parts,
+            row_tiles,
+        )
     return [a, b]
 
 

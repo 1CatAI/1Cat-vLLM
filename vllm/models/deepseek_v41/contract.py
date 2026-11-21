@@ -87,13 +87,13 @@ def pp_split_problem(config, split, *, staged_state=False):
         return f"split must be inside 1..{layers - 1}"
     if staged_state:
         source = kv_source_of(config, split)
-        ratio1 = source >= 0 and tuple(config.compress_ratios)[source] == 1
-        if split not in tuple(config.index_source_layer_ids) and not ratio1:
-            # Inside the ratio-1 layers the index group's top-k (512 int32 per
-            # token) is shipped with the residual; elsewhere it is not.
+        compressed = source >= 0 and tuple(config.compress_ratios)[source] in (1, 2)
+        if split not in tuple(config.index_source_layer_ids) and not compressed:
+            # Inside compressed layers the index group's top-k (512 int32 per
+            # token) and KV mirror rows are shipped with the residual.
             return "not an index source layer (index keys would cross the boundary)"
-        if source != split and not ratio1:
-            return "a stage may start inside the consumers of a ratio-1 source only"
+        if source != split and not compressed:
+            return "a stage may start inside the consumers of a compressed source only"
         return None
     if split not in tuple(config.kv_source_layer_ids):
         return "not a KV source layer (KV would cross the boundary)"

@@ -7721,11 +7721,38 @@ class GPUModelRunner(
         ):
             from vllm.models.deepseek_v41.greedy_head import verify_top_tokens
 
-            top_tokens = self.model.get_v41_top_tokens(sample_hidden_states)
+            if sampling_metadata.all_greedy:
+                top_tokens = self.model.get_v41_top_tokens(sample_hidden_states)
+            else:
+                from vllm.v1.sample.ops.penalties import expand_batch_to_tokens
+                from vllm.v1.spec_decode import coupled_draw
+
+                assert spec_decode_metadata is not None
+                assert sampling_metadata.temperature is not None
+                num_reqs = len(spec_decode_metadata.num_draft_tokens)
+                num_rows = sample_hidden_states.shape[0]
+                k_buf = coupled_draw.keys_buffer(self.device, self.max_num_reqs)
+                row_temps = expand_batch_to_tokens(
+                    sampling_metadata.temperature,
+                    spec_decode_metadata.cu_num_sampled_tokens,
+                    num_rows,
+                )
+                row_keys = expand_batch_to_tokens(
+                    k_buf[:num_reqs],
+                    spec_decode_metadata.cu_num_sampled_tokens,
+                    num_rows,
+                )
+                row_pos = self.positions[spec_decode_metadata.logits_indices.long()] + 1
+                top_tokens = self.model.get_v41_top_tokens(
+                    sample_hidden_states,
+                    temperatures=row_temps,
+                    keys=row_keys,
+                    positions=row_pos,
+                )
             sampled = verify_top_tokens(
                 top_tokens, spec_decode_metadata, self.model_config.get_vocab_size()
             )
-            logger.info_once("V4.1 TP-local greedy verification enabled")
+            logger.info_once("V4.1 TP-local greedy/coupled verification enabled")
             return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
 
         spec_config = self.speculative_config
@@ -10743,11 +10770,33 @@ class GPUModelRunner(
         }
         for i, h in enumerate(aux_hidden_states):
             inputs[f"aux{i}"] = h[: cad.num_actual_tokens]
+        use_coupled = (
+            _COUPLED_DRAFTS
+            and sampling_metadata is not None
+            and not sampling_metadata.all_greedy
+            and sampling_metadata.temperature is not None
+        )
+        if use_coupled:
+            from vllm.v1.spec_decode import coupled_draw
+
+            self._fill_coupled_keys()
+            inputs["ckeys"] = coupled_draw.keys_buffer(self.device, self.max_num_reqs)[
+                : cad.num_reqs
+            ]
+            inputs["ctemp"] = sampling_metadata.temperature[: cad.num_reqs]
 
         # The DSpark proposer (VLLM_V41_PROPOSE_GRAPH is only used with it).
         drafter: Any = self.drafter
 
         def round_fn(d: dict[str, torch.Tensor]) -> torch.Tensor:
+            if "ckeys" in d:
+                from vllm.v1.spec_decode import coupled_draw
+
+                kbuf = coupled_draw.keys_buffer(self.device, self.max_num_reqs)
+                kbuf[: d["ckeys"].shape[0]].copy_(d["ckeys"])
+                sm_use = replace(sampling_metadata, temperature=d["ctemp"])
+            else:
+                sm_use = sampling_metadata
             static_cad = replace(
                 cad,
                 query_start_loc=d["qsl"],
@@ -10770,7 +10819,7 @@ class GPUModelRunner(
                 target_hidden_states=hidden,
                 next_token_ids=d["next"],
                 token_indices_to_sample=token_indices,
-                sampling_metadata=sampling_metadata,
+                sampling_metadata=sm_use,
                 common_attn_metadata=spec_cad,
                 mm_embed_inputs=None,
                 num_rejected_tokens_gpu=num_rejected,

@@ -556,7 +556,9 @@ if TYPE_CHECKING:
     VLLM_V41_HC_PARTS_CUDA: str = "0"
     VLLM_V41_HC_SIDE: str = "0"
     VLLM_V41_HC_SIDE_MAX: str = "64"
+    VLLM_V41_DECODE_PROTECT: str = "1"
     VLLM_V41_INDEX_SHARD: str = "0"
+    VLLM_V41_KV_SHARD: str = "0"
     VLLM_V41_INLINE_DRAFTS: str = "0"
     VLLM_V41_LATE_GATHER: str = "0"
     VLLM_V41_LAZY_OUTPUT_IDS: str = "0"
@@ -8665,6 +8667,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "DS-V4.1 PP: broadcast sampled tokens over a dedicated NCCL communicator."
         ),
         category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DECODE_PROTECT": env_var(
+        lambda: os.getenv("VLLM_V41_DECODE_PROTECT", "1"),
+        description=(
+            "DS-V4.1 PP: interleave pure CUDA-graph decode microbatches with "
+            "pure prefill microbatches when both active decoders and prefills exist."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_KV_SHARD": env_var(
+        lambda: os.getenv("VLLM_V41_KV_SHARD", "0"),
+        description=(
+            "DS-V4.1 TP4 DCP: shard compressed MLA latents and indexer keys "
+            "4x across TP4 ranks with NVLink online-softmax combine."
+        ),
+        category="tuning",
         declared_default="'0'",
         effective_default="'0'",
         automatic_conditions=(),
@@ -21965,7 +21993,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_HC_PARTS_CUDA",
         "VLLM_V41_HC_SIDE",
         "VLLM_V41_HC_SIDE_MAX",
+        "VLLM_V41_DECODE_PROTECT",
         "VLLM_V41_INDEX_SHARD",
+        "VLLM_V41_KV_SHARD",
         "VLLM_V41_INLINE_DRAFTS",
         "VLLM_V41_LATE_GATHER",
         "VLLM_V41_LAZY_OUTPUT_IDS",

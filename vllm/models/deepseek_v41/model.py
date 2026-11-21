@@ -73,9 +73,11 @@ from vllm.sequence import IntermediateTensors
 
 from .attention_ops import (
     WINDOW_RING,
+    attend_dcp_latents_batch,
     attend_paged_latents,
     attend_paged_latents_batch,
     attend_ring_post,
+    compact_dcp_topk,
     gather_index_keys,
     insert_latents,
     insert_latents_batch,
@@ -543,6 +545,7 @@ class V41Indexer(nn.Module):
             return
         key = attention_qdq(key, fp4=True, group=32)
         metadata = self.k_cache.metadata()  # type: ignore[union-attr]
+        sharded = bool(getattr(self.k_cache, "sharded", False))
         insert_latents(
             self.k_cache.kv_cache,  # type: ignore[union-attr]
             key,
@@ -551,6 +554,8 @@ class V41Indexer(nn.Module):
             metadata.block_table,
             block_size=metadata.block_size,
             ratio=ratio,
+            shard=get_tensor_model_parallel_rank() if sharded else 0,
+            nshard=get_tensor_model_parallel_world_size() if sharded else 1,
         )
         return key
 
@@ -560,6 +565,7 @@ class V41Indexer(nn.Module):
         key = apply_rope(key, group_positions.clamp_min(0), table)
         key = attention_qdq(key, fp4=True, group=32)
         metadata = self.k_cache.metadata()  # type: ignore[union-attr]
+        sharded = bool(getattr(self.k_cache, "sharded", False))
         insert_latents_batch(
             self.k_cache.kv_cache,  # type: ignore[union-attr]
             key,
@@ -569,6 +575,8 @@ class V41Indexer(nn.Module):
             layout,
             block_size=metadata.block_size,
             ratio=ratio,
+            shard=get_tensor_model_parallel_rank() if sharded else 0,
+            nshard=get_tensor_model_parallel_world_size() if sharded else 1,
         )
         return key
 
@@ -592,6 +600,7 @@ class V41Indexer(nn.Module):
             all_gather=_index_all_gather(),
             tp_rank=get_tensor_model_parallel_rank(),
             tp_size=get_tensor_model_parallel_world_size(),
+            kv_sharded=bool(getattr(source_cache, "sharded", False)),
         )
 
     def forward(
@@ -946,6 +955,9 @@ class V41Attention(nn.Module):
                         # Ratio 1: one row per token, mirrored by the next stage.
                         self.shared.exported = (compact, index_key)
                     compressed_metadata = self.compressor.cache.metadata()  # type: ignore[union-attr]
+                    comp_sharded = bool(
+                        getattr(self.compressor.cache, "sharded", False)
+                    )
                     insert_latents(
                         self.compressor.cache.kv_cache,  # type: ignore[union-attr]
                         compact,
@@ -954,6 +966,8 @@ class V41Attention(nn.Module):
                         compressed_metadata.block_table,
                         block_size=compressed_metadata.block_size,
                         ratio=self.ratio,
+                        shard=self.rank if comp_sharded else 0,
+                        nshard=4 if comp_sharded else 1,
                     )
                 if hasattr(self, "indexer"):
                     _tmark("a.indexer", tokens)
@@ -1067,6 +1081,7 @@ class V41Attention(nn.Module):
                 if self.shared.export_source == self.layer:
                     self.shared.exported = (compact, index_key)
                 compressed_metadata = self.compressor.cache.metadata()  # type: ignore[union-attr]
+                comp_sharded = bool(getattr(self.compressor.cache, "sharded", False))
                 insert_latents_batch(
                     self.compressor.cache.kv_cache,  # type: ignore[union-attr]
                     compact,
@@ -1076,12 +1091,26 @@ class V41Attention(nn.Module):
                     layout,
                     block_size=compressed_metadata.block_size,
                     ratio=self.ratio,
+                    shard=self.rank if comp_sharded else 0,
+                    nshard=4 if comp_sharded else 1,
                 )
+            compressed_metadata = source.compressor.cache.metadata()
+            dcp_sharded = bool(getattr(source.compressor.cache, "sharded", False))
             if hasattr(self, "indexer"):
                 self.shared.topk = self.indexer.forward_batch(
                     x, qr, positions, valid, table, source.indexer.k_cache, self.ratio
                 )
-            compressed_metadata = source.compressor.cache.metadata()
+                self.shared.dcp_topk = (
+                    compact_dcp_topk(
+                        self.shared.topk, positions, valid, self.ratio, self.rank
+                    )
+                    if dcp_sharded
+                    else None
+                )
+            elif dcp_sharded and getattr(self.shared, "dcp_topk", None) is None:
+                self.shared.dcp_topk = compact_dcp_topk(
+                    self.shared.topk, positions, valid, self.ratio, self.rank
+                )
             arguments.update(
                 compressed_cache=source.compressor.cache.kv_cache,
                 compressed_table=compressed_metadata.block_table,
@@ -1089,6 +1118,32 @@ class V41Attention(nn.Module):
                 ratio=self.ratio,
                 topk=self.shared.topk,
             )
+        else:
+            dcp_sharded = False
+        if dcp_sharded:
+            out_dcp = attend_dcp_latents_batch(
+                query,
+                window,
+                positions,
+                valid,
+                self.window_cache.kv_cache,
+                metadata.block_table,
+                arguments["compressed_cache"],
+                arguments["compressed_table"],
+                self.attn_sink,
+                layout,
+                window_block=metadata.block_size,
+                compressed_block=arguments["compressed_block"],
+                ratio=self.ratio,
+                topk=arguments["topk"],
+                shard=self.rank,
+                dcp_topk=getattr(self.shared, "dcp_topk", None),
+                paged_fused=fused,
+                rope=table if fused else None,
+            )
+            if fused:
+                return (out_dcp.view(tokens, 2, 4096),)
+            return out_dcp
         if fused and (
             "topk" not in arguments or arguments["topk"].dtype == torch.int32
         ):
@@ -1219,7 +1274,7 @@ class V41Attention(nn.Module):
 
 
 class V41KVMirror(nn.Module):
-    """A ratio-1 KV source's caches on the stage after the source's stage.
+    """A compressed KV source's caches on the stage after the source's stage.
 
     The caches carry the source's own prefixes, so they get the same KV specs
     and the same block ids from this stage's KV manager. ``ingest`` inserts
@@ -1229,26 +1284,32 @@ class V41KVMirror(nn.Module):
 
     def __init__(self, c, source, shared, prefix):
         super().__init__()
-        if c.compress_ratios[source] != 1:
-            raise ValueError("V4.1 KV mirrors hold ratio-1 sources only")
-        self.layer, self.ratio = source, 1
+        ratio = int(c.compress_ratios[source])
+        if ratio not in (1, 2):
+            raise ValueError(
+                "V4.1 KV mirrors hold compressed sources (ratio 1 or 2) only"
+            )
+        self.layer, self.ratio = source, ratio
         self.compressor = nn.Module()
         self.compressor.cache = V41LatentCache(
-            prefix + ".attn.compressor.cache", ratio=1
+            prefix + ".attn.compressor.cache", ratio=ratio
         )
         self.indexer = nn.Module()
         self.indexer.k_cache = V41LatentCache(
-            prefix + ".attn.indexer.k_cache", head_dim=128, ratio=1
+            prefix + ".attn.indexer.k_cache", head_dim=128, ratio=ratio
         )
         shared.layers[source] = self
 
     def ingest(self, compact, index_key, positions, valid):
         tokens = positions.shape[0]
+        rank = get_tensor_model_parallel_rank()
+        world = get_tensor_model_parallel_world_size()
         for cache, rows in (
             (self.compressor.cache, compact),
             (self.indexer.k_cache, index_key),
         ):
             metadata = cache.metadata()
+            sharded = bool(getattr(cache, "sharded", False))
             if metadata.layout is not None:
                 insert_latents_batch(
                     cache.kv_cache,
@@ -1258,7 +1319,9 @@ class V41KVMirror(nn.Module):
                     metadata.block_table,
                     metadata.layout,
                     block_size=metadata.block_size,
-                    ratio=1,
+                    ratio=self.ratio,
+                    shard=rank if sharded else 0,
+                    nshard=world if sharded else 1,
                 )
                 continue
             insert_latents(
@@ -1268,7 +1331,9 @@ class V41KVMirror(nn.Module):
                 valid,
                 metadata.block_table,
                 block_size=metadata.block_size,
-                ratio=1,
+                ratio=self.ratio,
+                shard=rank if sharded else 0,
+                nshard=world if sharded else 1,
             )
 
 
@@ -1333,6 +1398,7 @@ def v41_stage_bounds(config):
         source = kv_source_of(config, split)
         if (
             problem is None
+            and not _NATIVE
             and source != split
             and not (starts[rank - 1] <= source < split)
         ):
@@ -1462,6 +1528,12 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self.export_source = (
             following if self.start_layer <= following < self.end_layer else None
         )
+        self.passthrough_mirror = (
+            self.kv_mirror is not None
+            and self.end_layer < c.num_hidden_layers
+            and following == self.kv_mirror.layer
+        )
+        self._forwarded_mirror: tuple[torch.Tensor, torch.Tensor] | None = None
         shared.export_source = self.export_source
         # A stage boundary inside an index group (ratio-1 layers): the first
         # layer after it reuses the group's top-k, shipped with the residual.
@@ -1660,12 +1732,11 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 hashes = self.hash_state(input_ids, positions, valid)
                 self.engram_io.runtime.prefetch(hashes)
             if self.kv_mirror is not None and intermediate_tensors is not None:
-                self.kv_mirror.ingest(
-                    intermediate_tensors["kv_mirror_ckv"],
-                    intermediate_tensors["kv_mirror_ik"],
-                    positions,
-                    valid,
-                )
+                ckv = intermediate_tensors["kv_mirror_ckv"]
+                ik = intermediate_tensors["kv_mirror_ik"]
+                if self.passthrough_mirror:
+                    self._forwarded_mirror = (ckv[:tokens], ik[:tokens])
+                self.kv_mirror.ingest(ckv, ik, positions, valid)
             self._import_topk(intermediate_tensors, tokens)
             # Every stage: the first commits from these, the last clips its
             # samples with them (output_budget).
@@ -1718,12 +1789,14 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             assert runtime is not None
             runtime.prefetch(hashes)
         if self.kv_mirror is not None and self._intermediate is not None:
-            self.kv_mirror.ingest(
-                self._intermediate["kv_mirror_ckv"],
-                self._intermediate["kv_mirror_ik"],
-                positions,
-                valid,
-            )
+            ckv = self._intermediate["kv_mirror_ckv"]
+            ik = self._intermediate["kv_mirror_ik"]
+            if self.passthrough_mirror:
+                self._forwarded_mirror = (
+                    ckv[: positions.shape[0]],
+                    ik[: positions.shape[0]],
+                )
+            self.kv_mirror.ingest(ckv, ik, positions, valid)
         self._import_topk(self._intermediate, positions.shape[0])
         reqs = layout.num_reqs
         starts = layout.query_start_loc[: reqs + 1].to(torch.int64)
@@ -1865,6 +1938,21 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         tensors = {"hidden": hidden, "pre": pre.contiguous()}
         if self.export_source is not None:
             tensors.update(self._exported_rows(hidden.shape[0], hidden.device))
+        elif self.passthrough_mirror:
+            fwd = self._forwarded_mirror
+            self._forwarded_mirror = None
+            toks, dev = hidden.shape[0], hidden.device
+            if fwd is None or fwd[0].shape[0] != toks:
+                tensors.update(
+                    kv_mirror_ckv=torch.zeros(
+                        toks, 512, device=dev, dtype=torch.float16
+                    ),
+                    kv_mirror_ik=torch.zeros(
+                        toks, 128, device=dev, dtype=torch.float16
+                    ),
+                )
+            else:
+                tensors.update(kv_mirror_ckv=fwd[0], kv_mirror_ik=fwd[1])
         if self.topk_export:
             tensors["v41_topk"] = self._exported_topk(hidden.shape[0], hidden.device)
         return IntermediateTensors(tensors)
@@ -1881,9 +1969,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
     def _import_topk(self, intermediate, tokens):
         if self.topk_import and intermediate is not None:
-            self.layers[self.start_layer].attn.shared.topk = intermediate["v41_topk"][
-                :tokens
-            ]
+            shared = self.layers[self.start_layer].attn.shared
+            shared.topk = intermediate["v41_topk"][:tokens]
+            shared.dcp_topk = None
 
     def _exported_rows(self, tokens, device):
         """The mirrored source's new compressed/index rows for the next stage."""
@@ -2452,10 +2540,21 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP, SupportsMult
             )
         return IntermediateTensors(tensors)
 
-    def get_v41_top_tokens(self, hidden_states):
-        from .greedy_head import greedy_top_tokens
+    def get_v41_top_tokens(
+        self,
+        hidden_states,
+        *,
+        temperatures=None,
+        keys=None,
+        positions=None,
+    ):
+        from .greedy_head import greedy_top_tokens, keyed_top_tokens
         from .native import H16Head
 
+        if temperatures is not None and keys is not None and positions is not None:
+            return keyed_top_tokens(
+                self.lm_head, hidden_states, temperatures, keys, positions
+            )
         if (
             not isinstance(self.lm_head.quant_method, H16Head)
             or get_tensor_model_parallel_world_size() != 4

@@ -113,9 +113,9 @@ class V41GreedyDraftGraph:
         self.entries: dict[int, tuple] = {}
         self.captures = self.replays = 0
 
-    def __call__(self, hidden, anchor):
+    def __call__(self, hidden, anchor, c_keys=None, c_pos=None, c_temps=None):
         if torch.cuda.is_current_stream_capturing():
-            return self.forward(hidden, anchor)
+            return self.forward(hidden, anchor, c_keys, c_pos, c_temps)
         reqs = anchor.numel()
         if (
             hidden.ndim != 2
@@ -127,10 +127,15 @@ class V41GreedyDraftGraph:
             or anchor.dtype not in (torch.int32, torch.int64)
         ):
             raise ValueError("V4.1 greedy draft graph requires M5 per anchor")
-        entry = self.entries.get(reqs)
+        coupled = c_keys is not None and c_pos is not None and c_temps is not None
+        gkey = (reqs, coupled)
+        entry = self.entries.get(gkey)
         if entry is None:
             owned_hidden, owned_anchor = hidden.clone(), anchor.clone()
-            self.forward(owned_hidden, owned_anchor)
+            ok = c_keys.clone() if coupled else None
+            op = c_pos.clone() if coupled else None
+            ot = c_temps.clone() if coupled else None
+            self.forward(owned_hidden, owned_anchor, ok, op, ot)
             torch.accelerator.synchronize(hidden.device)
             graph = torch.cuda.CUDAGraph()
             with (
@@ -141,20 +146,32 @@ class V41GreedyDraftGraph:
                     stream=context.stream,
                 ),
             ):
-                output = self.forward(owned_hidden, owned_anchor)
-            entry = self.entries[reqs] = (graph, owned_hidden, owned_anchor, output)
+                output = self.forward(owned_hidden, owned_anchor, ok, op, ot)
+            entry = self.entries[gkey] = (
+                graph,
+                owned_hidden,
+                owned_anchor,
+                ok,
+                op,
+                ot,
+                output,
+            )
             self.captures += 1
         else:
-            _, owned_hidden, owned_anchor, _ = entry
+            _, owned_hidden, owned_anchor, ok, op, ot, _ = entry
             if _storage(hidden)[1:] != _storage(owned_hidden)[1:] or (
                 _storage(anchor)[1:] != _storage(owned_anchor)[1:]
             ):
                 raise ValueError("V4.1 greedy graph input geometry changed")
             owned_hidden.copy_(hidden)
             owned_anchor.copy_(anchor)
+            if coupled:
+                ok.copy_(c_keys)
+                op.copy_(c_pos)
+                ot.copy_(c_temps)
         entry[0].replay()
         self.replays += 1
-        return entry[3]
+        return entry[6]
 
 
 # VLLM_V41_BATCH: context rows of several requests (padded by the caller to

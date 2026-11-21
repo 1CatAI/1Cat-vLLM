@@ -21,25 +21,39 @@ def _insert(
     STRIDE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     RATIO: tl.constexpr,
+    SHARD: tl.constexpr,
+    NSHARD: tl.constexpr,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     token = tl.program_id(0)
     position = tl.load(positions + token).to(tl.int64)
+    idx = position // RATIO
     valid = tl.load(valid_tokens + token) & ((position + 1) % RATIO == 0)
+    if NSHARD > 1:
+        valid &= (idx % NSHARD) == SHARD
     page = tl.load(block_table + position // BLOCK_SIZE, valid, -1).to(tl.int64)
     valid &= page >= 0
     col = tl.arange(0, BLOCK)
     data = tl.load(values + token * D + col, valid & (col < D), 0)
-    row = (position % BLOCK_SIZE) // RATIO
+    row = ((position % BLOCK_SIZE) // RATIO) // NSHARD
     tl.store(cache + page * STRIDE + row * D + col, data, valid & (col < D))
 
 
 def insert_latents(
-    cache, values, positions, valid_tokens, block_table, *, block_size, ratio=1
+    cache,
+    values,
+    positions,
+    valid_tokens,
+    block_table,
+    *,
+    block_size,
+    ratio=1,
+    shard=0,
+    nshard=1,
 ):
     """Insert only complete groups; values have already passed RoPE and QDQ."""
-    _validate_cache(cache, block_table, block_size, ratio)
+    _validate_cache(cache, block_table, block_size, ratio, nshard=nshard)
     if (
         values.shape != (positions.numel(), cache.shape[-1])
         or values.dtype != torch.float16
@@ -55,18 +69,20 @@ def insert_latents(
         STRIDE=cache.stride(0),
         BLOCK_SIZE=block_size,
         RATIO=ratio,
+        SHARD=shard,
+        NSHARD=nshard,
         D=values.shape[1],
         BLOCK=triton.next_power_of_2(values.shape[1]),
     )
 
 
-def _validate_cache(cache, block_table, block_size, ratio):
+def _validate_cache(cache, block_table, block_size, ratio, nshard=1):
     if (
         not cache.is_cuda
         or cache.dtype != torch.float16
         or cache.ndim != 3
-        or cache.shape[1] != block_size // ratio
-        or block_size % ratio
+        or cache.shape[1] != block_size // (ratio * nshard)
+        or block_size % (ratio * nshard)
         or cache.shape[2] not in (128, 512)
         or cache.stride(1) != cache.shape[2]
         or cache.stride(2) != 1
@@ -130,7 +146,8 @@ def gather_index_keys(
 _FUSED_TOPK = envs.VLLM_V41_INDEX_TOPK == "1"
 # VLLM_V41_INDEX_SHARD=1 (default off): batched decode indexer sharded by key
 # tiles across TP ranks instead of by heads (_sharded_index_topk).
-_INDEX_SHARD = envs.VLLM_V41_INDEX_SHARD == "1"
+_KV_SHARD = envs.VLLM_V41_KV_SHARD == "1"
+_INDEX_SHARD = envs.VLLM_V41_INDEX_SHARD == "1" or _KV_SHARD
 
 
 _INDEX_TILE_BYTES = int(envs.VLLM_V41_INDEX_TILE_MB) << 20
@@ -1580,13 +1597,13 @@ def attend_draft_latents(q, kv, positions, valid, cache, table, sink, block_size
 # first token in this forward is bases[t]. Block tables are [rows, blocks].
 
 
-def _validate_batch_cache(cache, block_table, block_size, ratio):
+def _validate_batch_cache(cache, block_table, block_size, ratio, nshard=1):
     if (
         not cache.is_cuda
         or cache.dtype != torch.float16
         or cache.ndim != 3
-        or cache.shape[1] != block_size // ratio
-        or block_size % ratio
+        or cache.shape[1] != block_size // (ratio * nshard)
+        or block_size % (ratio * nshard)
         or cache.shape[2] not in (128, 512)
         or cache.stride(1) != cache.shape[2]
         or cache.stride(2) != 1
@@ -1610,26 +1627,41 @@ def _binsert(
     STRIDE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     RATIO: tl.constexpr,
+    SHARD: tl.constexpr,
+    NSHARD: tl.constexpr,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     token = tl.program_id(0)
     position = tl.load(positions + token).to(tl.int64)
+    idx = position // RATIO
     valid = tl.load(valid_tokens + token) & ((position + 1) % RATIO == 0)
+    if NSHARD > 1:
+        valid &= (idx % NSHARD) == SHARD
     table = block_table + tl.load(rows + token).to(tl.int64) * TABLE_STRIDE
     page = tl.load(table + position // BLOCK_SIZE, valid, -1).to(tl.int64)
     valid &= page >= 0
     col = tl.arange(0, BLOCK)
     data = tl.load(values + token * D + col, valid & (col < D), 0)
-    row = (position % BLOCK_SIZE) // RATIO
+    row = ((position % BLOCK_SIZE) // RATIO) // NSHARD
     tl.store(cache + page * STRIDE + row * D + col, data, valid & (col < D))
 
 
 def insert_latents_batch(
-    cache, values, positions, valid_tokens, block_table, layout, *, block_size, ratio=1
+    cache,
+    values,
+    positions,
+    valid_tokens,
+    block_table,
+    layout,
+    *,
+    block_size,
+    ratio=1,
+    shard=0,
+    nshard=1,
 ):
     """insert_latents for a batch: each token uses its request's table row."""
-    _validate_batch_cache(cache, block_table, block_size, ratio)
+    _validate_batch_cache(cache, block_table, block_size, ratio, nshard=nshard)
     if (
         values.shape != (positions.numel(), cache.shape[-1])
         or values.dtype != torch.float16
@@ -1648,6 +1680,8 @@ def insert_latents_batch(
             STRIDE=cache.stride(0),
             BLOCK_SIZE=block_size,
             RATIO=ratio,
+            SHARD=shard,
+            NSHARD=nshard,
             D=values.shape[1],
             BLOCK=triton.next_power_of_2(values.shape[1]),
         )
@@ -1733,9 +1767,12 @@ def select_compressed_positions_batch(
     all_gather=None,
     tp_rank=0,
     tp_size=1,
+    kv_sharded=False,
 ):
     """select_compressed_positions over paged index keys, several requests."""
-    _validate_batch_cache(cache, block_table, block_size, ratio)
+    _validate_batch_cache(
+        cache, block_table, block_size, ratio, nshard=tp_size if kv_sharded else 1
+    )
     tokens, heads = q.shape[0], q.shape[1]
     if (
         q.dtype != torch.float16
@@ -1749,7 +1786,7 @@ def select_compressed_positions_batch(
     columns = max_context // ratio
     width = min(top_k, columns)
     starts = layout.query_start_loc_cpu[: layout.num_reqs + 1].tolist()
-    if any(b - a > 8 for a, b in zip(starts, starts[1:])):
+    if any(b - a > 6 for a, b in zip(starts, starts[1:])):
         # A prefill chunk in the step: every request goes through the
         # single-request gather + cuBLAS scores, row by row (decode-only
         # steps, and so every graph, take the batched kernel below).
@@ -1785,6 +1822,7 @@ def select_compressed_positions_batch(
                 all_gather,
                 tp_rank,
                 tp_size,
+                kv_sharded=kv_sharded,
             )
             return result
         for r, (a, b) in enumerate(zip(starts, starts[1:])):
@@ -1836,6 +1874,7 @@ def select_compressed_positions_batch(
             all_gather,
             tp_rank,
             tp_size,
+            kv_sharded=kv_sharded,
         )
     head = torch.empty(tokens, columns, dtype=torch.float16, device=q.device)
     if _BINDEX_CUDA and 8 * heads <= 64:
@@ -1912,6 +1951,8 @@ def _sharded_index_topk(
     all_gather,
     rank,
     world,
+    *,
+    kv_sharded=False,
 ):
     """VLLM_V41_INDEX_SHARD: the decode indexer sharded by key tiles.
 
@@ -1937,6 +1978,7 @@ def _sharded_index_topk(
         all_gather,
         rank,
         world,
+        kv_sharded=kv_sharded,
     )
 
 
@@ -1954,6 +1996,8 @@ def _sharded_index_core(
     all_gather,
     rank,
     world,
+    *,
+    kv_sharded=False,
 ):
     """_sharded_index_topk after the query / weight gather (all heads)."""
     from vllm.models.deepseek_v41.index_topk import index_topk, index_topk_parallel
@@ -1982,6 +2026,7 @@ def _sharded_index_core(
             ratio,
             rank,
             world,
+            kv_sharded,
         )
     else:
         torch.ops.v41sk.index_scores_shard(
@@ -1999,10 +2044,9 @@ def _sharded_index_core(
             ),
             rank,
             world,
+            kv_sharded,
         )
-    # This rank's keys below each row's length (whole tiles t % world == rank,
-    # plus the partial last tile when it is ours), as the select kernels'
-    # positions: p = mine * ratio - 1 makes their (p + 1) // ratio == mine.
+    map_kt = 1 if kv_sharded else kt
     mine = torch.empty(tokens, dtype=torch.int64, device=q.device)
     _shard_lengths[(triton.cdiv(tokens, 128),)](
         positions,
@@ -2011,18 +2055,27 @@ def _sharded_index_core(
         tokens,
         columns,
         RATIO=ratio,
-        KT=kt,
+        KT=map_kt,
         RANK=rank,
         WORLD=world,
         BLOCK=128,
     )
     local = torch.empty(tokens, top_k, dtype=torch.int32, device=q.device)
-    select = index_topk_parallel if local_columns > 16384 else index_topk
+    select = (
+        index_topk_parallel if (local_columns > 16384 and tokens < 80) else index_topk
+    )
     select(local, head, mine, valid_tokens, ratio, top_k)
     # One gather: [global indices | FP16 score bits] per rank.
     packed = torch.empty(tokens, 2 * top_k, dtype=torch.int32, device=q.device)
     _shard_pack[(tokens,)](
-        local, head, packed, head.stride(0), KT=kt, RANK=rank, WORLD=world, K=top_k
+        local,
+        head,
+        packed,
+        head.stride(0),
+        KT=map_kt,
+        RANK=rank,
+        WORLD=world,
+        K=top_k,
     )
     # (bit-cast to FP32: the one-shot TP gather moves FP16/FP32 rows)
     packed = all_gather(packed.view(torch.float32), 1).view(torch.int32)
@@ -2134,6 +2187,8 @@ def _sharded_index_prefill(
     all_gather,
     rank,
     world,
+    *,
+    kv_sharded=False,
 ):
     """VLLM_V41_INDEX_SHARD for prefill chunks: the decode kernel over groups
     of 6 rows (each group one pseudo-request on the request's block table),
@@ -2183,6 +2238,7 @@ def _sharded_index_prefill(
                     all_gather,
                     rank,
                     world,
+                    kv_sharded=kv_sharded,
                 )
             else:
                 groups = triton.cdiv(last - first, group)
@@ -2203,6 +2259,7 @@ def _sharded_index_prefill(
                     all_gather,
                     rank,
                     world,
+                    kv_sharded=kv_sharded,
                 )
 
 
@@ -2304,7 +2361,7 @@ def _has_prefill_chunk(layout):
     Decode steps (and so every graph) keep the split-K decode kernels: one CTA
     per token (attn_paged_tok) leaves most SMs idle at decode batch sizes."""
     starts = layout.query_start_loc_cpu[: layout.num_reqs + 1]
-    return layout.num_reqs > 0 and bool((starts[1:] - starts[:-1]).max() > 8)
+    return layout.num_reqs > 0 and bool((starts[1:] - starts[:-1]).max() > 6)
 
 
 def attend_paged_latents_batch(
@@ -2425,6 +2482,130 @@ def attend_paged_latents_batch(
             attn_sink,
             result[first:last],
             scores,
+        )
+    return result
+
+
+_DCP_OML_STRIDE = 258
+_DCP_SEND_WS: dict[int, torch.Tensor] = {}
+
+
+def compact_dcp_topk(topk, positions, valid_tokens, ratio: int, shard: int):
+    """Filter topk [T, K] once per index group to this TP rank's KV shard."""
+    from vllm.models.deepseek_v41.native import load_v41sk
+
+    load_v41sk()
+    pos64 = positions if positions.dtype == torch.int64 else positions.long()
+    topk32 = topk.contiguous() if topk.dtype == torch.int32 else topk.to(torch.int32)
+    t, k = topk32.shape
+    local_topk = torch.empty((t, k), dtype=torch.int32, device=topk32.device)
+    local_cnt = torch.empty((t,), dtype=torch.int32, device=topk32.device)
+    torch.ops.v41sk.dcp_compact_topk(
+        local_topk, local_cnt, topk32, pos64, valid_tokens, ratio, shard
+    )
+    return local_topk, local_cnt
+
+
+def _get_oml_send_buf(n: int, device: torch.device) -> torch.Tensor:
+    if n <= 192:
+        idx = device.index or 0
+        buf = _DCP_SEND_WS.get(idx)
+        if buf is None and not torch.cuda.is_current_stream_capturing():
+            buf = torch.empty(
+                (4, 192 * 16 * _DCP_OML_STRIDE), dtype=torch.float32, device=device
+            )
+            _DCP_SEND_WS[idx] = buf
+        if buf is not None:
+            return buf[:, : n * 16 * _DCP_OML_STRIDE].contiguous()
+    return torch.empty((4, n, 16, _DCP_OML_STRIDE), dtype=torch.float32, device=device)
+
+
+def attend_dcp_latents_batch(
+    q_local,
+    window_values,
+    positions,
+    valid_tokens,
+    window_cache,
+    window_table,
+    compressed_cache,
+    compressed_table,
+    attn_sink,
+    layout,
+    *,
+    window_block,
+    compressed_block,
+    ratio,
+    topk,
+    shard,
+    dcp_topk=None,
+    window=128,
+    paged_fused=False,
+    rope=None,
+    chunk_tokens=240,
+):
+    """TP4 KV-sharded DCP attention with single-round-trip packed NVLink P2P A2A."""
+    from vllm.models.deepseek_v41.native import (
+        load_v41sk,
+        tp_all_gather,
+        tp_all_to_all,
+    )
+
+    load_v41sk()
+    tokens = q_local.shape[0]
+    q_local = q_local.contiguous()
+    pos64 = positions if positions.dtype == torch.int64 else positions.long()
+    if dcp_topk is not None and dcp_topk[0].shape[0] == tokens:
+        local_topk_all, local_cnt_all = dcp_topk
+    else:
+        local_topk_all, local_cnt_all = compact_dcp_topk(
+            topk, pos64, valid_tokens, ratio, shard
+        )
+    result = torch.empty_like(q_local)
+    step = tokens if paged_fused or tokens <= chunk_tokens else chunk_tokens
+    for first in range(0, tokens, step):
+        last = min(first + step, tokens)
+        n = last - first
+        ql = q_local[first:last]
+        q_all = tp_all_gather(ql.view(n, -1), 1).view(n, 64, 512)
+        oml_send = (
+            torch.empty(
+                (4, n, 16, _DCP_OML_STRIDE), dtype=torch.float32, device=ql.device
+            )
+            if n > 192
+            else _get_oml_send_buf(n, ql.device).view(4, n, 16, _DCP_OML_STRIDE)
+        )
+        torch.ops.v41sk.attn_dcp_comp(
+            oml_send,
+            q_all,
+            compressed_cache,
+            compressed_table,
+            layout.rows[first:last],
+            pos64[first:last],
+            valid_tokens[first:last],
+            local_topk_all[first:last],
+            local_cnt_all[first:last],
+            512**-0.5,
+            compressed_block,
+            ratio,
+        )
+        oml_recv = tp_all_to_all(oml_send)
+        torch.ops.v41sk.attn_dcp_win_combine(
+            result[first:last],
+            ql,
+            window_values[first:last].contiguous() if paged_fused else ql,
+            window_cache,
+            window_table,
+            layout.rows[first:last],
+            layout.bases[first:last] if paged_fused else layout.rows[first:last],
+            pos64[first:last],
+            valid_tokens[first:last],
+            oml_recv,
+            attn_sink,
+            512**-0.5,
+            window_block,
+            window,
+            paged_fused,
+            rope,
         )
     return result
 

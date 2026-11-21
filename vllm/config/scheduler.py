@@ -133,8 +133,7 @@ class SchedulerConfig:
     NOTE: This is not currently configurable. It will be overridden by
     max_num_batched_tokens in case max multimodal embedding size is larger."""
 
-    # TODO (ywang96): Make this configurable.
-    encoder_cache_size: int = Field(init=False)
+    encoder_cache_size: int | None = Field(default=None, ge=1)
     """Multimodal encoder cache size, only used in V1.
 
     NOTE: This is not currently configurable. It will be overridden by
@@ -340,7 +339,16 @@ class SchedulerConfig:
             )
 
         self.max_num_encoder_input_tokens = self.max_num_batched_tokens
-        self.encoder_cache_size = self.max_num_batched_tokens
+        if self.encoder_cache_size is None:
+            self.encoder_cache_size = (
+                max(self.max_num_batched_tokens * 8, 32768)
+                if self.is_multimodal_model and not is_encoder_decoder
+                else self.max_num_batched_tokens
+            )
+        else:
+            self.encoder_cache_size = max(
+                self.encoder_cache_size, self.max_num_batched_tokens
+            )
 
         if self.enable_chunked_prefill:
             logger.info_once(

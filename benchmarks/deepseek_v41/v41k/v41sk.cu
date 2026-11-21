@@ -1750,12 +1750,15 @@ struct RingGather {
   // step come from the paged window cache, the step's own from values; every
   // token reads its request row of both block tables.
   bool paged = false;
+  bool paged_all_cached = false;
   const half* wcache = nullptr;  // [pages, wblock, 512]
   const int* wtable = nullptr;   // [reqs, wtable_stride]
   const int* rows = nullptr;     // token -> request row
   const int* bases = nullptr;    // token -> first token of its row
+  const int* key_counts = nullptr;
   int64_t wstride = 0;
   int wtable_stride = 0, wblock = 1, table_stride = 0;
+  int cshard_shift = 0, t_mod = 0, q_groups = 1;
 };
 
 template <bool GATHER>
@@ -1774,10 +1777,22 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
   float* stage = reinterpret_cast<float*>(dsm + T_OFF);
   __shared__ unsigned live_mask;
   const int t = blockIdx.x, chunk = blockIdx.y, nchunk = gridDim.y;
+  const int tm = (GATHER && rg.t_mod) ? (t % rg.t_mod) : t;
+  const int qg = (GATHER && rg.t_mod) ? (t / rg.t_mod) : 0;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int k0 = chunk * KC;
+  if constexpr (GATHER) {
+    if (rg.key_counts != nullptr && k0 >= rg.key_counts[tm]) {
+      if (threadIdx.x < H) {
+        mpart[((size_t)t * nchunk + chunk) * H + threadIdx.x] = -1e30f;
+        lpart[((size_t)t * nchunk + chunk) * H + threadIdx.x] = 0.f;
+      }
+      return;
+    }
+  }
   const int kn = min(KC, width - k0);
-  const half* qt = q + (size_t)t * H * D;
+  const half* qt =
+      q + ((size_t)tm * (GATHER ? rg.q_groups : 1) + qg) * H * D;
   const half* kt = keys + ((size_t)t * width + k0) * D;
   // Chunks without a live key (short contexts leave most of the 512 top-k
   // slots unused) read no keys: they report an empty softmax (l = 0).
@@ -1786,16 +1801,17 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
     bool live;
     if constexpr (GATHER) {
       const int key = k0 + lane;
-      const int64_t pos = rg.positions[t];
-      live = lane < kn && rg.valid[t];
+      const int64_t pos = rg.positions[tm];
+      live = lane < kn && rg.valid[tm];
       const half* src = nullptr;
-      const int row = rg.paged ? rg.rows[t] : 0;
-      const int vbase = rg.paged ? rg.bases[t] : 0;
+      const int row = rg.paged ? rg.rows[tm] : 0;
+      const int vbase = rg.paged ? rg.bases[tm] : 0;
       if (key < rg.window) {
         const int64_t at = pos - rg.window + 1 + key;
         live &= at >= 0;
-        const int64_t start = rg.paged ? rg.positions[vbase] : rg.starts[0];
-        if (at >= start) {
+        const int64_t start =
+            rg.paged ? rg.positions[vbase] : rg.starts[0];
+        if (!rg.paged_all_cached && at >= start) {
           src = rg.values + (vbase + at - start) * D;
         } else if (rg.paged) {
           const int page =
@@ -1808,13 +1824,19 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
               rg.ring + ((at % rg.ring_rows + rg.ring_rows) % rg.ring_rows) * D;
         }
       } else if (live) {
-        const int64_t index = rg.topk[(size_t)t * rg.ntopk + key - rg.window];
+        if (rg.key_counts != nullptr) {
+          live &= (key - rg.window) < rg.key_counts[tm];
+        }
+        const int64_t index =
+            live ? rg.topk[(size_t)tm * rg.ntopk + key - rg.window] : -1;
         const int per = rg.block / rg.ratio;
         live &= index >= 0 && index < (pos + 1) / rg.ratio;
         const int page =
             live ? rg.table[(size_t)row * rg.table_stride + index / per] : -1;
         live &= page >= 0;
-        if (live) src = rg.cache + page * rg.stride + (index % per) * D;
+        if (live)
+          src = rg.cache + page * rg.stride +
+                ((index % per) >> rg.cshard_shift) * D;
       }
       srcs[lane] = src;
     } else {
@@ -2102,12 +2124,15 @@ __device__ __forceinline__ const half* ring_key_src(const RingGather& rg, int t,
                : rg.ring +
                      ((at % rg.ring_rows + rg.ring_rows) % rg.ring_rows) * D;
   }
+  if (rg.key_counts != nullptr && (key - rg.window) >= rg.key_counts[t])
+    return nullptr;
   const int64_t index = rg.topk[(size_t)t * rg.ntopk + key - rg.window];
   const int per = rg.block / rg.ratio;
   if (index < 0 || index >= (pos + 1) / rg.ratio) return nullptr;
   const int page = rg.table[(size_t)row * rg.table_stride + index / per];
   if (page < 0) return nullptr;
-  return rg.cache + page * rg.stride + (index % per) * D;
+  return rg.cache + page * rg.stride +
+         ((index % per) >> rg.cshard_shift) * D;
 }
 
 __global__ void __launch_bounds__(32 * attn::TKW)
@@ -2543,6 +2568,767 @@ void attn_paged_dec(torch::Tensor out, torch::Tensor q, torch::Tensor values,
         sink.data_ptr<float>(),
         reinterpret_cast<half*>(out.data_ptr<at::Half>()), nchunk, RingGather{},
         nullptr, 0, nullptr);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+__global__ void __launch_bounds__(128)
+    dcp_compact_topk_kernel(int* __restrict__ local_topk,
+                            int* __restrict__ local_cnt,
+                            const int* __restrict__ topk,
+                            const int64_t* __restrict__ positions,
+                            const bool* __restrict__ valid,
+                            int ntopk, int ratio, int shard) {
+  __shared__ int cnt_sh;
+  const int t = blockIdx.x;
+  const int lane = threadIdx.x & 31;
+  if (!valid[t]) {
+    if (threadIdx.x == 0) local_cnt[t] = 0;
+    return;
+  }
+  if (threadIdx.x == 0) cnt_sh = 0;
+  __syncthreads();
+  const int64_t limit = (positions[t] + 1) / ratio;
+  for (int k0 = 0; k0 < ntopk; k0 += 128) {
+    const int k = k0 + threadIdx.x;
+    const int idx = (k < ntopk) ? topk[(size_t)t * ntopk + k] : -1;
+    const bool keep = (idx >= 0) && (idx < limit) && ((idx & 3) == shard);
+    const unsigned m = __ballot_sync(0xffffffffu, keep);
+    int base = 0;
+    if (lane == 0 && m != 0u) base = atomicAdd(&cnt_sh, __popc(m));
+    base = __shfl_sync(0xffffffffu, base, 0);
+    if (keep) {
+      const int off = __popc(m & ((1u << lane) - 1u));
+      local_topk[(size_t)t * ntopk + base + off] = idx;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) local_cnt[t] = cnt_sh;
+}
+
+constexpr int DCP_OML_STRIDE = 258;  // 256 uint32 (512 FP16) + 2 float32 (M, L)
+constexpr int DCP_SPLIT_CTAS = 6;
+
+// True GQA-64 DCP=4 decode split kernel: loads each 32x512 compressed KV tile
+// ONCE into shared memory and computes WMMA QK + softmax + PV across all 4 TP
+// query groups (64 heads total), cutting global KV HBM traffic 4x and CTAs 10.7x.
+__global__ void __launch_bounds__(32 * attn::DEC_WARPS)
+    dcp_gqa64_split_kernel(const half* __restrict__ q_all,
+                           half* __restrict__ opart,
+                           float* __restrict__ mpart,
+                           float* __restrict__ lpart,
+                           int T, int nchunk_stride, float scale,
+                           RingGather rg) {
+  using namespace nvcuda;
+  using namespace attn;
+  extern __shared__ __align__(128) unsigned char dsm[];
+  half* qs = reinterpret_cast<half*>(dsm + Q_OFF);
+  half* ks = reinterpret_cast<half*>(dsm + K_OFF);
+  float* sc = reinterpret_cast<float*>(dsm + S_OFF);
+  half* ps = reinterpret_cast<half*>(dsm + P_OFF);
+  float* stage = reinterpret_cast<float*>(dsm + T_OFF);
+  __shared__ unsigned live_mask;
+  __shared__ const half* srcs[KC];
+
+  const int t = blockIdx.x, split = blockIdx.y;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int cnt = rg.valid[t] ? rg.key_counts[t] : 0;
+  if (split * KC >= cnt) return;
+
+  const int64_t pos = rg.positions[t];
+  const int row = rg.rows[t];
+  const int per = rg.block / rg.ratio;
+  const int64_t limit = (pos + 1) / rg.ratio;
+
+  for (int chunk = split; chunk * KC < cnt; chunk += DCP_SPLIT_CTAS) {
+    const int k0 = chunk * KC;
+    const int kn = min(KC, cnt - k0);
+    if (warp == 0) {
+      bool live = lane < kn;
+      const int64_t index =
+          live ? rg.topk[(size_t)t * rg.ntopk + k0 + lane] : -1;
+      live &= index >= 0 && index < limit;
+      const int page =
+          live ? rg.table[(size_t)row * rg.table_stride + index / per] : -1;
+      live &= page >= 0;
+      srcs[lane] = live
+                       ? (rg.cache + page * rg.stride +
+                          ((index % per) >> rg.cshard_shift) * D)
+                       : nullptr;
+      const unsigned m = __ballot_sync(0xffffffffu, live);
+      if (lane == 0) live_mask = m;
+    }
+    __syncthreads();
+    const unsigned lm = live_mask;
+    if (lm == 0) {
+      if (threadIdx.x < 4 * H) {
+        const int g = threadIdx.x >> 4, h = threadIdx.x & 15;
+        const size_t idx = (((size_t)g * T + t) * nchunk_stride + chunk) * H + h;
+        mpart[idx] = -1e30f;
+        lpart[idx] = 0.f;
+      }
+      __syncthreads();
+      continue;
+    }
+    {
+      constexpr int PER = KC * D / 8 / (32 * DEC_WARPS);
+      uint4 v[PER];
+#pragma unroll
+      for (int u = 0; u < PER; ++u) {
+        const int i = threadIdx.x + u * (32 * DEC_WARPS);
+        const int j = i / (D / 8), c = (i % (D / 8)) * 8;
+        v[u] = (lm >> j) & 1u
+                   ? __ldcg(reinterpret_cast<const uint4*>(srcs[j] + c))
+                   : make_uint4(0, 0, 0, 0);
+      }
+#pragma unroll
+      for (int u = 0; u < PER; ++u) {
+        const int i = threadIdx.x + u * (32 * DEC_WARPS);
+        const int j = i / (D / 8), c = (i % (D / 8)) * 8;
+        *reinterpret_cast<uint4*>(ks + j * KLD + c) = v[u];
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      const half* qt = q_all + ((size_t)t * 4 + g) * H * D;
+      for (int i = threadIdx.x; i < H * D / 8; i += 32 * DEC_WARPS) {
+        const int h = i / (D / 8), c = (i % (D / 8)) * 8;
+        *reinterpret_cast<uint4*>(qs + h * QLD + c) =
+            *reinterpret_cast<const uint4*>(qt + h * D + c);
+      }
+      __syncthreads();
+      if (warp < 4) {
+        const int tile = warp & 1, half_d = warp >> 1;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.f);
+#pragma unroll 1
+        for (int d = half_d * (D / 2); d < (half_d + 1) * (D / 2); d += 16) {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+          wmma::load_matrix_sync(a, qs + d, QLD);
+          wmma::load_matrix_sync(b, ks + tile * 16 * KLD + d, KLD);
+          wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(sc + half_d * H * SLD + tile * 16, acc, SLD,
+                                wmma::mem_row_major);
+      }
+      __syncthreads();
+      const size_t ml_base =
+          (((size_t)g * T + t) * nchunk_stride + chunk) * H;
+      for (int h = warp; h < H; h += DEC_WARPS) {
+        const bool live = (lm >> lane) & 1u;
+        const float raw = sc[h * SLD + lane] + sc[H * SLD + h * SLD + lane];
+        const float sv = live ? raw * scale : -INFINITY;
+        float m = sv;
+#pragma unroll
+        for (int o = 16; o; o >>= 1)
+          m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        const float e = live ? __expf(sv - m) : 0.f;
+        float l = e;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+        ps[h * PLD + lane] = __float2half(e);
+        if (lane == 0) {
+          mpart[ml_base + h] = m;
+          lpart[ml_base + h] = l;
+        }
+      }
+      __syncthreads();
+      half* o_tok = opart + ml_base * D;
+      float* st = stage + warp * 256;
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0, pa1;
+      wmma::load_matrix_sync(pa0, ps, PLD);
+      wmma::load_matrix_sync(pa1, ps + 16, PLD);
+#pragma unroll 1
+      for (int tile = warp; tile < D / 16; tile += DEC_WARPS) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.f);
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0, b1;
+        wmma::load_matrix_sync(b0, ks + tile * 16, KLD);
+        wmma::load_matrix_sync(b1, ks + 16 * KLD + tile * 16, KLD);
+        wmma::mma_sync(acc, pa0, b0, acc);
+        wmma::mma_sync(acc, pa1, b1, acc);
+        wmma::store_matrix_sync(st, acc, 16, wmma::mem_row_major);
+        __syncwarp();
+#pragma unroll
+        for (int i = lane; i < 128; i += 32) {
+          const int r_h = i >> 3, col = (i & 7) * 2;
+          *reinterpret_cast<half2*>(o_tok + r_h * D + tile * 16 + col) =
+              __floats2half2_rn(st[r_h * 16 + col], st[r_h * 16 + col + 1]);
+        }
+        __syncwarp();
+      }
+      __syncthreads();
+    }
+  }
+}
+
+__global__ void __launch_bounds__(128)
+    dcp_comp_reduce_kernel(const half* __restrict__ opart,
+                           const float* __restrict__ mpart,
+                           const float* __restrict__ lpart,
+                           const int* __restrict__ local_cnt,
+                           const bool* __restrict__ valid,
+                           float* __restrict__ oml_send,
+                           int T, int nchunk_stride) {
+  using namespace attn;
+  __shared__ float wsh[64];
+  __shared__ float inv_l;
+  __shared__ int nchunk_sh;
+  const int t = blockIdx.x, h_all = blockIdx.y;
+  const int g = h_all >> 4, h = h_all & 15;
+  const int t_ext = g * T + t;
+  const size_t base = ((size_t)t_ext * nchunk_stride) * H + h;
+  float* row_out = oml_send + (((size_t)g * T + t) * H + h) * DCP_OML_STRIDE;
+  if (threadIdx.x < 32) {
+    const int nchunk =
+        valid[t] ? min(nchunk_stride, (local_cnt[t] + KC - 1) / KC) : 0;
+    if (threadIdx.x == 0) nchunk_sh = nchunk;
+    float M = -1e30f;
+    for (int c = threadIdx.x; c < nchunk; c += 32) {
+      if (lpart[base + (size_t)c * H] > 0.f)
+        M = fmaxf(M, mpart[base + (size_t)c * H]);
+    }
+    for (int o = 16; o; o >>= 1)
+      M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+    float L = 0.f;
+    for (int c = threadIdx.x; c < nchunk; c += 32) {
+      const float l = lpart[base + (size_t)c * H];
+      const float w = l > 0.f ? __expf(mpart[base + (size_t)c * H] - M) : 0.f;
+      wsh[c] = w;
+      L += w * l;
+    }
+    for (int o = 16; o; o >>= 1) L += __shfl_xor_sync(0xffffffffu, L, o);
+    if (threadIdx.x == 0) {
+      inv_l = L > 0.f ? (1.f / L) : 0.f;
+      row_out[256] = M;
+      row_out[257] = L;
+    }
+  }
+  __syncthreads();
+  const float inv = inv_l;
+  const int nchunk = nchunk_sh;
+  const int d = threadIdx.x * 4;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  if (inv > 0.f) {
+    for (int c = 0; c < nchunk; ++c) {
+      const float w = wsh[c];
+      if (w == 0.f) continue;
+      const uint2 v = *reinterpret_cast<const uint2*>(
+          opart + (((size_t)t_ext * nchunk_stride + c) * H + h) * D + d);
+      const half2* hv = reinterpret_cast<const half2*>(&v);
+      const float2 a = __half22float2(hv[0]), b = __half22float2(hv[1]);
+      acc[0] += w * a.x;
+      acc[1] += w * a.y;
+      acc[2] += w * b.x;
+      acc[3] += w * b.y;
+    }
+  }
+  half2* output = reinterpret_cast<half2*>(reinterpret_cast<half*>(row_out) + d);
+  output[0] = __floats2half2_rn(acc[0] * inv, acc[1] * inv);
+  output[1] = __floats2half2_rn(acc[2] * inv, acc[3] * inv);
+}
+
+__global__ void __launch_bounds__(32 * attn::TKW)
+    dcp_comp_tok_kernel(const half* __restrict__ q_all,
+                        float* __restrict__ oml_send,
+                        int T, float scale, RingGather rg) {
+  using namespace nvcuda;
+  using namespace attn;
+  constexpr int NT = 32 * TKW;
+  constexpr int PER = KC * D / 8 / NT;
+  extern __shared__ __align__(128) unsigned char dsm[];
+  half* qs = reinterpret_cast<half*>(dsm + TK_Q);
+  half* ks = reinterpret_cast<half*>(dsm + TK_K);
+  float* sc = reinterpret_cast<float*>(dsm + TK_S);
+  half* ps = reinterpret_cast<half*>(dsm + TK_P);
+  float* os = reinterpret_cast<float*>(dsm + TK_O);
+  __shared__ const half* srcs[2][KC];
+  __shared__ unsigned live_mask[2];
+  __shared__ float run_m[H], run_l[H], alpha[H];
+  const int t = blockIdx.x, g = blockIdx.y;
+  const int cnt = rg.key_counts[t];
+  const size_t out_base = ((size_t)g * T + t) * H;
+  if (cnt <= 0 || !rg.valid[t]) {
+    for (int i = threadIdx.x * 2; i < H * D; i += 2 * NT) {
+      const int h = i / D, d = i % D;
+      half* o_row = reinterpret_cast<half*>(oml_send + (out_base + h) * DCP_OML_STRIDE);
+      *reinterpret_cast<half2*>(o_row + d) = __floats2half2_rn(0.f, 0.f);
+    }
+    if (threadIdx.x < H) {
+      float* ml_row = oml_send + (out_base + threadIdx.x) * DCP_OML_STRIDE + 256;
+      ml_row[0] = -1e30f;
+      ml_row[1] = 0.f;
+    }
+    return;
+  }
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int nchunk = (cnt + KC - 1) / KC;
+  const half* qt = q_all + ((size_t)t * 4 + g) * H * D;
+  const int64_t pos = rg.positions[t];
+  for (int i = threadIdx.x; i < H * D / 8; i += NT) {
+    const int h = i / (D / 8), c = (i % (D / 8)) * 8;
+    *reinterpret_cast<uint4*>(qs + h * QLD + c) =
+        *reinterpret_cast<const uint4*>(qt + h * D + c);
+  }
+  for (int i = threadIdx.x; i < H * D; i += NT) os[i] = 0.f;
+  if (threadIdx.x < H) {
+    run_m[threadIdx.x] = -1e30f;
+    run_l[threadIdx.x] = 0.f;
+  }
+  auto plan = [&](int chunk, int slot) {
+    const half* src = ring_key_src(rg, t, chunk * KC + lane, cnt, pos, true);
+    srcs[slot][lane] = src;
+    const unsigned m = __ballot_sync(0xffffffffu, src != nullptr);
+    if (lane == 0) live_mask[slot] = m;
+  };
+  uint4 v[PER];
+  auto fetch = [&](int slot) {
+    const unsigned lm = live_mask[slot];
+#pragma unroll
+    for (int u = 0; u < PER; ++u) {
+      const int i = threadIdx.x + u * NT;
+      const int j = i / (D / 8), c = (i % (D / 8)) * 8;
+      v[u] = (lm >> j) & 1u
+                 ? __ldcg(reinterpret_cast<const uint4*>(srcs[slot][j] + c))
+                 : make_uint4(0, 0, 0, 0);
+    }
+  };
+  if (warp == 0) plan(0, 0);
+  __syncthreads();
+  fetch(0);
+  for (int chunk = 0; chunk < nchunk; ++chunk) {
+    const int slot = chunk & 1;
+    const unsigned lm = live_mask[slot];
+#pragma unroll
+    for (int u = 0; u < PER; ++u) {
+      const int i = threadIdx.x + u * NT;
+      const int j = i / (D / 8), c = (i % (D / 8)) * 8;
+      *reinterpret_cast<uint4*>(ks + j * KLD + c) = v[u];
+    }
+    if (warp == 0 && chunk + 1 < nchunk) plan(chunk + 1, slot ^ 1);
+    __syncthreads();
+    if (chunk + 1 < nchunk) fetch(slot ^ 1);
+    if (lm != 0) {
+      {
+        const int tile = warp & 1, part = warp >> 1;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.f);
+#pragma unroll
+        for (int d = part * (D / 4); d < (part + 1) * (D / 4); d += 16) {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+          wmma::load_matrix_sync(a, qs + d, QLD);
+          wmma::load_matrix_sync(b, ks + tile * 16 * KLD + d, KLD);
+          wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(sc + part * H * SLD + tile * 16, acc, SLD,
+                                wmma::mem_row_major);
+      }
+      __syncthreads();
+      for (int h = warp; h < H; h += TKW) {
+        const bool live = (lm >> lane) & 1u;
+        const int o = h * SLD + lane;
+        const float raw =
+            sc[o] + sc[H * SLD + o] + sc[2 * H * SLD + o] + sc[3 * H * SLD + o];
+        const float sv = live ? raw * scale : -INFINITY;
+        float m = sv;
+#pragma unroll
+        for (int x = 16; x; x >>= 1)
+          m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, x));
+        const float l_prev = run_l[h];
+        const float m_old = run_m[h];
+        const float m_new = l_prev > 0.f ? fmaxf(m_old, m) : m;
+        const float e = live ? __expf(sv - m_new) : 0.f;
+        float l = e;
+#pragma unroll
+        for (int x = 16; x; x >>= 1) l += __shfl_xor_sync(0xffffffffu, l, x);
+        ps[h * PLD + lane] = __float2half(e);
+        if (lane == 0) {
+          const float a = l_prev > 0.f ? __expf(m_old - m_new) : 0.f;
+          alpha[h] = a;
+          run_l[h] = l_prev * a + l;
+          run_m[h] = m_new;
+        }
+      }
+      __syncthreads();
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0, pa1;
+      wmma::load_matrix_sync(pa0, ps, PLD);
+      wmma::load_matrix_sync(pa1, ps + 16, PLD);
+#pragma unroll
+      for (int tile = warp; tile < D / 16; tile += TKW) {
+        for (int i = lane; i < 256; i += 32)
+          os[(i >> 4) * D + tile * 16 + (i & 15)] *= alpha[i >> 4];
+        __syncwarp();
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::load_matrix_sync(acc, os + tile * 16, D, wmma::mem_row_major);
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0, b1;
+        wmma::load_matrix_sync(b0, ks + tile * 16, KLD);
+        wmma::load_matrix_sync(b1, ks + 16 * KLD + tile * 16, KLD);
+        wmma::mma_sync(acc, pa0, b0, acc);
+        wmma::mma_sync(acc, pa1, b1, acc);
+        wmma::store_matrix_sync(os + tile * 16, acc, D, wmma::mem_row_major);
+      }
+    }
+    __syncthreads();
+  }
+  for (int i = threadIdx.x * 2; i < H * D; i += 2 * NT) {
+    const int h = i / D, d = i % D;
+    const float rl = run_l[h];
+    const float inv = rl > 0.f ? (1.f / rl) : 0.f;
+    half* o_row = reinterpret_cast<half*>(oml_send + (out_base + h) * DCP_OML_STRIDE);
+    *reinterpret_cast<half2*>(o_row + d) =
+        __floats2half2_rn(os[i] * inv, os[i + 1] * inv);
+  }
+  if (threadIdx.x < H) {
+    float* ml_row = oml_send + (out_base + threadIdx.x) * DCP_OML_STRIDE + 256;
+    ml_row[0] = run_m[threadIdx.x];
+    ml_row[1] = run_l[threadIdx.x];
+  }
+}
+
+template <bool POST>
+__global__ void __launch_bounds__(128)
+    dcp_win_combine_kernel(const half* __restrict__ opart_w,
+                           const float* __restrict__ mpart_w,
+                           const float* __restrict__ lpart_w,
+                           const float* __restrict__ oml_recv,
+                           const float* __restrict__ sink,
+                           half* __restrict__ out,
+                           int T, int nchunk_w, RingGather rg,
+                           const float* rope, int rope_length) {
+  using namespace attn;
+  __shared__ float wsh[16];
+  __shared__ float csh[4];
+  __shared__ float inv_l;
+  const int t = blockIdx.x, h = blockIdx.y;
+  if constexpr (POST) {
+    if (h == H) {
+      const int64_t position = rg.positions[t];
+      if (rg.valid[t] && position >= 0) {
+        const int page = rg.wtable[(size_t)rg.rows[t] * rg.wtable_stride +
+                                   position / rg.wblock];
+        if (page < 0) return;
+        const half* source = rg.values + (size_t)t * D;
+        half* destination = const_cast<half*>(rg.wcache) + page * rg.wstride +
+                            (position % rg.wblock) * D;
+        for (int i = threadIdx.x; i < D / 8; i += blockDim.x)
+          reinterpret_cast<uint4*>(destination)[i] =
+              reinterpret_cast<const uint4*>(source)[i];
+      }
+      return;
+    }
+  }
+  const size_t wbase = (size_t)t * nchunk_w * H + h;
+  if (threadIdx.x < 32) {
+    float M = sink[h];
+    if (threadIdx.x < nchunk_w) {
+      const float lw = lpart_w[wbase + (size_t)threadIdx.x * H];
+      if (lw > 0.f) M = fmaxf(M, mpart_w[wbase + (size_t)threadIdx.x * H]);
+    } else if (threadIdx.x >= 16 && threadIdx.x < 20) {
+      const int s = threadIdx.x - 16;
+      const float* ml = oml_recv + (((size_t)s * T + t) * H + h) * DCP_OML_STRIDE + 256;
+      if (ml[1] > 0.f) M = fmaxf(M, ml[0]);
+    }
+    for (int o = 16; o; o >>= 1)
+      M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+    float L = 0.f;
+    if (threadIdx.x < nchunk_w) {
+      const float lw = lpart_w[wbase + (size_t)threadIdx.x * H];
+      const float w = lw > 0.f ? __expf(mpart_w[wbase + (size_t)threadIdx.x * H] - M) : 0.f;
+      wsh[threadIdx.x] = w;
+      L += w * lw;
+    } else if (threadIdx.x >= 16 && threadIdx.x < 20) {
+      const int s = threadIdx.x - 16;
+      const float* ml = oml_recv + (((size_t)s * T + t) * H + h) * DCP_OML_STRIDE + 256;
+      const float wc = ml[1] > 0.f ? (__expf(ml[0] - M) * ml[1]) : 0.f;
+      csh[s] = wc;
+      L += wc;
+    }
+    for (int o = 16; o; o >>= 1) L += __shfl_xor_sync(0xffffffffu, L, o);
+    if (threadIdx.x == 0) inv_l = 1.f / (L + __expf(sink[h] - M));
+  }
+  __syncthreads();
+  const float inv = inv_l;
+  const int d = threadIdx.x * 4;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  for (int c = 0; c < nchunk_w; ++c) {
+    const float w = wsh[c];
+    if (w == 0.f) continue;
+    const uint2 v = *reinterpret_cast<const uint2*>(
+        opart_w + ((size_t)(t * nchunk_w + c) * H + h) * D + d);
+    const half2* hv = reinterpret_cast<const half2*>(&v);
+    const float2 a = __half22float2(hv[0]), b = __half22float2(hv[1]);
+    acc[0] += w * a.x;
+    acc[1] += w * a.y;
+    acc[2] += w * b.x;
+    acc[3] += w * b.y;
+  }
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const float wc = csh[s];
+    if (wc == 0.f) continue;
+    const half* o_row = reinterpret_cast<const half*>(
+        oml_recv + (((size_t)s * T + t) * H + h) * DCP_OML_STRIDE);
+    const uint2 v = *reinterpret_cast<const uint2*>(o_row + d);
+    const half2* hv = reinterpret_cast<const half2*>(&v);
+    const float2 a = __half22float2(hv[0]), b = __half22float2(hv[1]);
+    acc[0] += wc * a.x;
+    acc[1] += wc * a.y;
+    acc[2] += wc * b.x;
+    acc[3] += wc * b.y;
+  }
+  if constexpr (POST) {
+    float value[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      value[i] = __half2float(__float2half_rn(acc[i] * inv));
+    if (d >= D - 64) {
+      const int64_t position = rg.positions[t];
+      const int first_pair = (d - (D - 64)) / 2;
+#pragma unroll
+      for (int pair = 0; pair < 2; ++pair) {
+        const int index = first_pair + pair;
+        float cosine, sine;
+        if (position < rope_length) {
+          cosine = rope[position * 64 + index];
+          sine = -rope[position * 64 + 32 + index];
+        } else {
+          const float angle = (float)position * rope[rope_length * 64 + index];
+          sincosf(angle, &sine, &cosine);
+          sine = -sine;
+        }
+        const float a = value[pair * 2], b = value[pair * 2 + 1];
+        value[pair * 2] = __half2float(__float2half_rn(
+            __fsub_rn(__fmul_rn(a, cosine), __fmul_rn(b, sine))));
+        value[pair * 2 + 1] = __half2float(__float2half_rn(
+            __fadd_rn(__fmul_rn(a, sine), __fmul_rn(b, cosine))));
+      }
+    }
+    float maximum = fmaxf(fmaxf(fabsf(value[0]), fabsf(value[1])),
+                          fmaxf(fabsf(value[2]), fabsf(value[3])));
+#pragma unroll
+    for (int delta = 16; delta; delta >>= 1)
+      maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, delta));
+    const unsigned bits =
+        __float_as_uint(fmaxf(maximum, 1e-4f) * (1.f / 448.f));
+    const unsigned exponent = (bits >> 23) + ((bits & 0x7fffffu) != 0);
+    const float quant_scale = __uint_as_float(exponent << 23);
+    const float reciprocal = __uint_as_float((254u - exponent) << 23);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      value[i] = attn_fp8_round(value[i] * reciprocal) * quant_scale;
+    half2* output = reinterpret_cast<half2*>(out + ((size_t)t * H + h) * D + d);
+    output[0] = __floats2half2_rn(value[0], value[1]);
+    output[1] = __floats2half2_rn(value[2], value[3]);
+  } else {
+    half2* output = reinterpret_cast<half2*>(out + ((size_t)t * H + h) * D + d);
+    output[0] = __floats2half2_rn(acc[0] * inv, acc[1] * inv);
+    output[1] = __floats2half2_rn(acc[2] * inv, acc[3] * inv);
+  }
+}
+
+struct DCPWorkspace {
+  torch::Tensor opart_c;
+  torch::Tensor ml_c;
+  torch::Tensor opart_w;
+  torch::Tensor ml_w;
+};
+
+static DCPWorkspace& get_dcp_ws(int dev, const torch::TensorOptions& half_opts) {
+  static DCPWorkspace ws[8];
+  TORCH_CHECK(dev >= 0 && dev < 8);
+  DCPWorkspace& w = ws[dev];
+  if (!w.opart_c.defined() &&
+      at::cuda::currentStreamCaptureStatusMayInitCtx() ==
+          at::cuda::CaptureStatus::None) {
+    constexpr int64_t T_MAX = 192, NC_MAX = 16, NW_MAX = 8;
+    auto f32_opts = half_opts.dtype(torch::kFloat32);
+    w.opart_c = torch::empty({4 * T_MAX * NC_MAX * attn::H * attn::D}, half_opts);
+    w.ml_c = torch::empty({2 * 4 * T_MAX * NC_MAX * attn::H}, f32_opts);
+    w.opart_w = torch::empty({T_MAX * NW_MAX * attn::H * attn::D}, half_opts);
+    w.ml_w = torch::empty({2 * T_MAX * NW_MAX * attn::H}, f32_opts);
+  }
+  return w;
+}
+
+void dcp_compact_topk(torch::Tensor local_topk, torch::Tensor local_cnt,
+                      torch::Tensor topk, torch::Tensor positions,
+                      torch::Tensor valid, int64_t ratio, int64_t shard) {
+  const int T = topk.size(0);
+  const int ntopk = topk.size(1);
+  if (T <= 0) return;
+  TORCH_CHECK(topk.is_cuda() && topk.scalar_type() == torch::kInt32 &&
+              topk.is_contiguous() && local_topk.is_contiguous() &&
+              local_cnt.is_contiguous());
+  const at::cuda::OptionalCUDAGuard guard(device_of(topk));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dcp_compact_topk_kernel<<<T, 128, 0, stream>>>(
+      local_topk.data_ptr<int>(), local_cnt.data_ptr<int>(),
+      topk.data_ptr<int>(), positions.data_ptr<int64_t>(),
+      valid.data_ptr<bool>(), ntopk, (int)ratio, (int)shard);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void attn_dcp_comp(torch::Tensor oml_send, torch::Tensor q_all,
+                   torch::Tensor cache, torch::Tensor table,
+                   torch::Tensor rows, torch::Tensor positions,
+                   torch::Tensor valid, torch::Tensor local_topk,
+                   torch::Tensor local_cnt, double scale, int64_t block,
+                   int64_t ratio) {
+  using namespace attn;
+  const int T = q_all.size(0);
+  const int ntopk = local_topk.size(1);
+  TORCH_CHECK(q_all.is_cuda() && q_all.scalar_type() == torch::kFloat16 &&
+              q_all.is_contiguous() && q_all.size(1) == 4 * H &&
+              q_all.size(2) == D);
+  TORCH_CHECK(oml_send.is_contiguous() &&
+              oml_send.scalar_type() == torch::kFloat32 &&
+              oml_send.numel() == (int64_t)4 * T * H * DCP_OML_STRIDE);
+  TORCH_CHECK(local_topk.scalar_type() == torch::kInt32 &&
+              local_topk.is_contiguous() &&
+              local_cnt.scalar_type() == torch::kInt32 &&
+              local_cnt.is_contiguous());
+  if (T <= 0) return;
+  const at::cuda::OptionalCUDAGuard guard(device_of(q_all));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  RingGather rg{};
+  rg.cache = reinterpret_cast<const half*>(cache.data_ptr<at::Half>());
+  rg.table = table.data_ptr<int>();
+  rg.positions = positions.data_ptr<int64_t>();
+  rg.valid = valid.data_ptr<bool>();
+  rg.topk = local_topk.data_ptr<int>();
+  rg.key_counts = local_cnt.data_ptr<int>();
+  rg.stride = cache.stride(0);
+  rg.block = (int)block;
+  rg.ratio = (int)ratio;
+  rg.window = 0;
+  rg.ntopk = ntopk;
+  rg.paged = true;
+  rg.rows = rows.data_ptr<int>();
+  rg.bases = rows.data_ptr<int>();
+  rg.table_stride = (int)table.stride(0);
+  rg.cshard_shift = 2;
+  const int nchunk = (ntopk + KC - 1) / KC;
+  if (T <= 192 && nchunk <= 16) {
+    rg.t_mod = T;
+    rg.q_groups = 4;
+    DCPWorkspace& ws = get_dcp_ws(q_all.get_device(), q_all.options());
+    torch::Tensor opart =
+        ws.opart_c.defined()
+            ? ws.opart_c
+            : torch::empty({4 * (int64_t)T * nchunk * H * D}, q_all.options());
+    torch::Tensor ml =
+        ws.ml_c.defined()
+            ? ws.ml_c
+            : torch::empty({2 * 4 * (int64_t)T * nchunk * H},
+                           q_all.options().dtype(torch::kFloat32));
+    float* mp = ml.data_ptr<float>();
+    float* lp = mp + 4 * (int64_t)T * nchunk * H;
+    static bool smem_set_dcp_dec = false;
+    if (!smem_set_dcp_dec) {
+      cudaFuncSetAttribute(dcp_gqa64_split_kernel,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           (int)DEC_SMEM);
+      smem_set_dcp_dec = true;
+    }
+    dcp_gqa64_split_kernel<<<dim3(T, DCP_SPLIT_CTAS), 32 * DEC_WARPS, DEC_SMEM, stream>>>(
+        reinterpret_cast<const half*>(q_all.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(opart.data_ptr<at::Half>()), mp, lp, T, nchunk,
+        (float)scale, rg);
+    dcp_comp_reduce_kernel<<<dim3(T, 4 * H), 128, 0, stream>>>(
+        reinterpret_cast<const half*>(opart.data_ptr<at::Half>()), mp, lp,
+        local_cnt.data_ptr<int>(), valid.data_ptr<bool>(),
+        oml_send.data_ptr<float>(), T, nchunk);
+  } else {
+    static bool smem_set_dcp_tok = false;
+    if (!smem_set_dcp_tok) {
+      cudaFuncSetAttribute(dcp_comp_tok_kernel,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           (int)TK_SMEM);
+      smem_set_dcp_tok = true;
+    }
+    dcp_comp_tok_kernel<<<dim3(T, 4), 32 * TKW, TK_SMEM, stream>>>(
+        reinterpret_cast<const half*>(q_all.data_ptr<at::Half>()),
+        oml_send.data_ptr<float>(), T, (float)scale, rg);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void attn_dcp_win_combine(torch::Tensor out, torch::Tensor q_local,
+                          torch::Tensor values, torch::Tensor wcache,
+                          torch::Tensor wtable, torch::Tensor rows,
+                          torch::Tensor bases, torch::Tensor positions,
+                          torch::Tensor valid, torch::Tensor oml_recv,
+                          torch::Tensor sink, double scale, int64_t wblock,
+                          int64_t window, bool paged_fused,
+                          std::optional<torch::Tensor> rope) {
+  using namespace attn;
+  const int T = q_local.size(0);
+  if (T <= 0) return;
+  TORCH_CHECK(q_local.scalar_type() == torch::kFloat16 &&
+              q_local.is_contiguous() && q_local.size(1) == H &&
+              q_local.size(2) == D);
+  TORCH_CHECK(oml_recv.is_contiguous() &&
+              oml_recv.scalar_type() == torch::kFloat32 &&
+              oml_recv.numel() == (int64_t)4 * T * H * DCP_OML_STRIDE);
+  const int nchunk_w = ((int)window + KC - 1) / KC;
+  TORCH_CHECK(nchunk_w <= 16);
+  const at::cuda::OptionalCUDAGuard guard(device_of(q_local));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  DCPWorkspace& ws = get_dcp_ws(q_local.get_device(), q_local.options());
+  const bool use_ws = (T <= 192 && nchunk_w <= 8 && ws.opart_w.defined());
+  torch::Tensor opart_w =
+      use_ws ? ws.opart_w
+             : torch::empty({(int64_t)T * nchunk_w * H * D}, q_local.options());
+  torch::Tensor ml_w =
+      use_ws ? ws.ml_w
+             : torch::empty({2 * (int64_t)T * nchunk_w * H},
+                            q_local.options().dtype(torch::kFloat32));
+  float* mp_w = ml_w.data_ptr<float>();
+  float* lp_w = mp_w + (int64_t)T * nchunk_w * H;
+  RingGather rg{};
+  rg.values = paged_fused
+                  ? reinterpret_cast<const half*>(values.data_ptr<at::Half>())
+                  : nullptr;
+  rg.positions = positions.data_ptr<int64_t>();
+  rg.valid = valid.data_ptr<bool>();
+  rg.window = (int)window;
+  rg.ntopk = 0;
+  rg.paged = true;
+  rg.paged_all_cached = !paged_fused;
+  rg.wcache = reinterpret_cast<const half*>(wcache.data_ptr<at::Half>());
+  rg.wtable = wtable.data_ptr<int>();
+  rg.rows = rows.data_ptr<int>();
+  rg.bases = bases.data_ptr<int>();
+  rg.wstride = wcache.stride(0);
+  rg.wtable_stride = (int)wtable.stride(0);
+  rg.wblock = (int)wblock;
+  static bool smem_set_win = false;
+  if (!smem_set_win) {
+    cudaFuncSetAttribute(attn_dec_split<true>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)DEC_SMEM);
+    smem_set_win = true;
+  }
+  attn_dec_split<true><<<dim3(T, nchunk_w), 32 * DEC_WARPS, DEC_SMEM, stream>>>(
+      reinterpret_cast<const half*>(q_local.data_ptr<at::Half>()), nullptr,
+      nullptr, reinterpret_cast<half*>(opart_w.data_ptr<at::Half>()), mp_w,
+      lp_w, (int)window, (float)scale, rg);
+  if (rope.has_value()) {
+    dcp_win_combine_kernel<true><<<dim3(T, H + (paged_fused ? 1 : 0)), 128, 0, stream>>>(
+        reinterpret_cast<const half*>(opart_w.data_ptr<at::Half>()), mp_w, lp_w,
+        oml_recv.data_ptr<float>(), sink.data_ptr<float>(),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()), T, nchunk_w, rg,
+        rope->data_ptr<float>(), (int)rope->size(0) - 1);
+  } else {
+    dcp_win_combine_kernel<false><<<dim3(T, H), 128, 0, stream>>>(
+        reinterpret_cast<const half*>(opart_w.data_ptr<at::Half>()), mp_w, lp_w,
+        oml_recv.data_ptr<float>(), sink.data_ptr<float>(),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()), T, nchunk_w, rg,
+        nullptr, 0);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -3596,6 +4382,76 @@ void ll_allgather(torch::Tensor out, torch::Tensor inp, int64_t p0, int64_t p1,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <bool HALF>
+__global__ void __launch_bounds__(LL_THREADS)
+    ll_alltoall_kernel(uint4* __restrict__ out, const uint4* __restrict__ in,
+                       LLPeers peers, int rank, int slice_packs,
+                       int64_t cap, int* __restrict__ counter) {
+  const int64_t base = (int64_t)(counter[blockIdx.x] & 1) * 4 * cap;
+  const int stride = gridDim.x * blockDim.x;
+  const int first = blockIdx.x * blockDim.x + threadIdx.x;
+  for (int p = first; p < slice_packs; p += stride) {
+    out[(int64_t)rank * slice_packs + p] =
+        in[(int64_t)rank * slice_packs + p];
+#pragma unroll
+    for (int r = 1; r < 4; ++r) {
+      const int dst = (rank + r) & 3;
+      uint4 v = in[(int64_t)dst * slice_packs + p];
+      v.x = ll_escape<HALF>(v.x);
+      v.y = ll_escape<HALF>(v.y);
+      v.z = ll_escape<HALF>(v.z);
+      v.w = ll_escape<HALF>(v.w);
+      ll_store(peers.p[dst] + base + rank * cap + (int64_t)p * 16, v);
+    }
+  }
+  char* mine = peers.p[rank] + base;
+  const uint4 empty = make_uint4(~0u, ~0u, ~0u, ~0u);
+  for (int p = first; p < slice_packs; p += stride) {
+#pragma unroll
+    for (int src = 0; src < 4; ++src) {
+      if (src == rank) continue;
+      char* a = mine + src * cap + (int64_t)p * 16;
+      uint4 v;
+      do {
+        v = ll_load(a);
+      } while (!ll_ready4<HALF>(v));
+      ll_store(a, empty);
+      out[(int64_t)src * slice_packs + p] = v;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) counter[blockIdx.x] += 1;
+}
+
+void ll_alltoall(torch::Tensor out, torch::Tensor inp, int64_t p0, int64_t p1,
+                 int64_t p2, int64_t p3, int64_t rank, int64_t cap,
+                 torch::Tensor counter) {
+  const bool half_t = inp.scalar_type() == torch::kFloat16;
+  TORCH_CHECK(half_t || inp.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(inp.dim() == 2 && out.dim() == 2 && inp.is_contiguous() &&
+              out.is_contiguous() && inp.size(0) == 4 && out.size(0) == 4 &&
+              out.size(1) == inp.size(1) &&
+              out.scalar_type() == inp.scalar_type());
+  const int64_t slice_bytes = inp.size(1) * inp.element_size();
+  TORCH_CHECK(slice_bytes % 16 == 0 && slice_bytes <= cap, "ll_alltoall: size");
+  TORCH_CHECK(counter.numel() >= LL_BLOCKS &&
+              counter.scalar_type() == torch::kInt32);
+  const at::cuda::OptionalCUDAGuard guard(device_of(inp));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  LLPeers peers{{reinterpret_cast<char*>(p0), reinterpret_cast<char*>(p1),
+                 reinterpret_cast<char*>(p2), reinterpret_cast<char*>(p3)}};
+  auto* o = reinterpret_cast<uint4*>(out.data_ptr());
+  const auto* i = reinterpret_cast<const uint4*>(inp.data_ptr());
+  const int sp = (int)(slice_bytes / 16);
+  if (half_t)
+    ll_alltoall_kernel<true><<<LL_BLOCKS, LL_THREADS, 0, stream>>>(
+        o, i, peers, (int)rank, sp, cap, counter.data_ptr<int>());
+  else
+    ll_alltoall_kernel<false><<<LL_BLOCKS, LL_THREADS, 0, stream>>>(
+        o, i, peers, (int)rank, sp, cap, counter.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // out may alias inp. peers: the four ranks' receive buffers (2 * 4 * cap bytes,
 // all-ones when armed); counter: LL_BLOCKS int32 zeros, private to this rank.
 void ll_allreduce(torch::Tensor out, torch::Tensor inp, int64_t p0, int64_t p1,
@@ -3948,7 +4804,8 @@ __global__ void __launch_bounds__(128)
                         const int64_t* __restrict__ positions,
                         const int* __restrict__ qsl, int table_stride,
                         int n_out, int64_t page_stride, int keys_per_page,
-                        int ratio, int H, int shard, int nshard) {
+                        int ratio, int H, int shard, int nshard,
+                        bool kv_sharded) {
   using namespace bidx;
   using namespace nvcuda;
   extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -3960,7 +4817,10 @@ __global__ void __launch_bounds__(128)
   const int first = qsl[r], count = qsl[r + 1] - first;
   if (count <= 0) return;
   const int64_t end = (positions[first + count - 1] + 1) / ratio;
-  if (((int64_t)blockIdx.y * nshard + shard) * KT >= end) return;
+  const int64_t min_key = kv_sharded
+                              ? (((int64_t)blockIdx.y * KT) * nshard + shard)
+                              : (((int64_t)blockIdx.y * nshard + shard) * KT);
+  if (min_key >= end) return;
   const int rows = count * H, mtiles = (rows + 15) / 16;
   if (rows > ROWS) return;  // callers keep decode rows within ROWS / H
   // Stage the request's query rows (zero padding) and weights.
@@ -3977,18 +4837,20 @@ __global__ void __launch_bounds__(128)
   const int* trow = table + (size_t)r * table_stride;
   const int warp = threadIdx.x >> 5;
   for (int64_t local = blockIdx.y;; local += gridDim.y) {
-    const int64_t n0 = (local * nshard + shard) * KT;
+    const int64_t n0 = kv_sharded ? ((local * KT) * nshard + shard)
+                                  : ((local * nshard + shard) * KT);
     if (n0 >= end) break;
     __syncthreads();  // qs ready / previous tile's sc consumed
     for (int i = threadIdx.x; i < KT * (D / 8); i += blockDim.x) {
       const int j = i / (D / 8), c = (i % (D / 8)) * 8;
-      const int64_t n = n0 + j;
+      const int64_t lk = kv_sharded ? (local * KT + j) : (n0 + j);
+      const int64_t n = kv_sharded ? (lk * nshard + shard) : lk;
       uint4 v = make_uint4(0, 0, 0, 0);
       if (n < end) {
-        const int page = trow[n / keys_per_page];
+        const int page = trow[lk / keys_per_page];
         if (page >= 0)
           v = __ldcg(reinterpret_cast<const uint4*>(
-              cache + (int64_t)page * page_stride + (n % keys_per_page) * D +
+              cache + (int64_t)page * page_stride + (lk % keys_per_page) * D +
               c));
       }
       *reinterpret_cast<uint4*>(ks + j * KLD + c) = v;
@@ -4013,7 +4875,9 @@ __global__ void __launch_bounds__(128)
     const int64_t column0 = local * KT;
     for (int i = threadIdx.x; i < count * KT; i += blockDim.x) {
       const int t = i / KT, j = i % KT;
-      if (n0 + j >= end) continue;
+      const int64_t n = kv_sharded ? ((column0 + j) * nshard + shard)
+                                   : (n0 + j);
+      if (n >= end) continue;
       float total = 0.f;
       for (int h = 0; h < H; ++h) {
         float v = __half2float(__float2half(sc[(t * H + h) * SLD + j]));
@@ -4031,7 +4895,7 @@ static void index_scores_launch(torch::Tensor out, torch::Tensor q,
                                 torch::Tensor table, torch::Tensor positions,
                                 torch::Tensor qsl, int64_t num_reqs,
                                 int64_t ratio, int64_t ctas, int64_t shard,
-                                int64_t nshard) {
+                                int64_t nshard, bool kv_sharded) {
   using namespace bidx;
   const int H = q.size(1);
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kFloat16 &&
@@ -4063,7 +4927,8 @@ static void index_scores_launch(torch::Tensor out, torch::Tensor q,
       reinterpret_cast<const __half*>(cache.data_ptr<at::Half>()),
       table.data_ptr<int>(), positions.data_ptr<int64_t>(), qsl.data_ptr<int>(),
       (int)table.stride(0), (int)out.size(1), cache.stride(0),
-      (int)cache.size(1), (int)ratio, H, (int)shard, (int)nshard);
+      (int)cache.size(1), (int)ratio, H, (int)shard, (int)nshard,
+      kv_sharded);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -4074,7 +4939,7 @@ void index_scores(torch::Tensor out, torch::Tensor q, torch::Tensor w,
                   int64_t ratio, int64_t ctas) {
   TORCH_CHECK(8 * q.size(1) <= 64);
   index_scores_launch<64>(out, q, w, cache, table, positions, qsl, num_reqs,
-                          ratio, ctas, 0, 1);
+                          ratio, ctas, 0, 1, false);
 }
 
 // Key-sharded: all H heads (32), at most 192 / H query rows (6) per request.
@@ -4082,9 +4947,9 @@ void index_scores_shard(torch::Tensor out, torch::Tensor q, torch::Tensor w,
                         torch::Tensor cache, torch::Tensor table,
                         torch::Tensor positions, torch::Tensor qsl,
                         int64_t num_reqs, int64_t ratio, int64_t ctas,
-                        int64_t shard, int64_t nshard) {
+                        int64_t shard, int64_t nshard, bool kv_sharded) {
   index_scores_launch<192>(out, q, w, cache, table, positions, qsl, num_reqs,
-                           ratio, ctas, shard, nshard);
+                           ratio, ctas, shard, nshard, kv_sharded);
 }
 
 // Key-stationary WMMA prefill indexer for key-sharded TP4:
@@ -4098,7 +4963,7 @@ __global__ void __launch_bounds__(256) index_scores_prefill_shard_kernel(
     const __half* __restrict__ w, const __half* __restrict__ cache,
     const int* __restrict__ table, const int64_t* __restrict__ positions, int T,
     int n_out, int64_t page_stride, int keys_per_page, int ratio, int shard,
-    int nshard) {
+    int nshard, bool kv_sharded) {
   using namespace nvcuda;
   constexpr int D = 128, H = 32, BT = 4, ROWS = BT * H;  // 128 rows
   constexpr int QLD = D + 8, KLD = D + 8, SLD = 64 + 4;
@@ -4115,7 +4980,9 @@ __global__ void __launch_bounds__(256) index_scores_prefill_shard_kernel(
   const int column0 = local0 * 32;
   if (column0 >= n_out || T <= 0) return;
   const bool has_half1 = (column0 + 32) < n_out;
-  const int64_t n_base0 = (int64_t(local0) * nshard + shard) * 32;
+  const int64_t n_base0 = kv_sharded
+                              ? (int64_t(column0) * nshard + shard)
+                              : ((int64_t(local0) * nshard + shard) * 32);
   const int64_t n_base1 = (int64_t(local0 + 1) * nshard + shard) * 32;
 
   // Scan positions[0..T-1] across 256 threads to find max_end and first causal
@@ -4146,12 +5013,15 @@ __global__ void __launch_bounds__(256) index_scores_prefill_shard_kernel(
     const int j = i / (D / 8), c = (i % (D / 8)) * 8;
     uint4 v = make_uint4(0, 0, 0, 0);
     if (j < 32 || has_half1) {
-      const int64_t n = (j < 32) ? (n_base0 + j) : (n_base1 + (j - 32));
+      const int64_t lk = kv_sharded
+                             ? int64_t(column0 + j)
+                             : ((j < 32) ? (n_base0 + j) : (n_base1 + (j - 32)));
+      const int64_t n = kv_sharded ? (lk * nshard + shard) : lk;
       if (n < max_end) {
-        const int page = table[n / keys_per_page];
+        const int page = table[lk / keys_per_page];
         if (page >= 0) {
           v = __ldg(reinterpret_cast<const uint4*>(
-              cache + int64_t(page) * page_stride + (n % keys_per_page) * D +
+              cache + int64_t(page) * page_stride + (lk % keys_per_page) * D +
               c));
         }
       }
@@ -4214,7 +5084,9 @@ __global__ void __launch_bounds__(256) index_scores_prefill_shard_kernel(
     const int j = threadIdx.x & 63;
     if (t < count && (j < 32 || has_half1)) {
       const int64_t end_t = (positions[t0 + t] + 1) / ratio;
-      const int64_t n = (j < 32) ? (n_base0 + j) : (n_base1 + (j - 32));
+      const int64_t n = kv_sharded
+                            ? (int64_t(column0 + j) * nshard + shard)
+                            : ((j < 32) ? (n_base0 + j) : (n_base1 + (j - 32)));
       if (n < end_t) {
         float total = 0.f;
 #pragma unroll 8
@@ -4233,7 +5105,8 @@ __global__ void __launch_bounds__(256) index_scores_prefill_shard_kernel(
 void index_scores_prefill_shard(torch::Tensor out, torch::Tensor q,
                                 torch::Tensor w, torch::Tensor cache,
                                 torch::Tensor table, torch::Tensor positions,
-                                int64_t ratio, int64_t shard, int64_t nshard) {
+                                int64_t ratio, int64_t shard, int64_t nshard,
+                                bool kv_sharded) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kFloat16 &&
               q.is_contiguous() && q.dim() == 3 && q.size(1) == 32 &&
               q.size(2) == 128);
@@ -4266,7 +5139,8 @@ void index_scores_prefill_shard(torch::Tensor out, torch::Tensor q,
       reinterpret_cast<const __half*>(w.data_ptr<at::Half>()),
       reinterpret_cast<const __half*>(cache.data_ptr<at::Half>()),
       table.data_ptr<int>(), positions.data_ptr<int64_t>(), T, n_out,
-      cache.stride(0), int(cache.size(1)), int(ratio), int(shard), int(nshard));
+      cache.stride(0), int(cache.size(1)), int(ratio), int(shard), int(nshard),
+      kv_sharded);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -4938,6 +5812,26 @@ constexpr int MK_CTAS = 80;
 constexpr int MK_MAX_R = 64;
 constexpr int MK_K = 256;
 
+__device__ __forceinline__ uint32_t mk_mix32(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7FEB352Du;
+  x ^= x >> 15;
+  x *= 0x846CA68Bu;
+  return x ^ (x >> 16);
+}
+
+__device__ __forceinline__ uint32_t mk_row_seed(uint64_t key, uint64_t pos) {
+  const uint32_t hi = mk_mix32((uint32_t)(key >> 32) ^ 0x9E3779B9u);
+  const uint32_t s = mk_mix32((uint32_t)key ^ hi);
+  return mk_mix32(s ^ (uint32_t)pos);
+}
+
+__device__ __forceinline__ float mk_gumbel(uint32_t seed, uint32_t v) {
+  const uint32_t h = mk_mix32(mk_mix32(seed ^ v) ^ (seed + 0x6A09E667u));
+  const float u = ((float)(h >> 9) + 0.5f) * (1.0f / 8388608.0f);
+  return -logf(-logf(u));
+}
+
 template <bool FP8, bool EMB_FP16>
 __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
     const void* __restrict__ weight, const half* __restrict__ w_scales,
@@ -4946,7 +5840,9 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
     float* __restrict__ ws_val, int* __restrict__ ws_idx,
     int* __restrict__ prev_tok, int* __restrict__ state_ctrl,
     v41ll_mk::LLTilePeers peers, int rank, int64_t cap, int R, int V, int vocab,
-    int vocab_start, int steps) {
+    int vocab_start, int steps, const int64_t* __restrict__ c_keys,
+    const int64_t* __restrict__ c_pos, const float* __restrict__ c_temps,
+    float draft_scale) {
   // state_ctrl layout (4 int32s, initialized to 0 once at startup):
   //   [0]: ticket (0..79, self-resetting)
   //   [1]: step_done (monotonically increasing across launches, graph safe!)
@@ -5030,7 +5926,16 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
           dot += __shfl_xor_sync(0xffffffffu, dot, off);
         if (lane == 0) {
           const float lg = __half2float(local_logits[(size_t)step * V + v]);
-          const float val = lg + dot;
+          float val = lg + dot;
+          if (c_temps != nullptr) {
+            const float t0 = c_temps[0];
+            if (t0 > 0.f) {
+              const uint32_t sd = mk_row_seed((uint64_t)c_keys[0],
+                                              (uint64_t)(c_pos[0] + step));
+              val = val / (t0 * draft_scale) +
+                    mk_gumbel(sd, (uint32_t)(vocab_start + v));
+            }
+          }
           if (val > bv0 || (val == bv0 && v < bi0)) {
             bv0 = val;
             bi0 = v;
@@ -5054,7 +5959,16 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
           if (lane == 0) {
             const float lg = __half2float(
                 local_logits[((size_t)r * steps + step) * V + v]);
-            const float val = lg + dot;
+            float val = lg + dot;
+            if (c_temps != nullptr) {
+              const float tr = c_temps[r];
+              if (tr > 0.f) {
+                const uint32_t sd = mk_row_seed((uint64_t)c_keys[r],
+                                                (uint64_t)(c_pos[r] + step));
+                val = val / (tr * draft_scale) +
+                      mk_gumbel(sd, (uint32_t)(vocab_start + v));
+              }
+            }
             if (val > w_best_v[warp][r] ||
                 (val == w_best_v[warp][r] && v < w_best_i[warp][r])) {
               w_best_v[warp][r] = val;
@@ -5216,7 +6130,9 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_wmma_kernel(
     float* __restrict__ ws_val, int* __restrict__ ws_idx,
     int* __restrict__ prev_tok, int* __restrict__ state_ctrl,
     v41ll_mk::LLTilePeers peers, int rank, int64_t cap, int R, int V, int vocab,
-    int vocab_start, int steps) {
+    int vocab_start, int steps, const int64_t* __restrict__ c_keys,
+    const int64_t* __restrict__ c_pos, const float* __restrict__ c_temps,
+    float draft_scale) {
   using namespace nvcuda;
   __shared__ half s_emb[MK_MAX_R][MK_K + 8];  // 33.0 KiB, ld=264
   __shared__ half s_w[32][40];                //  2.5 KiB, ld=40
@@ -5343,7 +6259,16 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_wmma_kernel(
         if (v_ok) {
           const float lg =
               __half2float(local_logits[((size_t)r * steps + step) * V + v_cur]);
-          const float cand = lg + s_c[r][lane];
+          float cand = lg + s_c[r][lane];
+          if (c_temps != nullptr) {
+            const float tr = c_temps[r];
+            if (tr > 0.f) {
+              const uint32_t sd = mk_row_seed((uint64_t)c_keys[r],
+                                              (uint64_t)(c_pos[r] + step));
+              cand = cand / (tr * draft_scale) +
+                     mk_gumbel(sd, (uint32_t)(vocab_start + v_cur));
+            }
+          }
           if (!isnan(cand)) {
             val = cand;
             idx = v_cur;
@@ -5495,7 +6420,11 @@ void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
                         torch::Tensor ws_idx, torch::Tensor prev_tok,
                         torch::Tensor state_ctrl, int64_t p0, int64_t p1,
                         int64_t p2, int64_t p3, int64_t rank, int64_t cap,
-                        int64_t vocab_start, int64_t steps) {
+                        int64_t vocab_start, int64_t steps,
+                        std::optional<torch::Tensor> c_keys,
+                        std::optional<torch::Tensor> c_pos,
+                        std::optional<torch::Tensor> c_temps,
+                        double draft_scale) {
   const bool fp8 = w_scales.has_value();
   const int R = anchors.numel();
   const int V = weight.size(0);
@@ -5532,6 +6461,13 @@ void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
   const bool emb_fp16 = (embed.scalar_type() == torch::kFloat16);
   TORCH_CHECK(emb_fp16 || embed.scalar_type() == torch::kBFloat16,
               "markov_shard_5step: embed must be fp16 or bf16");
+  const int64_t* ck_ptr =
+      (c_keys.has_value() && c_pos.has_value() && c_temps.has_value())
+          ? c_keys->data_ptr<int64_t>()
+          : nullptr;
+  const int64_t* cp_ptr = ck_ptr ? c_pos->data_ptr<int64_t>() : nullptr;
+  const float* ct_ptr = ck_ptr ? c_temps->data_ptr<float>() : nullptr;
+  const float d_sc = (float)draft_scale;
   if (R >= 2) {
     if (fp8) {
       if (emb_fp16) {
@@ -5540,14 +6476,14 @@ void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
             out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
             ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
             state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-            (int)vocab_start, (int)steps);
+            (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
       } else {
         markov_shard_5step_wmma_kernel<true, false><<<MK_CTAS, 256, 0, stream>>>(
             weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
             out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
             ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
             state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-            (int)vocab_start, (int)steps);
+            (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
       }
     } else {
       if (emb_fp16) {
@@ -5556,14 +6492,14 @@ void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
             out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
             ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
             state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-            (int)vocab_start, (int)steps);
+            (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
       } else {
         markov_shard_5step_wmma_kernel<false, false><<<MK_CTAS, 256, 0, stream>>>(
             weight.data_ptr(), nullptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
             out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
             ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
             state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-            (int)vocab_start, (int)steps);
+            (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
       }
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -5576,14 +6512,14 @@ void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
           out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
           ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
           state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-          (int)vocab_start, (int)steps);
+          (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
     } else {
       markov_shard_5step_kernel<true, false><<<MK_CTAS, 256, 0, stream>>>(
           weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
           out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
           ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
           state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-          (int)vocab_start, (int)steps);
+          (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
     }
   } else {
     if (emb_fp16) {
@@ -5592,14 +6528,16 @@ void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
           anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
           ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
           prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers, (int)rank,
-          cap, R, V, vocab, (int)vocab_start, (int)steps);
+          cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr, cp_ptr,
+          ct_ptr, d_sc);
     } else {
       markov_shard_5step_kernel<false, false><<<MK_CTAS, 256, 0, stream>>>(
           weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
           anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
           ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
           prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers, (int)rank,
-          cap, R, V, vocab, (int)vocab_start, (int)steps);
+          cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr, cp_ptr,
+          ct_ptr, d_sc);
     }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -5703,6 +6641,24 @@ TORCH_LIBRARY(v41sk, m) {
       "p3, "
       "int rank, int cap, Tensor(b!) counter) -> ()");
   m.def(
+      "ll_alltoall(Tensor(a!) out, Tensor inp, int p0, int p1, int p2, int "
+      "p3, "
+      "int rank, int cap, Tensor(b!) counter) -> ()");
+  m.def(
+      "dcp_compact_topk(Tensor(a!) local_topk, Tensor(b!) local_cnt, "
+      "Tensor topk, Tensor positions, Tensor valid, int ratio, int shard) -> ()");
+  m.def(
+      "attn_dcp_comp(Tensor(a!) oml_send, Tensor q_all, Tensor cache, "
+      "Tensor table, Tensor rows, Tensor positions, Tensor valid, "
+      "Tensor local_topk, Tensor local_cnt, float scale, int block, "
+      "int ratio) -> ()");
+  m.def(
+      "attn_dcp_win_combine(Tensor(a!) out, Tensor q_local, Tensor values, "
+      "Tensor wcache, Tensor wtable, Tensor rows, Tensor bases, "
+      "Tensor positions, Tensor valid, Tensor oml_recv, Tensor sink, "
+      "float scale, int wblock, int window, bool paged_fused, "
+      "Tensor? rope) -> ()");
+  m.def(
       "hc_mix(Tensor residual, Tensor fn, Tensor scale, Tensor base, "
       "Tensor(a!) pre_o, "
       "Tensor(b!) post_o, Tensor(c!) comb_o, Tensor(d!) ws, Tensor(e!) ticket, "
@@ -5721,11 +6677,11 @@ TORCH_LIBRARY(v41sk, m) {
       "Tensor table, "
       "Tensor positions, Tensor qsl, int num_reqs, int ratio, int ctas, int "
       "shard, "
-      "int nshard) -> ()");
+      "int nshard, bool kv_sharded=False) -> ()");
   m.def(
       "index_scores_prefill_shard(Tensor(a!) out, Tensor q, Tensor w, "
       "Tensor cache, Tensor table, Tensor positions, int ratio, int shard, "
-      "int nshard) -> ()");
+      "int nshard, bool kv_sharded=False) -> ()");
   m.def(
       "hc_expand_norm(Tensor(a!) out, Tensor(b!) residual, Tensor y, "
       "Tensor post, Tensor comb, Tensor cpre, Tensor norm_weight, "
@@ -5739,7 +6695,8 @@ TORCH_LIBRARY(v41sk, m) {
       "w_scales, Tensor embed, Tensor local_logits, Tensor anchors, "
       "Tensor(b!) ws_val, Tensor(c!) ws_idx, Tensor(d!) prev_tok, "
       "Tensor(e!) state_ctrl, int p0, int p1, int p2, int p3, int rank, "
-      "int cap, int vocab_start, int steps) -> ()");
+      "int cap, int vocab_start, int steps, Tensor? c_keys=None, "
+      "Tensor? c_pos=None, Tensor? c_temps=None, float draft_scale=0.5) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(v41sk, CUDA, m) {
@@ -5761,6 +6718,10 @@ TORCH_LIBRARY_IMPL(v41sk, CUDA, m) {
   m.impl("moe_w2_route", &v41sk::moe_w2_route);
   m.impl("moe_w13_units", &v41sk::moe_w13_units);
   m.impl("ll_allgather", &v41sk::ll_allgather);
+  m.impl("ll_alltoall", &v41sk::ll_alltoall);
+  m.impl("dcp_compact_topk", &v41sk::dcp_compact_topk);
+  m.impl("attn_dcp_comp", &v41sk::attn_dcp_comp);
+  m.impl("attn_dcp_win_combine", &v41sk::attn_dcp_win_combine);
   m.impl("hc_mix", &v41sk::hc_mix);
   m.impl("index_scores", &v41sk::index_scores);
   m.impl("index_scores_shard", &v41sk::index_scores_shard);
