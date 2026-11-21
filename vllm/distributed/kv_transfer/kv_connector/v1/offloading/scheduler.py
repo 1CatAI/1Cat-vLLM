@@ -695,6 +695,11 @@ class OffloadingConnectorScheduler:
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
 
+        # After async preemption the worker can finish the store before the
+        # scheduler has consumed its completion. Defer re-admission until then.
+        if req_status.transfer_jobs:
+            return None, False
+
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
 
