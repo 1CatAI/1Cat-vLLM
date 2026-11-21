@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 KEEP = 128
 _CANDIDATE_TOPK_KEEP = 128
-_MAX_BOUNDED_ROWS = 64
+_MAX_BOUNDED_ROWS = 40  # cap to the fp8_qpn8_gemm_sm70_out kernel limit (M in [1, 40]); 64 overflowed it
 
 
 @triton.jit
