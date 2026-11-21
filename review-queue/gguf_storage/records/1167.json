@@ -1,0 +1,198 @@
+{
+  "initial_inventory": {
+    "number": 1167,
+    "title": "[Core] Bound GGUF weight storage and host KV state on SM70",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1167",
+    "isDraft": true,
+    "headRefOid": "403a76e9ad09fd0466b698e9a7b24f01a1a3f26b",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1167,
+    "title": "[Core] Bound GGUF weight storage and host KV state on SM70",
+    "body": "## Purpose\n\nFit Flash-Next GGUF with TP4 and MTP4 on 16 GiB SM70 devices while keeping the model weights on device and attention history in host memory. The compact profile removes duplicate expert representations, bounds conversion scratch and separates recurrent state capacity from the logical 256K attention history.\n\n- Retain original GGUF expert blocks in a single device arena, including TP slices that cross quantization blocks. Use bounded conversion for larger batches.\n- Share compressed embedding/head storage and keep HC weights sharded. Encode the approved FP16 MTP expert values losslessly instead of retaining the full dense expert banks.\n- Place host KV banks in one pinned allocation per worker; bound device hot rows, miss staging and indexer score tiles. Preserve speculative rollback and existing attention arithmetic groups.\n- Bound engine-owned TurboMind split-K scratch and reject cached plans that exceed its capacity. Report CUDA allocation errors at the allocation site and expose scratch usage in the worker memory report.\n- Provide a source launcher with prefix caching, tool parsing, TP4/MTP4, disk-backed PLE and bounded row caching. Preserve the normal native extension build and resource ABI.\n\n## Test Plan\n\nCompare native projections and MoE against FP32 dequantization, compare lossless MTP storage against the existing FP16 values, and exercise changed-input CUDA graph replay. Verify full host-cache geometry, bounded staging and score tiles. Then validate full-model startup, output, prefix reuse, tool calls, long-context capacity and matched C1/C4 measurements.\n\n## Test Result\n\n- Real four-rank MTP expert chains at M1/M4/M5/M20: output and changed-input graphs bitwise identical; expert storage reduced by 225 MiB per rank.\n- Original expert prefill, compact head, row-major router and host indexer operator checks passed. TP block-boundary and guarded arena views passed.\n- Complete 256K pinned-history allocation: four ranks passed changed-input graph checks; protected process memory peaked at 18.7 GiB without swap.\n- Eight-row attention staging retained bitwise M5/M20 output; bounded 256K indexer tiles retained identical selected indices.\n- Q4_K/Q6_K/IQ4_XS at M1/M5/M20/M512 with 32 MiB and 8 MiB scratch: FP32 relative L2 below 2.4e-4; changed-input graphs matched eager. Imported control plans respected the smaller capacity. Two-stream scratch decreased from 68 MiB to 20 MiB. Larger prefill candidates can be slower under the compact capacity bound.\n- Maximum dense segment scratch shapes passed restored-storage comparisons and changed-input graphs at M5/M20/M32/M10/M512; 4 GPU tests passed. Fixed segment scratch decreased by 34.5 MiB per device. The single-request launcher captures M5 and retains larger prefill fallbacks.\n- Fused side-projection workspace remains FP32 when model loading sets the default dtype to FP16. Six formats passed shared-bank and changed-input M5/M20 graph checks under both defaults; 12 GPU tests passed.\n- Reject fused side-projection combinations unsupported by the native reader before packing. All 12 real attention layers were checked; the three-format layer retains the existing fallback. Side-projection tests, including real TP4 QKV shapes and both default dtypes: 45 passed.\n- HC shard fallback rank reorder is graph safe: identity order retains the input; other orders concatenate device views. Full packed HC fallback at M5/M20/M512 passed bitwise output and changed-input graph checks for both orders; 7 GPU tests passed.\n- Target/draft graph transition releases unused eager warmup allocations before creating the separate draft pool. Two GPU tests at M5/M20 retained stable target addresses and bitwise changed-input output. In the full-model run this cleanup released zero bytes; its isolated saving did not improve full-model capacity.\n- Serial target and Eagle graph routines share the capture stream while retaining separate target/draft pools. Four M5/M20 GPU tests passed; four native graph streams versus one saved 30 MiB of stream scratch, including an unchanged tuning stream. Four-rank M5/M20 shared-stream graph/all-reduce replay matched integer-valued references bitwise.\n- Prepared single/mixed projections borrow their native engine owner during sampling outside model forward. Six affine/LUT/lattice GPU cases passed M1/M5/M20 graphs and fullgraph compilation. A real Q6_K head (62080 by 2560) retained an 8 MiB scratch budget, left process-default storage unchanged, and passed changed-input graphs bitwise; FP32 relative L2 error was 0.0334–0.0347%.\n- Native resource/cache CPU tests: 8 passed; native workspace GPU tests: 3 passed.\n\nFull-model serving and C1/C4 results on 16 GiB devices remain pending. The historical 15.53 ms/round result on 32 GiB devices is a reference, not a measurement of this profile.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1167",
+    "isDraft": true,
+    "headRefName": "agent/v100-gguf-16gb-256k-20261010-161458",
+    "headRefOid": "403a76e9ad09fd0466b698e9a7b24f01a1a3f26b",
+    "baseRefName": "main",
+    "baseRefOid": "8d4fd9401ce0fd713821be0f045dc1f1f718b57b",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1167,
+    "id": "PR_kwDORjYFXs8AAAABHuEg2g",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "403a76e9ad09fd0466b698e9a7b24f01a1a3f26b",
+    "title": "[Core] Bound GGUF weight storage and host KV state on SM70",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1167",
+    "body": "## Purpose\n\nFit Flash-Next GGUF with TP4 and MTP4 on 16 GiB SM70 devices while keeping the model weights on device and attention history in host memory. The compact profile removes duplicate expert representations, bounds conversion scratch and separates recurrent state capacity from the logical 256K attention history.\n\n- Retain original GGUF expert blocks in a single device arena, including TP slices that cross quantization blocks. Use bounded conversion for larger batches.\n- Share compressed embedding/head storage and keep HC weights sharded. Encode the approved FP16 MTP expert values losslessly instead of retaining the full dense expert banks.\n- Place host KV banks in one pinned allocation per worker; bound device hot rows, miss staging and indexer score tiles. Preserve speculative rollback and existing attention arithmetic groups.\n- Bound engine-owned TurboMind split-K scratch and reject cached plans that exceed its capacity. Report CUDA allocation errors at the allocation site and expose scratch usage in the worker memory report.\n- Provide a source launcher with prefix caching, tool parsing, TP4/MTP4, disk-backed PLE and bounded row caching. Preserve the normal native extension build and resource ABI.\n\n## Test Plan\n\nCompare native projections and MoE against FP32 dequantization, compare lossless MTP storage against the existing FP16 values, and exercise changed-input CUDA graph replay. Verify full host-cache geometry, bounded staging and score tiles. Then validate full-model startup, output, prefix reuse, tool calls, long-context capacity and matched C1/C4 measurements.\n\n## Test Result\n\n- Real four-rank MTP expert chains at M1/M4/M5/M20: output and changed-input graphs bitwise identical; expert storage reduced by 225 MiB per rank.\n- Original expert prefill, compact head, row-major router and host indexer operator checks passed. TP block-boundary and guarded arena views passed.\n- Complete 256K pinned-history allocation: four ranks passed changed-input graph checks; protected process memory peaked at 18.7 GiB without swap.\n- Eight-row attention staging retained bitwise M5/M20 output; bounded 256K indexer tiles retained identical selected indices.\n- Q4_K/Q6_K/IQ4_XS at M1/M5/M20/M512 with 32 MiB and 8 MiB scratch: FP32 relative L2 below 2.4e-4; changed-input graphs matched eager. Imported control plans respected the smaller capacity. Two-stream scratch decreased from 68 MiB to 20 MiB. Larger prefill candidates can be slower under the compact capacity bound.\n- Maximum dense segment scratch shapes passed restored-storage comparisons and changed-input graphs at M5/M20/M32/M10/M512; 4 GPU tests passed. Fixed segment scratch decreased by 34.5 MiB per device. The single-request launcher captures M5 and retains larger prefill fallbacks.\n- Fused side-projection workspace remains FP32 when model loading sets the default dtype to FP16. Six formats passed shared-bank and changed-input M5/M20 graph checks under both defaults; 12 GPU tests passed.\n- Reject fused side-projection combinations unsupported by the native reader before packing. All 12 real attention layers were checked; the three-format layer retains the existing fallback. Side-projection tests, including real TP4 QKV shapes and both default dtypes: 45 passed.\n- HC shard fallback rank reorder is graph safe: identity order retains the input; other orders concatenate device views. Full packed HC fallback at M5/M20/M512 passed bitwise output and changed-input graph checks for both orders; 7 GPU tests passed.\n- Target/draft graph transition releases unused eager warmup allocations before creating the separate draft pool. Two GPU tests at M5/M20 retained stable target addresses and bitwise changed-input output. In the full-model run this cleanup released zero bytes; its isolated saving did not improve full-model capacity.\n- Serial target and Eagle graph routines share the capture stream while retaining separate target/draft pools. Four M5/M20 GPU tests passed; four native graph streams versus one saved 30 MiB of stream scratch, including an unchanged tuning stream. Four-rank M5/M20 shared-stream graph/all-reduce replay matched integer-valued references bitwise.\n- Prepared single/mixed projections borrow their native engine owner during sampling outside model forward. Six affine/LUT/lattice GPU cases passed M1/M5/M20 graphs and fullgraph compilation. A real Q6_K head (62080 by 2560) retained an 8 MiB scratch budget, left process-default storage unchanged, and passed changed-input graphs bitwise; FP32 relative L2 error was 0.0334–0.0347%.\n- Native resource/cache CPU tests: 8 passed; native workspace GPU tests: 3 passed.\n\nFull-model serving and C1/C4 results on 16 GiB devices remain pending. The historical 15.53 ms/round result on 32 GiB devices is a reference, not a measurement of this profile.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "agent/v100-gguf-16gb-256k-20261010-161458",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1167,
+    "title": "[Core] Bound GGUF weight storage and host KV state on SM70",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1167",
+    "isDraft": true,
+    "headRefOid": "403a76e9ad09fd0466b698e9a7b24f01a1a3f26b",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "csrc/ops.h",
+      "csrc/ple_disk_rows.cpp",
+      "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/gemm.cu",
+      "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/tuner/cache_utils.cu",
+      "csrc/sm70_turbomind/ops/gemm_runtime.cpp",
+      "csrc/sm70_turbomind/ops/gguf_dp4a.cuh",
+      "csrc/sm70_turbomind/ops/gguf_dp4a_sm70.cu",
+      "csrc/sm70_turbomind/ops/hcx_sm70.cu",
+      "csrc/sm70_turbomind/ops/mtp_moe_fp16_sm70.cu",
+      "csrc/sm70_turbomind/ops/qwen38_gdn_input_batch_sm70.cu",
+      "csrc/torch_bindings.cpp",
+      "docs/design/architecture/runtime_reference.md",
+      "docs/design/flashnext_16gb_host_kv.md",
+      "examples/deployment/sm70_flashnext_gguf/constraints-cu128.txt",
+      "examples/deployment/sm70_flashnext_gguf/serve-16gb-256k.sh",
+      "tests/config/test_sm70_loaded_routes.py",
+      "tests/config/test_sm70_native_runtime.py",
+      "tests/config/test_unused_kernel_policy_hash.py",
+      "tests/distributed/test_ep_communicator_admission.py",
+      "tests/kernels/moe/test_sm70_mtp_lossless.py",
+      "tests/kernels/ple/test_gguf_rows.py",
+      "tests/kernels/quantization/test_gguf_compact_storage.py",
+      "tests/kernels/quantization/test_gguf_dp4a.py",
+      "tests/kernels/quantization/test_gguf_expert_arena.py",
+      "tests/kernels/quantization/test_gguf_guarded_storage.py",
+      "tests/kernels/quantization/test_gguf_lm_head_dispatch.py",
+      "tests/kernels/quantization/test_gguf_original_prefill.py",
+      "tests/kernels/quantization/test_gguf_original_reduce.py",
+      "tests/kernels/quantization/test_gguf_projection_native_owner.py",
+      "tests/kernels/quantization/test_sm70_dmv13_side.py",
+      "tests/kernels/quantization/test_sm70_gemm_workspace.py",
+      "tests/kernels/test_ple_disk_rows.py",
+      "tests/kernels/test_sm70_hc_sharded_fallback.py",
+      "tests/model_executor/test_fla_context_free_import.py",
+      "tests/models/gguf/test_dense_linear_loading.py",
+      "tests/models/qwen4_exp/test_compact_initialization.py",
+      "tests/models/qwen4_exp/test_dmv13_dense_side_weights.py",
+      "tests/models/qwen4_exp/test_host_indexer_history.py",
+      "tests/models/qwen4_exp/test_host_kv.py",
+      "tests/models/qwen4_exp/test_mtp_lossless_experts.py",
+      "tests/models/qwen4_exp/test_qsa_cache.py",
+      "tests/models/qwen4_exp/test_qsa_indexer_request_split.py",
+      "tests/models/qwen4_exp/test_sm70_hc_storage_lifetime.py",
+      "tests/models/qwen4_exp/test_sm70_hcx_dispatch.py",
+      "tests/models/qwen4_exp/test_sm70_router_storage.py",
+      "tests/v1/core/test_qwen4_exp_kv_cache.py",
+      "tests/v1/worker/test_gpu_worker_memory_profile.py",
+      "tests/v1/worker/test_host_kv_cache_pool.py",
+      "tests/v1/worker/test_shared_graph_capture_stream.py",
+      "tests/v1/worker/test_target_draft_graph_allocator.py",
+      "tools/pre_commit/layering_baseline.json",
+      "vllm/_sm70/runtime.py",
+      "vllm/config/kernel.py",
+      "vllm/distributed/parallel_state.py",
+      "vllm/model_executor/kernels/gguf.py",
+      "vllm/model_executor/kernels/ple/disk_rows.py",
+      "vllm/model_executor/layers/fla/ops/gdn_chunk_kernels.py",
+      "vllm/model_executor/layers/fla/ops/sm70/gdn_decode.py",
+      "vllm/model_executor/layers/fla/ops/utils.py",
+      "vllm/model_executor/layers/fused_moe/layer.py",
+      "vllm/model_executor/layers/fused_moe/runner/shared_experts.py",
+      "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+      "vllm/model_executor/layers/ple_offload_layer.py",
+      "vllm/model_executor/layers/quantization/gguf.py",
+      "vllm/model_executor/layers/quantization/gguf_dense_hmma.py",
+      "vllm/model_executor/layers/quantization/gguf_expert_storage.py",
+      "vllm/model_executor/layers/quantization/gguf_moe.py",
+      "vllm/model_executor/layers/quantization/gguf_native.py",
+      "vllm/model_executor/layers/quantization/gguf_turbomind.py",
+      "vllm/model_executor/layers/quantization/sm70_dmv13_projection.py",
+      "vllm/model_executor/model_loader/gguf_adapters/qwen35_moe.py",
+      "vllm/model_executor/model_loader/gguf_loader.py",
+      "vllm/model_executor/models/qwen2_moe.py",
+      "vllm/model_executor/models/qwen3_next.py",
+      "vllm/models/qwen4_exp/common/qsa_cache.py",
+      "vllm/models/qwen4_exp/nvidia/gguf_embedding.py",
+      "vllm/models/qwen4_exp/nvidia/hyperconnection.py",
+      "vllm/models/qwen4_exp/nvidia/model.py",
+      "vllm/models/qwen4_exp/nvidia/mtp.py",
+      "vllm/models/qwen4_exp/nvidia/mtp_lossless_experts.py",
+      "vllm/models/qwen4_exp/nvidia/ops/host_kv_attention.py",
+      "vllm/models/qwen4_exp/nvidia/ops/qsa.py",
+      "vllm/models/qwen4_exp/nvidia/ple_layer.py",
+      "vllm/models/qwen4_exp/nvidia/qsa.py",
+      "vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py",
+      "vllm/models/qwen4_exp/nvidia/sm70_fp16_hc.py",
+      "vllm/models/qwen4_exp/nvidia/sm70_hcx.py",
+      "vllm/sm70_profiles/acceleration.py",
+      "vllm/transformers_utils/gguf_rows.py",
+      "vllm/utils/mem_utils.py",
+      "vllm/v1/core/block_pool.py",
+      "vllm/v1/core/kv_cache_coordinator.py",
+      "vllm/v1/core/kv_cache_utils.py",
+      "vllm/v1/core/single_type_kv_cache_manager.py",
+      "vllm/v1/kv_cache_interface.py",
+      "vllm/v1/ple_offload/worker.py",
+      "vllm/v1/worker/gpu/attn_utils.py",
+      "vllm/v1/worker/gpu/cudagraph_utils.py",
+      "vllm/v1/worker/gpu/model_runner.py",
+      "vllm/v1/worker/gpu/spec_decode/eagle/speculator.py",
+      "vllm/v1/worker/gpu_model_runner.py",
+      "vllm/v1/worker/gpu_worker.py",
+      "vllm/v1/worker/utils.py",
+      "vllm/vllm_flash_attn/flash_attn_interface.py"
+    ],
+    "diff_bytes": 395434,
+    "diff_sha256": "b13b1370771eedc3db471a75a03b1f0cae67a7441da104be07cb4dc49eafd194"
+  },
+  "full_tree_diff_proof": null
+}
