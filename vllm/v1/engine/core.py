@@ -830,13 +830,16 @@ class EngineCore:
             and scheduler_output.total_num_scheduled_tokens > 0
         ):
             # Apply only this step's proposals, after its sampled tokens. A later
-            # in-flight step must not replace or delay these proposals.
+            # in-flight step must not replace or delay these proposals. That
+            # later step may be the request's final prompt chunk: pass this
+            # step's output so drafts proposed from an intermediate chunk are
+            # dropped instead of being scheduled without the prompt's token.
             draft_token_ids = model_output.draft_token_ids
             if draft_token_ids is None:
                 raise RuntimeError(
                     "PP synchronous speculative decoding: missing step drafts"
                 )
-            self.scheduler.update_draft_token_ids(draft_token_ids)
+            self.scheduler.update_draft_token_ids(draft_token_ids, scheduler_output)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
