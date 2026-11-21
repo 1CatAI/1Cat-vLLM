@@ -722,6 +722,7 @@ class Qwen3_5Model(Qwen3NextModel):
                 quant_config
                 if quant_config is not None
                 and quant_config.get_name() == "gguf"
+                and vllm_config.kernel_config.sm70_gguf.embedding_storage == "original"
                 and not config.tie_word_embeddings
                 else None
             ),
