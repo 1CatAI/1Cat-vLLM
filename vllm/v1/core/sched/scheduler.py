@@ -322,6 +322,7 @@ class Scheduler(SchedulerInterface):
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        self.pp_size = self.parallel_config.pipeline_parallel_size
         # VLLM_V41_PP_MICRO: PP micro-batches. With two or more decoding
         # requests, a request is never scheduled while one of its steps is in
         # flight and a step takes at most ceil(decoders / pp_size) of them, so
@@ -2065,6 +2066,18 @@ class Scheduler(SchedulerInterface):
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
+            if self.use_v2_model_runner and not request.is_prefill_chunk:
+                # Model Runner V2 under pipeline parallelism: the stages before
+                # the last get this step's sampled tokens, accepted count and
+                # next drafts through PPHandler's slot ring (pp_utils.py) at the
+                # start of the pp_size-th execute_model call after this one (one
+                # call per scheduling step, empty steps included). The request
+                # must not run again before that, or its first stage embeds what
+                # its request-state row held before. The batch queue alone spaces
+                # a lone request's first decode step only two calls after its
+                # prompt's step (R E R E E R ...): on time for two stages, one
+                # call early for three. AsyncScheduler sets the same bound.
+                request.next_decode_eligible_step = self.current_step + self.pp_size
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
