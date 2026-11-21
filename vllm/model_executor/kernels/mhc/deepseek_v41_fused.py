@@ -487,6 +487,42 @@ def hc_transition(
             hc_eps,
             iters,
         )
+    if (
+        tokens > 0
+        and residual.is_cuda
+        and (y.dtype == torch.float16 or y.dtype == torch.float32)
+        and (norm_weight.dtype == torch.float16 or norm_weight.dtype == torch.float32)
+        and (not mix or (fn.dtype == torch.float32 and fn.is_contiguous()))
+    ):
+        from vllm.models.deepseek_v41.native import load_v41sk
+
+        load_v41sk()
+        res_sq = (
+            torch.empty(tokens, dtype=torch.float32, device=device) if mix else None
+        )
+        out = torch.empty(tokens, H, dtype=torch.float16, device=device)
+        torch.ops.v41sk.hc_expand_norm(
+            out,
+            residual,
+            y,
+            post.contiguous(),
+            comb.contiguous(),
+            collapse_pre.contiguous(),
+            norm_weight.contiguous(),
+            norm_eps,
+            res_sq,
+        )
+        if not mix:
+            return out, None
+        dots_g = torch.mm(residual.view(tokens, 4 * H), fn.view(24, 4 * H).t())
+        pre = torch.empty(tokens, 4, dtype=torch.float32, device=device)
+        post_n = torch.empty_like(pre)
+        comb_n = torch.empty(tokens, 4, 4, dtype=torch.float32, device=device)
+        torch.ops.v41sk.hc_sinkhorn_from_dots(
+            dots_g, res_sq, scale, base, pre, post_n, comb_n, norm_eps, hc_eps, iters
+        )
+        return out, (pre, post_n, comb_n)
+
     # Per-token kernels: process bounded windows so the FP32 collapse buffer
     # does not scale with the prefill chunk.
     window = min(tokens, _WINDOW)
@@ -841,21 +877,38 @@ def _hc_transition_side(
 
     load_v41sk()
     hc_join()  # post / comb / collapse_pre may come from the previous side mix
-    out, _ = _hc_transition3(
-        residual,
-        y,
-        post,
-        comb,
-        collapse_pre,
-        norm_weight,
-        None,
-        None,
-        None,
-        norm_eps,
-        hc_eps,
-        iters,
-    )
     tokens, device = residual.shape[0], residual.device
+    use_gemm_side = tokens >= 30
+    if use_gemm_side:
+        res_sq = torch.empty(tokens, dtype=torch.float32, device=device)
+        out = torch.empty(tokens, H, dtype=torch.float16, device=device)
+        torch.ops.v41sk.hc_expand_norm(
+            out,
+            residual,
+            y,
+            post.contiguous(),
+            comb.contiguous(),
+            collapse_pre.contiguous(),
+            norm_weight.contiguous(),
+            norm_eps,
+            res_sq,
+        )
+    else:
+        res_sq = None
+        out, _ = _hc_transition3(
+            residual,
+            y,
+            post,
+            comb,
+            collapse_pre,
+            norm_weight,
+            None,
+            None,
+            None,
+            norm_eps,
+            hc_eps,
+            iters,
+        )
     main = torch.cuda.current_stream(device)
     key = (device, main.cuda_stream)
     state = _HC_STREAMS.get(key)
@@ -868,30 +921,51 @@ def _hc_transition_side(
     pre = torch.empty(tokens, 4, dtype=torch.float32, device=device)
     post_n = torch.empty_like(pre)
     comb_n = torch.empty(tokens, 4, 4, dtype=torch.float32, device=device)
-    ws = torch.empty(80 * tokens * 25, dtype=torch.float32, device=device)
+    ws = (
+        None
+        if use_gemm_side
+        else torch.empty(80 * tokens * 25, dtype=torch.float32, device=device)
+    )
 
     def launch():
         side.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(side):
-            torch.ops.v41sk.hc_mix(
-                residual,
-                fn,
-                scale,
-                base,
-                pre,
-                post_n,
-                comb_n,
-                ws,
-                ticket,
-                norm_eps,
-                hc_eps,
-                iters,
-            )
+            if use_gemm_side:
+                dots = torch.mm(residual.view(tokens, 4 * H), fn.t())
+                torch.ops.v41sk.hc_sinkhorn_from_dots(
+                    dots,
+                    res_sq,
+                    scale,
+                    base,
+                    pre,
+                    post_n,
+                    comb_n,
+                    norm_eps,
+                    hc_eps,
+                    iters,
+                )
+                keep = (dots, res_sq)
+            else:
+                torch.ops.v41sk.hc_mix(
+                    residual,
+                    fn,
+                    scale,
+                    base,
+                    pre,
+                    post_n,
+                    comb_n,
+                    ws,
+                    ticket,
+                    norm_eps,
+                    hc_eps,
+                    iters,
+                )
+                keep = ws
             event = torch.cuda.Event()
             event.record(side)
         # Held until the join: no main-stream reuse of these before the side
         # kernel is done (the join orders main after it).
-        _HC_PENDING.append((event, ws))
+        _HC_PENDING.append((event, keep))
 
     # Deferred to the next hc_kick (or hc_join); the residual is not written
     # again before the join, so a later start reads the same values.

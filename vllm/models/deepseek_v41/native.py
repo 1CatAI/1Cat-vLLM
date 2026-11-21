@@ -231,8 +231,39 @@ def gate_route(gate, x, top_k, scale):
 # TP4 one-shot push all-reduce (v41sk.ll_allreduce) for small FP16/FP32
 # payloads: no barriers, the receive slots carry a sentinel. Default off.
 _LL_AR = envs.VLLM_V41_LL_AR == "1"
-_LL_CAP = 1024 * 1024
+_LL_CAP = int(envs.VLLM_V41_LL_CAP)
 _LL_STATE: list = []
+_LL_MARKOV_CAP = 4096
+_LL_MARKOV_STATE: list = []
+
+
+def _ll_markov_state():
+    """Dedicated 4 KiB/slot TP4 NVLink buffer for 5-step fused Markov."""
+    if not _LL_MARKOV_STATE:
+        import torch.distributed as dist
+
+        from vllm import _custom_ops as ops
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        if group.world_size != 4:
+            _LL_MARKOV_STATE.append(None)
+            return None
+        load_v41sk()
+        size = 2 * 4 * _LL_MARKOV_CAP
+        pointer, handle = ops.allocate_shared_buffer_and_handle(size)
+        torch.ops.v41sk.ll_arm(pointer, size)
+        torch.accelerator.synchronize()
+        handles = [None] * 4
+        dist.all_gather_object(handles, handle, group=group.cpu_group)
+        rank = group.rank_in_group
+        ptrs = [
+            pointer if i == rank else ops.open_mem_handle(h)
+            for i, h in enumerate(handles)
+        ]
+        dist.barrier(group.cpu_group)
+        _LL_MARKOV_STATE.append((ptrs, rank, _LL_MARKOV_CAP))
+    return _LL_MARKOV_STATE[0]
 
 
 def _ll_state():

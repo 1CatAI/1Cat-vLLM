@@ -879,6 +879,27 @@ def _encode_messages_text(
     return prompt
 
 
+def _normalize_developer_role(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Map OpenAI's "developer" role onto "system" (identical semantics).
+
+    Without this the role reaches render_message and raises NotImplementedError,
+    or is silently dropped by _drop_thinking_messages before rendering.
+    """
+    if not any(
+        isinstance(msg, dict) and msg.get("role") == "developer" for msg in messages
+    ):
+        return messages
+    normalized: List[Dict[str, Any]] = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "developer":
+            msg = copy.copy(msg)
+            msg["role"] = "system"
+        normalized.append(msg)
+    return normalized
+
+
 def encode_messages(
     messages: List[Dict[str, Any]],
     thinking_mode: str,
@@ -893,8 +914,14 @@ def encode_messages(
     Text-only calls return the prompt string. When return_multi_modal_data is
     true, the result is ``(prompt, media_data)``.
     """
+    # OpenAI's newer "developer" role is a drop-in replacement for "system".
+    # Normalize first so it is neither rejected at render time (HTTP 501) nor
+    # silently dropped when it precedes the last user message.
+    context = _normalize_developer_role(context or [])
+    messages = _normalize_developer_role(messages)
+
     # Validate before merging can discard message-level textual fields.
-    for msg in (context or []) + messages:
+    for msg in context + messages:
         _validate_no_image_sp_tokens(msg)
 
     # Collect images only after tool results are in their final prompt order.

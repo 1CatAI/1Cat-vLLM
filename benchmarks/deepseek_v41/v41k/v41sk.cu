@@ -4394,6 +4394,151 @@ __global__ void __launch_bounds__(256)
   }
 }
 
+template <int EPL>
+__global__ void __launch_bounds__(256)
+    route_topk_parallel_kernel(const float* __restrict__ logits,
+                               const float* __restrict__ bias,
+                               float* __restrict__ probs,
+                               int* __restrict__ ids, int T, int K,
+                               float scale) {
+  constexpr int E = EPL * 32;
+  __shared__ float sh_score[8][E];
+  __shared__ unsigned sh_key[8][E];
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int t = blockIdx.x * 8 + warp;
+  if (t >= T) return;
+  const unsigned full = 0xffffffffu;
+  float* sc = sh_score[warp];
+  unsigned* ky = sh_key[warp];
+#pragma unroll
+  for (int i = 0; i < EPL; ++i) {
+    const int e = lane + 32 * i;
+    sc[e] = logits[(size_t)t * E + e];
+    ky[e] = __float_as_uint(bias[e]);
+  }
+#pragma unroll 1
+  for (int i = 0; i < EPL; ++i) {
+    const int e = lane + 32 * i;
+    const float score = route_score(sc[e]);
+    sc[e] = score;
+    unsigned key = __float_as_uint(score + __uint_as_float(ky[e]));
+    ky[e] = (key & 0x80000000u) ? ~key : (key | 0x80000000u);
+  }
+  __syncwarp();
+  float my_v = 0.0f;
+  int my_e = 0;
+#pragma unroll 1
+  for (int j = 0; j < K; ++j) {
+    unsigned long long best = 0ull;
+#pragma unroll 4
+    for (int i = 0; i < EPL; ++i) {
+      const unsigned u = ky[lane + 32 * i];
+      const unsigned long long packed =
+          ((unsigned long long)u << 32) | (0xffffffffu - (lane + 32 * i));
+      best = packed > best ? packed : best;
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+      const unsigned long long other = __shfl_xor_sync(full, best, o);
+      best = other > best ? other : best;
+    }
+    const int best_e =
+        (int)(0xffffffffu - (unsigned int)(best & 0xffffffffu));
+    if (lane == j) {
+      my_v = sc[best_e];
+      my_e = best_e;
+    }
+    if (lane == (best_e & 31)) ky[best_e] = 0x007fffffu;
+    __syncwarp();
+  }
+  float total = my_v + __shfl_xor_sync(full, my_v, 4);
+  total += __shfl_xor_sync(full, total, 2);
+  total += __shfl_xor_sync(full, total, 1);
+  const float denom = __shfl_sync(full, total, 0) + 1e-20f;
+  if (lane < K) {
+    probs[t * K + lane] = rp_div(my_v, denom) * scale;
+    ids[t * K + lane] = my_e;
+  }
+}
+
+template <int EPL>
+__global__ void __launch_bounds__(256)
+    route_plan_scatter_kernel(const int* __restrict__ ids,
+                              int* __restrict__ perm,
+                              int* __restrict__ experts,
+                              int* __restrict__ offsets, int S) {
+  constexpr int E = EPL * 32;
+  __shared__ int slot_ids[RPW_MAX];
+  __shared__ int cnt[E], start[E], cur[E], gid[E];
+  __shared__ int groups_total;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  const unsigned full = 0xffffffffu;
+  for (int e = tid; e < E; e += 256) cnt[e] = 0;
+  __syncthreads();
+  for (int s = tid; s < S; s += 256) {
+    const int e = ids[s];
+    slot_ids[s] = e;
+    atomicAdd(&cnt[e], 1);
+  }
+  __syncthreads();
+  if (warp == 0) {
+    int run = 0, grun = 0;
+    for (int base = 0; base < E; base += 32) {
+      const int c = cnt[base + lane];
+      int inc = c, ginc = c > 0;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int a = __shfl_up_sync(full, inc, o),
+                  b = __shfl_up_sync(full, ginc, o);
+        if (lane >= o) {
+          inc += a;
+          ginc += b;
+        }
+      }
+      const int st = run + inc - c;
+      start[base + lane] = st;
+      cur[base + lane] = st;
+      gid[base + lane] = grun + ginc - (c > 0);
+      run += __shfl_sync(full, inc, 31);
+      grun += __shfl_sync(full, ginc, 31);
+    }
+    if (lane == 0) groups_total = grun;
+  }
+  __syncthreads();
+  // O(S) scatter into perm, then deterministic ascending sort per expert.
+  for (int s = tid; s < S; s += 256) {
+    const int e = slot_ids[s];
+    perm[atomicAdd(&cur[e], 1)] = s;
+  }
+  __syncthreads();
+  for (int e = tid; e < E; e += 256) {
+    const int c = cnt[e];
+    if (c > 1) {
+      int* p = perm + start[e];
+      for (int i = 1; i < c; ++i) {
+        const int key = p[i];
+        int j = i - 1;
+        while (j >= 0 && p[j] > key) {
+          p[j + 1] = p[j];
+          --j;
+        }
+        p[j + 1] = key;
+      }
+    }
+    if (c > 0) {
+      experts[gid[e]] = e;
+      offsets[gid[e]] = start[e];
+    }
+  }
+  const int groups = groups_total;
+  for (int j = tid; j <= S; j += 256) {
+    if (j >= groups && j < S) experts[j] = 0;
+    if (j >= groups) offsets[j] = S;
+  }
+}
+
 void route_plan_wide(torch::Tensor logits, torch::Tensor bias,
                      torch::Tensor probs, torch::Tensor ids, torch::Tensor perm,
                      torch::Tensor experts, torch::Tensor offsets,
@@ -4410,11 +4555,24 @@ void route_plan_wide(torch::Tensor logits, torch::Tensor bias,
               "route_plan_wide: T*K <= 640");
   const at::cuda::OptionalCUDAGuard guard(device_of(logits));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-#define V41SK_RPW(EPL)                                                    \
-  route_plan_wide_kernel<EPL><<<1, 256, 0, stream>>>(                     \
-      logits.data_ptr<float>(), bias.data_ptr<float>(),                   \
-      probs.data_ptr<float>(), ids.data_ptr<int>(), perm.data_ptr<int>(), \
-      experts.data_ptr<int>(), offsets.data_ptr<int>(), T, K, (float)scale)
+#define V41SK_RPW(EPL)                                                      \
+  do {                                                                      \
+    if (T >= 16) {                                                          \
+      route_topk_parallel_kernel<EPL><<<(T + 7) / 8, 256, 0, stream>>>(     \
+          logits.data_ptr<float>(), bias.data_ptr<float>(),                 \
+          probs.data_ptr<float>(), ids.data_ptr<int>(), T, K,               \
+          (float)scale);                                                    \
+      route_plan_scatter_kernel<EPL><<<1, 256, 0, stream>>>(                \
+          ids.data_ptr<int>(), perm.data_ptr<int>(),                        \
+          experts.data_ptr<int>(), offsets.data_ptr<int>(), T * K);         \
+    } else {                                                                \
+      route_plan_wide_kernel<EPL><<<1, 256, 0, stream>>>(                   \
+          logits.data_ptr<float>(), bias.data_ptr<float>(),                 \
+          probs.data_ptr<float>(), ids.data_ptr<int>(), perm.data_ptr<int>(),\
+          experts.data_ptr<int>(), offsets.data_ptr<int>(), T, K,           \
+          (float)scale);                                                    \
+    }                                                                       \
+  } while (0)
   if (E == 384)
     V41SK_RPW(12);
   else if (E == 256)
@@ -4426,6 +4584,1029 @@ void route_plan_wide(torch::Tensor logits, torch::Tensor bias,
 #undef V41SK_RPW
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// ---- Phase 3B-1: Single-launch register-resident hc_expand_norm ----
+// Replaces _transition_parts3 + _transition_finish3 (MIX=False) with 1 launch
+// and zero cbuf/csq HBM traffic. 1 CTA per token, 256 threads x 5 float4 = 5120.
+template <bool Y_FP16, bool W_FP16>
+__global__ void __launch_bounds__(256)
+    hc_expand_norm_kernel(half* __restrict__ out, float* __restrict__ residual,
+                          const void* __restrict__ y_ptr,
+                          const float* __restrict__ post,
+                          const float* __restrict__ comb,
+                          const float* __restrict__ cpre,
+                          const void* __restrict__ w_ptr,
+                          float* __restrict__ res_sq_out, float norm_eps) {
+  constexpr int H = 5120;
+  const int t = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  __shared__ float s_comb[16];
+  __shared__ float s_post[4];
+  __shared__ float s_cpre[4];
+  __shared__ float s_sq[8];
+  __shared__ float s_rsq[8];
+
+  if (tid < 16) s_comb[tid] = comb[t * 16 + tid];
+  else if (tid < 20) s_post[tid - 16] = post[t * 4 + (tid - 16)];
+  else if (tid < 24) s_cpre[tid - 20] = cpre[t * 4 + (tid - 20)];
+  __syncthreads();
+
+  const float p0 = s_post[0], p1 = s_post[1], p2 = s_post[2], p3 = s_post[3];
+  const float cp0 = s_cpre[0], cp1 = s_cpre[1], cp2 = s_cpre[2], cp3 = s_cpre[3];
+  float c00 = s_comb[0],  c01 = s_comb[4],  c02 = s_comb[8],  c03 = s_comb[12];
+  float c10 = s_comb[1],  c11 = s_comb[5],  c12 = s_comb[9],  c13 = s_comb[13];
+  float c20 = s_comb[2],  c21 = s_comb[6],  c22 = s_comb[10], c23 = s_comb[14];
+  float c30 = s_comb[3],  c31 = s_comb[7],  c32 = s_comb[11], c33 = s_comb[15];
+
+  float* rb = residual + (size_t)t * 4 * H;
+  float4 cv[5];
+  float sq = 0.0f;
+  float rsq = 0.0f;
+
+#pragma unroll
+  for (int k = 0; k < 5; ++k) {
+    const int col = tid * 4 + k * 1024;
+    float4 yv;
+    if constexpr (Y_FP16) {
+      const uint2 yh = *reinterpret_cast<const uint2*>(
+          reinterpret_cast<const half*>(y_ptr) + (size_t)t * H + col);
+      const half2* h2 = reinterpret_cast<const half2*>(&yh);
+      const float2 f0 = __half22float2(h2[0]);
+      const float2 f1 = __half22float2(h2[1]);
+      yv = make_float4(f0.x, f0.y, f1.x, f1.y);
+    } else {
+      yv = *reinterpret_cast<const float4*>(
+          reinterpret_cast<const float*>(y_ptr) + (size_t)t * H + col);
+    }
+    const float4 r0 = *reinterpret_cast<const float4*>(rb + 0 * H + col);
+    const float4 r1 = *reinterpret_cast<const float4*>(rb + 1 * H + col);
+    const float4 r2 = *reinterpret_cast<const float4*>(rb + 2 * H + col);
+    const float4 r3 = *reinterpret_cast<const float4*>(rb + 3 * H + col);
+
+    float4 n0 = make_float4(
+        c00 * r0.x + c01 * r1.x + c02 * r2.x + c03 * r3.x + p0 * yv.x,
+        c00 * r0.y + c01 * r1.y + c02 * r2.y + c03 * r3.y + p0 * yv.y,
+        c00 * r0.z + c01 * r1.z + c02 * r2.z + c03 * r3.z + p0 * yv.z,
+        c00 * r0.w + c01 * r1.w + c02 * r2.w + c03 * r3.w + p0 * yv.w);
+    float4 n1 = make_float4(
+        c10 * r0.x + c11 * r1.x + c12 * r2.x + c13 * r3.x + p1 * yv.x,
+        c10 * r0.y + c11 * r1.y + c12 * r2.y + c13 * r3.y + p1 * yv.y,
+        c10 * r0.z + c11 * r1.z + c12 * r2.z + c13 * r3.z + p1 * yv.z,
+        c10 * r0.w + c11 * r1.w + c12 * r2.w + c13 * r3.w + p1 * yv.w);
+    float4 n2 = make_float4(
+        c20 * r0.x + c21 * r1.x + c22 * r2.x + c23 * r3.x + p2 * yv.x,
+        c20 * r0.y + c21 * r1.y + c22 * r2.y + c23 * r3.y + p2 * yv.y,
+        c20 * r0.z + c21 * r1.z + c22 * r2.z + c23 * r3.z + p2 * yv.z,
+        c20 * r0.w + c21 * r1.w + c22 * r2.w + c23 * r3.w + p2 * yv.w);
+    float4 n3 = make_float4(
+        c30 * r0.x + c31 * r1.x + c32 * r2.x + c33 * r3.x + p3 * yv.x,
+        c30 * r0.y + c31 * r1.y + c32 * r2.y + c33 * r3.y + p3 * yv.y,
+        c30 * r0.z + c31 * r1.z + c32 * r2.z + c33 * r3.z + p3 * yv.z,
+        c30 * r0.w + c31 * r1.w + c32 * r2.w + c33 * r3.w + p3 * yv.w);
+
+    *reinterpret_cast<float4*>(rb + 0 * H + col) = n0;
+    *reinterpret_cast<float4*>(rb + 1 * H + col) = n1;
+    *reinterpret_cast<float4*>(rb + 2 * H + col) = n2;
+    *reinterpret_cast<float4*>(rb + 3 * H + col) = n3;
+
+    cv[k] = make_float4(
+        cp0 * n0.x + cp1 * n1.x + cp2 * n2.x + cp3 * n3.x,
+        cp0 * n0.y + cp1 * n1.y + cp2 * n2.y + cp3 * n3.y,
+        cp0 * n0.z + cp1 * n1.z + cp2 * n2.z + cp3 * n3.z,
+        cp0 * n0.w + cp1 * n1.w + cp2 * n2.w + cp3 * n3.w);
+    sq += cv[k].x * cv[k].x + cv[k].y * cv[k].y + cv[k].z * cv[k].z +
+          cv[k].w * cv[k].w;
+    if (res_sq_out != nullptr) {
+      rsq += n0.x * n0.x + n0.y * n0.y + n0.z * n0.z + n0.w * n0.w +
+             n1.x * n1.x + n1.y * n1.y + n1.z * n1.z + n1.w * n1.w +
+             n2.x * n2.x + n2.y * n2.y + n2.z * n2.z + n2.w * n2.w +
+             n3.x * n3.x + n3.y * n3.y + n3.z * n3.z + n3.w * n3.w;
+    }
+  }
+
+  sq = warp_sum(sq);
+  if (lane == 0) s_sq[warp] = sq;
+  if (res_sq_out != nullptr) {
+    rsq = warp_sum(rsq);
+    if (lane == 0) s_rsq[warp] = rsq;
+  }
+  __syncthreads();
+  float tot = 0.0f;
+  if (warp == 0) {
+    tot = (lane < 8) ? s_sq[lane] : 0.0f;
+    tot += __shfl_xor_sync(0xffffffffu, tot, 4);
+    tot += __shfl_xor_sync(0xffffffffu, tot, 2);
+    tot += __shfl_xor_sync(0xffffffffu, tot, 1);
+    if (lane == 0) s_sq[0] = rsqrtf(tot / (float)H + norm_eps);
+    if (res_sq_out != nullptr) {
+      float rtot = (lane < 8) ? s_rsq[lane] : 0.0f;
+      rtot += __shfl_xor_sync(0xffffffffu, rtot, 4);
+      rtot += __shfl_xor_sync(0xffffffffu, rtot, 2);
+      rtot += __shfl_xor_sync(0xffffffffu, rtot, 1);
+      if (lane == 0) res_sq_out[t] = rtot;
+    }
+  }
+  __syncthreads();
+  const float rs = s_sq[0];
+
+  half* ob = out + (size_t)t * H;
+#pragma unroll
+  for (int k = 0; k < 5; ++k) {
+    const int col = tid * 4 + k * 1024;
+    float4 wv;
+    if constexpr (W_FP16) {
+      const uint2 wh = *reinterpret_cast<const uint2*>(
+          reinterpret_cast<const half*>(w_ptr) + col);
+      const half2* h2 = reinterpret_cast<const half2*>(&wh);
+      const float2 f0 = __half22float2(h2[0]);
+      const float2 f1 = __half22float2(h2[1]);
+      wv = make_float4(f0.x, f0.y, f1.x, f1.y);
+    } else {
+      wv = *reinterpret_cast<const float4*>(
+          reinterpret_cast<const float*>(w_ptr) + col);
+    }
+    half2 o0 = __floats2half2_rn(cv[k].x * rs * wv.x, cv[k].y * rs * wv.y);
+    half2 o1 = __floats2half2_rn(cv[k].z * rs * wv.z, cv[k].w * rs * wv.w);
+    uint2 uo;
+    uo.x = *reinterpret_cast<const unsigned*>(&o0);
+    uo.y = *reinterpret_cast<const unsigned*>(&o1);
+    *reinterpret_cast<uint2*>(ob + col) = uo;
+  }
+}
+
+void hc_expand_norm(torch::Tensor out, torch::Tensor residual, torch::Tensor y,
+                    torch::Tensor post, torch::Tensor comb, torch::Tensor cpre,
+                    torch::Tensor norm_weight, double norm_eps,
+                    std::optional<torch::Tensor> res_sq) {
+  const int T = residual.size(0);
+  TORCH_CHECK(T >= 1 && residual.size(1) == 4 && residual.size(2) == 5120);
+  TORCH_CHECK(residual.scalar_type() == torch::kFloat32 &&
+              residual.is_contiguous() && y.is_contiguous() &&
+              out.scalar_type() == torch::kFloat16 && out.is_contiguous() &&
+              norm_weight.is_contiguous());
+  const bool y_fp16 = y.scalar_type() == torch::kFloat16;
+  const bool w_fp16 = norm_weight.scalar_type() == torch::kFloat16;
+  TORCH_CHECK(y_fp16 || y.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(w_fp16 || norm_weight.scalar_type() == torch::kFloat32);
+  const at::cuda::OptionalCUDAGuard guard(device_of(residual));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  half* op = reinterpret_cast<half*>(out.data_ptr<at::Half>());
+  float* rp = residual.data_ptr<float>();
+  const void* yp = y.data_ptr();
+  const void* wp = norm_weight.data_ptr();
+  float* rsqp = res_sq.has_value() ? res_sq->data_ptr<float>() : nullptr;
+  if (y_fp16 && w_fp16) {
+    hc_expand_norm_kernel<true, true><<<T, 256, 0, stream>>>(
+        op, rp, yp, post.data_ptr<float>(), comb.data_ptr<float>(),
+        cpre.data_ptr<float>(), wp, rsqp, (float)norm_eps);
+  } else if (y_fp16 && !w_fp16) {
+    hc_expand_norm_kernel<true, false><<<T, 256, 0, stream>>>(
+        op, rp, yp, post.data_ptr<float>(), comb.data_ptr<float>(),
+        cpre.data_ptr<float>(), wp, rsqp, (float)norm_eps);
+  } else if (!y_fp16 && w_fp16) {
+    hc_expand_norm_kernel<false, true><<<T, 256, 0, stream>>>(
+        op, rp, yp, post.data_ptr<float>(), comb.data_ptr<float>(),
+        cpre.data_ptr<float>(), wp, rsqp, (float)norm_eps);
+  } else {
+    hc_expand_norm_kernel<false, false><<<T, 256, 0, stream>>>(
+        op, rp, yp, post.data_ptr<float>(), comb.data_ptr<float>(),
+        cpre.data_ptr<float>(), wp, rsqp, (float)norm_eps);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+
+// ---- Phase 3B-3: Fast 1-warp/token Sinkhorn from cuBLAS dots[T,24] + res_sq[T] ----
+__global__ void __launch_bounds__(128)
+    hc_sinkhorn_from_dots_kernel(const float* __restrict__ dots,
+                                 const float* __restrict__ res_sq,
+                                 const float* __restrict__ scale,
+                                 const float* __restrict__ base,
+                                 float* __restrict__ pre_o,
+                                 float* __restrict__ post_o,
+                                 float* __restrict__ comb_o, int T,
+                                 float norm_eps, float hc_eps, int iters) {
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= T) return;
+  const float* d = dots + (size_t)t * 24;
+  const float rs = rsqrtf(res_sq[t] / (4.0f * 5120) + norm_eps);
+  const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float p = d[i] * rs * s0 + base[i];
+    const float qv = d[4 + i] * rs * s1 + base[4 + i];
+    pre_o[t * 4 + i] = 1.f / (1.f + __expf(-p)) + hc_eps;
+    post_o[t * 4 + i] = 2.f * (1.f / (1.f + __expf(-qv)));
+  }
+  float m[4][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float mx = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      m[i][j] = d[8 + i * 4 + j] * rs * s2 + base[8 + i * 4 + j];
+      mx = fmaxf(mx, m[i][j]);
+    }
+    float rsum = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      m[i][j] = __expf(m[i][j] - mx);
+      rsum += m[i][j];
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) m[i][j] = m[i][j] / rsum + hc_eps;
+  }
+  for (int it = 0; it < iters; ++it) {
+    if (it > 0) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float r = 1.f / (m[i][0] + m[i][1] + m[i][2] + m[i][3] + hc_eps);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) m[i][j] *= r;
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float c = 1.f / (m[0][j] + m[1][j] + m[2][j] + m[3][j] + hc_eps);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) m[i][j] *= c;
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) comb_o[t * 16 + i * 4 + j] = m[i][j];
+}
+
+void hc_sinkhorn_from_dots(torch::Tensor dots, torch::Tensor res_sq,
+                           torch::Tensor scale, torch::Tensor base,
+                           torch::Tensor pre_o, torch::Tensor post_o,
+                           torch::Tensor comb_o, double norm_eps, double hc_eps,
+                           int64_t iters) {
+  const int T = dots.size(0);
+  TORCH_CHECK(T >= 1 && dots.size(1) == 24 && dots.is_contiguous() &&
+              dots.scalar_type() == torch::kFloat32);
+  const at::cuda::OptionalCUDAGuard guard(device_of(dots));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  hc_sinkhorn_from_dots_kernel<<<(T + 127) / 128, 128, 0, stream>>>(
+      dots.data_ptr<float>(), res_sq.data_ptr<float>(), scale.data_ptr<float>(),
+      base.data_ptr<float>(), pre_o.data_ptr<float>(), post_o.data_ptr<float>(),
+      comb_o.data_ptr<float>(), T, (float)norm_eps, (float)hc_eps, (int)iters);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+
+namespace v41ll_mk {
+struct LLTilePeers {
+  char* p[4];
+};
+__device__ __forceinline__ uint4 ll_tile_load(const void* a) {
+  uint4 v;
+  asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(a));
+  return v;
+}
+__device__ __forceinline__ void ll_tile_store(void* a, uint4 v) {
+  asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(a),
+               "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+               : "memory");
+}
+template <bool HALF>
+__device__ __forceinline__ uint32_t ll_tile_escape(uint32_t w) {
+  return w == 0xFFFFFFFFu ? 0x7FC00000u : w;
+}
+template <bool HALF>
+__device__ __forceinline__ bool ll_tile_ready4(const uint4& v) {
+  return v.x != 0xFFFFFFFFu && v.y != 0xFFFFFFFFu &&
+         v.z != 0xFFFFFFFFu && v.w != 0xFFFFFFFFu;
+}
+}  // namespace v41ll_mk
+
+
+// ---- Phase 2B: Single-Launch 80-CTA 5-Step Sharded Markov CUDA Kernel -------
+// 80 CTAs (1 per V100 SM, <= 36 KiB SMEM, 100% co-resident) run all 5 Markov
+// draft steps in ONE launch with direct NVLink 16-byte exchange per step.
+
+__device__ __forceinline__ float bf16_u16_to_f32(uint16_t u) {
+  const uint32_t bits = (uint32_t)u << 16;
+  return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ int ld_vol_i32(const int* p) {
+  int v;
+  asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+
+__device__ __forceinline__ void st_vol_i32(int* p, int v) {
+  asm volatile("st.volatile.global.s32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
+// Fast linear decode of 8 FP8 E4M3 bytes (uint2) -> 8 floats scaled by row_scale.
+// row_scale already includes the 256.0f factor (exact match to fp8_qpn8).
+__device__ __forceinline__ void fp8x8_to_f32x8(uint2 q, float row_scale,
+                                               float out[8]) {
+  constexpr unsigned kSign = 0x80008000u;
+  constexpr unsigned kExpMant = 0x3f803f80u;
+  const unsigned p0 = __byte_perm(q.x, 0u, 0x4140);
+  const unsigned p1 = __byte_perm(q.x, 0u, 0x4342);
+  const unsigned p2 = __byte_perm(q.y, 0u, 0x4140);
+  const unsigned p3 = __byte_perm(q.y, 0u, 0x4342);
+  const unsigned u0 = ((p0 << 8) & kSign) | ((p0 << 7) & kExpMant);
+  const unsigned u1 = ((p1 << 8) & kSign) | ((p1 << 7) & kExpMant);
+  const unsigned u2 = ((p2 << 8) & kSign) | ((p2 << 7) & kExpMant);
+  const unsigned u3 = ((p3 << 8) & kSign) | ((p3 << 7) & kExpMant);
+  const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&u0));
+  const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&u1));
+  const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&u2));
+  const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&u3));
+  out[0] = f0.x * row_scale;
+  out[1] = f0.y * row_scale;
+  out[2] = f1.x * row_scale;
+  out[3] = f1.y * row_scale;
+  out[4] = f2.x * row_scale;
+  out[5] = f2.y * row_scale;
+  out[6] = f3.x * row_scale;
+  out[7] = f3.y * row_scale;
+}
+
+constexpr int MK_CTAS = 80;
+constexpr int MK_MAX_R = 64;
+constexpr int MK_K = 256;
+
+template <bool FP8, bool EMB_FP16>
+__global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
+    const void* __restrict__ weight, const half* __restrict__ w_scales,
+    const uint16_t* __restrict__ embed, const half* __restrict__ local_logits,
+    const int64_t* __restrict__ anchors, int64_t* __restrict__ out_tokens,
+    float* __restrict__ ws_val, int* __restrict__ ws_idx,
+    int* __restrict__ prev_tok, int* __restrict__ state_ctrl,
+    v41ll_mk::LLTilePeers peers, int rank, int64_t cap, int R, int V, int vocab,
+    int vocab_start, int steps) {
+  // state_ctrl layout (4 int32s, initialized to 0 once at startup):
+  //   [0]: ticket (0..79, self-resetting)
+  //   [1]: step_done (monotonically increasing across launches, graph safe!)
+  //   [2]: ll_counter (parity counter for LL_MARKOV buffer)
+  __shared__ uint16_t s_emb[MK_MAX_R][MK_K];  // 32 KiB lossless BF16!
+  __shared__ float w_best_v[8][MK_MAX_R];     // 2 KiB
+  __shared__ int w_best_i[8][MK_MAX_R];       // 2 KiB
+  __shared__ bool is_last;
+
+  const int cta = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  // Snapshot monotonic step_done baseline BEFORE step 0 (CUDA Graph safe!)
+  int base_done = ld_vol_i32(state_ctrl + 1);
+
+  // Initialize prev_tok from anchors on CTA 0? Better: every CTA reads anchors
+  // directly on step 0 so zero cross-CTA barrier is needed before step 0!
+  const int v0 = (cta * V) / MK_CTAS;
+  const int v1 = ((cta + 1) * V) / MK_CTAS;
+
+  for (int step = 0; step < steps; ++step) {
+    // 1. Load R embedding rows [R, 256] BF16 into SMEM
+    for (int idx = tid; idx < R * MK_K; idx += 256) {
+      const int r = idx >> 8;
+      const int k = idx & 255;
+      int64_t tok;
+      if (step == 0) {
+        tok = anchors[r];
+        if (tok < 0) tok = 0;
+        if (tok >= vocab) tok = vocab - 1;
+      } else {
+        tok = (int64_t)ld_vol_i32(prev_tok + r);
+      }
+      s_emb[r][k] = embed[tok * MK_K + k];
+    }
+    __syncthreads();
+
+    // 2. Score rows [v0, v1) against all R requests (zero local-memory spill!)
+    if (lane == 0) {
+      for (int r = 0; r < R; ++r) {
+        w_best_v[warp][r] = -INFINITY;
+        w_best_i[warp][r] = 2147483647;
+      }
+    }
+    __syncwarp();
+    float bv0 = -INFINITY;
+    int bi0 = 2147483647;
+
+    for (int v = v0 + warp; v < v1; v += 8) {
+      float w[8];
+      if constexpr (FP8) {
+        const uint2 q = __ldcs(reinterpret_cast<const uint2*>(
+            reinterpret_cast<const uint8_t*>(weight) + (size_t)v * MK_K +
+            lane * 8));
+        const float rsc = __half2float(__ldg(w_scales + v));
+        fp8x8_to_f32x8(q, rsc, w);
+      } else {
+        const uint4 raw = __ldcs(reinterpret_cast<const uint4*>(
+            reinterpret_cast<const uint16_t*>(weight) + (size_t)v * MK_K +
+            lane * 8));
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(&raw);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) w[i] = bf16_u16_to_f32(h[i]);
+      }
+
+      if (R == 1) {
+        const uint4 eraw =
+            *reinterpret_cast<const uint4*>(&s_emb[0][lane * 8]);
+        const uint16_t* eh = reinterpret_cast<const uint16_t*>(&eraw);
+        float dot = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          float ev = EMB_FP16 ? __half2float(*reinterpret_cast<const half*>(&eh[i]))
+                              : bf16_u16_to_f32(eh[i]);
+          dot += w[i] * ev;
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+          dot += __shfl_xor_sync(0xffffffffu, dot, off);
+        if (lane == 0) {
+          const float lg = __half2float(local_logits[(size_t)step * V + v]);
+          const float val = lg + dot;
+          if (val > bv0 || (val == bv0 && v < bi0)) {
+            bv0 = val;
+            bi0 = v;
+          }
+        }
+      } else {
+        for (int r = 0; r < R; ++r) {
+          const uint4 eraw =
+              *reinterpret_cast<const uint4*>(&s_emb[r][lane * 8]);
+          const uint16_t* eh = reinterpret_cast<const uint16_t*>(&eraw);
+          float dot = 0.f;
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+          float ev = EMB_FP16 ? __half2float(*reinterpret_cast<const half*>(&eh[i]))
+                              : bf16_u16_to_f32(eh[i]);
+          dot += w[i] * ev;
+        }
+#pragma unroll
+          for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_xor_sync(0xffffffffu, dot, off);
+          if (lane == 0) {
+            const float lg = __half2float(
+                local_logits[((size_t)r * steps + step) * V + v]);
+            const float val = lg + dot;
+            if (val > w_best_v[warp][r] ||
+                (val == w_best_v[warp][r] && v < w_best_i[warp][r])) {
+              w_best_v[warp][r] = val;
+              w_best_i[warp][r] = v;
+            }
+          }
+        }
+      }
+    }
+
+    if (R == 1 && lane == 0) {
+      w_best_v[warp][0] = bv0;
+      w_best_i[warp][0] = bi0;
+    }
+    __syncthreads();
+
+    // Reduce 8 warps per request r -> ws_val[r * 80 + cta], ws_idx[r * 80 + cta]
+    for (int r = tid; r < R; r += 256) {
+      float bv = -INFINITY;
+      int bi = 2147483647;
+#pragma unroll
+      for (int w = 0; w < 8; ++w) {
+        const float v = w_best_v[w][r];
+        const int idx = w_best_i[w][r];
+        if (v > bv || (v == bv && idx < bi)) {
+          bv = v;
+          bi = idx;
+        }
+      }
+      ws_val[r * MK_CTAS + cta] = bv;
+      ws_idx[r * MK_CTAS + cta] = bi;
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) is_last = (atomicAdd(state_ctrl + 0, 1) == MK_CTAS - 1);
+    __syncthreads();
+
+    if (is_last) {
+      if (tid == 0) st_vol_i32(state_ctrl + 0, 0);
+      __threadfence();
+      const int64_t ll_base =
+          (int64_t)(ld_vol_i32(state_ctrl + 2) & 1) * 4 * cap;
+      // Reduce 80 CTAs per request r using 1 warp per request (up to 8 warps)
+      for (int r = warp; r < R; r += 8) {
+        float bv = -INFINITY;
+        int bi = 2147483647;
+        for (int c = lane; c < MK_CTAS; c += 32) {
+          const float v = __ldcg(ws_val + r * MK_CTAS + c);
+          const int idx = __ldcg(ws_idx + r * MK_CTAS + c);
+          if (v > bv || (v == bv && idx < bi)) {
+            bv = v;
+            bi = idx;
+          }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+          const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+          if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+          }
+        }
+        if (lane == 0) {
+          const bool real = bi < V;
+          const float out_v = real ? bv : nanf("");
+          const int out_gid = real ? (bi + vocab_start) : 2147483647;
+          if (peers.p[0] != nullptr) {
+            uint4 pkt = make_uint4(
+                v41ll_mk::ll_tile_escape<false>(__float_as_uint(out_v)),
+                v41ll_mk::ll_tile_escape<false>((uint32_t)out_gid), 0u, 0u);
+#pragma unroll
+            for (int pr = 1; pr < 4; ++pr) {
+              v41ll_mk::ll_tile_store(peers.p[(rank + pr) & 3] + ll_base +
+                                       (int64_t)rank * cap + (int64_t)r * 16,
+                                   pkt);
+            }
+            // Also stash own values in w_best_v/i[0][r] for Phase 2!
+            w_best_v[0][r] = out_v;
+            w_best_i[0][r] = out_gid;
+          } else {
+            const int64_t winner = real ? (int64_t)out_gid : 2147483647LL;
+            out_tokens[r * steps + step] = winner;
+            int clamped = (int)(winner < vocab ? winner : (vocab - 1));
+            if (clamped < 0) clamped = 0;
+            st_vol_i32(prev_tok + r, clamped);
+          }
+        }
+      }
+      __syncthreads();
+      if (peers.p[0] != nullptr) {
+        char* mine = peers.p[rank] + ll_base;
+        const uint4 empty = make_uint4(~0u, ~0u, ~0u, ~0u);
+        for (int r = tid; r < R; r += 256) {
+          float gv = -INFINITY;
+          int gi = 2147483647;
+          bool any_real = false;
+#pragma unroll
+          for (int pr = 0; pr < 4; ++pr) {
+            float rv;
+            int ri;
+            if (pr == rank) {
+              rv = w_best_v[0][r];
+              ri = w_best_i[0][r];
+            } else {
+              char* a = mine + (int64_t)pr * cap + (int64_t)r * 16;
+              uint4 pkt;
+              do {
+                pkt = v41ll_mk::ll_tile_load(a);
+              } while (!v41ll_mk::ll_tile_ready4<false>(pkt));
+              v41ll_mk::ll_tile_store(a, empty);
+              rv = __uint_as_float(pkt.x);
+              ri = (int)pkt.y;
+            }
+            if (!isnan(rv)) {
+              if (!any_real || rv > gv || (rv == gv && ri < gi)) {
+                gv = rv;
+                gi = ri;
+                any_real = true;
+              }
+            }
+          }
+          const int64_t winner = any_real ? (int64_t)gi : 2147483647LL;
+          out_tokens[r * steps + step] = winner;
+          int clamped = (int)(winner < vocab ? winner : (vocab - 1));
+          if (clamped < 0) clamped = 0;
+          st_vol_i32(prev_tok + r, clamped);
+        }
+        __syncthreads();
+        if (tid == 0) st_vol_i32(state_ctrl + 2, ld_vol_i32(state_ctrl + 2) + 1);
+      }
+      __threadfence();
+      __syncthreads();
+      if (tid == 0) atomicAdd(state_ctrl + 1, 1);
+    }
+
+    // All 80 CTAs wait for step completion before starting step + 1
+    if (step + 1 < steps) {
+      const int target_done = base_done + step + 1;
+      if (tid == 0) {
+        while (ld_vol_i32(state_ctrl + 1) < target_done) {
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
+
+// ---- Phase 2C-1: SM70 WMMA 80-CTA cooperative 5-step sharded Markov (R=5..64) ----
+// Uses Volta 16x16x16 FP16->FP32 Tensor Cores + coalesced 32-row local_logits reads
+// in 45 KiB static SMEM (1 CTA/SM, 80/80 co-resident, CUDA-Graph safe).
+template <bool FP8, bool EMB_FP16>
+__global__ void __launch_bounds__(256, 1) markov_shard_5step_wmma_kernel(
+    const void* __restrict__ weight, const half* __restrict__ w_scales,
+    const uint16_t* __restrict__ embed, const half* __restrict__ local_logits,
+    const int64_t* __restrict__ anchors, int64_t* __restrict__ out_tokens,
+    float* __restrict__ ws_val, int* __restrict__ ws_idx,
+    int* __restrict__ prev_tok, int* __restrict__ state_ctrl,
+    v41ll_mk::LLTilePeers peers, int rank, int64_t cap, int R, int V, int vocab,
+    int vocab_start, int steps) {
+  using namespace nvcuda;
+  __shared__ half s_emb[MK_MAX_R][MK_K + 8];  // 33.0 KiB, ld=264
+  __shared__ half s_w[32][40];                //  2.5 KiB, ld=40
+  __shared__ float s_c[MK_MAX_R][36];         //  9.0 KiB, ld=36
+  __shared__ float r_best_v[MK_MAX_R];        //  0.25 KiB
+  __shared__ int r_best_i[MK_MAX_R];          //  0.25 KiB
+  __shared__ bool is_last;
+
+  const int cta = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int wm = warp >> 1;  // 0..3 -> 16 requests each
+  const int wn = warp & 1;   // 0..1 -> 16 vocab rows each
+  const int m_pad = (R + 15) & ~15;
+  const bool active_wmma = (wm * 16 < R);
+
+  const int base_done = ld_vol_i32(state_ctrl + 1);
+  const int v0 = (cta * V) / MK_CTAS;
+  const int v1 = ((cta + 1) * V) / MK_CTAS;
+
+  for (int step = 0; step < steps; ++step) {
+    // 1. Load R embedding rows [R, 256] as FP16 into s_emb (+ zero-pad up to m_pad)
+    for (int idx = tid; idx < m_pad * MK_K; idx += 256) {
+      const int r = idx >> 8;
+      const int k = idx & 255;
+      if (r < R) {
+        int64_t tok;
+        if (step == 0) {
+          tok = anchors[r];
+          if (tok < 0) tok = 0;
+          if (tok >= vocab) tok = vocab - 1;
+        } else {
+          tok = (int64_t)ld_vol_i32(prev_tok + r);
+        }
+        const uint16_t raw = embed[tok * MK_K + k];
+        if constexpr (EMB_FP16) {
+          s_emb[r][k] = *reinterpret_cast<const half*>(&raw);
+        } else {
+          s_emb[r][k] = __float2half(bf16_u16_to_f32(raw));
+        }
+      } else {
+        s_emb[r][k] = __float2half(0.f);
+      }
+    }
+    if (tid < R) {
+      r_best_v[tid] = -INFINITY;
+      r_best_i[tid] = 2147483647;
+    }
+    __syncthreads();
+
+    // 2. Tile vocab [v0, v1) in chunks of 32 rows using Volta WMMA
+    const int w_row = tid >> 3;         // 0..31
+    const int w_col4 = (tid & 7) << 2;  // 0, 4, ..., 28
+    for (int vb = v0; vb < v1; vb += 32) {
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+      wmma::fill_fragment(acc, 0.f);
+      const int v_load = vb + w_row;
+      const bool v_load_ok = (v_load < v1);
+      float rsc = 0.f;
+      if constexpr (FP8) {
+        if (v_load_ok) rsc = __half2float(__ldg(w_scales + v_load));
+      }
+
+#pragma unroll
+      for (int kb = 0; kb < MK_K; kb += 32) {
+        half h4[4];
+        if (v_load_ok) {
+          if constexpr (FP8) {
+            const uint32_t q4 = __ldcs(reinterpret_cast<const uint32_t*>(
+                reinterpret_cast<const uint8_t*>(weight) +
+                (size_t)v_load * MK_K + kb + w_col4));
+            const uint2 qpair = make_uint2(q4, 0u);
+            float f8[8];
+            fp8x8_to_f32x8(qpair, rsc, f8);
+            h4[0] = __float2half(f8[0]);
+            h4[1] = __float2half(f8[1]);
+            h4[2] = __float2half(f8[2]);
+            h4[3] = __float2half(f8[3]);
+          } else {
+            const uint2 raw4 = __ldcs(reinterpret_cast<const uint2*>(
+                reinterpret_cast<const uint16_t*>(weight) +
+                (size_t)v_load * MK_K + kb + w_col4));
+            const uint16_t* u = reinterpret_cast<const uint16_t*>(&raw4);
+            h4[0] = __float2half(bf16_u16_to_f32(u[0]));
+            h4[1] = __float2half(bf16_u16_to_f32(u[1]));
+            h4[2] = __float2half(bf16_u16_to_f32(u[2]));
+            h4[3] = __float2half(bf16_u16_to_f32(u[3]));
+          }
+        } else {
+          h4[0] = h4[1] = h4[2] = h4[3] = __float2half(0.f);
+        }
+        *reinterpret_cast<uint2*>(&s_w[w_row][w_col4]) =
+            *reinterpret_cast<const uint2*>(h4);
+        __syncthreads();
+
+        if (active_wmma) {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a0,
+              a1;
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b0,
+              b1;
+          wmma::load_matrix_sync(a0, &s_emb[wm * 16][kb], MK_K + 8);
+          wmma::load_matrix_sync(b0, &s_w[wn * 16][0], 40);
+          wmma::mma_sync(acc, a0, b0, acc);
+          wmma::load_matrix_sync(a1, &s_emb[wm * 16][kb + 16], MK_K + 8);
+          wmma::load_matrix_sync(b1, &s_w[wn * 16][16], 40);
+          wmma::mma_sync(acc, a1, b1, acc);
+        }
+        __syncthreads();
+      }
+
+      if (active_wmma) {
+        wmma::store_matrix_sync(&s_c[wm * 16][wn * 16], acc, 36,
+                                wmma::mem_row_major);
+      }
+      __syncthreads();
+
+      // 3. Coalesced local_logits load + warp-level max-with-lowest-index
+      const int v_cur = vb + lane;
+      const bool v_ok = (v_cur < v1);
+      for (int r = warp; r < R; r += 8) {
+        float val = -INFINITY;
+        int idx = 2147483647;
+        if (v_ok) {
+          const float lg =
+              __half2float(local_logits[((size_t)r * steps + step) * V + v_cur]);
+          const float cand = lg + s_c[r][lane];
+          if (!isnan(cand)) {
+            val = cand;
+            idx = v_cur;
+          }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          const float ov = __shfl_xor_sync(0xffffffffu, val, off);
+          const int oi = __shfl_xor_sync(0xffffffffu, idx, off);
+          if (ov > val || (ov == val && oi < idx)) {
+            val = ov;
+            idx = oi;
+          }
+        }
+        if (lane == 0) {
+          const float bv = r_best_v[r];
+          const int bi = r_best_i[r];
+          if (val > bv || (val == bv && idx < bi)) {
+            r_best_v[r] = val;
+            r_best_i[r] = idx;
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+    // 4. Write CTA best -> global ws and synchronize across 80 CTAs + 4 ranks
+    for (int r = tid; r < R; r += 256) {
+      ws_val[r * MK_CTAS + cta] = r_best_v[r];
+      ws_idx[r * MK_CTAS + cta] = r_best_i[r];
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) is_last = (atomicAdd(state_ctrl + 0, 1) == MK_CTAS - 1);
+    __syncthreads();
+
+    if (is_last) {
+      if (tid == 0) st_vol_i32(state_ctrl + 0, 0);
+      __threadfence();
+      const int64_t ll_base =
+          (int64_t)(ld_vol_i32(state_ctrl + 2) & 1) * 4 * cap;
+      for (int r = warp; r < R; r += 8) {
+        float bv = -INFINITY;
+        int bi = 2147483647;
+        for (int c = lane; c < MK_CTAS; c += 32) {
+          const float v = __ldcg(ws_val + r * MK_CTAS + c);
+          const int idx = __ldcg(ws_idx + r * MK_CTAS + c);
+          if (v > bv || (v == bv && idx < bi)) {
+            bv = v;
+            bi = idx;
+          }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+          const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+          if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+          }
+        }
+        if (lane == 0) {
+          const bool real = bi < V;
+          const float out_v = real ? bv : nanf("");
+          const int out_gid = real ? (bi + vocab_start) : 2147483647;
+          if (peers.p[0] != nullptr) {
+            uint4 pkt = make_uint4(
+                v41ll_mk::ll_tile_escape<false>(__float_as_uint(out_v)),
+                v41ll_mk::ll_tile_escape<false>((uint32_t)out_gid), 0u, 0u);
+#pragma unroll
+            for (int pr = 1; pr < 4; ++pr) {
+              v41ll_mk::ll_tile_store(peers.p[(rank + pr) & 3] + ll_base +
+                                       (int64_t)rank * cap + (int64_t)r * 16,
+                                   pkt);
+            }
+            r_best_v[r] = out_v;
+            r_best_i[r] = out_gid;
+          } else {
+            const int64_t winner = real ? (int64_t)out_gid : 2147483647LL;
+            out_tokens[r * steps + step] = winner;
+            int clamped = (int)(winner < vocab ? winner : (vocab - 1));
+            if (clamped < 0) clamped = 0;
+            st_vol_i32(prev_tok + r, clamped);
+          }
+        }
+      }
+      __syncthreads();
+      if (peers.p[0] != nullptr) {
+        char* mine = peers.p[rank] + ll_base;
+        const uint4 empty = make_uint4(~0u, ~0u, ~0u, ~0u);
+        for (int r = tid; r < R; r += 256) {
+          float gv = -INFINITY;
+          int gi = 2147483647;
+          bool any_real = false;
+#pragma unroll
+          for (int pr = 0; pr < 4; ++pr) {
+            float rv;
+            int ri;
+            if (pr == rank) {
+              rv = r_best_v[r];
+              ri = r_best_i[r];
+            } else {
+              char* a = mine + (int64_t)pr * cap + (int64_t)r * 16;
+              uint4 pkt;
+              do {
+                pkt = v41ll_mk::ll_tile_load(a);
+              } while (!v41ll_mk::ll_tile_ready4<false>(pkt));
+              v41ll_mk::ll_tile_store(a, empty);
+              rv = __uint_as_float(pkt.x);
+              ri = (int)pkt.y;
+            }
+            if (!isnan(rv)) {
+              if (!any_real || rv > gv || (rv == gv && ri < gi)) {
+                gv = rv;
+                gi = ri;
+                any_real = true;
+              }
+            }
+          }
+          const int64_t winner = any_real ? (int64_t)gi : 2147483647LL;
+          out_tokens[r * steps + step] = winner;
+          int clamped = (int)(winner < vocab ? winner : (vocab - 1));
+          if (clamped < 0) clamped = 0;
+          st_vol_i32(prev_tok + r, clamped);
+        }
+        __syncthreads();
+        if (tid == 0) st_vol_i32(state_ctrl + 2, ld_vol_i32(state_ctrl + 2) + 1);
+      }
+      __threadfence();
+      __syncthreads();
+      if (tid == 0) atomicAdd(state_ctrl + 1, 1);
+    }
+
+    if (step + 1 < steps) {
+      const int target_done = base_done + step + 1;
+      if (tid == 0) {
+        while (ld_vol_i32(state_ctrl + 1) < target_done) {
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
+void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
+                        std::optional<torch::Tensor> w_scales,
+                        torch::Tensor embed, torch::Tensor local_logits,
+                        torch::Tensor anchors, torch::Tensor ws_val,
+                        torch::Tensor ws_idx, torch::Tensor prev_tok,
+                        torch::Tensor state_ctrl, int64_t p0, int64_t p1,
+                        int64_t p2, int64_t p3, int64_t rank, int64_t cap,
+                        int64_t vocab_start, int64_t steps) {
+  const bool fp8 = w_scales.has_value();
+  const int R = anchors.numel();
+  const int V = weight.size(0);
+  const int vocab = embed.size(0);
+  TORCH_CHECK(R >= 1 && R <= MK_MAX_R && weight.size(1) == MK_K &&
+              embed.size(1) == MK_K);
+  TORCH_CHECK(local_logits.scalar_type() == torch::kFloat16 &&
+              local_logits.is_contiguous() && local_logits.size(0) == R * steps &&
+              local_logits.size(1) == V);
+  TORCH_CHECK(out_tokens.scalar_type() == torch::kInt64 &&
+              out_tokens.is_contiguous() && out_tokens.numel() == R * steps);
+  TORCH_CHECK((embed.scalar_type() == torch::kFloat16 || embed.scalar_type() == torch::kBFloat16) && embed.is_contiguous());
+  TORCH_CHECK(ws_val.numel() >= R * MK_CTAS && ws_idx.numel() >= R * MK_CTAS &&
+              prev_tok.numel() >= R && state_ctrl.numel() >= 4);
+  if (fp8) {
+    TORCH_CHECK(weight.scalar_type() == torch::kUInt8 && weight.is_contiguous());
+    TORCH_CHECK(w_scales->scalar_type() == torch::kFloat16 &&
+                w_scales->numel() == V && w_scales->is_contiguous());
+  } else {
+    TORCH_CHECK((weight.scalar_type() == torch::kBFloat16 || weight.scalar_type() == torch::kInt16) &&
+                weight.is_contiguous());
+  }
+  const at::cuda::OptionalCUDAGuard guard(device_of(local_logits));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  v41ll_mk::LLTilePeers peers{
+      {reinterpret_cast<char*>(p0), reinterpret_cast<char*>(p1),
+       reinterpret_cast<char*>(p2), reinterpret_cast<char*>(p3)}};
+  const half* sc_ptr =
+      fp8 ? reinterpret_cast<const half*>(w_scales->data_ptr<at::Half>())
+          : nullptr;
+  const auto* emb_ptr = reinterpret_cast<const uint16_t*>(embed.data_ptr());
+  const auto* lg_ptr =
+      reinterpret_cast<const half*>(local_logits.data_ptr<at::Half>());
+  const bool emb_fp16 = (embed.scalar_type() == torch::kFloat16);
+  TORCH_CHECK(emb_fp16 || embed.scalar_type() == torch::kBFloat16,
+              "markov_shard_5step: embed must be fp16 or bf16");
+  if (R >= 2) {
+    if (fp8) {
+      if (emb_fp16) {
+        markov_shard_5step_wmma_kernel<true, true><<<MK_CTAS, 256, 0, stream>>>(
+            weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
+            out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
+            ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
+            state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
+            (int)vocab_start, (int)steps);
+      } else {
+        markov_shard_5step_wmma_kernel<true, false><<<MK_CTAS, 256, 0, stream>>>(
+            weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
+            out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
+            ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
+            state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
+            (int)vocab_start, (int)steps);
+      }
+    } else {
+      if (emb_fp16) {
+        markov_shard_5step_wmma_kernel<false, true><<<MK_CTAS, 256, 0, stream>>>(
+            weight.data_ptr(), nullptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
+            out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
+            ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
+            state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
+            (int)vocab_start, (int)steps);
+      } else {
+        markov_shard_5step_wmma_kernel<false, false><<<MK_CTAS, 256, 0, stream>>>(
+            weight.data_ptr(), nullptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
+            out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
+            ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
+            state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
+            (int)vocab_start, (int)steps);
+      }
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  if (fp8) {
+    if (emb_fp16) {
+      markov_shard_5step_kernel<true, true><<<MK_CTAS, 256, 0, stream>>>(
+          weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
+          out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
+          ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
+          state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
+          (int)vocab_start, (int)steps);
+    } else {
+      markov_shard_5step_kernel<true, false><<<MK_CTAS, 256, 0, stream>>>(
+          weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
+          out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
+          ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
+          state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
+          (int)vocab_start, (int)steps);
+    }
+  } else {
+    if (emb_fp16) {
+      markov_shard_5step_kernel<false, true><<<MK_CTAS, 256, 0, stream>>>(
+          weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
+          anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+          ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers, (int)rank,
+          cap, R, V, vocab, (int)vocab_start, (int)steps);
+    } else {
+      markov_shard_5step_kernel<false, false><<<MK_CTAS, 256, 0, stream>>>(
+          weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
+          anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+          ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers, (int)rank,
+          cap, R, V, vocab, (int)vocab_start, (int)steps);
+    }
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+
+// ---- Phase 3A: Parallel Multi-CTA route_plan_wide_v2 (bitwise identical) ----
 
 }  // namespace v41sk
 
@@ -4545,6 +5726,20 @@ TORCH_LIBRARY(v41sk, m) {
       "index_scores_prefill_shard(Tensor(a!) out, Tensor q, Tensor w, "
       "Tensor cache, Tensor table, Tensor positions, int ratio, int shard, "
       "int nshard) -> ()");
+  m.def(
+      "hc_expand_norm(Tensor(a!) out, Tensor(b!) residual, Tensor y, "
+      "Tensor post, Tensor comb, Tensor cpre, Tensor norm_weight, "
+      "float norm_eps, Tensor(c!)? res_sq=None) -> ()");
+  m.def(
+      "hc_sinkhorn_from_dots(Tensor dots, Tensor res_sq, Tensor scale, "
+      "Tensor base, Tensor(a!) pre_o, Tensor(b!) post_o, Tensor(c!) comb_o, "
+      "float norm_eps, float hc_eps, int iters) -> ()");
+  m.def(
+      "markov_shard_5step(Tensor(a!) out_tokens, Tensor weight, Tensor? "
+      "w_scales, Tensor embed, Tensor local_logits, Tensor anchors, "
+      "Tensor(b!) ws_val, Tensor(c!) ws_idx, Tensor(d!) prev_tok, "
+      "Tensor(e!) state_ctrl, int p0, int p1, int p2, int p3, int rank, "
+      "int cap, int vocab_start, int steps) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(v41sk, CUDA, m) {
@@ -4571,6 +5766,9 @@ TORCH_LIBRARY_IMPL(v41sk, CUDA, m) {
   m.impl("index_scores_shard", &v41sk::index_scores_shard);
   m.impl("index_scores_prefill_shard", &v41sk::index_scores_prefill_shard);
   m.impl("route_plan_wide", &v41sk::route_plan_wide);
+  m.impl("hc_expand_norm", &v41sk::hc_expand_norm);
+  m.impl("hc_sinkhorn_from_dots", &v41sk::hc_sinkhorn_from_dots);
+  m.impl("markov_shard_5step", &v41sk::markov_shard_5step);
 }
 
 TORCH_LIBRARY_IMPL(v41sk, CompositeExplicitAutograd, m) {

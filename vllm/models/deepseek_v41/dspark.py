@@ -674,6 +674,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         assert shard is not None
         failures, cases = self._markov_shard_check(shard)
         self._markov_shard_agree(failures, "self-check failed")
+        shard.enable_cuda()
         self._markov_shard = shard
         # Only after the bitwise self-check: the FP8 draft head is lossy.
         self._fp8_ready = _DRAFT_HEAD_FP8
