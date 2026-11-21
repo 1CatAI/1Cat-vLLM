@@ -31,8 +31,10 @@ def generate_v41q8():
     with open(os.path.join(here, "v41q8_entry.cuh")) as f:
         entry = f.read()
     out = os.path.join(here, "build", "v41q8.cu")
-    with open(out, "w") as f:
-        f.write(body + "\n\n" + entry)
+    content = body + "\n\n" + entry
+    if not os.path.exists(out) or open(out).read() != content:
+        with open(out, "w") as f:
+            f.write(content)
     return out
 
 

@@ -27,9 +27,12 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 
 from .markov_fused import ROWS, _markov_block
+
+_MARKOV_CUDA = envs.VLLM_V41_MARKOV_CUDA == "1"
 
 
 @triton.jit
@@ -208,6 +211,33 @@ class MarkovShardGreedy:
         self.slots = torch.empty(
             (self.steps, tp, 2), dtype=torch.float32, device=device
         )
+        self._cuda_ready = False
+
+    def enable_cuda(self):
+        if (
+            _MARKOV_CUDA
+            and self.tp == 4
+            and self.rank == 256
+            and self.weight.dtype in (torch.bfloat16, torch.int16)
+        ):
+            from .native import _ll_markov_state, load_v41sk
+
+            load_v41sk()
+            st = _ll_markov_state()
+            if st is not None:
+                device = self.weight.device
+                self._ll_mk = st
+                self._ws_val = torch.empty(64 * 80, dtype=torch.float32, device=device)
+                self._ws_idx = torch.empty(64 * 80, dtype=torch.int32, device=device)
+                self._prev_tok = torch.zeros(64, dtype=torch.int32, device=device)
+                self._state_ctrl = torch.zeros(4, dtype=torch.int32, device=device)
+                w_bf16 = (
+                    self.weight.view(torch.bfloat16)
+                    if self.weight.dtype == torch.int16
+                    else self.weight
+                )
+                self._mk_w = w_bf16.contiguous()
+                self._cuda_ready = True
 
     def _score(self, logits, slot):
         """This rank's best row for one step's FP32 logits [n] into ``slot``."""
@@ -257,8 +287,39 @@ class MarkovShardGreedy:
         self._score(logits, self.slots[0])
         self._pick(self.slots[0], token)
 
+    def _run_cuda_5step(self, local_logits, anchors):
+        r = anchors.numel()
+        ptrs, rank, cap = self._ll_mk
+        lg16 = (
+            local_logits.half().contiguous()
+            if local_logits.dtype != torch.float16
+            else local_logits.contiguous()
+        )
+        anc = anchors.reshape(-1).to(torch.int64).contiguous()
+        out = torch.empty(r * self.steps, dtype=torch.int64, device=local_logits.device)
+        torch.ops.v41sk.markov_shard_5step(
+            out,
+            self._mk_w,
+            None,
+            self.embed.contiguous(),
+            lg16,
+            anc,
+            self._ws_val,
+            self._ws_idx,
+            self._prev_tok,
+            self._state_ctrl,
+            *ptrs,
+            rank,
+            cap,
+            self.start,
+            self.steps,
+        )
+        return out
+
     def __call__(self, local_logits, anchor):
         """local_logits: this rank's [steps, n] logits; anchor: [1] token id."""
+        if self._cuda_ready:
+            return self._run_cuda_5step(local_logits, anchor.reshape(1))
         tokens = torch.empty(self.steps, dtype=torch.int64, device=local_logits.device)
         logits = local_logits.float().contiguous()
         # Non-sampling steps may carry an unfilled anchor; clamp as upstream.
@@ -275,6 +336,8 @@ class MarkovShardGreedy:
         request's scores, exchange and pick are independent); returns
         [R * steps] request-major."""
         r = anchors.numel()
+        if self._cuda_ready and 1 <= r <= 64:
+            return self._run_cuda_5step(local_logits, anchors)
         if r == 1:
             return self(local_logits, anchors)
         device = local_logits.device

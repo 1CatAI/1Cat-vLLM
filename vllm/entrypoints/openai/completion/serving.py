@@ -24,9 +24,9 @@ from vllm.entrypoints.openai.completion.protocol import (
 )
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
-    PromptTokenUsageInfo,
     RequestResponseMetadata,
     UsageInfo,
+    populate_prompt_cache_usage,
 )
 from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
@@ -446,8 +446,8 @@ class OpenAIServingCompletion(OpenAIServing):
             )
 
             if self.enable_prompt_tokens_details and num_cached_tokens is not None:
-                final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
-                    cached_tokens=num_cached_tokens
+                populate_prompt_cache_usage(
+                    final_usage_info, total_prompt_tokens, num_cached_tokens
                 )
 
             if include_usage:
@@ -587,8 +587,8 @@ class OpenAIServingCompletion(OpenAIServing):
             and last_final_res
             and last_final_res.num_cached_tokens is not None
         ):
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=last_final_res.num_cached_tokens
+            populate_prompt_cache_usage(
+                usage, num_prompt_tokens, last_final_res.num_cached_tokens
             )
 
         request_metadata.final_usage_info = usage

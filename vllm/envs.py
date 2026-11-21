@@ -597,6 +597,8 @@ if TYPE_CHECKING:
     VLLM_V41_TRACE_NOSYNC: str = "0"
     VLLM_V41_W13_UNITS: str = ""
     VLLM_V41_W2_ROUTE: str = "0"
+    VLLM_V41_LL_CAP: str = "4194304"
+    VLLM_V41_MARKOV_CUDA: str = "1"
     VLLM_V41_HC_V3: str = "1"
     VLLM_V41_HC_V3_GROUPS: str = "8"
     VLLM_V41_HC_WINDOW: str = "2048"
@@ -8932,6 +8934,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="'0'",
         effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_LL_CAP": env_var(
+        lambda: os.getenv("VLLM_V41_LL_CAP", "4194304"),
+        description=(
+            "DS-V4.1 SM70: per-slot byte capacity for ll_allreduce/ll_allgather."
+        ),
+        category="tuning",
+        declared_default="'4194304'",
+        effective_default="'4194304'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_MARKOV_CUDA": env_var(
+        lambda: os.getenv("VLLM_V41_MARKOV_CUDA", "1"),
+        description=(
+            "DS-V4.1 SM70: single-launch 80-CTA 5-step sharded Markov CUDA kernel."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,

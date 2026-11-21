@@ -2151,6 +2151,8 @@ async def test_prompt_tokens_details_reports_zero_cached_tokens(stream: bool):
         assert isinstance(response, ChatCompletionResponse)
         assert response.usage.prompt_tokens_details is not None
         assert response.usage.prompt_tokens_details.cached_tokens == 0
+        assert response.usage.prompt_cache_hit_tokens == 0
+        assert response.usage.prefix_cache_hit_rate == 0.0
 
 
 class TestCreateRemainingArgsDelta:

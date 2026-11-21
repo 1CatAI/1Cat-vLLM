@@ -53,10 +53,10 @@ from vllm.entrypoints.openai.engine.protocol import (
     DeltaToolCall,
     ErrorResponse,
     FunctionCall,
-    PromptTokenUsageInfo,
     RequestResponseMetadata,
     ToolCall,
     UsageInfo,
+    populate_prompt_cache_usage,
 )
 from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
@@ -2060,8 +2060,8 @@ class OpenAIServingChat(OpenAIServing):
                     total_tokens=num_prompt_tokens + completion_tokens,
                 )
                 if self.enable_prompt_tokens_details and num_cached_tokens is not None:
-                    final_usage.prompt_tokens_details = PromptTokenUsageInfo(
-                        cached_tokens=num_cached_tokens
+                    populate_prompt_cache_usage(
+                        final_usage, num_prompt_tokens, num_cached_tokens
                     )
                 # Engine-authoritative per-request timings. Omitted when the
                 # engine collected no stats for this request.
@@ -2554,8 +2554,8 @@ class OpenAIServingChat(OpenAIServing):
             self.enable_prompt_tokens_details
             and final_res.num_cached_tokens is not None
         ):
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=final_res.num_cached_tokens
+            populate_prompt_cache_usage(
+                usage, num_prompt_tokens, final_res.num_cached_tokens
             )
         # Engine-authoritative per-request timings. Without this a
         # non-streaming caller has no prefill/decode split at all, and any
