@@ -1034,6 +1034,12 @@ class KVCacheTensor:
     """Pinned host allocation exposed through a lifetime-owning CUDA view."""
     physical_num_blocks: int | None = None
     """A fixed physical state pool independent of logical history capacity."""
+    qsa_scale_page_size_bytes: int = 0
+    """Separate per-token K/V scale bytes required to offload one QSA page."""
+
+    def get_physical_page_size_bytes(self, num_blocks: int) -> int:
+        """Return the payload bytes for one physical cache page."""
+        return self.size // (self.physical_num_blocks or num_blocks)
 
 
 @dataclass

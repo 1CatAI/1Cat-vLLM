@@ -12,6 +12,8 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
+import torch
+
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -634,9 +636,18 @@ def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
     # to 5.67 accepted tokens per round), and gained no first-token time.
     if speculative_config.use_dspark():
         return False
-    # KV connectors keep the legacy hashes.
-    if vllm_config.kv_transfer_config is not None:
-        return False
+    if transfer := vllm_config.kv_transfer_config:
+        if transfer.kv_connector is None:
+            return False
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        connector = KVConnectorFactory.get_connector_class(transfer)
+        if not connector.supports_lookahead_block_hashes(
+            transfer.kv_connector_extra_config
+        ):
+            return False
     return vllm_config.cache_config.enable_prefix_caching
 
 
@@ -2013,7 +2024,17 @@ def _get_kv_cache_config_csa_linear(
         ):
             raise ValueError("A bounded state pool requires all main KV owners on host")
         if getattr(vllm_config, "kv_transfer_config", None) is not None:
-            raise ValueError("Bounded host-KV state pools do not support KV connectors")
+            from vllm.models.qwen4_exp.common.kv_policy import (
+                supports_qsa_host_kv_offload,
+            )
+
+            if layout.host_compressed_names or not supports_qsa_host_kv_offload(
+                vllm_config
+            ):
+                raise ValueError(
+                    "Bounded host-KV state pools require the qualified native "
+                    "CPU offloading connector"
+                )
         requests = vllm_config.scheduler_config.max_num_seqs
 
         def demand(group):
@@ -2116,6 +2137,15 @@ def _get_kv_cache_config_csa_linear(
         )
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     kv_cache_tensors = []
+    scale_page_sizes = {
+        name: 2 * spec.storage_block_size * get_dtype_size(torch.float32)
+        for group in kv_cache_groups
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for name, spec in group.kv_cache_spec.kv_cache_specs.items()
+        if isinstance(spec, FullAttentionSpec)
+        and spec.host_backed
+        and spec.dtype in (torch.int8, torch.uint8)
+    }
     for index, owner in enumerate(layout.main_kv_owners):
         members = [layout.main_kv_names[i] for i in owner]
         host_members = [name for name in members if name in layout.host_main_kv_names]
@@ -2126,6 +2156,7 @@ def _get_kv_cache_config_csa_linear(
                     size=layout.main_kv_page_sizes[member_index] * num_blocks,
                     shared_by=[member],
                     host_backed=True,
+                    qsa_scale_page_size_bytes=scale_page_sizes.get(member, 0),
                 )
             )
         device_members = [name for name in members if name not in host_members] + [

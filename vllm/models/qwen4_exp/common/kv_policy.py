@@ -83,6 +83,45 @@ def resolve_qsa_auto_e4m3(cfg) -> bool:
     return policy.qsa_auto_e4m3_active
 
 
+def supports_qsa_host_kv_offload(cfg) -> bool:
+    """Admit the local native connector with private per-rank host history."""
+    transfer = cfg.kv_transfer_config
+    if transfer is None or transfer.kv_connector != "OffloadingConnector":
+        return False
+    extra = transfer.kv_connector_extra_config
+    parallel = cfg.parallel_config
+    spec_name = extra.get("spec_name", "CPUOffloadingSpec")
+    if spec_name == "TieringOffloadingSpec":
+        tiers = extra.get("secondary_tiers", [])
+        if not (
+            parallel.nnodes == 1
+            and isinstance(tiers, list)
+            and all(
+                isinstance(tier, dict) and tier.get("type") == "fs" for tier in tiers
+            )
+        ):
+            return False
+    elif spec_name != "CPUOffloadingSpec":
+        return False
+    return (
+        transfer.kv_role == "kv_both"
+        and transfer.kv_connector_module_path is None
+        and "block_size" not in extra
+        and parallel.pipeline_parallel_size == 1
+        and parallel.data_parallel_size == 1
+        and parallel.decode_context_parallel_size == 2
+        and parallel.prefill_context_parallel_size == 1
+        # The internal MTP config runs inside the target's MRV2 worker even
+        # when the draft architecture does not itself select MRV2.
+        and (cfg.is_speculative_draft or cfg.use_v2_model_runner)
+        and cfg.cache_config.enable_prefix_caching
+        and not cfg.scheduler_config.disable_hybrid_kv_cache_manager
+        and not cfg.kernel_config.qsa_host_kv_device_reference
+        and not cfg.kernel_config.qsa_host_indexer_history
+        and cfg.kernel_config.qsa_host_kv_state_blocks > 0
+    )
+
+
 def resolve_qsa_host_kv(cfg) -> bool:
     """Admit per-vector host storage independently of draft cache precision."""
     from vllm.platforms import current_platform
@@ -123,10 +162,12 @@ def resolve_qsa_host_kv(cfg) -> bool:
         "int8_per_token_head",
     ):
         reason = "host KV uses separate per-vector scales; keep draft KV FP16 or INT8"
-    elif cfg.cache_config.kv_offloading_size is not None:
-        reason = "active host storage cannot share a prefix-offloading connector"
-    elif getattr(getattr(cfg, "kv_transfer_config", None), "kv_connector", None):
-        reason = "active host storage is not qualified with KV transfer connectors"
+    elif (
+        (transfer := cfg.kv_transfer_config) is not None
+        and transfer.kv_connector
+        and not supports_qsa_host_kv_offload(cfg)
+    ):
+        reason = "active host storage requires the qualified native CPU connector"
     policy.qsa_host_kv_reason = reason
     policy.qsa_host_kv_active = reason is None
     return policy.qsa_host_kv_active

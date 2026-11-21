@@ -1155,6 +1155,9 @@ class VllmConfig:
 
         self.kernel_config.resolve_speculative_defaults(self)
 
+        # QSA admission must inspect the effective connector, including one
+        # selected by --kv-offloading-size.
+        self._post_init_kv_transfer_config()
         if self.kernel_config.resolve_attention_history(self):
             policy = self.kernel_config
             logger.info_once(
@@ -1851,10 +1854,6 @@ class VllmConfig:
                     "Please check whether your reasoning parser has implemented "
                     "the `reasoning_start_str` and `reasoning_end_str`."
                 )
-
-        # Resolve kv_offloading-derived connector name into kv_transfer_config
-        # before the HMA check below, which inspects the connector class.
-        self._post_init_kv_transfer_config()
 
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
