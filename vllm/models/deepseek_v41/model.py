@@ -102,6 +102,7 @@ from .vision import (
     DeepseekV41MultiModalProcessor,
     DeepseekV41ProcessingInfo,
     V41VisionTower,
+    load_bias_vl,
 )
 
 logger = init_logger(__name__)
@@ -188,14 +189,24 @@ class V41Gate(nn.Module):
             requires_grad=False,
         )
         # Routing bias of image-span tokens (selects experts, never scales).
-        self.bias_vl = (
-            nn.Parameter(
+        # Native: a checkpoint tensor. GGUF: not in the GGUF, filled from the
+        # VLLM_V41_VISION_BIAS_VL sidecar after construction (a buffer, so
+        # the GGUF loader does not expect it).
+        self.bias_vl: torch.Tensor | None
+        if VISION and _NATIVE:
+            self.bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
-            if VISION
-            else None
-        )
+        elif VISION:
+            # Not assigned before: register_buffer refuses an existing name.
+            self.register_buffer(
+                "bias_vl",
+                torch.zeros(config.n_routed_experts, dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.bias_vl = None
         self.temperature = getattr(config, "gate_temp", 1.0)
 
     def forward(self, x):
@@ -2331,10 +2342,14 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP, SupportsMult
         c.image_token_index = self.model.image_token_id
         # The vision tower runs where the embeddings are made (first stage),
         # replicated on its TP ranks; rank 0's spans are broadcast.
+        # GGUF route: the tower comes from llama.cpp's vision projector
+        # (VLLM_V41_VISION_MMPROJ) and the image routing bias from its F32
+        # sidecar (VLLM_V41_VISION_BIAS_VL); neither is in the backbone GGUF.
         self.vision_tower: V41VisionTower | None = None
+        self.vision_dtype = vllm_config.model_config.dtype
+        if VISION and not _NATIVE:
+            load_bias_vl(self.model.layers, V41Gate, c)
         if VISION and get_pp_group().is_first_rank:
-            if not _NATIVE:
-                raise ValueError("VLLM_V41_VISION needs the native weights")
             vision_config = getattr(
                 vllm_config.model_config.hf_config, "vision_config", None
             )
@@ -2343,6 +2358,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP, SupportsMult
             self.vision_tower = V41VisionTower(
                 vision_config, c.hidden_size, vllm_config.model_config.dtype
             )
+            if not _NATIVE:
+                self.vision_tower.load_mmproj()
 
     def embed_input_ids(
         self, input_ids, multimodal_embeddings=None, *, is_multimodal=None
@@ -2375,8 +2392,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP, SupportsMult
                 torch.zeros(
                     -(-int(h) // ratio) * (-(-int(w) // ratio) + 1) + 2,
                     self.config.hidden_size,
-                    dtype=self.model.embed_tokens.weight.dtype,
-                    device=self.model.embed_tokens.weight.device,
+                    # Not embed_tokens.weight: GGUF packed embeddings have none.
+                    dtype=self.vision_dtype,
+                    device=torch.device("cuda", torch.cuda.current_device()),
                 )
                 for h, w in grids
             ]
