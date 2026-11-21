@@ -52,6 +52,7 @@ from vllm.utils.counter import AtomicCounter
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.metrics.stats import MultiModalCacheStats
 
+from . import prefix_token_cache
 from .embed_utils import safe_load_prompt_embeds
 from .inputs import (
     DictPrompt,
@@ -75,6 +76,46 @@ logger = init_logger(__name__)
 
 
 _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
+
+
+def _prefix_cached(tokenizer, text, kwargs):
+    """VLLM_V41_PREFIX_TOKEN_CACHE (renderers/prefix_token_cache.py): the ids,
+    or None when the switch is off or the call is not one the cache serves (then
+    the caller makes the normal call). A cache miss makes the normal call here,
+    tokenizer.encode(text, **kwargs), and caches its result. Blocking: run it in
+    the renderer's executor."""
+    if prefix_token_cache.MODE == "0":
+        return None
+    max_length = prefix_token_cache.served_max_length(kwargs)
+    if max_length is False:
+        return None
+    cache = prefix_token_cache.cache_for(tokenizer)
+    ids, reused, key = cache.tokenize(
+        text,
+        lambda s: tokenizer.encode(s, add_special_tokens=False),
+        lambda: tokenizer.encode(text, **kwargs),
+        max_length,
+    )
+    if prefix_token_cache.MODE == "verify":
+        full = list(tokenizer.encode(text, **kwargs))
+        same = full == ids
+        if not same:
+            cache.drop(key)  # a result that differed never becomes a parent
+        # one line per served request: ids compared, ids reused (0 = a miss),
+        # the result
+        logger.info(
+            "%s=verify: %d ids compared, %d reused (%s): %s",
+            prefix_token_cache.KNOB,
+            len(full),
+            reused,
+            "hit" if reused else "miss",
+            "identical" if same else "DIFFERENT (the full tokenization is used)",
+        )
+        ids = full
+    s = cache.stats
+    if (s["hits"] + s["misses"]) % prefix_token_cache.SUMMARY_EVERY == 0:
+        logger.info("%s", cache.summary())
+    return ids
 
 
 class _PrefixTokenizeCache:
@@ -574,6 +615,18 @@ class BaseRenderer(ABC, Generic[_T]):
         return self.render_messages(messages, params)
 
     # Step 2: Tokenize prompts if necessary
+    def _v41_prefix_cache_serves(self, encode_kwargs: dict[str, Any]) -> bool:
+        """VLLM_V41_PREFIX_TOKEN_CACHE takes this call: the switch is on, the
+        call's arguments are ones it serves, and the renderer's own
+        _PrefixTokenizeCache does not serve this tokenizer (that one stays in
+        charge wherever it is enabled)."""
+        own_cache = getattr(self, "_prefix_tok_cache", None)
+        return (
+            prefix_token_cache.MODE != "0"
+            and prefix_token_cache.served_max_length(encode_kwargs) is not False
+            and not (own_cache is not None and own_cache.enabled)
+        )
+
     def _tokenize_prompt(
         self,
         prompt: TextPrompt,
@@ -582,6 +635,11 @@ class BaseRenderer(ABC, Generic[_T]):
         tokenizer = self.get_tokenizer()
         encode_kwargs = params.get_encode_kwargs()
         text = prompt["prompt"]
+        if self._v41_prefix_cache_serves(encode_kwargs):
+            ids = _prefix_cached(tokenizer, text, encode_kwargs)
+            if ids is not None:
+                # VLLM_V41_PREFIX_TOKEN_CACHE served the call
+                return TokensPrompt(prompt_token_ids=ids, **prompt)
         cache = getattr(self, "_prefix_tok_cache", None)
         plan = (
             cache.plan(text, encode_kwargs)
@@ -616,9 +674,20 @@ class BaseRenderer(ABC, Generic[_T]):
         prompt: TextPrompt,
         params: TokenizeParams,
     ) -> TokensPrompt:
-        tokenizer = self.get_async_tokenizer()
         encode_kwargs = params.get_encode_kwargs()
         text = prompt["prompt"]
+        if self._v41_prefix_cache_serves(encode_kwargs):
+            # VLLM_V41_PREFIX_TOKEN_CACHE: the piece after the cached prefix is
+            # tokenized in the renderer's thread pool (the same blocking call
+            # the microbatch tokenizer makes, on fewer tokens)
+            sync_tokenizer = self.get_tokenizer()
+            ids = await asyncio.get_running_loop().run_in_executor(
+                self._executor,
+                lambda: _prefix_cached(sync_tokenizer, text, encode_kwargs),
+            )
+            if ids is not None:
+                return TokensPrompt(prompt_token_ids=ids, **prompt)
+        tokenizer = self.get_async_tokenizer()
         cache = getattr(self, "_prefix_tok_cache", None)
         plan = (
             cache.plan(text, encode_kwargs)

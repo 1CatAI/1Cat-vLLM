@@ -578,6 +578,7 @@ if TYPE_CHECKING:
     VLLM_V41_PP_SERIAL: str = "0"
     VLLM_V41_PP_TOKEN_NCCL: str = "0"
     VLLM_V41_PREFILL_PIPELINE: str = "0"
+    VLLM_V41_PREFIX_TOKEN_CACHE: str = "0"
     VLLM_V41_VISION: str = "0"
     VLLM_V41_PROPOSE_GRAPH: str = "0"
     VLLM_V41_PROPOSE_GRAPH_MODE: str = "relaxed"
@@ -8663,6 +8664,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: os.getenv("VLLM_V41_PP_TOKEN_NCCL", "0"),
         description=(
             "DS-V4.1 PP: broadcast sampled tokens over a dedicated NCCL communicator."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFIX_TOKEN_CACHE": env_var(
+        lambda: os.getenv("VLLM_V41_PREFIX_TOKEN_CACHE", "0"),
+        description=(
+            "API server: keep the last prompts' text and ids and tokenize only "
+            "the part after the longest cached prefix that ends at an added "
+            "token (tokenizers without <|im_start|>, e.g. DeepSeek-V4.1). "
+            "0: off; 1: on; verify: on, every served call checked against a "
+            "full tokenization."
         ),
         category="experimental",
         declared_default="'0'",
@@ -21987,6 +22004,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_PP_SERIAL",
         "VLLM_V41_PP_TOKEN_NCCL",
         "VLLM_V41_PREFILL_PIPELINE",
+        "VLLM_V41_PREFIX_TOKEN_CACHE",
         "VLLM_V41_VISION",
         "VLLM_V41_PROPOSE_GRAPH",
         "VLLM_V41_PROPOSE_GRAPH_MODE",
