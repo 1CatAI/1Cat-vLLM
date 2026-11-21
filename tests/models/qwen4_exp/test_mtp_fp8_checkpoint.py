@@ -167,6 +167,65 @@ def test_checkpoint_stream_orders_preserve_pairs_and_unrelated_tensors():
         assert actual[prefix + ".0.gate_proj.weight"].shape == (1024, 256)
 
 
+def test_q8_wrapper_preserves_fp8_checkpoint_preparation(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization import sm70_turbomind
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+    from vllm.models.qwen4_exp.nvidia import mtp
+    from vllm.models.qwen4_exp.nvidia.mtp_fp8_checkpoint import (
+        prepare_mtp_fp8_checkpoint,
+    )
+    from vllm.models.qwen4_exp.nvidia.mtp_q8_experts import MTPQ80Config
+
+    quant_config = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "mtp.layers.0.mlp.experts": {
+                        "quant_algo": "FP8_BLOCK_SCALES",
+                        "group_size": 128,
+                    }
+                },
+            }
+        }
+    )
+    monkeypatch.setattr(mtp, "get_draft_quant_config", lambda _: quant_config)
+    monkeypatch.setattr(sm70_turbomind, "is_exact_sm70_cuda_platform", lambda: True)
+    # Use a CPU config stub to bypass engine initialization during replacement.
+    monkeypatch.setattr(
+        mtp, "replace", lambda cfg, **changes: SimpleNamespace(**(vars(cfg) | changes))
+    )
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                dtype=torch.float16,
+                hf_text_config=SimpleNamespace(mtp_num_hidden_layers=1),
+            ),
+            rejection_sample_method="standard",
+        ),
+        kernel_config=SimpleNamespace(
+            sm70_mtp_q8_0_experts=True, sm70_mtp_lossless_storage=False
+        ),
+        parallel_config=SimpleNamespace(enable_expert_parallel=False),
+    )
+    draft, prefixes = mtp._make_draft_vllm_config(config, mtp_start_layer_idx=48)
+    assert isinstance(draft.quant_config, MTPQ80Config)
+    assert prefixes == {"mtp.layers.48.mlp.experts"}
+
+    prefix, rows = checkpoint_pairs()
+    loader_prefixes = {
+        name.replace("mtp.layers.48.", "model.layers.0.") for name in prefixes
+    }
+    prepared = dict(
+        prepare_mtp_fp8_checkpoint(rows, loader_prefixes, tp_size=4, num_experts=2)
+    )
+    assert prepared[prefix + ".0.gate_proj.weight_scale_inv"].shape == (8, 2)
+
+
 @pytest.mark.parametrize("failure", ["missing_pair", "duplicate", "extra_expert"])
 def test_checkpoint_stream_rejects_incomplete_or_duplicate_experts(failure):
     from vllm.models.qwen4_exp.nvidia.mtp_fp8_checkpoint import (
