@@ -466,7 +466,7 @@ def _fn_shared_expert_prefill(
             del raw
         down_out = torch.nn.functional.linear(act_out, down_weight)
         del act_out
-        if defer_gate_allowed and m >= 1024:
+        if defer_gate_allowed and m >= 320:
             _PENDING_SHARED_GATE_LOGITS[(dev_idx, int(down_weight.data_ptr()))] = (
                 gate_logits
             )

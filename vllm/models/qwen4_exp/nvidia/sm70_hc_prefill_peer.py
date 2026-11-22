@@ -258,7 +258,7 @@ class HcPrefillPeerRuntime:
             self.barrier_out = torch.empty_like(self.barrier_in)
 
     def can_use(self, hidden, first, second, injection, weight) -> bool:
-        min_rows = 1024 if getattr(self, "p2p_enabled", False) else 4096
+        min_rows = 320 if getattr(self, "p2p_enabled", False) else 4096
         valid_weights = (
             (2560, 10240) if getattr(self, "p2p_enabled", False) else (10240,)
         )
@@ -295,7 +295,7 @@ class HcPrefillPeerRuntime:
             getattr(self, "p2p_enabled", False)
             and self.pointers
             and not torch.cuda.is_current_stream_capturing()
-            and 1024 <= padded_rows <= ((self.max_rows + 3) // 4) * 4
+            and 320 <= padded_rows <= ((self.max_rows + 3) // 4) * 4
             and padded_rows * 2560 * 2 <= self.rs_bank_bytes
         ):
             return None
@@ -350,7 +350,7 @@ class HcPrefillPeerRuntime:
             getattr(self, "p2p_enabled", False)
             and self.pointers
             and not torch.cuda.is_current_stream_capturing()
-            and 1024 <= 4 * hidden.shape[0] <= ((self.max_rows + 3) // 4) * 4
+            and 320 <= 4 * hidden.shape[0] <= ((self.max_rows + 3) // 4) * 4
             and first.ndim == 2
             and first.shape[1] == 2560
             and hidden.shape[1] == 10240
@@ -462,7 +462,7 @@ class HcPrefillPeerRuntime:
             and self.pointers
             and not torch.cuda.is_current_stream_capturing()
             and x.ndim == 2
-            and 256 <= x.shape[0] <= (self.max_rows + 3) // 4
+            and 80 <= x.shape[0] <= (self.max_rows + 3) // 4
             and x.shape[1] == 10240
             and x.dtype == torch.float16
             and x.device == self.device
@@ -578,7 +578,7 @@ class HcPrefillPeerRuntime:
         injection = torch.empty(
             (local_rows, 4), dtype=torch.float16, device=self.device
         )
-        if local_rows >= 256 and os.getenv("FN_HC_FUSED_DOWN", "0") != "0":
+        if local_rows >= 80 and os.getenv("FN_HC_FUSED_DOWN", "0") != "0":
             torch.ops.vllm_sm70_fn_prefill.hc_down_proj_split_silu(
                 lora, injection, x, cur_down
             )
@@ -592,10 +592,10 @@ class HcPrefillPeerRuntime:
 
         slot = self._ag_ep_host & 1
         ptr = self.ag_ptrs[self.rank] + slot * self.ag_bank_bytes
-        use_fused_up = local_rows >= 256 and os.getenv("FN_HC_FUSED_UP", "0") != "0"
+        use_fused_up = local_rows >= 80 and os.getenv("FN_HC_FUSED_UP", "0") != "0"
         do_async_pull = (
             defer_pull
-            and local_rows >= 256
+            and local_rows >= 80
             and os.getenv("FN_HC_ASYNC_PULL", "1") != "0"
         )
         if use_fused_up and do_async_pull:
@@ -856,8 +856,8 @@ def prepare_hc_prefill_peer_runtime(vllm_config, device) -> None:
         if nccl is None or nccl.disabled
         else "ipc_close_operator_missing"
         if not hasattr(torch.ops._C, "sm70_ring_close_mem_handle")
-        else "query_capacity_below_1024"
-        if sched_rows < 1024
+        else "query_capacity_below_320"
+        if sched_rows < 320
         else None
     )
     reasons = [None] * group.world_size

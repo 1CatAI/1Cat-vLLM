@@ -193,6 +193,7 @@ def flashqla_sm70_chunk_gated_delta_rule(
             os.getenv("FN_DISABLE_CUSTOM_GDN", "0") != "1"
             and has_sm70_flashnext_prefill_ops()
             and current_platform.is_device_capability(70)
+            and chunk_offsets is None
             and q_arg.shape[0] == 1
             and q_arg.shape[1] >= 256
             and q_arg.shape[2:] == (4, 128)

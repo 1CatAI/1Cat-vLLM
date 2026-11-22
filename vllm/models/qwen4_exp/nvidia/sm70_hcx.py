@@ -99,7 +99,7 @@ def _output_projection(x: torch.Tensor, name: str) -> torch.Tensor:
     if (
         hc_prefill_sequence_parallel_active()
         and x.ndim == 2
-        and x.shape[0] >= 1024
+        and x.shape[0] >= 320
         and layer.output_size == 2560
         and getattr(layer, "bias", None) is None
         and not getattr(layer, "reduce_results", False)

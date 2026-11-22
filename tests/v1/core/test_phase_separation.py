@@ -408,3 +408,62 @@ def test_phase_pure_auto_enabled_for_zero_mixed_latency_and_short_warm_turns(
     assert scheduler._split_mtp_prefill_burst_tokens == 0
     p_w3 = scheduler.schedule()
     assert p_w3.num_scheduled_tokens == {"w3": 300}
+
+
+def test_split_mtp_phase_pure_preserves_large_block_alignment_at_long_context(
+    monkeypatch, tmp_path
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            dict(
+                model_type="llama",
+                architectures=["LlamaForCausalLM"],
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                vocab_size=128,
+                max_position_embeddings=65536,
+                torch_dtype="float16",
+            )
+        )
+    )
+    monkeypatch.setenv("VLLM_SM70_PHASE_SEPARATION", "0")
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_seqs=4,
+        max_num_batched_tokens=16384,
+        max_model_len=65536,
+        num_blocks=64,
+        block_size=2048,
+        async_scheduling=True,
+        skip_tokenizer_init=True,
+        split_mtp_phase_pure=True,
+        split_mtp_prefill_cap=2048,
+    )
+    dec = create_requests(1, num_tokens=16, max_tokens=512, req_ids=["decode"])[0]
+    scheduler.add_request(dec)
+    _finish_step(scheduler, scheduler.schedule())
+    assert dec.num_output_tokens == 1
+
+    long_req = create_requests(
+        1, num_tokens=55296, max_tokens=16, req_ids=["long_64k"]
+    )[0]
+    scheduler.add_request(long_req)
+    # On block_size=2048, concurrent prefill preserves full 2048-token block
+    # alignment across early and >=49K context with 4 interleaved decode steps.
+    scheduler._split_mtp_decode_steps_due = 0
+    p_early = scheduler.schedule()
+    assert p_early.num_scheduled_tokens == {"long_64k": 2048}
+    assert scheduler._split_mtp_decode_steps_due == 4
+    _finish_step(scheduler, p_early)
+
+    while long_req.num_computed_tokens < 49152:
+        out = scheduler.schedule()
+        _finish_step(scheduler, out)
+
+    scheduler._split_mtp_decode_steps_due = 0
+    p_long = scheduler.schedule()
+    assert p_long.num_scheduled_tokens == {"long_64k": 2048}
+    assert scheduler._split_mtp_decode_steps_due == 4

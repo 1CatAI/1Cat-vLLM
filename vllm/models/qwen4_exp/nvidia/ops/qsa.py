@@ -1393,11 +1393,15 @@ def _use_sm70_qsa_indexer_cublas(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
+    bounded_columns: int = 0,
 ) -> bool:
+    min_rows = sparse_policy().value("qsa_cublas_min_rows")
+    if bounded_columns >= 4096:
+        min_rows = min(min_rows, 128)
     return (
         sparse_policy().value("qsa_indexer_cublas")
         and current_platform.is_device_capability_family(70)
-        and q.shape[0] >= sparse_policy().value("qsa_cublas_min_rows")
+        and q.shape[0] >= min_rows
         and _qsa_indexer_cublas_shape_supported(q, k_cache, page_table)
     )
 
@@ -1656,7 +1660,11 @@ def _qsa_select_by_request(
     if query_start_loc[0] != 0 or query_start_loc[-1] != rows:
         return False
     segments = _qsa_indexer_request_segments(
-        query_start_loc, sparse_policy().value("qsa_cublas_min_rows")
+        query_start_loc,
+        min(
+            sparse_policy().value("qsa_cublas_min_rows"),
+            128 if (max_seq_len or 0) >= 16384 else 512,
+        ),
     )
     if all(request is None for _, _, request in segments):
         return False
@@ -1773,13 +1781,13 @@ def qsa_select_paged_tokens(
     block_topk = token_topk // compress_ratio
     bounded_columns = capacity_columns
     if max_seq_len is not None and not torch.cuda.is_current_stream_capturing():
-        live_bound = max(block_topk, max_seq_len // compress_ratio)
+        live_bound = max(block_topk, triton.cdiv(max_seq_len, compress_ratio))
         bounded_columns = min(capacity_columns, triton.cdiv(live_bound, 4) * 4)
     score_columns = bounded_columns
     contiguous_keys: torch.Tensor | None = None
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None
-    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
+    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table, bounded_columns):
         all_visible = _qsa_visible_blocks(
             token_to_req[:rows],
             query_positions[:rows],
@@ -1789,15 +1797,16 @@ def qsa_select_paged_tokens(
         # cuBLAS has a rectangular host-side launch shape, unlike the paged
         # Triton kernel's device-side early exit. Bound it to this chunk's live
         # prefix so early-context prefill does not multiply the unused 140K
-        # model-capacity tail. Visible blocks never exceed seq_len // ratio,
-        # so the host bound needs no sync; columns past a row's visible
-        # blocks are ignored by the top-k. Without it, one scalar sync.
+        # model-capacity tail. Round up to 4 columns so FP32 logits rows stay
+        # 16-byte float4-aligned for SM70 lexicographic top-k at odd lengths.
         live_blocks = (
-            max_seq_len // compress_ratio
+            triton.cdiv(max_seq_len, compress_ratio)
             if max_seq_len is not None
             else int(all_visible.max().item())
         )
-        cublas_columns = min(capacity_columns, max(block_topk, live_blocks))
+        cublas_columns = min(
+            capacity_columns, triton.cdiv(max(block_topk, live_blocks), 4) * 4
+        )
         if _qsa_indexer_cublas_work_supported(rows, cublas_columns):
             score_columns = cublas_columns
             logger.info_once(
@@ -1823,7 +1832,7 @@ def qsa_select_paged_tokens(
     if (
         tp_group is not None
         and tp_group.world_size == 4
-        and 1024 <= rows <= 16384
+        and 320 <= rows <= 16384
         and q.shape[1:] == (4, 128)
         and token_topk == 2048
         and compress_ratio == 4
@@ -1832,9 +1841,15 @@ def qsa_select_paged_tokens(
     ):
         step = triton.cdiv(rows, tp_group.world_size)
         smallest_partition = rows - (tp_group.world_size - 1) * step
-        if smallest_partition >= sparse_policy().value(
-            "qsa_cublas_min_rows"
-        ) and _qsa_indexer_cublas_work_supported(smallest_partition, score_columns):
+        tp_min_rows = (
+            80
+            if score_columns >= 4096
+            else min(256, sparse_policy().value("qsa_cublas_min_rows"))
+        )
+        if smallest_partition >= tp_min_rows and (
+            _qsa_indexer_cublas_work_supported(smallest_partition, score_columns)
+            or (score_columns >= 4096 and smallest_partition * score_columns >= 524288)
+        ):
             tp_step = step
             assert all_visible is not None
             if (rows & 7) == 0 and rows >= 2048:
