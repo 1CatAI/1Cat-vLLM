@@ -318,6 +318,10 @@ class MsgpackDecoder:
 
     ``oob_tensor_provider`` must be used when an OOBTensorConsumer is used on the
     encoder side.
+
+    With ``share_mem=False``, large tensors are copied out of the received
+    buffers into pinned memory when the platform supports it.
+    ``pin_tensors=False`` makes these copies ordinary pageable memory instead.
     """
 
     def __init__(
@@ -325,9 +329,10 @@ class MsgpackDecoder:
         t: Any | None = None,
         share_mem: bool = True,
         oob_tensor_provider: OOBTensorProvider | None = None,
+        pin_tensors: bool = True,
     ):
         self.share_mem = share_mem
-        self.pin_tensors = is_pin_memory_available()
+        self.pin_tensors = pin_tensors and is_pin_memory_available()
         args = () if t is None else (t,)
         self.decoder = msgpack.Decoder(
             *args, ext_hook=self.ext_hook, dec_hook=self.dec_hook

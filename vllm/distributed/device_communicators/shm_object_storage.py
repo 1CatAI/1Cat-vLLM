@@ -371,8 +371,20 @@ class MsgpackSerde(ObjectSerde):
         from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
         self.encoder = MsgpackEncoder()
-        self.tensor_decoder = MsgpackDecoder(torch.Tensor, share_mem=False)
-        self.mm_decoder = MsgpackDecoder(MultiModalKwargsItem, share_mem=False)
+        # The copy out of the ring is needed (the slot is reused once every
+        # reader has fetched it), but pinning it is not needed for
+        # correctness: Model Runner V2 batches encoder inputs with
+        # pin_memory=False; V1 concatenates a multi-item batch into a new
+        # pinned tensor and copies a single item from pageable memory.
+        # torch's caching host allocator rounds pinned blocks up to a power of
+        # two and keeps them until the process exits, so pinning every copy
+        # grew each reader's host memory for the life of the server.
+        self.tensor_decoder = MsgpackDecoder(
+            torch.Tensor, share_mem=False, pin_tensors=False
+        )
+        self.mm_decoder = MsgpackDecoder(
+            MultiModalKwargsItem, share_mem=False, pin_tensors=False
+        )
         self._mm_kwargs_item_cls = MultiModalKwargsItem
 
     def serialize(self, value: Any) -> tuple[bytes | list[bytes], int, bytes, int]:

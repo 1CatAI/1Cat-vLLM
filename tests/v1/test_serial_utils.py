@@ -239,6 +239,31 @@ def test_numpy_array_serialization():
     )
 
 
+@pytest.mark.parametrize("pin_tensors", [True, False])
+def test_tensor_copy_pinning(monkeypatch: pytest.MonkeyPatch, pin_tensors: bool):
+    """With share_mem=False a large tensor is copied out of the buffer.
+    The copy is pinned by default when pinning is available, and pageable
+    with pin_tensors=False."""
+    monkeypatch.setattr("vllm.v1.serial_utils.is_pin_memory_available", lambda: True)
+    pinned: list[torch.Tensor] = []
+
+    def fake_pin_memory(self: torch.Tensor) -> torch.Tensor:
+        pinned.append(self)
+        return self.clone()
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", fake_pin_memory)
+    decoder = MsgpackDecoder(torch.Tensor, share_mem=False, pin_tensors=pin_tensors)
+
+    tensor = torch.rand(16, 16)
+    encoded = MsgpackEncoder().encode(tensor)
+    assert len(encoded) == 2  # sent as an aux buffer, the branch that pins
+    decoded = decoder.decode(encoded)
+
+    assert torch.equal(decoded, tensor)
+    assert decoded.data_ptr() != tensor.data_ptr()
+    assert len(pinned) == int(pin_tensors)
+
+
 class CustomClass:
     def __init__(self, value):
         self.value = value

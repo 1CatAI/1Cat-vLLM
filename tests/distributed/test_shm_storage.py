@@ -7,6 +7,7 @@ import time
 import traceback
 import unittest
 from multiprocessing import Lock
+from unittest.mock import patch
 
 import torch
 
@@ -148,6 +149,58 @@ class TestShmObjectStorageReferenceCounting(unittest.TestCase):
         self.readers[0].touch("image", address=address, monotonic_id=monotonic_id)
 
         self.assertEqual(bytes(self.writer.ring_buffer.shared_memory.buf), before)
+
+
+class TestShmObjectStorageReaderCopy(unittest.TestCase):
+    """A reader decodes into its own copy, since the slot is reused once
+    every reader has fetched it. The copy must be pageable: torch keeps
+    pinned host blocks, rounded up to a power of two, until the process
+    exits."""
+
+    def test_reader_copy_is_pageable_and_private(self):
+        pixels = torch.arange(1024, dtype=torch.int32)
+        item = MultiModalKwargsItem(
+            {
+                "pixel_values": MultiModalFieldElem(
+                    data=pixels, field=MultiModalSharedField(batch_size=1)
+                )
+            }
+        )
+        # 4 KiB is above the zero-copy threshold, so the tensor travels as an
+        # aux buffer: the decode branch that used to pin.
+        self.assertGreater(len(MsgpackSerde().serialize(item)[0]), 1)
+
+        writer = SingleWriterShmObjectStorage(
+            max_object_size=1024 * 10,
+            n_readers=1,
+            ring_buffer=SingleWriterShmRingBuffer(
+                data_buffer_size=1024 * 100, create=True
+            ),
+            serde_class=MsgpackSerde,
+        )
+        self.addCleanup(writer.close)
+        handle = writer.handle()
+        handle.reader_lock = Lock()
+
+        # Make pinning available, so the reader would pin if it chose to.
+        with (
+            patch("vllm.v1.serial_utils.is_pin_memory_available", return_value=True),
+            patch.object(
+                torch.Tensor,
+                "pin_memory",
+                side_effect=AssertionError("shm reader pinned its copy"),
+            ),
+        ):
+            reader = SingleWriterShmObjectStorage.create_from_handle(handle)
+            self.addCleanup(reader.close)
+            decoded = reader.get(*writer.put("image", item))
+
+        copy = decoded["pixel_values"].data
+        self.assertFalse(copy.is_pinned())
+        # The writer may reuse the slot as soon as every reader has read it.
+        shm_buf = writer.ring_buffer.shared_memory.buf
+        shm_buf[:] = bytes(len(shm_buf))
+        self.assertTrue(torch.equal(copy, pixels))
 
 
 class TestSingleWriterShmObjectStorage(unittest.TestCase):
