@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,8 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.cache import ShmObjectStoreReceiverCache
+from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
@@ -34,6 +36,16 @@ _R = TypeVar("_R")
 class CompilationTimes(NamedTuple):
     language_model: float
     encoder: float
+
+
+def _shm_reference(item: MultiModalKwargsItem | None) -> tuple[int, int] | None:
+    """The (address, monotonic_id) of an item P0 stored in the shm cache, or
+    None for an item it sent inline."""
+    if item is None or "address" not in item:
+        return None
+    address = cast(int, item["address"].data)
+    monotonic_id = cast(int, item["monotonic_id"].data)
+    return address, monotonic_id
 
 
 class WorkerBase:
@@ -211,6 +223,22 @@ class WorkerWrapperBase:
         self.rpc_rank: int = rpc_rank
         self.global_rank: int = self.rpc_rank if global_rank is None else global_rank
 
+        # Shm items this worker fetched, per request and mm_features index:
+        # ((address, monotonic_id), item), or None for an item sent inline.
+        # Model Runner V2 sends a resumed (preempted) request in
+        # scheduled_new_reqs again with the references it had, and so does a
+        # streaming-input session with each new chunk. A reference may be
+        # read once per reader (it holds one writer count) and its slot may
+        # hold another item by then, so those features are served from here.
+        # These are the objects the model runner holds until the request
+        # finishes, so only a preempted request costs extra memory. The entry
+        # goes when the request finishes; reset_mm_cache keeps it, since P0's
+        # ids restart after a reset and a stale reference could then name
+        # another request's item.
+        self._shm_mm_items: dict[
+            str, list[tuple[tuple[int, int], MultiModalKwargsItem] | None]
+        ] = {}
+
         # Initialized after init_worker is called
         self.worker: WorkerBase
         self.vllm_config: VllmConfig
@@ -332,10 +360,51 @@ class WorkerWrapperBase:
         if mm_cache is None:
             return
 
+        if isinstance(mm_cache, ShmObjectStoreReceiverCache):
+            self._apply_shm_mm_cache(mm_cache, scheduler_output)
+            return
+
         for req_data in scheduler_output.scheduled_new_reqs:
             req_data.mm_features = mm_cache.get_and_update_features(
                 req_data.mm_features
             )
+
+    def _apply_shm_mm_cache(
+        self,
+        mm_cache: ShmObjectStoreReceiverCache,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        fetched_by_req = self._shm_mm_items
+        # Before the new requests: a finished id can be reused by a new
+        # request in the same step. finished_req_ids also carries requests
+        # aborted while preempted.
+        for req_id in scheduler_output.finished_req_ids:
+            fetched_by_req.pop(req_id, None)
+
+        for req_data in scheduler_output.scheduled_new_reqs:
+            features = req_data.mm_features
+            if not features:
+                continue
+            fetched = fetched_by_req.setdefault(req_data.req_id, [])
+            fetched.extend([None] * (len(features) - len(fetched)))
+
+            to_fetch: list[tuple[int, tuple[int, int] | None]] = []
+            for idx, feature in enumerate(features):
+                ref = _shm_reference(feature.data)
+                entry = fetched[idx]
+                if ref is not None and entry is not None and entry[0] == ref:
+                    feature.data = entry[1]
+                else:
+                    to_fetch.append((idx, ref))
+            if not to_fetch:
+                continue
+
+            mm_cache.get_and_update_features([features[idx] for idx, _ in to_fetch])
+            for idx, ref in to_fetch:
+                item = features[idx].data
+                # An inline item is sent again with the request, so it is
+                # not held here across a preemption.
+                fetched[idx] = None if ref is None or item is None else (ref, item)
 
     def execute_model(
         self, scheduler_output: SchedulerOutput

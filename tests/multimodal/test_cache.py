@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 import multiprocessing as mp
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
+from vllm.distributed.device_communicators.shm_object_storage import (
+    MsgpackSerde,
+    SingleWriterShmObjectStorage,
+    SingleWriterShmRingBuffer,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import (
     BaseMultiModalProcessorCache,
@@ -22,6 +29,7 @@ from vllm.multimodal.cache import (
 )
 from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.inputs import (
+    MultiModalBatchedField,
     MultiModalFeatureSpec,
     MultiModalFieldElem,
     MultiModalKwargsItem,
@@ -31,6 +39,8 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.processing import PromptInsertion
 from vllm.utils.mem_constants import GiB_bytes, MiB_bytes
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 pytestmark = pytest.mark.cpu_test
 
@@ -549,6 +559,242 @@ def test_processor_cache_shared_across_loras():
 
     receiver_cache.get_and_update_features([feature_lora_b])
     assert feature_lora_b.data == item_data
+
+
+class _CountingShmStorage(SingleWriterShmObjectStorage):
+    """A worker's shm reader that records every get()."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.gets: list[tuple[int, int]] = []
+
+    def get(self, address: int, monotonic_id: int) -> Any:
+        self.gets.append((address, monotonic_id))
+        return super().get(address, monotonic_id)
+
+
+class _ShmReceiverCacheStub(ShmObjectStoreReceiverCache):
+    """The worker-side shm receiver cache around a given reader."""
+
+    def __init__(self, reader: SingleWriterShmObjectStorage) -> None:
+        self._shm_cache = reader
+
+
+class _ShmTPWorkers:
+    """P0's shm writer and one WorkerWrapperBase per TP rank, each reading
+    through its own shm receiver cache."""
+
+    def __init__(self, tp_size: int) -> None:
+        self.writer = SingleWriterShmObjectStorage(
+            max_object_size=10 * 1024,
+            n_readers=tp_size,
+            ring_buffer=SingleWriterShmRingBuffer(
+                data_buffer_size=100 * 1024, create=True
+            ),
+            serde_class=MsgpackSerde,
+        )
+        reader_lock = mp.Lock()
+        self.readers: list[_CountingShmStorage] = []
+        self.workers: list[WorkerWrapperBase] = []
+        for rank in range(tp_size):
+            reader = _CountingShmStorage(
+                max_object_size=10 * 1024,
+                n_readers=tp_size,
+                ring_buffer=SingleWriterShmRingBuffer(
+                    *self.writer.ring_buffer.handle()
+                ),
+                serde_class=MsgpackSerde,
+                reader_lock=reader_lock,
+            )
+            worker = WorkerWrapperBase(rpc_rank=rank)
+            worker.mm_receiver_cache = _ShmReceiverCacheStub(reader)
+            self.readers.append(reader)
+            self.workers.append(worker)
+
+    def close(self) -> None:
+        for reader in self.readers:
+            reader.close()
+        self.writer.close()
+
+    def reference(
+        self, mm_hash: str, item: MultiModalKwargsItem
+    ) -> MultiModalKwargsItem:
+        """What P0 sends for one reference to an item: one writer count."""
+        if self.writer.is_cached(mm_hash):
+            address, monotonic_id = self.writer.get_cached(mm_hash)
+        else:
+            address, monotonic_id = self.writer.put(mm_hash, item)
+        return MultiModalKwargsItem(
+            {
+                "address": MultiModalFieldElem(
+                    data=address, field=MultiModalBatchedField()
+                ),
+                "monotonic_id": MultiModalFieldElem(
+                    data=monotonic_id, field=MultiModalBatchedField()
+                ),
+            }
+        )
+
+    def step(
+        self,
+        *,
+        new_reqs: list[tuple[str, list[MultiModalFeatureSpec]]] | None = None,
+        finished: set[str] | None = None,
+        preempted: set[str] | None = None,
+    ) -> list[SchedulerOutput]:
+        """Send one scheduler output to every rank and return what each rank
+        resolved. Each rank gets its own copy, as from the executor's
+        broadcast, so the engine's features keep their shm references."""
+        output = SchedulerOutput.make_empty()
+        output.scheduled_new_reqs = [
+            NewRequestData(
+                req_id=req_id,
+                prompt_token_ids=[0],
+                mm_features=features,
+                sampling_params=None,
+                pooling_params=None,
+                block_ids=([],),
+                num_computed_tokens=0,
+                lora_request=None,
+            )
+            for req_id, features in new_reqs or []
+        ]
+        output.finished_req_ids = finished or set()
+        output.preempted_req_ids = preempted
+        received = []
+        for worker in self.workers:
+            worker_output = copy.deepcopy(output)
+            worker._apply_mm_cache(worker_output)
+            received.append(worker_output)
+        return received
+
+    def num_gets(self) -> list[int]:
+        return [len(reader.gets) for reader in self.readers]
+
+    def is_evictable(self, mm_hash: str) -> bool:
+        self.writer.free_unused()
+        return not self.writer.is_cached(mm_hash)
+
+
+def _image_feature(
+    mm_hash: str, data: MultiModalKwargsItem, offset: int
+) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=data,
+        modality="image",
+        identifier=mm_hash,
+        mm_position=PlaceholderRange(offset=offset, length=4),
+        mm_hash=mm_hash,
+    )
+
+
+def _resolved_data(output: SchedulerOutput) -> list[MultiModalKwargsItem | None]:
+    return [feature.data for feature in output.scheduled_new_reqs[0].mm_features]
+
+
+def test_shm_worker_reads_each_reference_once_across_preemption():
+    """Model Runner V2 sends a resumed request in scheduled_new_reqs again,
+    with the shm references the engine kept for it. Reading them again
+    over-counts the readers, and the slot may hold another item by then."""
+    rng = np.random.RandomState(0)
+    image_a, image_b, image_c = (
+        _dummy_item({"pixel_values": 1024}, rng=rng) for _ in range(3)
+    )
+    shm = _ShmTPWorkers(tp_size=2)
+    try:
+        # image_a twice in one request: two writer counts, two reads per rank.
+        features = [
+            _image_feature("a", shm.reference("a", image_a), offset=0),
+            _image_feature("a", shm.reference("a", image_a), offset=4),
+            _image_feature("b", shm.reference("b", image_b), offset=8),
+        ]
+        first = shm.step(new_reqs=[("req", features)])
+        assert shm.num_gets() == [3, 3]
+        assert all(_resolved_data(out) == [image_a, image_a, image_b] for out in first)
+        assert shm.is_evictable("a")
+        assert shm.is_evictable("b")
+
+        shm.step(preempted={"req"})
+        # While the request waits, P0 resets its cache and stores another
+        # image under the reference image_a had.
+        shm.writer.clear()
+        address_a = features[0].data["address"].data
+        monotonic_id_a = features[0].data["monotonic_id"].data
+        assert shm.writer.put("c", image_c) == (address_a, monotonic_id_a)
+
+        resumed = shm.step(new_reqs=[("req", features)])
+        assert shm.num_gets() == [3, 3]
+        for before, after in zip(first, resumed):
+            assert _resolved_data(after) == [image_a, image_a, image_b]
+            # The very objects fetched before: no second copy.
+            assert all(
+                x is y for x, y in zip(_resolved_data(before), _resolved_data(after))
+            )
+        assert not shm.is_evictable("c")
+
+        shm.step(finished={"req"})
+        assert all(not worker._shm_mm_items for worker in shm.workers)
+    finally:
+        shm.close()
+
+
+def test_shm_worker_streaming_chunk_reads_only_new_references():
+    """A streaming-input session comes back in scheduled_new_reqs with every
+    chunk. Only the new chunk's references are read, also one naming an
+    image an earlier chunk had. An inline item is passed through as sent."""
+    rng = np.random.RandomState(0)
+    image_a, image_b, inline_item = (
+        _dummy_item({"pixel_values": 1024}, rng=rng) for _ in range(3)
+    )
+    shm = _ShmTPWorkers(tp_size=1)
+    try:
+        features = [
+            _image_feature("a", shm.reference("a", image_a), offset=0),
+            _image_feature("x", inline_item, offset=4),
+        ]
+        shm.step(new_reqs=[("session", features)])
+        assert shm.num_gets() == [1]
+
+        features += [
+            _image_feature("a", shm.reference("a", image_a), offset=8),
+            _image_feature("b", shm.reference("b", image_b), offset=12),
+        ]
+        (output,) = shm.step(new_reqs=[("session", features)])
+        assert shm.num_gets() == [3]
+        assert _resolved_data(output) == [image_a, inline_item, image_a, image_b]
+        assert shm.is_evictable("a")
+        assert shm.is_evictable("b")
+        # The engine sends the inline item with every chunk; it is not kept.
+        assert shm.workers[0]._shm_mm_items["session"][1] is None
+    finally:
+        shm.close()
+
+
+def test_shm_worker_drops_a_request_aborted_while_preempted():
+    """A request aborted while preempted is reported in finished_req_ids.
+    Its items are dropped before the step's new requests, so a new request
+    reusing the id and the image reads its own reference."""
+    image_a = _dummy_item({"pixel_values": 1024}, rng=np.random.RandomState(0))
+    shm = _ShmTPWorkers(tp_size=1)
+    try:
+        shm.step(
+            new_reqs=[("req", [_image_feature("a", shm.reference("a", image_a), 0)])]
+        )
+        shm.step(preempted={"req"})
+        assert "req" in shm.workers[0]._shm_mm_items
+
+        (output,) = shm.step(
+            finished={"req"},
+            new_reqs=[("req", [_image_feature("a", shm.reference("a", image_a), 0)])],
+        )
+        assert shm.num_gets() == [2]
+        assert _resolved_data(output) == [image_a]
+        assert shm.is_evictable("a")
+
+        shm.step(finished={"req"})
+        assert not shm.workers[0]._shm_mm_items
+    finally:
+        shm.close()
 
 
 _SLEEP_VISION_PROMPT = (
