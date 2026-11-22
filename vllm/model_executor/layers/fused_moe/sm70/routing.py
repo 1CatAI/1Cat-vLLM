@@ -12,9 +12,12 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-# Slots one program sorts by pairwise ranking (an S x S comparison in registers):
-# one decode token has 8, a speculative verify of 16 tokens 128.
+# Slots one program sorts (one warp, a register/shuffle bitonic sort): one decode
+# token has 8, a speculative verify of 16 tokens 128.
 _MAX_KERNEL_SLOTS = 128
+# A single warp keeps the sort and the barrier below inside shuffles; more warps
+# only add shared-memory round trips for at most 128 keys.
+_NUM_WARPS = 1
 
 
 def group_routing_reference(
@@ -49,34 +52,30 @@ def _group_routing_kernel(
     goff_ptr,
     num_slots,
     BLOCK: tl.constexpr,
+    LOG2_BLOCK: tl.constexpr,
 ):
     slot = tl.arange(0, BLOCK)
     valid = slot < num_slots
-    # Padding slots carry the largest key and rank behind every real slot.
-    expert = tl.load(ids_ptr + slot, mask=valid, other=0x7FFFFFFF).to(tl.int32)
-    # Stable rank: slot b sorts before slot a if its expert is smaller, or equal
-    # and it comes first.
-    before = (expert[None, :] < expert[:, None]) | (
-        (expert[None, :] == expert[:, None]) & (slot[None, :] < slot[:, None])
-    )
-    rank = tl.sum(before.to(tl.int32), axis=1)
-    # Row r of `at_rank` selects the slot of rank r.
-    at_rank = rank[None, :] == slot[:, None]
-    sorted_expert = tl.sum(tl.where(at_rank, expert[None, :], 0), axis=1)
-    perm = tl.sum(tl.where(at_rank, slot[None, :], 0), axis=1)
-    previous_expert = tl.sum(
-        tl.where(rank[None, :] == slot[:, None] - 1, expert[None, :], 0), axis=1
-    )
+    expert = tl.load(ids_ptr + slot, mask=valid, other=0).to(tl.int32)
+    # One sort key per slot, expert-major and slot-minor: the keys are distinct,
+    # so sorting them is the stable sort by expert and the slot index rides in
+    # the low bits (needs |expert| < 2**(31 - LOG2_BLOCK), far above any expert
+    # count). Padding lanes take the largest key and end up behind every slot.
+    key = tl.where(valid, expert * BLOCK + slot, 0x7FFFFFFF)
+    ordered = tl.sort(key)
+    perm = ordered & (BLOCK - 1)
+    sorted_expert = ordered >> LOG2_BLOCK
+    previous_expert = tl.gather(sorted_expert, tl.maximum(slot - 1, 0), axis=0)
     starts = valid & ((slot == 0) | (sorted_expert != previous_expert))
     group = tl.cumsum(starts.to(tl.int32), axis=0) - 1
-    # Row g of `is_start` selects the sorted position that opens group g.
-    is_start = starts[None, :] & (group[None, :] == slot[:, None])
-    opens = tl.sum(is_start.to(tl.int32), axis=1) > 0
-    first = tl.sum(tl.where(is_start, slot[None, :], 0), axis=1)
-    group_expert = tl.sum(tl.where(is_start, sorted_expert[None, :], 0), axis=1)
     tl.store(perm_ptr + slot, perm, mask=valid)
-    tl.store(goff_ptr + slot, tl.where(opens, first, num_slots), mask=valid)
-    tl.store(gids_ptr + slot, tl.where(opens, group_expert, 0), mask=valid)
+    # Unused group rows first, then each group start scatters into its row; the
+    # barrier orders the two writes to the same address.
+    tl.store(goff_ptr + slot, num_slots, mask=valid)
+    tl.store(gids_ptr + slot, 0, mask=valid)
+    tl.debug_barrier()
+    tl.store(goff_ptr + group, slot, mask=starts)
+    tl.store(gids_ptr + group, sorted_expert, mask=starts)
     tl.store(goff_ptr + num_slots, num_slots)
 
 
@@ -89,6 +88,8 @@ def group_routing(
     if num_slots > _MAX_KERNEL_SLOTS:
         return group_routing_reference(topk_ids)
     device = topk_ids.device
+    # tl.sort needs at least two lanes.
+    block = max(2, triton.next_power_of_2(num_slots))
     perm = torch.empty(num_slots, dtype=torch.int32, device=device)
     gids = torch.empty(num_slots, dtype=torch.int32, device=device)
     goff = torch.empty(num_slots + 1, dtype=torch.int32, device=device)
@@ -98,7 +99,8 @@ def group_routing(
         gids,
         goff,
         num_slots,
-        BLOCK=triton.next_power_of_2(num_slots),
-        num_warps=4,
+        BLOCK=block,
+        LOG2_BLOCK=block.bit_length() - 1,
+        num_warps=_NUM_WARPS,
     )
     return perm, gids, goff
