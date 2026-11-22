@@ -581,6 +581,8 @@ if TYPE_CHECKING:
     VLLM_V41_PP_TOKEN_NCCL: str = "0"
     VLLM_V41_PREFILL_PIPELINE: str = "0"
     VLLM_V41_VISION: str = "0"
+    VLLM_V41_VISION_MMPROJ: str | None = None
+    VLLM_V41_VISION_BIAS_VL: str | None = None
     VLLM_V41_PROPOSE_GRAPH: str = "0"
     VLLM_V41_PROPOSE_GRAPH_MODE: str = "relaxed"
     VLLM_V41_Q8: str = "1"
@@ -8714,12 +8716,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V41_VISION": env_var(
         lambda: os.getenv("VLLM_V41_VISION", "0"),
         description=(
-            "DS-V4.1 native: image inputs (ViT + aligner on the first stage, "
-            "VL routing bias, no Engram n-grams over image spans)."
+            "DS-V4.1: image inputs (ViT + aligner on the first stage, "
+            "VL routing bias, no Engram n-grams over image spans). The GGUF "
+            "route also needs VLLM_V41_VISION_MMPROJ and VLLM_V41_VISION_BIAS_VL."
         ),
         category="experimental",
         declared_default="'0'",
         effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_VISION_MMPROJ": env_var(
+        lambda: os.getenv("VLLM_V41_VISION_MMPROJ"),
+        description=(
+            "DS-V4.1 GGUF: the vision projector the tower is loaded from "
+            "(llama.cpp mmproj, projector type deepseek41v)."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_VISION_BIAS_VL": env_var(
+        lambda: os.getenv("VLLM_V41_VISION_BIAS_VL"),
+        description=(
+            "DS-V4.1 GGUF: the MoE image routing bias, raw little-endian F32 "
+            "[layers, experts] (exp_probs_b_vl.f32)."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -22018,6 +22047,8 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_PP_TOKEN_NCCL",
         "VLLM_V41_PREFILL_PIPELINE",
         "VLLM_V41_VISION",
+        "VLLM_V41_VISION_MMPROJ",
+        "VLLM_V41_VISION_BIAS_VL",
         "VLLM_V41_PROPOSE_GRAPH",
         "VLLM_V41_PROPOSE_GRAPH_MODE",
         "VLLM_V41_Q8",

@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1 vision input (VLLM_V41_VISION=1).
 
+GGUF route: the tower's weights come from llama.cpp's vision projector
+(``VLLM_V41_VISION_MMPROJ``, projector type deepseek41v) and the MoE image
+routing bias from its F32 sidecar (``VLLM_V41_VISION_BIAS_VL``, the
+``exp_probs_b_vl.f32`` of the GGUF repository: [layers, experts]).
+
 A port of the checkpoint's reference ``inference/vision.py`` and
 ``inference/image_processor.py``. An image becomes a ``n_vit_h x n_vit_w``
 patch grid for the ViT and a ``n_llm_h x n_llm_w`` token grid after the 3x3
@@ -289,6 +294,81 @@ class _Aligner(nn.Module):
         return self.w2(F.gelu(self.w1(x.to(dtype)).float()).to(dtype))
 
 
+def mmproj_state_dict(path: str) -> dict[str, torch.Tensor]:
+    """llama.cpp mmproj (deepseek41v) -> the checkpoint's tower names (FP32)."""
+    from gguf import GGUFReader
+
+    reader = GGUFReader(path)
+    field = reader.fields.get("clip.projector_type")
+    kind = field.contents() if field is not None else None
+    if kind not in ("deepseek41v", "deepseek4v"):
+        raise ValueError(f"{path}: not a DeepSeek V4.1 vision projector ({kind})")
+    tensors = {t.name: t for t in reader.tensors}
+
+    def get(name):
+        t = tensors[name]
+        a = np.asarray(t.data)
+        if t.tensor_type.name == "BF16":
+            a = (a.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+        elif t.tensor_type.name in ("F32", "F16"):
+            a = a.astype(np.float32)
+        else:
+            raise ValueError(
+                f"{path}: {name} is {t.tensor_type.name} (F32/F16/BF16 only)"
+            )
+        shape = [int(d) for d in reversed(t.shape.tolist())]
+        return torch.from_numpy(a.reshape(shape).copy())
+
+    sd = {
+        # conv2d [dim, 3, p, p] == the reference Linear over flattened patches
+        "vision.patch_embed.proj.weight": get("v.patch_embd.weight").flatten(1),
+        "vision.patch_embed.proj.bias": get("v.patch_embd.bias"),
+        "vision.norm.weight": get("v.post_ln.weight"),
+        "aligner.w1.weight": get("mm.1.weight"),
+        "aligner.w1.bias": get("mm.1.bias"),
+        "aligner.w2.weight": get("mm.2.weight"),
+        "aligner.w2.bias": get("mm.2.bias"),
+        "image_start": get("v.token_embd.img_start"),
+        "image_end": get("v.token_embd.img_end"),
+        "image_newline": get("v.image_newline"),
+    }
+    n = 0
+    while f"v.blk.{n}.ln1.weight" in tensors:
+        b, o = f"v.blk.{n}.", f"vision.blocks.{n}."
+        sd[o + "norm1.weight"] = get(b + "ln1.weight")
+        sd[o + "norm2.weight"] = get(b + "ln2.weight")
+        sd[o + "attn.wqkv.weight"] = get(b + "attn_qkv.weight")
+        sd[o + "attn.wqkv.bias"] = get(b + "attn_qkv.bias")
+        sd[o + "attn.wo.weight"] = get(b + "attn_out.weight")
+        sd[o + "attn.wo.bias"] = get(b + "attn_out.bias")
+        # llama.cpp splits the fused SwiGLU w1 (gate first, then up)
+        sd[o + "mlp.w1.weight"] = torch.cat(
+            [get(b + "ffn_gate.weight"), get(b + "ffn_up.weight")]
+        )
+        sd[o + "mlp.w2.weight"] = get(b + "ffn_down.weight")
+        n += 1
+    return sd
+
+
+def load_bias_vl(layers, gate_type, config) -> None:
+    """Fill every local MoE gate's bias_vl from VLLM_V41_VISION_BIAS_VL."""
+    path = envs.VLLM_V41_VISION_BIAS_VL
+    if not path:
+        raise ValueError(
+            "VLLM_V41_VISION=1 on the GGUF route needs VLLM_V41_VISION_BIAS_VL "
+            "(exp_probs_b_vl.f32, F32 [layers, experts])"
+        )
+    n_layers, n_experts = config.num_hidden_layers, config.n_routed_experts
+    raw = np.fromfile(path, dtype="<f4")
+    if raw.size != n_layers * n_experts or not np.isfinite(raw).all():
+        raise ValueError(f"{path}: expected {n_layers} x {n_experts} finite F32")
+    table = torch.from_numpy(raw.reshape(n_layers, n_experts).copy())
+    for index, layer in enumerate(layers):
+        gate = getattr(getattr(layer, "ffn", None), "gate", None)
+        if isinstance(gate, gate_type) and gate.bias_vl is not None:
+            gate.bias_vl.copy_(table[index].to(gate.bias_vl.device))
+
+
 class V41VisionTower(nn.Module):
     """ViT + aligner + learned span delimiters; parameter names follow the
     checkpoint (``vision.*``, ``aligner.*``, ``image_start`` ...)."""
@@ -307,6 +387,34 @@ class V41VisionTower(nn.Module):
         for module in self.modules():
             if isinstance(module, _RMSNorm):
                 module.weight.data = module.weight.data.float()
+
+    @torch.no_grad()
+    def load_mmproj(self, path: str | None = None) -> None:
+        """Weights from llama.cpp's vision projector (VLLM_V41_VISION_MMPROJ)."""
+        path = path or envs.VLLM_V41_VISION_MMPROJ
+        if not path:
+            raise ValueError(
+                "VLLM_V41_VISION=1 on the GGUF route needs VLLM_V41_VISION_MMPROJ "
+                "(mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf)"
+            )
+        state = mmproj_state_dict(path)
+        own = dict(self.named_parameters())
+        missing, extra = own.keys() - state.keys(), state.keys() - own.keys()
+        if missing or extra:
+            raise ValueError(
+                f"{path}: tower mismatch, missing {sorted(missing)[:4]}, "
+                f"extra {sorted(extra)[:4]}"
+            )
+        for name, value in state.items():
+            parameter = own[name]
+            if tuple(value.shape) != tuple(parameter.shape):
+                raise ValueError(
+                    f"{path}: {name} {tuple(value.shape)} != {tuple(parameter.shape)}"
+                )
+            converted = value.to(parameter.dtype)
+            if not torch.isfinite(converted).all():
+                raise ValueError(f"{path}: {name} overflows {parameter.dtype}")
+            parameter.data.copy_(converted.to(parameter.device))
 
     @torch.inference_mode()
     def span(self, patches, n_vit_h, n_vit_w):
