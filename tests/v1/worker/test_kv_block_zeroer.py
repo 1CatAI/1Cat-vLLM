@@ -35,8 +35,32 @@ class _BlockFirstAttentionBackend:
         return 0
 
 
+class _PhysicalBlockTableBuilder:
+    uses_physical_block_table = True
+
+
+class _VirtualPageBuilder:
+    uses_physical_block_table = False
+
+
+class _PhysicalBlockTableBackend(_BlockFirstAttentionBackend):
+    """Compressed cache addressed by whole storage blocks (QSA side caches)."""
+
+    @staticmethod
+    def get_builder_cls():
+        return _PhysicalBlockTableBuilder
+
+
+class _VirtualPageBackend(_BlockFirstAttentionBackend):
+    """Paged-MQA indexer: 64-row virtual pages inside a storage block."""
+
+    @staticmethod
+    def get_builder_cls():
+        return _VirtualPageBuilder
+
+
 @pytest.mark.parametrize(
-    ("spec", "group_kernel_bs", "expected"),
+    ("spec", "group_kernel_bs", "backend", "expected"),
     [
         (
             FullAttentionSpec(
@@ -46,6 +70,7 @@ class _BlockFirstAttentionBackend:
                 dtype=torch.bfloat16,
             ),
             16,
+            _BlockFirstAttentionBackend,
             (16, 49),
         ),
         (
@@ -57,7 +82,21 @@ class _BlockFirstAttentionBackend:
                 compress_ratio=8,
             ),
             16,
+            _PhysicalBlockTableBackend,
             (98, 1),
+        ),
+        # Storage block of 256 rows (1024 / 4) split into four 64-row pages.
+        (
+            MLAAttentionSpec(
+                block_size=1024,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+                compress_ratio=4,
+            ),
+            16,
+            _VirtualPageBackend,
+            (64, 4),
         ),
     ],
 )
@@ -65,9 +104,10 @@ class _BlockFirstAttentionBackend:
 def test_resolve_zeroer_kernel_layout(
     spec: FullAttentionSpec,
     group_kernel_bs: int,
+    backend: type,
     expected: tuple[int, int],
 ) -> None:
-    assert _resolve_zeroer_kernel_layout(spec, group_kernel_bs) == expected
+    assert _resolve_zeroer_kernel_layout(spec, group_kernel_bs, backend) == expected
 
 
 @pytest.mark.skip_global_cleanup
@@ -79,7 +119,7 @@ def test_resolve_zeroer_kernel_layout_rejects_nondivisible_size() -> None:
         dtype=torch.bfloat16,
     )
     with pytest.raises(ValueError, match="must be divisible"):
-        _resolve_zeroer_kernel_layout(spec, 30)
+        _resolve_zeroer_kernel_layout(spec, 30, _BlockFirstAttentionBackend)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -103,7 +143,7 @@ def test_zero_block_ids_compressed_attention_storage_page() -> None:
         kv_cache_spec=spec,
         kv_cache_group_id=0,
         layer_names=[layer_name],
-        backend=_BlockFirstAttentionBackend,
+        backend=_PhysicalBlockTableBackend,
     )
     static_forward_context = {layer_name: SimpleNamespace(kv_cache=kv)}
 
@@ -544,3 +584,80 @@ def test_zero_block_ids_packed_members_leave_next_block_alone() -> None:
     assert bool((pages[1] == 0).all())
     for block in (0, 2, 3):
         assert bool((pages[block] == 1).all()), block
+
+
+def _compressed_view_segment(backend: type, rows_per_page: int):
+    """Zeroer segment of a compressed cache (storage block 256 rows, four
+    scheduler-block rows per storage row) whose view uses ``rows_per_page``."""
+    spec = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+        compress_ratio=4,
+    )
+    pages_per_block = spec.storage_block_size // rows_per_page
+    kv = torch.ones(
+        (N_BLOCKS * pages_per_block, rows_per_page, 1, spec.head_size),
+        dtype=spec.dtype,
+    )
+    group = SimpleNamespace(
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        layer_names=["indexer"],
+        backend=backend,
+    )
+    zeroer = KVBlockZeroer(torch.device("cpu"), pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        # The group's kernel block size is not what the compressed view uses.
+        kernel_block_sizes=[16],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context={"indexer": SimpleNamespace(kv_cache=kv)},
+    )
+    assert zeroer._meta is not None
+    addrs, strides, pages, num_blocks = (t.tolist() for t in zeroer._meta[:4])
+    assert len(addrs) == 1
+    page_bytes = kv.stride(0) * kv.element_size()
+    return (
+        kv,
+        page_bytes,
+        pages_per_block,
+        addrs[0],
+        strides[0],
+        pages[0],
+        num_blocks[0],
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_compressed_virtual_pages_zero_every_page_of_the_block() -> None:
+    """Block ids address storage blocks. With a virtual-page backend one block
+    is four 64-row pages: zeroing block 1 must clear exactly pages 4..7. The
+    old layout treated one 64-row page as the block and cleared page 1."""
+    kv, page_bytes, pages_per_block, addr, stride, size, num_blocks = (
+        _compressed_view_segment(_VirtualPageBackend, rows_per_page=64)
+    )
+    assert pages_per_block == 4
+    assert num_blocks == N_BLOCKS
+    assert size * 4 == pages_per_block * page_bytes
+    assert stride * 4 == pages_per_block * page_bytes
+    start = addr + 1 * stride * 4 - kv.data_ptr()
+    assert (start, start + size * 4) == (
+        4 * page_bytes,
+        8 * page_bytes,
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_compressed_physical_block_table_zeroes_one_storage_block() -> None:
+    """With a physical block table the page is the whole storage block."""
+    kv, page_bytes, pages_per_block, addr, stride, size, num_blocks = (
+        _compressed_view_segment(_PhysicalBlockTableBackend, rows_per_page=256)
+    )
+    assert pages_per_block == 1
+    assert num_blocks == N_BLOCKS
+    assert size * 4 == page_bytes
+    start = addr + 1 * stride * 4 - kv.data_ptr()
+    assert (start, start + size * 4) == (page_bytes, 2 * page_bytes)

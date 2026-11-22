@@ -261,7 +261,7 @@ from .utils import (
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
-    compressed_kernel_block_size,
+    kv_cache_view_page_rows,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
@@ -13565,29 +13565,15 @@ class GPUModelRunner(
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
-                    # Compressed MLA is split into physical pool pages instead
-                    # of the scheduler's attention-kernel blocks.
-                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        # QSA side caches consume physical block tables; paged
-                        # MQA indexers consume smaller virtual pages. Match the
-                        # metadata builder and the V2 cache layout in each case.
-                        uses_physical_block_table = (
-                            attn_backend.get_builder_cls().uses_physical_block_table
-                        )
-                        shape_block_size = (
-                            kv_cache_spec.storage_block_size
-                            if uses_physical_block_table
-                            else compressed_kernel_block_size(kv_cache_spec)
-                        )
-                        kernel_num_blocks = num_blocks * (
-                            kv_cache_spec.storage_block_size // shape_block_size
-                        )
-                    else:
-                        num_blocks_per_kv_block = (
-                            kv_cache_spec.block_size // kernel_block_size
-                        )
-                        kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-                        shape_block_size = kernel_block_size
+                    # Compressed caches are split into the view pages the
+                    # metadata builder and the KV block zeroer also derive
+                    # from kv_cache_view_page_rows.
+                    shape_block_size = kv_cache_view_page_rows(
+                        kv_cache_spec, kernel_block_size, attn_backend
+                    )
+                    kernel_num_blocks = num_blocks * (
+                        kv_cache_spec.storage_block_size // shape_block_size
+                    )
 
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
