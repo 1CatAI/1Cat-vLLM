@@ -235,8 +235,12 @@ class GatedResidual(nn.Module):
 
         if not hasattr(self, "hc_shard_down"):
             raise ValueError("HC sequence rows require prepared sharded weights")
+        min_m = int(getattr(self, "_defer_ag_peers_min_m", 0))
         block, injection = sharded_hc_project_sequence_rows(
-            normalized, self.hc_shard_down, self.hc_shard_up
+            normalized,
+            self.hc_shard_down,
+            self.hc_shard_up,
+            min_m,
         )
         return block, injection if self.use_combine else None
 

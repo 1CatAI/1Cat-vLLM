@@ -137,6 +137,10 @@ class SharedExperts:
 
         if experts_order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
             assert self._stream is not None
+            if not torch.compiler.is_compiling():
+                from vllm import _prefill_custom_ops as prefill_ops
+
+                prefill_ops.wait_peer_prefill_if_needed(shared_experts_input)
 
             # Record that the clone will be used by shared_experts_stream
             # to avoid gc issue from deallocation of hidden_states_clone

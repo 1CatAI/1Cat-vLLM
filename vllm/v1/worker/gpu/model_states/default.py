@@ -203,5 +203,13 @@ class DefaultModelState(ModelState):
             positions=input_batch.positions,
             for_cudagraph_capture=for_capture,
             prefix_anchor_lens=input_batch.prefix_anchor_lens,
+            block_tables_cpu=getattr(input_batch, "_block_tables_cpu", None),
+            is_all_prefilling=(
+                not for_capture
+                and not input_batch.is_dummy_batch
+                and input_batch.num_reqs > 0
+                and input_batch.num_draft_tokens == 0
+                and bool(input_batch.is_prefilling_np[: input_batch.num_reqs].all())
+            ),
         )
         return attn_metadata

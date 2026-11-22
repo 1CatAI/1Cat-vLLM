@@ -1259,6 +1259,27 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             raw_fast_qpn=raw_fast_qpn,
         )
         self._allocate_graph_safe_decode_buffers(layer)
+        if (
+            fused_swiglu_prefill
+            and raw_scale
+            and num_experts == 512
+            and hidden == 2560
+            and intermediate == 160
+            and int(layer.moe_config.experts_per_token) == 10
+        ):
+            from vllm._sm70_flashnext_prefill_ops import (
+                has_sm70_flashnext_prefill_ops,
+            )
+
+            if has_sm70_flashnext_prefill_ops():
+                max_batched = (
+                    int(vllm_cfg.scheduler_config.max_num_batched_tokens)
+                    if vllm_cfg is not None
+                    else 4096
+                )
+                self._get_fn_prefill_raw_workspace(
+                    layer.w13_tm_weight.device, max_batched
+                )
 
         del layer.w13_weight
         del layer.w13_weight_scale
@@ -1316,6 +1337,72 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         return NvFp4MoEWorkspace.get(layer, num_tokens, indexed_w13)
 
     @staticmethod
+    def _get_fn_prefill_raw_workspace(
+        device: torch.device, num_tokens: int
+    ) -> tuple[torch.Tensor, ...]:
+        cache: dict[int, tuple[int, tuple[torch.Tensor, ...]]] = globals().setdefault(
+            "_FN_PREFILL_WS_CACHE", {}
+        )
+        dev_idx = device.index or 0
+        slots = num_tokens * 10
+        max_tiles = (slots + 31) // 32 + 512
+        if num_tokens <= 16384:
+            entry = cache.get(dev_idx)
+            if entry is not None and entry[0] >= num_tokens:
+                (
+                    ws_counts,
+                    ws_offsets,
+                    ws_cursors,
+                    ws_tiles,
+                    ws_num_tiles,
+                    ws_accum_f32,
+                ) = entry[1]
+            else:
+                cap = max(((num_tokens + 4095) // 4096) * 4096, 4096)
+                cap_tiles = (cap * 10 + 31) // 32 + 512
+                ws_counts = torch.empty(64 * 512, dtype=torch.int32, device=device)
+                ws_offsets = torch.empty(513, dtype=torch.int32, device=device)
+                ws_cursors = torch.empty(512, dtype=torch.int32, device=device)
+                ws_tiles = torch.empty(
+                    (2 * cap_tiles, 4), dtype=torch.int32, device=device
+                )
+                ws_num_tiles = torch.empty(1, dtype=torch.int32, device=device)
+                ws_accum_f32 = torch.zeros(
+                    (cap + 16) * 2560, dtype=torch.float32, device=device
+                )
+                cache[dev_idx] = (
+                    cap,
+                    (
+                        ws_counts,
+                        ws_offsets,
+                        ws_cursors,
+                        ws_tiles,
+                        ws_num_tiles,
+                        ws_accum_f32,
+                    ),
+                )
+        else:
+            ws_counts = torch.empty(64 * 512, dtype=torch.int32, device=device)
+            ws_offsets = torch.empty(513, dtype=torch.int32, device=device)
+            ws_cursors = torch.empty(512, dtype=torch.int32, device=device)
+            ws_tiles = torch.empty((2 * max_tiles, 4), dtype=torch.int32, device=device)
+            ws_num_tiles = torch.empty(1, dtype=torch.int32, device=device)
+            ws_accum_f32 = torch.zeros(
+                (num_tokens + 16) * 2560, dtype=torch.float32, device=device
+            )
+        return (
+            ws_counts,
+            ws_offsets,
+            ws_cursors,
+            torch.empty(slots, dtype=torch.int32, device=device),
+            torch.empty(slots, dtype=torch.float32, device=device),
+            ws_tiles[: 2 * max_tiles],
+            ws_num_tiles,
+            torch.empty((slots, 160), dtype=torch.float16, device=device),
+            ws_accum_f32,
+        )
+
+    @staticmethod
     def _apply_swiglu(layer, out, gate_up, *, interleaved=False) -> None:
         apply_swiglu(out, gate_up, layer.swiglu_limit, interleaved=interleaved)
 
@@ -1328,7 +1415,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        del shared_experts, shared_experts_input
+        del shared_experts_input
         if not x.is_cuda or x.dtype != torch.float16 or x.ndim != 2:
             raise TypeError("SM70 NVFP4 MoE requires CUDA FP16 activations [M, H].")
         if not is_exact_sm70_cuda(x, enabled=True):
@@ -1383,6 +1470,154 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 use_batch_reduce,
             )
             return buffers["output"]
+        if (
+            num_tokens >= 64
+            and interleaved_w13
+            and bool(getattr(layer, "sm70_nvfp4_qwen38_raw_scale", False))
+            and int(layer.sm70_nvfp4_num_experts) == 512
+            and hidden == 2560
+            and int(layer.sm70_nvfp4_intermediate_size) == 160
+            and top_k == 10
+            and layer.expert_map is None
+            and layer.swiglu_limit is None
+            and x.is_contiguous()
+            and topk_ids.dtype in (torch.int32, torch.int64)
+            and topk_ids.is_contiguous()
+            and topk_weights.is_contiguous()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            from vllm._sm70_flashnext_prefill_ops import (
+                has_sm70_flashnext_prefill_ops,
+            )
+
+            if has_sm70_flashnext_prefill_ops():
+                ws = self._get_fn_prefill_raw_workspace(x.device, num_tokens)
+                slots = num_tokens * 10
+                if (
+                    num_tokens >= 1024
+                    and shared_experts is not None
+                    and getattr(layer, "_hc_prefill_peer_consumer", False)
+                ):
+                    from vllm._sm70_flashnext_prefill_ops import (
+                        pop_pending_shared_gate_logits,
+                    )
+                    from vllm.models.qwen4_exp.nvidia.sm70_hcx import (
+                        hc_prefill_sequence_parallel_active,
+                    )
+                    from vllm.runtime_resources import current_runtime_resources
+
+                    runner = getattr(layer, "runner", None)
+                    sh = shared_experts._output[shared_experts._output_idx]
+                    shared_mlp = getattr(shared_experts, "_layer", None)
+                    down_proj = getattr(shared_mlp, "down_proj", None)
+                    down_w = getattr(down_proj, "weight", None)
+                    pending_gl = (
+                        pop_pending_shared_gate_logits(
+                            x.device.index or 0, int(down_w.data_ptr())
+                        )
+                        if isinstance(down_w, torch.Tensor)
+                        else None
+                    )
+                    resources = current_runtime_resources()
+                    owner = (
+                        resources.get("hc_prefill_peer")
+                        if resources is not None
+                        else None
+                    )
+                    if (
+                        hc_prefill_sequence_parallel_active()
+                        and owner is not None
+                        and getattr(owner, "p2p_enabled", False)
+                        and runner is not None
+                        and getattr(runner, "routed_scaling_factor", 1.0) == 1.0
+                        and not getattr(runner, "_fused_output_is_reduced", False)
+                        and getattr(runner, "routed_output_transform", None) is None
+                        and isinstance(sh, torch.Tensor)
+                        and sh.shape == (num_tokens, hidden)
+                        and sh.dtype == torch.float16
+                        and sh.device == x.device
+                        and sh.is_contiguous()
+                    ):
+                        padded_rows = ((num_tokens + 3) // 4) * 4
+                        ipc_view = owner.get_next_rs_view(padded_rows)
+                        if ipc_view is not None:
+                            if shared_mlp is not None:
+                                shared_mlp._fn_defer_gate_to_moe = True
+                            torch.ops.vllm_sm70_fn_prefill.moe_prefill_raw(
+                                ipc_view,
+                                x,
+                                topk_ids,
+                                topk_weights,
+                                layer.w13_tm_weight,
+                                layer.w13_raw_scale_codes,
+                                layer.w13_raw_global_scales,
+                                layer.w2_tm_weight,
+                                layer.w2_raw_scale_codes,
+                                layer.w2_raw_global_scales,
+                                sh,
+                                pending_gl,
+                                ws[0],
+                                ws[1],
+                                ws[2],
+                                ws[3][:slots],
+                                ws[4][:slots],
+                                ws[5],
+                                ws[6],
+                                ws[7][:slots],
+                                ws[8][: (num_tokens + 16) * hidden],
+                                True,
+                                *owner.rs_sync,
+                                owner.rs_ep,
+                                owner.rank,
+                            )
+                            out = ipc_view[:num_tokens]
+                            owner.mark_rs_prestaged(
+                                int(out.data_ptr()),
+                                int(sh.data_ptr()),
+                                True,
+                                int(ipc_view.data_ptr()),
+                                True,
+                            )
+                            logger.info_once(
+                                "SM70 Qwen3.8 NVFP4 pipelined prefill MoE v7 enabled "
+                                "(direct-to-IPC shared+routed*0.125f, zero-copy RS)."
+                            )
+                            return out
+                    if pending_gl is not None and isinstance(sh, torch.Tensor):
+                        torch.ops.vllm_sm70_fn_prefill.shared_gate_mul_inplace(
+                            sh, pending_gl
+                        )
+                out = torch.empty(
+                    (num_tokens, hidden), dtype=torch.float16, device=x.device
+                )
+                torch.ops.vllm_sm70_fn_prefill.moe_prefill_raw(
+                    out,
+                    x,
+                    topk_ids,
+                    topk_weights,
+                    layer.w13_tm_weight,
+                    layer.w13_raw_scale_codes,
+                    layer.w13_raw_global_scales,
+                    layer.w2_tm_weight,
+                    layer.w2_raw_scale_codes,
+                    layer.w2_raw_global_scales,
+                    None,
+                    None,
+                    ws[0],
+                    ws[1],
+                    ws[2],
+                    ws[3][:slots],
+                    ws[4][:slots],
+                    ws[5],
+                    ws[6],
+                    ws[7][:slots],
+                    ws[8][: (num_tokens + 16) * hidden],
+                )
+                logger.info_once(
+                    "SM70 Qwen3.8 NVFP4 pipelined prefill MoE v6 enabled "
+                    "(conflict-free smem_idx17, L2-resident atomicAdd W2)."
+                )
+                return out
         indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
         fused_indexed_w13 = indexed_w13 and interleaved_w13
         split_fused_indexed_w13 = fused_indexed_w13 and bool(

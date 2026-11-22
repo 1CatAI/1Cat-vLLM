@@ -121,6 +121,9 @@ class GdnConfig:
             ):
                 setattr(self, name, True)
                 self.sources[name] = "platform baseline"
+        if self.original_prefill_threads is None:
+            self.original_prefill_threads = 256
+            self.sources["original_prefill_threads"] = "platform baseline"
         # Schedule defaults are already true. Their parser intentionally keeps
         # the original exact-'1' semantics and explicit legacy overrides.
 

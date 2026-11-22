@@ -1137,7 +1137,7 @@ class KernelConfig:
     """Serve eligible CPU PLE requests from a native owner thread."""
     ple_draft_prefetch: bool = True
     """Read PLE table pages of drafted tokens into page cache while drafting."""
-    ple_prefill_early_request: bool = False
+    ple_prefill_early_request: bool | None = None
     """Send prompt-only PLE batches from host token copies at scheduling time and
     release mapped results right after their consumer copy, so the CPU worker
     gathers the next prefill chunk while the GPU still runs the current one."""
@@ -1226,6 +1226,8 @@ class KernelConfig:
 
         prefer = self.prefer_speculative_runner(cfg)
         qwen4_sm70 = self._prefer_qwen4_sm70(cfg)
+        if self.ple_prefill_early_request is None:
+            self.ple_prefill_early_request = qwen4_sm70
         if self.sm70_qsa_prep is None:
             self.sm70_qsa_prep = qwen4_sm70
         if self.sm70_hcx is None:

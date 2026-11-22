@@ -3264,9 +3264,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             if hc_sequence_parallel:
                 from vllm.distributed import get_tp_group
 
-                normalized = get_tp_group().all_gather(normalized, dim=0)[
-                    : input_ids.shape[0]
-                ]
+                from .sm70_hc_prefill_peer import hc_sequence_allgather_rows
+
+                normalized = hc_sequence_allgather_rows(normalized, input_ids.shape[0])
                 conv_output = torch.ops.vllm.qwen4_exp_ple_short_conv_rows(
                     normalized, self.prefix, get_tp_group().rank_in_group, 4
                 )
@@ -3296,7 +3296,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             order = tuple(communicator.order)
             local_kv = _unpack_ple_shard_kv(self.ple_shard_kv)
             if hc_sequence_parallel:
-                gathered_w = group.all_gather(local_kv, dim=0).reshape(4, 3200, 1024)
+                from .sm70_hc_prefill_peer import hc_sequence_allgather_rows
+
+                gathered_w = hc_sequence_allgather_rows(
+                    local_kv, 4 * local_kv.shape[0]
+                ).reshape(4, 3200, 1024)
                 key_w = torch.cat([gathered_w[r, :2560] for r in order], dim=0)
                 val_w = torch.cat([gathered_w[r, 2560:] for r in order], dim=0)
                 key = torch.mm(embeddings, key_w.T)
@@ -3330,14 +3334,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             normalized, self.prefix + ":07_conv_input", diagnostic
         )
         if hc_sequence_parallel:
-            from vllm.distributed import get_tp_group
+            from .sm70_hc_prefill_peer import hc_sequence_allgather_rows
 
             # Convolution and its commit retain the original complete query,
             # segment metadata, causal history and state owner. Padding is not
             # committed; the returned residual is local again.
-            normalized = get_tp_group().all_gather(normalized, dim=0)[
-                : input_ids.shape[0]
-            ]
+            normalized = hc_sequence_allgather_rows(normalized, input_ids.shape[0])
         if hc_sequence_parallel:
             # Each TP owner emits only its residual rows. The existing family
             # still reads the full causal input and commits every base state.
@@ -3562,14 +3564,21 @@ def qwen4_exp_ple_kv_gate_norm(
                         "SM70 Qwen3.8 sharded TP4 PLE KV+gate+norm fusion enabled."
                     )
                     return result
-        emb_fp16 = layer._dequantize_embeddings(embeddings, hidden_states.dtype)
         order = tuple(communicator.order)
         local_kv = _unpack_ple_shard_kv(layer.ple_shard_kv)
         if hc_sequence_parallel:
-            from .sm70_hc_prefill_peer import hc_sequence_shard_rows
+            from .sm70_hc_prefill_peer import hc_sequence_allgather_rows
 
-            emb_fp16 = hc_sequence_shard_rows(emb_fp16)
-            gathered_w = group.all_gather(local_kv, dim=0).reshape(4, 3200, 1024)
+            rk = group.rank_in_group
+            r0 = min(embeddings.shape[0], rk * m)
+            r1 = min(embeddings.shape[0], (rk + 1) * m)
+            local_emb = embeddings[r0:r1]
+            if local_emb.shape[0] < m:
+                local_emb = F.pad(local_emb, (0, 0, 0, m - local_emb.shape[0]))
+            emb_fp16 = layer._dequantize_embeddings(local_emb, hidden_states.dtype)
+            gathered_w = hc_sequence_allgather_rows(
+                local_kv, 4 * local_kv.shape[0]
+            ).reshape(4, 3200, 1024)
             del local_kv
             key_w = torch.cat([gathered_w[r, :2560] for r in order], dim=0)
             val_w = torch.cat([gathered_w[r, 2560:] for r in order], dim=0)
@@ -3578,6 +3587,7 @@ def qwen4_exp_ple_kv_gate_norm(
             value = torch.mm(emb_fp16, val_w.T)
             del key_w, val_w
         else:
+            emb_fp16 = layer._dequantize_embeddings(embeddings, hidden_states.dtype)
             local_out = torch.mm(emb_fp16, local_kv.T)
             del local_kv
             gathered = group.all_gather(local_out, dim=0).reshape(4, m, 3200)
@@ -3638,11 +3648,18 @@ def qwen4_exp_ple_kv_gate_norm(
             logger.info_once("SM70 Qwen3.8 local PLE KV+gate+norm fusion enabled.")
             return _ple_gate_norm_or_eager(layer, hidden_states, key, value, sm70_ok)
 
-    emb_fp16 = layer._dequantize_embeddings(embeddings, hidden_states.dtype)
     if hc_sequence_parallel:
-        from .sm70_hc_prefill_peer import hc_sequence_shard_rows
+        from vllm.distributed import get_tp_group
 
-        emb_fp16 = hc_sequence_shard_rows(emb_fp16)
+        rk = get_tp_group().rank_in_group
+        r0 = min(embeddings.shape[0], rk * m)
+        r1 = min(embeddings.shape[0], (rk + 1) * m)
+        local_emb = embeddings[r0:r1]
+        if local_emb.shape[0] < m:
+            local_emb = F.pad(local_emb, (0, 0, 0, m - local_emb.shape[0]))
+        emb_fp16 = layer._dequantize_embeddings(local_emb, hidden_states.dtype)
+    else:
+        emb_fp16 = layer._dequantize_embeddings(embeddings, hidden_states.dtype)
     key, _ = layer.key_proj(emb_fp16)
     value, _ = layer.value_proj(emb_fp16)
     return _ple_gate_norm_or_eager(layer, hidden_states, key, value, sm70_ok)

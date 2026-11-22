@@ -356,6 +356,74 @@ class EagleSpeculator(TargetSamplingHooks):
         return tuple(warmed)
 
     @torch.inference_mode()
+    def run_kv_only_prefill(
+        self,
+        num_tokens: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> bool:
+        fn = getattr(self.model, "forward_kv_only", None)
+        if fn is None:
+            return False
+        batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            num_tokens_across_dp=num_tokens_across_dp,
+            slot_mapping=slot_mappings,
+            batch_descriptor=batch_descriptor,
+        ):
+            draft_ctx = getattr(self.model, "draft_forward_context", None)
+            hc_ctx: AbstractContextManager[Any] = (
+                draft_ctx() if draft_ctx is not None else nullcontext()
+            )
+            with hc_ctx:
+                return bool(
+                    fn(
+                        input_ids=self.input_buffers.input_ids[:num_tokens],
+                        positions=self.input_buffers.positions[:num_tokens],
+                        hidden_states=self.hidden_states[:num_tokens],
+                    )
+                )
+
+    @torch.inference_mode()
+    def run_last_rows_prefill(
+        self,
+        num_tokens: int,
+        row_indices: torch.Tensor,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        fn = getattr(self.model, "forward_last_rows", None)
+        if fn is None:
+            return None
+        batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            num_tokens_across_dp=num_tokens_across_dp,
+            slot_mapping=slot_mappings,
+            batch_descriptor=batch_descriptor,
+        ):
+            draft_ctx = getattr(self.model, "draft_forward_context", None)
+            hc_ctx: AbstractContextManager[Any] = (
+                draft_ctx() if draft_ctx is not None else nullcontext()
+            )
+            with hc_ctx:
+                return fn(
+                    input_ids=self.input_buffers.input_ids[:num_tokens],
+                    positions=self.input_buffers.positions[:num_tokens],
+                    hidden_states=self.hidden_states[:num_tokens],
+                    row_indices=row_indices,
+                )
+
+    @torch.inference_mode()
     def run_model(
         self,
         num_tokens: int,
@@ -544,6 +612,35 @@ class EagleSpeculator(TargetSamplingHooks):
         last_token_indices = self.last_token_indices[:num_reqs]
         pos = self.input_buffers.positions[last_token_indices]
         idx_mapping = self.idx_mapping[:num_reqs]
+
+        if (
+            cudagraph_runtime_mode == CUDAGraphMode.NONE
+            and (mm_inputs is None or not mm_inputs[0])
+            and num_tokens > 64
+            and 0 < num_reqs <= 64
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            shortcut = self.run_last_rows_prefill(
+                num_tokens,
+                last_token_indices,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp=num_tokens_across_dp,
+            )
+            if shortcut is not None:
+                sample_hidden_states, multi_hidden_sel = shortcut
+                self.draft_tokens[:num_reqs, 0] = self._sample_draft(
+                    sample_hidden_states,
+                    idx_mapping,
+                    pos,
+                    self.current_draft_step,
+                    self.draft_logits,
+                )
+                self.hidden_states[:num_reqs] = multi_hidden_sel
+                self.input_buffers.positions[:num_reqs] = pos
+                if self.draft_step_listener is not None:
+                    self.draft_step_listener(self.draft_tokens, self.current_draft_step)
+                return
 
         last_hidden_states, hidden_states = self.run_model(
             num_tokens,
@@ -941,6 +1038,28 @@ class EagleSpeculator(TargetSamplingHooks):
             need_eager=is_profile,
         )
 
+        incomplete_prefill = input_batch.is_incomplete_prefilling_np
+        is_incomplete_only = bool(
+            not dummy_run
+            and not is_profile
+            and not input_batch.is_dummy_batch
+            and input_batch.num_draft_tokens == 0
+            and mm_inputs is None
+            and prefill_batch_desc.cg_mode == CUDAGraphMode.NONE
+            and incomplete_prefill is not None
+            and incomplete_prefill.size == num_reqs
+            and np.all(incomplete_prefill)
+        )
+        if is_incomplete_only:
+            self._mtp_prefill_begin()
+            if self.run_kv_only_prefill(
+                prefill_batch_desc.num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp=num_tokens_across_dp,
+            ):
+                return self.draft_tokens[:num_reqs]
+
         self._mtp_prefill_begin()
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
@@ -960,6 +1079,9 @@ class EagleSpeculator(TargetSamplingHooks):
                 mm_inputs=mm_inputs,
             )
         self._mtp_prefill_end(num_reqs)
+
+        if is_incomplete_only:
+            return self.draft_tokens[:num_reqs]
 
         if self.num_speculative_steps == 1:
             # Early exit.

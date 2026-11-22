@@ -676,8 +676,26 @@ class Worker(WorkerBase):
         decode_width = self.vllm_config.scheduler_config.max_num_seqs * (
             1 + (spec.num_speculative_tokens if spec is not None else 0)
         )
-        if max(compilation.cudagraph_capture_sizes or [0]) <= decode_width:
+        max_capture = max(compilation.cudagraph_capture_sizes or [0])
+        if max_capture <= decode_width:
             return 0
+        max_batched = max(
+            1, int(self.vllm_config.scheduler_config.max_num_batched_tokens)
+        )
+        if max_capture < max_batched:
+            scaled_peak = int(
+                activation_peak * min(1.0, (1.0 * max_capture) / max_batched)
+            )
+            logger.info(
+                "Reserving %.2f GiB (scaled from %.2f GiB activation peak for "
+                "max_capture=%d / max_batched=%d) for CUDA graph pools before "
+                "sizing the KV cache.",
+                scaled_peak / 2**30,
+                activation_peak / 2**30,
+                max_capture,
+                max_batched,
+            )
+            return max(0, scaled_peak)
         logger.info(
             "Reserving %.2f GiB (profiled activation peak) for prefill-size "
             "CUDA graph pools before sizing the KV cache.",

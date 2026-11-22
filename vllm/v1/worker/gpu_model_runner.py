@@ -374,7 +374,7 @@ def _clip_stateful_sample_limits(
     # Collect per-row sampling params once on CPU.
     has_any_max = False
     all_have_max = True
-    rem_list = None if output_budget is not None else []
+    rem_list: list[int] | None = None if output_budget is not None else []
     no_max_rows = []
     row_stops: list[tuple[int, ...]] = []
     has_any_stop = False
@@ -5851,12 +5851,24 @@ class GPUModelRunner(
         ):
             prefix_anchor_lens = num_prompt_tokens_cpu
 
+        block_table_cpu_gid_0 = (
+            self.input_batch.block_table[0].block_table.np[:num_reqs]
+            if (
+                seq_lens_cpu is not None
+                and num_reqs == num_reqs_padded
+                and not isinstance(
+                    kv_cache_groups[0].kv_cache_spec, EncoderOnlyAttentionSpec
+                )
+            )
+            else None
+        )
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
             _seq_lens_cpu=seq_lens_cpu,
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
+            _block_table_cpu=block_table_cpu_gid_0,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens_padded,
@@ -6095,6 +6107,17 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+                cm._block_table_cpu = (
+                    self.input_batch.block_table[kv_cache_gid].block_table.np[:num_reqs]
+                    if (
+                        seq_lens_cpu is not None
+                        and num_reqs == num_reqs_padded
+                        and not isinstance(
+                            kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
+                        )
+                    )
+                    else None
+                )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
@@ -7724,7 +7747,7 @@ class GPUModelRunner(
             if sampling_metadata.all_greedy:
                 top_tokens = self.model.get_v41_top_tokens(sample_hidden_states)
             else:
-                from vllm.v1.sample.ops.penalties import expand_batch_to_tokens
+                from vllm.v1.sample.rejection_sampler import expand_batch_to_tokens
                 from vllm.v1.spec_decode import coupled_draw
 
                 assert spec_decode_metadata is not None

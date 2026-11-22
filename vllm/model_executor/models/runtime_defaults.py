@@ -375,6 +375,32 @@ def apply_runtime_defaults(cfg, defaults, phase: str, *, is_sm70: bool):
         return qualified
     if phase == "prefill":
         if (
+            is_sm70
+            and _is_sm70_qwen38_decode_compile_contract(
+                cfg.model_config, cfg.speculative_config, cfg.parallel_config
+            )
+            and cfg.parallel_config.tensor_parallel_size == 4
+            and cfg.parallel_config.pipeline_parallel_size == 1
+            and cfg.parallel_config.decode_context_parallel_size in (1, 2)
+            and cfg.parallel_config.prefill_context_parallel_size == 1
+            and getattr(cfg.model_config, "quantization", None)
+            in ("gguf", "modelopt", "modelopt_fp4")
+        ):
+            layers = cfg.kernel_config.layer_execution
+            if layers.sources.get("hc_prefill_sequence_parallel") != "typed":
+                layers.hc_prefill_sequence_parallel = True
+                layers.sources["hc_prefill_sequence_parallel"] = "default:model.prefill"
+            if layers.sources.get("hc_prefill_peer_norm") != "typed":
+                layers.hc_prefill_peer_norm = True
+                layers.sources["hc_prefill_peer_norm"] = "default:model.prefill"
+            if layers.sources.get("ple_prefill_conv") != "typed":
+                layers.ple_prefill_conv = True
+                layers.sources["ple_prefill_conv"] = "default:model.prefill"
+            sparse = cfg.kernel_config.sm70_sparse
+            if sparse.sources.get("qsa_prefill_tp_rows") != "typed":
+                sparse.qsa_prefill_tp_rows = True
+                sparse.sources["qsa_prefill_tp_rows"] = "default:model.prefill"
+        if (
             defaults.value("VLLM_FLASH_V100_BFLA_PREFILL")
             and cfg.model_config is not None
             and "VLLM_FLASH_V100_BFLA_KEEP_RATIO" not in defaults

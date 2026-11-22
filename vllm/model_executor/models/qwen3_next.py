@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm._sm70_flashnext_prefill_ops import maybe_fused_moe_router_shared_prefill
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -295,7 +296,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
         else:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = maybe_fused_moe_router_shared_prefill(
+                hidden_states, self.gate, self.shared_expert
+            )
+            if router_logits is None:
+                router_logits, _ = self.gate(hidden_states)
             router_logits = _sm70_dump_qwen_layer_tensor(
                 "moe_router_logits",
                 self.layer_idx,

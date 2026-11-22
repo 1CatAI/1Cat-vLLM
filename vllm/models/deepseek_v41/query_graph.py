@@ -110,7 +110,7 @@ class V41GreedyDraftGraph:
 
     def __init__(self, forward):
         self.forward = forward
-        self.entries: dict[int, tuple] = {}
+        self.entries: dict[tuple[int, bool], tuple] = {}
         self.captures = self.replays = 0
 
     def __call__(self, hidden, anchor, c_keys=None, c_pos=None, c_temps=None):

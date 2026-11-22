@@ -469,17 +469,35 @@ def build_attn_metadata(
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     prefix_anchor_lens: torch.Tensor | None = None,
     is_dummy_batch: bool = False,
+    block_tables_cpu: Sequence[Any] | None = None,
+    is_all_prefilling: bool = False,
 ) -> dict[str, Any]:
+    query_start_loc_cpu = query_start_loc_cpu[: num_reqs + 1]
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
     if seq_lens_cpu_upper_bound is not None:
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
+    exact_seq_lens_cpu = (
+        seq_lens_cpu_upper_bound
+        if (is_all_prefilling and not is_dummy_batch and not for_cudagraph_capture)
+        else None
+    )
 
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
+        block_table_cpu = (
+            block_tables_cpu[i][:num_reqs]
+            if (
+                block_tables_cpu is not None
+                and i < len(block_tables_cpu)
+                and not is_dummy_batch
+                and not for_cudagraph_capture
+            )
+            else None
+        )
         slot_mapping = slot_mappings[i]
         # Hybrid drafters can assign different causality to each KV group.
         # A Mapping must be resolved here; passing the dict itself into the
@@ -497,6 +515,8 @@ def build_attn_metadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens=seq_lens,
+            _seq_lens_cpu=exact_seq_lens_cpu,
+            _block_table_cpu=block_table_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             max_seq_len=max_seq_len,
             num_reqs=num_reqs,

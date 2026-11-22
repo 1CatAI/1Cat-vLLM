@@ -96,6 +96,53 @@ def _output_projection(x: torch.Tensor, name: str) -> torch.Tensor:
     layer, defer = _OUTPUT_PROJECTIONS[name]
     if 0 < x.shape[0] <= HCX_BATCH_M and defer:
         return torch.nn.functional.pad(x, (0, layer.output_size - x.shape[1]))
+    if (
+        hc_prefill_sequence_parallel_active()
+        and x.ndim == 2
+        and x.shape[0] >= 1024
+        and layer.output_size == 2560
+        and getattr(layer, "bias", None) is None
+        and not getattr(layer, "reduce_results", False)
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.runtime_resources import current_runtime_resources
+
+        from .sm70_fp16_gemv import Qwen38SM70FP16LinearMethod
+
+        w = getattr(layer, "weight", None)
+        resources = current_runtime_resources()
+        owner = resources.get("hc_prefill_peer") if resources is not None else None
+        if (
+            owner is not None
+            and getattr(owner, "p2p_enabled", False)
+            and isinstance(
+                getattr(layer, "quant_method", None),
+                (UnquantizedLinearMethod, Qwen38SM70FP16LinearMethod),
+            )
+            and isinstance(w, torch.Tensor)
+            and w.ndim == 2
+            and w.shape == (2560, x.shape[1])
+            and w.dtype == x.dtype == torch.float16
+            and w.device == x.device
+            and x.is_contiguous()
+            and w.is_contiguous()
+        ):
+            m = x.shape[0]
+            padded_rows = ((m + 3) // 4) * 4
+            ipc_view = owner.get_next_rs_view(padded_rows)
+            if ipc_view is not None:
+                out_slice = ipc_view[:m]
+                torch.mm(x, w.T, out=out_slice)
+                if padded_rows > m:
+                    ipc_view[m:padded_rows].zero_()
+                owner.mark_rs_prestaged(
+                    int(out_slice.data_ptr()),
+                    0,
+                    False,
+                    int(ipc_view.data_ptr()),
+                )
+                return out_slice
     projected, _ = layer(x)
     if (
         x.shape[0] > HCX_BATCH_M

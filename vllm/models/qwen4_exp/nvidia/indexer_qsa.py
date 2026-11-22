@@ -135,7 +135,7 @@ class QSAIndexer(nn.Module):
         if (
             vllm_config.kernel_config.sm70_sparse.qsa_prefill_tp_rows
             and parallel.tensor_parallel_size == 4
-            and parallel.decode_context_parallel_size == 1
+            and parallel.decode_context_parallel_size in (1, 2)
             and parallel.prefill_context_parallel_size == 1
         ):
             from vllm.distributed.parallel_state import get_tp_group
@@ -243,24 +243,56 @@ class QSAIndexer(nn.Module):
         positions = positions[..., :num_tokens]
 
         # Q/K projection
+        q_already_folded8 = False
+        q_positions_override: torch.Tensor | None = None
         if hidden_states.shape[-1] != self.index_qk_proj.input_size:
             # Already projected inside the fused SM70 qkv launch.
-            projected_qk = hidden_states
+            from vllm._sm70_flashnext_prefill_ops import pop_pending_qsa_folded8
+
+            folded8_pair = pop_pending_qsa_folded8(
+                hidden_states.device.index or 0, int(hidden_states.data_ptr())
+            )
+            if (
+                folded8_pair is not None
+                and self.use_fused_pre_indexer
+                and self.prefill_tp_group is not None
+                and self.prefill_tp_group.world_size == 4
+                and folded8_pair[1].shape[0] == num_tokens
+            ):
+                projected_q, raw_keys = folded8_pair
+                q_already_folded8 = True
+                h_step = num_tokens >> 3
+                rk = self.prefill_tp_group.rank_in_group
+                q_positions_override = torch.cat(
+                    (
+                        positions[..., rk * h_step : (rk + 1) * h_step],
+                        positions[..., (7 - rk) * h_step : (8 - rk) * h_step],
+                    ),
+                    dim=-1,
+                )
+            else:
+                projected_q, raw_keys = hidden_states.split(
+                    (
+                        self.index_n_heads * self.index_head_dim,
+                        self.index_kv_heads * self.index_head_dim,
+                    ),
+                    dim=-1,
+                )
         else:
             projected_qk, _ = self.index_qk_proj(hidden_states)
-        projected_q, raw_keys = projected_qk.split(
-            (
-                self.index_n_heads * self.index_head_dim,
-                self.index_kv_heads * self.index_head_dim,
-            ),
-            dim=-1,
-        )
+            projected_q, raw_keys = projected_qk.split(
+                (
+                    self.index_n_heads * self.index_head_dim,
+                    self.index_kv_heads * self.index_head_dim,
+                ),
+                dim=-1,
+            )
         raw_key_state_cache = self.raw_key_cache
         compressed_key_cache = self.compressed_key_cache.kv_cache
 
         if self.use_fused_pre_indexer:
             q = projected_q.new_empty(
-                num_tokens,
+                projected_q.shape[0],
                 self.index_n_heads,
                 self.index_head_dim,
             )
@@ -288,6 +320,7 @@ class QSAIndexer(nn.Module):
                     if raw_key_state_cache.rope_position_cache is not None
                     else None
                 ),
+                q_positions=q_positions_override,
             )
         else:
             # Unfused reference path
@@ -374,6 +407,164 @@ class QSAIndexer(nn.Module):
             shared_key_scoring=self.shared_key_scoring,
             max_seq_len=compressed_metadata.max_seq_len,
             tp_group=self.prefill_tp_group,
+            seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
+            q_already_folded8=q_already_folded8,
+        )
+
+    def write_and_select_rows(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        row_indices: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Write raw/compressed key caches, then score/select `row_indices`."""
+        metadata = self._metadata()
+        if metadata is None:
+            out.fill_(-1)
+            return out
+
+        from .ops.qsa import (
+            qsa_compress_groups_with_ratio,
+            qsa_select_paged_tokens,
+            qsa_store_cache_rows,
+        )
+
+        raw_metadata, compressed_metadata = metadata
+        num_tokens = raw_metadata.num_actual_tokens
+        hidden_states = hidden_states[:num_tokens]
+        positions = positions[..., :num_tokens]
+
+        if hidden_states.shape[-1] != self.index_qk_proj.input_size:
+            projected_qk = hidden_states
+        else:
+            projected_qk, _ = self.index_qk_proj(hidden_states)
+        projected_q, raw_keys = projected_qk.split(
+            (
+                self.index_n_heads * self.index_head_dim,
+                self.index_kv_heads * self.index_head_dim,
+            ),
+            dim=-1,
+        )
+        raw_key_state_cache = self.raw_key_cache
+        compressed_key_cache = self.compressed_key_cache.kv_cache
+
+        if self.use_fused_pre_indexer:
+            q = projected_q.new_empty(
+                num_tokens,
+                self.index_n_heads,
+                self.index_head_dim,
+            )
+            qsa_pre_indexer(
+                projected_q,
+                raw_keys,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_layernorm.weight,
+                self.k_layernorm.weight,
+                self.q_layernorm.variance_epsilon,
+                q,
+                raw_key_state_cache.kv_cache,
+                raw_metadata.slot_mapping,
+                raw_metadata.block_table,
+                raw_metadata.query_start_loc,
+                raw_metadata.logical_positions,
+                compressed_key_cache,
+                compressed_metadata.slot_mapping,
+                compressed_metadata.k_work_metadata,
+                compress_ratio=self.compress_ratio,
+                mrope_section=getattr(self.rotary_emb, "mrope_section", None),
+                rope_pos_offset=(
+                    raw_key_state_cache.rope_position_offset
+                    if raw_key_state_cache.rope_position_cache is not None
+                    else None
+                ),
+            )
+        else:
+            from flashinfer.norm import gemma_rmsnorm
+
+            q = projected_q.reshape(-1, self.index_n_heads, self.index_head_dim)
+            q = gemma_rmsnorm(
+                q.reshape(-1, self.index_head_dim),
+                self.q_layernorm.weight,
+                self.q_layernorm.variance_epsilon,
+            ).reshape_as(q)
+            q = apply_qsa_rope(self.rotary_emb, positions, q)
+
+            raw_key_cache = raw_key_state_cache.key_cache
+            rope_position_cache = raw_key_state_cache.rope_position_cache
+            if rope_position_cache is None:
+                position_rows = raw_metadata.logical_positions.view(-1, 1, 1).expand(
+                    -1, 1, 3
+                )
+            else:
+                position_rows = canonical_qsa_rope_positions(positions).to(
+                    device=raw_key_cache.device
+                )
+            pooled, first_positions = qsa_compress_groups_with_ratio(
+                raw_keys.reshape(-1, 1, self.index_head_dim),
+                position_rows,
+                raw_key_cache,
+                raw_metadata.block_table,
+                raw_metadata.token_to_req,
+                raw_metadata.query_start_loc,
+                raw_metadata.logical_positions,
+                compressed_metadata.slot_mapping,
+                self.compress_ratio,
+                rope_position_cache,
+            )
+            compressed_keys = gemma_rmsnorm(
+                pooled.reshape(-1, self.index_head_dim),
+                self.k_layernorm.weight,
+                self.k_layernorm.variance_epsilon,
+            ).reshape(-1, 1, self.index_head_dim)
+            if getattr(self.rotary_emb, "mrope_section", None):
+                first_positions = first_positions.transpose(0, 1)
+            else:
+                first_positions = first_positions[:, 0]
+            compressed_keys = apply_qsa_rope(
+                self.rotary_emb,
+                first_positions,
+                compressed_keys,
+            )
+            qsa_store_cache_rows(
+                compressed_key_cache,
+                compressed_metadata.slot_mapping,
+                compressed_keys,
+            )
+            qsa_store_cache_rows(
+                raw_key_cache,
+                raw_metadata.slot_mapping,
+                raw_keys,
+            )
+            if rope_position_cache is not None:
+                qsa_store_cache_rows(
+                    rope_position_cache,
+                    raw_metadata.slot_mapping,
+                    position_rows,
+                )
+
+        q_sel = q.index_select(0, row_indices)
+        tok_to_req_sel = compressed_metadata.token_to_req[:num_tokens].index_select(
+            0, row_indices
+        )
+        log_pos_sel = compressed_metadata.logical_positions[:num_tokens].index_select(
+            0, row_indices
+        )
+        return qsa_select_paged_tokens(
+            q_sel,
+            compressed_key_cache,
+            compressed_metadata.block_table,
+            tok_to_req_sel,
+            log_pos_sel,
+            compressed_metadata.seq_lens,
+            self.token_topk,
+            self.compress_ratio,
+            out,
+            query_start_loc_cpu=None,
+            shared_key_scoring=self.shared_key_scoring,
+            max_seq_len=compressed_metadata.max_seq_len,
+            tp_group=None,
             seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
         )
 

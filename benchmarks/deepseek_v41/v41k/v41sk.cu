@@ -1791,8 +1791,7 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
     }
   }
   const int kn = min(KC, width - k0);
-  const half* qt =
-      q + ((size_t)tm * (GATHER ? rg.q_groups : 1) + qg) * H * D;
+  const half* qt = q + ((size_t)tm * (GATHER ? rg.q_groups : 1) + qg) * H * D;
   const half* kt = keys + ((size_t)t * width + k0) * D;
   // Chunks without a live key (short contexts leave most of the 512 top-k
   // slots unused) read no keys: they report an empty softmax (l = 0).
@@ -1809,8 +1808,7 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
       if (key < rg.window) {
         const int64_t at = pos - rg.window + 1 + key;
         live &= at >= 0;
-        const int64_t start =
-            rg.paged ? rg.positions[vbase] : rg.starts[0];
+        const int64_t start = rg.paged ? rg.positions[vbase] : rg.starts[0];
         if (!rg.paged_all_cached && at >= start) {
           src = rg.values + (vbase + at - start) * D;
         } else if (rg.paged) {
@@ -2131,8 +2129,7 @@ __device__ __forceinline__ const half* ring_key_src(const RingGather& rg, int t,
   if (index < 0 || index >= (pos + 1) / rg.ratio) return nullptr;
   const int page = rg.table[(size_t)row * rg.table_stride + index / per];
   if (page < 0) return nullptr;
-  return rg.cache + page * rg.stride +
-         ((index % per) >> rg.cshard_shift) * D;
+  return rg.cache + page * rg.stride + ((index % per) >> rg.cshard_shift) * D;
 }
 
 __global__ void __launch_bounds__(32 * attn::TKW)
@@ -2572,13 +2569,10 @@ void attn_paged_dec(torch::Tensor out, torch::Tensor q, torch::Tensor values,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-__global__ void __launch_bounds__(128)
-    dcp_compact_topk_kernel(int* __restrict__ local_topk,
-                            int* __restrict__ local_cnt,
-                            const int* __restrict__ topk,
-                            const int64_t* __restrict__ positions,
-                            const bool* __restrict__ valid,
-                            int ntopk, int ratio, int shard) {
+__global__ void __launch_bounds__(128) dcp_compact_topk_kernel(
+    int* __restrict__ local_topk, int* __restrict__ local_cnt,
+    const int* __restrict__ topk, const int64_t* __restrict__ positions,
+    const bool* __restrict__ valid, int ntopk, int ratio, int shard) {
   __shared__ int cnt_sh;
   const int t = blockIdx.x;
   const int lane = threadIdx.x & 31;
@@ -2611,14 +2605,13 @@ constexpr int DCP_SPLIT_CTAS = 6;
 
 // True GQA-64 DCP=4 decode split kernel: loads each 32x512 compressed KV tile
 // ONCE into shared memory and computes WMMA QK + softmax + PV across all 4 TP
-// query groups (64 heads total), cutting global KV HBM traffic 4x and CTAs 10.7x.
+// query groups (64 heads total), cutting global KV HBM traffic 4x and
+// CTAs 10.7x.
 __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
     dcp_gqa64_split_kernel(const half* __restrict__ q_all,
-                           half* __restrict__ opart,
-                           float* __restrict__ mpart,
-                           float* __restrict__ lpart,
-                           int T, int nchunk_stride, float scale,
-                           RingGather rg) {
+                           half* __restrict__ opart, float* __restrict__ mpart,
+                           float* __restrict__ lpart, int T, int nchunk_stride,
+                           float scale, RingGather rg) {
   using namespace nvcuda;
   using namespace attn;
   extern __shared__ __align__(128) unsigned char dsm[];
@@ -2651,10 +2644,9 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
       const int page =
           live ? rg.table[(size_t)row * rg.table_stride + index / per] : -1;
       live &= page >= 0;
-      srcs[lane] = live
-                       ? (rg.cache + page * rg.stride +
-                          ((index % per) >> rg.cshard_shift) * D)
-                       : nullptr;
+      srcs[lane] = live ? (rg.cache + page * rg.stride +
+                           ((index % per) >> rg.cshard_shift) * D)
+                        : nullptr;
       const unsigned m = __ballot_sync(0xffffffffu, live);
       if (lane == 0) live_mask = m;
     }
@@ -2663,7 +2655,8 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
     if (lm == 0) {
       if (threadIdx.x < 4 * H) {
         const int g = threadIdx.x >> 4, h = threadIdx.x & 15;
-        const size_t idx = (((size_t)g * T + t) * nchunk_stride + chunk) * H + h;
+        const size_t idx =
+            (((size_t)g * T + t) * nchunk_stride + chunk) * H + h;
         mpart[idx] = -1e30f;
         lpart[idx] = 0.f;
       }
@@ -2715,8 +2708,7 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
                                 wmma::mem_row_major);
       }
       __syncthreads();
-      const size_t ml_base =
-          (((size_t)g * T + t) * nchunk_stride + chunk) * H;
+      const size_t ml_base = (((size_t)g * T + t) * nchunk_stride + chunk) * H;
       for (int h = warp; h < H; h += DEC_WARPS) {
         const bool live = (lm >> lane) & 1u;
         const float raw = sc[h * SLD + lane] + sc[H * SLD + h * SLD + lane];
@@ -2738,14 +2730,16 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
       __syncthreads();
       half* o_tok = opart + ml_base * D;
       float* st = stage + warp * 256;
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0, pa1;
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0,
+          pa1;
       wmma::load_matrix_sync(pa0, ps, PLD);
       wmma::load_matrix_sync(pa1, ps + 16, PLD);
 #pragma unroll 1
       for (int tile = warp; tile < D / 16; tile += DEC_WARPS) {
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
         wmma::fill_fragment(acc, 0.f);
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0, b1;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0,
+            b1;
         wmma::load_matrix_sync(b0, ks + tile * 16, KLD);
         wmma::load_matrix_sync(b1, ks + 16 * KLD + tile * 16, KLD);
         wmma::mma_sync(acc, pa0, b0, acc);
@@ -2765,14 +2759,11 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
   }
 }
 
-__global__ void __launch_bounds__(128)
-    dcp_comp_reduce_kernel(const half* __restrict__ opart,
-                           const float* __restrict__ mpart,
-                           const float* __restrict__ lpart,
-                           const int* __restrict__ local_cnt,
-                           const bool* __restrict__ valid,
-                           float* __restrict__ oml_send,
-                           int T, int nchunk_stride) {
+__global__ void __launch_bounds__(128) dcp_comp_reduce_kernel(
+    const half* __restrict__ opart, const float* __restrict__ mpart,
+    const float* __restrict__ lpart, const int* __restrict__ local_cnt,
+    const bool* __restrict__ valid, float* __restrict__ oml_send, int T,
+    int nchunk_stride) {
   using namespace attn;
   __shared__ float wsh[64];
   __shared__ float inv_l;
@@ -2826,15 +2817,16 @@ __global__ void __launch_bounds__(128)
       acc[3] += w * b.y;
     }
   }
-  half2* output = reinterpret_cast<half2*>(reinterpret_cast<half*>(row_out) + d);
+  half2* output =
+      reinterpret_cast<half2*>(reinterpret_cast<half*>(row_out) + d);
   output[0] = __floats2half2_rn(acc[0] * inv, acc[1] * inv);
   output[1] = __floats2half2_rn(acc[2] * inv, acc[3] * inv);
 }
 
 __global__ void __launch_bounds__(32 * attn::TKW)
     dcp_comp_tok_kernel(const half* __restrict__ q_all,
-                        float* __restrict__ oml_send,
-                        int T, float scale, RingGather rg) {
+                        float* __restrict__ oml_send, int T, float scale,
+                        RingGather rg) {
   using namespace nvcuda;
   using namespace attn;
   constexpr int NT = 32 * TKW;
@@ -2854,11 +2846,13 @@ __global__ void __launch_bounds__(32 * attn::TKW)
   if (cnt <= 0 || !rg.valid[t]) {
     for (int i = threadIdx.x * 2; i < H * D; i += 2 * NT) {
       const int h = i / D, d = i % D;
-      half* o_row = reinterpret_cast<half*>(oml_send + (out_base + h) * DCP_OML_STRIDE);
+      half* o_row =
+          reinterpret_cast<half*>(oml_send + (out_base + h) * DCP_OML_STRIDE);
       *reinterpret_cast<half2*>(o_row + d) = __floats2half2_rn(0.f, 0.f);
     }
     if (threadIdx.x < H) {
-      float* ml_row = oml_send + (out_base + threadIdx.x) * DCP_OML_STRIDE + 256;
+      float* ml_row =
+          oml_send + (out_base + threadIdx.x) * DCP_OML_STRIDE + 256;
       ml_row[0] = -1e30f;
       ml_row[1] = 0.f;
     }
@@ -2954,7 +2948,8 @@ __global__ void __launch_bounds__(32 * attn::TKW)
         }
       }
       __syncthreads();
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0, pa1;
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0,
+          pa1;
       wmma::load_matrix_sync(pa0, ps, PLD);
       wmma::load_matrix_sync(pa1, ps + 16, PLD);
 #pragma unroll
@@ -2964,7 +2959,8 @@ __global__ void __launch_bounds__(32 * attn::TKW)
         __syncwarp();
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
         wmma::load_matrix_sync(acc, os + tile * 16, D, wmma::mem_row_major);
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0, b1;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0,
+            b1;
         wmma::load_matrix_sync(b0, ks + tile * 16, KLD);
         wmma::load_matrix_sync(b1, ks + 16 * KLD + tile * 16, KLD);
         wmma::mma_sync(acc, pa0, b0, acc);
@@ -2978,7 +2974,8 @@ __global__ void __launch_bounds__(32 * attn::TKW)
     const int h = i / D, d = i % D;
     const float rl = run_l[h];
     const float inv = rl > 0.f ? (1.f / rl) : 0.f;
-    half* o_row = reinterpret_cast<half*>(oml_send + (out_base + h) * DCP_OML_STRIDE);
+    half* o_row =
+        reinterpret_cast<half*>(oml_send + (out_base + h) * DCP_OML_STRIDE);
     *reinterpret_cast<half2*>(o_row + d) =
         __floats2half2_rn(os[i] * inv, os[i + 1] * inv);
   }
@@ -2996,9 +2993,8 @@ __global__ void __launch_bounds__(128)
                            const float* __restrict__ lpart_w,
                            const float* __restrict__ oml_recv,
                            const float* __restrict__ sink,
-                           half* __restrict__ out,
-                           int T, int nchunk_w, RingGather rg,
-                           const float* rope, int rope_length) {
+                           half* __restrict__ out, int T, int nchunk_w,
+                           RingGather rg, const float* rope, int rope_length) {
   using namespace attn;
   __shared__ float wsh[16];
   __shared__ float csh[4];
@@ -3029,7 +3025,8 @@ __global__ void __launch_bounds__(128)
       if (lw > 0.f) M = fmaxf(M, mpart_w[wbase + (size_t)threadIdx.x * H]);
     } else if (threadIdx.x >= 16 && threadIdx.x < 20) {
       const int s = threadIdx.x - 16;
-      const float* ml = oml_recv + (((size_t)s * T + t) * H + h) * DCP_OML_STRIDE + 256;
+      const float* ml =
+          oml_recv + (((size_t)s * T + t) * H + h) * DCP_OML_STRIDE + 256;
       if (ml[1] > 0.f) M = fmaxf(M, ml[0]);
     }
     for (int o = 16; o; o >>= 1)
@@ -3037,12 +3034,14 @@ __global__ void __launch_bounds__(128)
     float L = 0.f;
     if (threadIdx.x < nchunk_w) {
       const float lw = lpart_w[wbase + (size_t)threadIdx.x * H];
-      const float w = lw > 0.f ? __expf(mpart_w[wbase + (size_t)threadIdx.x * H] - M) : 0.f;
+      const float w =
+          lw > 0.f ? __expf(mpart_w[wbase + (size_t)threadIdx.x * H] - M) : 0.f;
       wsh[threadIdx.x] = w;
       L += w * lw;
     } else if (threadIdx.x >= 16 && threadIdx.x < 20) {
       const int s = threadIdx.x - 16;
-      const float* ml = oml_recv + (((size_t)s * T + t) * H + h) * DCP_OML_STRIDE + 256;
+      const float* ml =
+          oml_recv + (((size_t)s * T + t) * H + h) * DCP_OML_STRIDE + 256;
       const float wc = ml[1] > 0.f ? (__expf(ml[0] - M) * ml[1]) : 0.f;
       csh[s] = wc;
       L += wc;
@@ -3137,7 +3136,8 @@ struct DCPWorkspace {
   torch::Tensor ml_w;
 };
 
-static DCPWorkspace& get_dcp_ws(int dev, const torch::TensorOptions& half_opts) {
+static DCPWorkspace& get_dcp_ws(int dev,
+                                const torch::TensorOptions& half_opts) {
   static DCPWorkspace ws[8];
   TORCH_CHECK(dev >= 0 && dev < 8);
   DCPWorkspace& w = ws[dev];
@@ -3146,7 +3146,8 @@ static DCPWorkspace& get_dcp_ws(int dev, const torch::TensorOptions& half_opts) 
           at::cuda::CaptureStatus::None) {
     constexpr int64_t T_MAX = 192, NC_MAX = 16, NW_MAX = 8;
     auto f32_opts = half_opts.dtype(torch::kFloat32);
-    w.opart_c = torch::empty({4 * T_MAX * NC_MAX * attn::H * attn::D}, half_opts);
+    w.opart_c =
+        torch::empty({4 * T_MAX * NC_MAX * attn::H * attn::D}, half_opts);
     w.ml_c = torch::empty({2 * 4 * T_MAX * NC_MAX * attn::H}, f32_opts);
     w.opart_w = torch::empty({T_MAX * NW_MAX * attn::H * attn::D}, half_opts);
     w.ml_w = torch::empty({2 * T_MAX * NW_MAX * attn::H}, f32_opts);
@@ -3173,11 +3174,10 @@ void dcp_compact_topk(torch::Tensor local_topk, torch::Tensor local_cnt,
 }
 
 void attn_dcp_comp(torch::Tensor oml_send, torch::Tensor q_all,
-                   torch::Tensor cache, torch::Tensor table,
-                   torch::Tensor rows, torch::Tensor positions,
-                   torch::Tensor valid, torch::Tensor local_topk,
-                   torch::Tensor local_cnt, double scale, int64_t block,
-                   int64_t ratio) {
+                   torch::Tensor cache, torch::Tensor table, torch::Tensor rows,
+                   torch::Tensor positions, torch::Tensor valid,
+                   torch::Tensor local_topk, torch::Tensor local_cnt,
+                   double scale, int64_t block, int64_t ratio) {
   using namespace attn;
   const int T = q_all.size(0);
   const int ntopk = local_topk.size(1);
@@ -3187,10 +3187,9 @@ void attn_dcp_comp(torch::Tensor oml_send, torch::Tensor q_all,
   TORCH_CHECK(oml_send.is_contiguous() &&
               oml_send.scalar_type() == torch::kFloat32 &&
               oml_send.numel() == (int64_t)4 * T * H * DCP_OML_STRIDE);
-  TORCH_CHECK(local_topk.scalar_type() == torch::kInt32 &&
-              local_topk.is_contiguous() &&
-              local_cnt.scalar_type() == torch::kInt32 &&
-              local_cnt.is_contiguous());
+  TORCH_CHECK(
+      local_topk.scalar_type() == torch::kInt32 && local_topk.is_contiguous() &&
+      local_cnt.scalar_type() == torch::kInt32 && local_cnt.is_contiguous());
   if (T <= 0) return;
   const at::cuda::OptionalCUDAGuard guard(device_of(q_all));
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -3234,7 +3233,8 @@ void attn_dcp_comp(torch::Tensor oml_send, torch::Tensor q_all,
                            (int)DEC_SMEM);
       smem_set_dcp_dec = true;
     }
-    dcp_gqa64_split_kernel<<<dim3(T, DCP_SPLIT_CTAS), 32 * DEC_WARPS, DEC_SMEM, stream>>>(
+    dcp_gqa64_split_kernel<<<dim3(T, DCP_SPLIT_CTAS), 32 * DEC_WARPS, DEC_SMEM,
+                             stream>>>(
         reinterpret_cast<const half*>(q_all.data_ptr<at::Half>()),
         reinterpret_cast<half*>(opart.data_ptr<at::Half>()), mp, lp, T, nchunk,
         (float)scale, rg);
@@ -3318,11 +3318,12 @@ void attn_dcp_win_combine(torch::Tensor out, torch::Tensor q_local,
       nullptr, reinterpret_cast<half*>(opart_w.data_ptr<at::Half>()), mp_w,
       lp_w, (int)window, (float)scale, rg);
   if (rope.has_value()) {
-    dcp_win_combine_kernel<true><<<dim3(T, H + (paged_fused ? 1 : 0)), 128, 0, stream>>>(
-        reinterpret_cast<const half*>(opart_w.data_ptr<at::Half>()), mp_w, lp_w,
-        oml_recv.data_ptr<float>(), sink.data_ptr<float>(),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()), T, nchunk_w, rg,
-        rope->data_ptr<float>(), (int)rope->size(0) - 1);
+    dcp_win_combine_kernel<true>
+        <<<dim3(T, H + (paged_fused ? 1 : 0)), 128, 0, stream>>>(
+            reinterpret_cast<const half*>(opart_w.data_ptr<at::Half>()), mp_w,
+            lp_w, oml_recv.data_ptr<float>(), sink.data_ptr<float>(),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()), T, nchunk_w, rg,
+            rope->data_ptr<float>(), (int)rope->size(0) - 1);
   } else {
     dcp_win_combine_kernel<false><<<dim3(T, H), 128, 0, stream>>>(
         reinterpret_cast<const half*>(opart_w.data_ptr<at::Half>()), mp_w, lp_w,
@@ -4385,14 +4386,13 @@ void ll_allgather(torch::Tensor out, torch::Tensor inp, int64_t p0, int64_t p1,
 template <bool HALF>
 __global__ void __launch_bounds__(LL_THREADS)
     ll_alltoall_kernel(uint4* __restrict__ out, const uint4* __restrict__ in,
-                       LLPeers peers, int rank, int slice_packs,
-                       int64_t cap, int* __restrict__ counter) {
+                       LLPeers peers, int rank, int slice_packs, int64_t cap,
+                       int* __restrict__ counter) {
   const int64_t base = (int64_t)(counter[blockIdx.x] & 1) * 4 * cap;
   const int stride = gridDim.x * blockDim.x;
   const int first = blockIdx.x * blockDim.x + threadIdx.x;
   for (int p = first; p < slice_packs; p += stride) {
-    out[(int64_t)rank * slice_packs + p] =
-        in[(int64_t)rank * slice_packs + p];
+    out[(int64_t)rank * slice_packs + p] = in[(int64_t)rank * slice_packs + p];
 #pragma unroll
     for (int r = 1; r < 4; ++r) {
       const int dst = (rank + r) & 3;
@@ -4875,8 +4875,8 @@ __global__ void __launch_bounds__(128)
     const int64_t column0 = local * KT;
     for (int i = threadIdx.x; i < count * KT; i += blockDim.x) {
       const int t = i / KT, j = i % KT;
-      const int64_t n = kv_sharded ? ((column0 + j) * nshard + shard)
-                                   : (n0 + j);
+      const int64_t n =
+          kv_sharded ? ((column0 + j) * nshard + shard) : (n0 + j);
       if (n >= end) continue;
       float total = 0.f;
       for (int h = 0; h < H; ++h) {
@@ -4927,8 +4927,7 @@ static void index_scores_launch(torch::Tensor out, torch::Tensor q,
       reinterpret_cast<const __half*>(cache.data_ptr<at::Half>()),
       table.data_ptr<int>(), positions.data_ptr<int64_t>(), qsl.data_ptr<int>(),
       (int)table.stride(0), (int)out.size(1), cache.stride(0),
-      (int)cache.size(1), (int)ratio, H, (int)shard, (int)nshard,
-      kv_sharded);
+      (int)cache.size(1), (int)ratio, H, (int)shard, (int)nshard, kv_sharded);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -5013,9 +5012,9 @@ __global__ void __launch_bounds__(256) index_scores_prefill_shard_kernel(
     const int j = i / (D / 8), c = (i % (D / 8)) * 8;
     uint4 v = make_uint4(0, 0, 0, 0);
     if (j < 32 || has_half1) {
-      const int64_t lk = kv_sharded
-                             ? int64_t(column0 + j)
-                             : ((j < 32) ? (n_base0 + j) : (n_base1 + (j - 32)));
+      const int64_t lk =
+          kv_sharded ? int64_t(column0 + j)
+                     : ((j < 32) ? (n_base0 + j) : (n_base1 + (j - 32)));
       const int64_t n = kv_sharded ? (lk * nshard + shard) : lk;
       if (n < max_end) {
         const int page = table[lk / keys_per_page];
@@ -5272,9 +5271,8 @@ template <int EPL>
 __global__ void __launch_bounds__(256)
     route_topk_parallel_kernel(const float* __restrict__ logits,
                                const float* __restrict__ bias,
-                               float* __restrict__ probs,
-                               int* __restrict__ ids, int T, int K,
-                               float scale) {
+                               float* __restrict__ probs, int* __restrict__ ids,
+                               int T, int K, float scale) {
   constexpr int E = EPL * 32;
   __shared__ float sh_score[8][E];
   __shared__ unsigned sh_key[8][E];
@@ -5317,8 +5315,7 @@ __global__ void __launch_bounds__(256)
       const unsigned long long other = __shfl_xor_sync(full, best, o);
       best = other > best ? other : best;
     }
-    const int best_e =
-        (int)(0xffffffffu - (unsigned int)(best & 0xffffffffu));
+    const int best_e = (int)(0xffffffffu - (unsigned int)(best & 0xffffffffu));
     if (lane == j) {
       my_v = sc[best_e];
       my_e = best_e;
@@ -5339,8 +5336,7 @@ __global__ void __launch_bounds__(256)
 template <int EPL>
 __global__ void __launch_bounds__(256)
     route_plan_scatter_kernel(const int* __restrict__ ids,
-                              int* __restrict__ perm,
-                              int* __restrict__ experts,
+                              int* __restrict__ perm, int* __restrict__ experts,
                               int* __restrict__ offsets, int S) {
   constexpr int E = EPL * 32;
   __shared__ int slot_ids[RPW_MAX];
@@ -5429,23 +5425,22 @@ void route_plan_wide(torch::Tensor logits, torch::Tensor bias,
               "route_plan_wide: T*K <= 640");
   const at::cuda::OptionalCUDAGuard guard(device_of(logits));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-#define V41SK_RPW(EPL)                                                      \
-  do {                                                                      \
-    if (T >= 16) {                                                          \
-      route_topk_parallel_kernel<EPL><<<(T + 7) / 8, 256, 0, stream>>>(     \
-          logits.data_ptr<float>(), bias.data_ptr<float>(),                 \
-          probs.data_ptr<float>(), ids.data_ptr<int>(), T, K,               \
-          (float)scale);                                                    \
-      route_plan_scatter_kernel<EPL><<<1, 256, 0, stream>>>(                \
-          ids.data_ptr<int>(), perm.data_ptr<int>(),                        \
-          experts.data_ptr<int>(), offsets.data_ptr<int>(), T * K);         \
-    } else {                                                                \
-      route_plan_wide_kernel<EPL><<<1, 256, 0, stream>>>(                   \
-          logits.data_ptr<float>(), bias.data_ptr<float>(),                 \
-          probs.data_ptr<float>(), ids.data_ptr<int>(), perm.data_ptr<int>(),\
-          experts.data_ptr<int>(), offsets.data_ptr<int>(), T, K,           \
-          (float)scale);                                                    \
-    }                                                                       \
+#define V41SK_RPW(EPL)                                                        \
+  do {                                                                        \
+    if (T >= 16) {                                                            \
+      route_topk_parallel_kernel<EPL><<<(T + 7) / 8, 256, 0, stream>>>(       \
+          logits.data_ptr<float>(), bias.data_ptr<float>(),                   \
+          probs.data_ptr<float>(), ids.data_ptr<int>(), T, K, (float)scale);  \
+      route_plan_scatter_kernel<EPL><<<1, 256, 0, stream>>>(                  \
+          ids.data_ptr<int>(), perm.data_ptr<int>(), experts.data_ptr<int>(), \
+          offsets.data_ptr<int>(), T * K);                                    \
+    } else {                                                                  \
+      route_plan_wide_kernel<EPL><<<1, 256, 0, stream>>>(                     \
+          logits.data_ptr<float>(), bias.data_ptr<float>(),                   \
+          probs.data_ptr<float>(), ids.data_ptr<int>(), perm.data_ptr<int>(), \
+          experts.data_ptr<int>(), offsets.data_ptr<int>(), T, K,             \
+          (float)scale);                                                      \
+    }                                                                         \
   } while (0)
   if (E == 384)
     V41SK_RPW(12);
@@ -5461,7 +5456,8 @@ void route_plan_wide(torch::Tensor logits, torch::Tensor bias,
 
 // ---- Phase 3B-1: Single-launch register-resident hc_expand_norm ----
 // Replaces _transition_parts3 + _transition_finish3 (MIX=False) with 1 launch
-// and zero cbuf/csq HBM traffic. 1 CTA per token, 256 threads x 5 float4 = 5120.
+// and zero cbuf/csq HBM traffic. 1 CTA per token, 256 threads x 5 float4 =
+// 5120.
 template <bool Y_FP16, bool W_FP16>
 __global__ void __launch_bounds__(256)
     hc_expand_norm_kernel(half* __restrict__ out, float* __restrict__ residual,
@@ -5483,17 +5479,21 @@ __global__ void __launch_bounds__(256)
   __shared__ float s_sq[8];
   __shared__ float s_rsq[8];
 
-  if (tid < 16) s_comb[tid] = comb[t * 16 + tid];
-  else if (tid < 20) s_post[tid - 16] = post[t * 4 + (tid - 16)];
-  else if (tid < 24) s_cpre[tid - 20] = cpre[t * 4 + (tid - 20)];
+  if (tid < 16)
+    s_comb[tid] = comb[t * 16 + tid];
+  else if (tid < 20)
+    s_post[tid - 16] = post[t * 4 + (tid - 16)];
+  else if (tid < 24)
+    s_cpre[tid - 20] = cpre[t * 4 + (tid - 20)];
   __syncthreads();
 
   const float p0 = s_post[0], p1 = s_post[1], p2 = s_post[2], p3 = s_post[3];
-  const float cp0 = s_cpre[0], cp1 = s_cpre[1], cp2 = s_cpre[2], cp3 = s_cpre[3];
-  float c00 = s_comb[0],  c01 = s_comb[4],  c02 = s_comb[8],  c03 = s_comb[12];
-  float c10 = s_comb[1],  c11 = s_comb[5],  c12 = s_comb[9],  c13 = s_comb[13];
-  float c20 = s_comb[2],  c21 = s_comb[6],  c22 = s_comb[10], c23 = s_comb[14];
-  float c30 = s_comb[3],  c31 = s_comb[7],  c32 = s_comb[11], c33 = s_comb[15];
+  const float cp0 = s_cpre[0], cp1 = s_cpre[1], cp2 = s_cpre[2],
+              cp3 = s_cpre[3];
+  float c00 = s_comb[0], c01 = s_comb[4], c02 = s_comb[8], c03 = s_comb[12];
+  float c10 = s_comb[1], c11 = s_comb[5], c12 = s_comb[9], c13 = s_comb[13];
+  float c20 = s_comb[2], c21 = s_comb[6], c22 = s_comb[10], c23 = s_comb[14];
+  float c30 = s_comb[3], c31 = s_comb[7], c32 = s_comb[11], c33 = s_comb[15];
 
   float* rb = residual + (size_t)t * 4 * H;
   float4 cv[5];
@@ -5546,11 +5546,10 @@ __global__ void __launch_bounds__(256)
     *reinterpret_cast<float4*>(rb + 2 * H + col) = n2;
     *reinterpret_cast<float4*>(rb + 3 * H + col) = n3;
 
-    cv[k] = make_float4(
-        cp0 * n0.x + cp1 * n1.x + cp2 * n2.x + cp3 * n3.x,
-        cp0 * n0.y + cp1 * n1.y + cp2 * n2.y + cp3 * n3.y,
-        cp0 * n0.z + cp1 * n1.z + cp2 * n2.z + cp3 * n3.z,
-        cp0 * n0.w + cp1 * n1.w + cp2 * n2.w + cp3 * n3.w);
+    cv[k] = make_float4(cp0 * n0.x + cp1 * n1.x + cp2 * n2.x + cp3 * n3.x,
+                        cp0 * n0.y + cp1 * n1.y + cp2 * n2.y + cp3 * n3.y,
+                        cp0 * n0.z + cp1 * n1.z + cp2 * n2.z + cp3 * n3.z,
+                        cp0 * n0.w + cp1 * n1.w + cp2 * n2.w + cp3 * n3.w);
     sq += cv[k].x * cv[k].x + cv[k].y * cv[k].y + cv[k].z * cv[k].z +
           cv[k].w * cv[k].w;
     if (res_sq_out != nullptr) {
@@ -5652,17 +5651,14 @@ void hc_expand_norm(torch::Tensor out, torch::Tensor residual, torch::Tensor y,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-
-// ---- Phase 3B-3: Fast 1-warp/token Sinkhorn from cuBLAS dots[T,24] + res_sq[T] ----
-__global__ void __launch_bounds__(128)
-    hc_sinkhorn_from_dots_kernel(const float* __restrict__ dots,
-                                 const float* __restrict__ res_sq,
-                                 const float* __restrict__ scale,
-                                 const float* __restrict__ base,
-                                 float* __restrict__ pre_o,
-                                 float* __restrict__ post_o,
-                                 float* __restrict__ comb_o, int T,
-                                 float norm_eps, float hc_eps, int iters) {
+// ---- Phase 3B-3: Fast 1-warp/token Sinkhorn from cuBLAS dots[T,24] +
+// res_sq[T] ----
+__global__ void __launch_bounds__(128) hc_sinkhorn_from_dots_kernel(
+    const float* __restrict__ dots, const float* __restrict__ res_sq,
+    const float* __restrict__ scale, const float* __restrict__ base,
+    float* __restrict__ pre_o, float* __restrict__ post_o,
+    float* __restrict__ comb_o, int T, float norm_eps, float hc_eps,
+    int iters) {
   const int t = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= T) return;
   const float* d = dots + (size_t)t * 24;
@@ -5732,7 +5728,6 @@ void hc_sinkhorn_from_dots(torch::Tensor dots, torch::Tensor res_sq,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-
 namespace v41ll_mk {
 struct LLTilePeers {
   char* p[4];
@@ -5755,11 +5750,10 @@ __device__ __forceinline__ uint32_t ll_tile_escape(uint32_t w) {
 }
 template <bool HALF>
 __device__ __forceinline__ bool ll_tile_ready4(const uint4& v) {
-  return v.x != 0xFFFFFFFFu && v.y != 0xFFFFFFFFu &&
-         v.z != 0xFFFFFFFFu && v.w != 0xFFFFFFFFu;
+  return v.x != 0xFFFFFFFFu && v.y != 0xFFFFFFFFu && v.z != 0xFFFFFFFFu &&
+         v.w != 0xFFFFFFFFu;
 }
 }  // namespace v41ll_mk
-
 
 // ---- Phase 2B: Single-Launch 80-CTA 5-Step Sharded Markov CUDA Kernel -------
 // 80 CTAs (1 per V100 SM, <= 36 KiB SMEM, 100% co-resident) run all 5 Markov
@@ -5780,8 +5774,9 @@ __device__ __forceinline__ void st_vol_i32(int* p, int v) {
   asm volatile("st.volatile.global.s32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
 
-// Fast linear decode of 8 FP8 E4M3 bytes (uint2) -> 8 floats scaled by row_scale.
-// row_scale already includes the 256.0f factor (exact match to fp8_qpn8).
+// Fast linear decode of 8 FP8 E4M3 bytes (uint2) -> 8 floats scaled by
+// row_scale. row_scale already includes the 256.0f factor (exact match to
+// fp8_qpn8).
 __device__ __forceinline__ void fp8x8_to_f32x8(uint2 q, float row_scale,
                                                float out[8]) {
   constexpr unsigned kSign = 0x80008000u;
@@ -5911,14 +5906,14 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
       }
 
       if (R == 1) {
-        const uint4 eraw =
-            *reinterpret_cast<const uint4*>(&s_emb[0][lane * 8]);
+        const uint4 eraw = *reinterpret_cast<const uint4*>(&s_emb[0][lane * 8]);
         const uint16_t* eh = reinterpret_cast<const uint16_t*>(&eraw);
         float dot = 0.f;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-          float ev = EMB_FP16 ? __half2float(*reinterpret_cast<const half*>(&eh[i]))
-                              : bf16_u16_to_f32(eh[i]);
+          float ev = EMB_FP16
+                         ? __half2float(*reinterpret_cast<const half*>(&eh[i]))
+                         : bf16_u16_to_f32(eh[i]);
           dot += w[i] * ev;
         }
 #pragma unroll
@@ -5930,8 +5925,8 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
           if (c_temps != nullptr) {
             const float t0 = c_temps[0];
             if (t0 > 0.f) {
-              const uint32_t sd = mk_row_seed((uint64_t)c_keys[0],
-                                              (uint64_t)(c_pos[0] + step));
+              const uint32_t sd =
+                  mk_row_seed((uint64_t)c_keys[0], (uint64_t)(c_pos[0] + step));
               val = val / (t0 * draft_scale) +
                     mk_gumbel(sd, (uint32_t)(vocab_start + v));
             }
@@ -5949,16 +5944,17 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
           float dot = 0.f;
 #pragma unroll
           for (int i = 0; i < 8; ++i) {
-          float ev = EMB_FP16 ? __half2float(*reinterpret_cast<const half*>(&eh[i]))
-                              : bf16_u16_to_f32(eh[i]);
-          dot += w[i] * ev;
-        }
+            float ev =
+                EMB_FP16 ? __half2float(*reinterpret_cast<const half*>(&eh[i]))
+                         : bf16_u16_to_f32(eh[i]);
+            dot += w[i] * ev;
+          }
 #pragma unroll
           for (int off = 16; off > 0; off >>= 1)
             dot += __shfl_xor_sync(0xffffffffu, dot, off);
           if (lane == 0) {
-            const float lg = __half2float(
-                local_logits[((size_t)r * steps + step) * V + v]);
+            const float lg =
+                __half2float(local_logits[((size_t)r * steps + step) * V + v]);
             float val = lg + dot;
             if (c_temps != nullptr) {
               const float tr = c_temps[r];
@@ -5985,7 +5981,8 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
     }
     __syncthreads();
 
-    // Reduce 8 warps per request r -> ws_val[r * 80 + cta], ws_idx[r * 80 + cta]
+    // Reduce 8 warps per request r -> ws_val[r * 80 + cta], ws_idx[r * 80 +
+    // cta]
     for (int r = tid; r < R; r += 256) {
       float bv = -INFINITY;
       int bi = 2147483647;
@@ -6044,8 +6041,8 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
 #pragma unroll
             for (int pr = 1; pr < 4; ++pr) {
               v41ll_mk::ll_tile_store(peers.p[(rank + pr) & 3] + ll_base +
-                                       (int64_t)rank * cap + (int64_t)r * 16,
-                                   pkt);
+                                          (int64_t)rank * cap + (int64_t)r * 16,
+                                      pkt);
             }
             // Also stash own values in w_best_v/i[0][r] for Phase 2!
             w_best_v[0][r] = out_v;
@@ -6099,7 +6096,8 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
           st_vol_i32(prev_tok + r, clamped);
         }
         __syncthreads();
-        if (tid == 0) st_vol_i32(state_ctrl + 2, ld_vol_i32(state_ctrl + 2) + 1);
+        if (tid == 0)
+          st_vol_i32(state_ctrl + 2, ld_vol_i32(state_ctrl + 2) + 1);
       }
       __threadfence();
       __syncthreads();
@@ -6118,10 +6116,10 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
   }
 }
 
-
-// ---- Phase 2C-1: SM70 WMMA 80-CTA cooperative 5-step sharded Markov (R=5..64) ----
-// Uses Volta 16x16x16 FP16->FP32 Tensor Cores + coalesced 32-row local_logits reads
-// in 45 KiB static SMEM (1 CTA/SM, 80/80 co-resident, CUDA-Graph safe).
+// ---- Phase 2C-1: SM70 WMMA 80-CTA cooperative 5-step sharded Markov (R=5..64)
+// ---- Uses Volta 16x16x16 FP16->FP32 Tensor Cores + coalesced 32-row
+// local_logits reads in 45 KiB static SMEM (1 CTA/SM, 80/80 co-resident,
+// CUDA-Graph safe).
 template <bool FP8, bool EMB_FP16>
 __global__ void __launch_bounds__(256, 1) markov_shard_5step_wmma_kernel(
     const void* __restrict__ weight, const half* __restrict__ w_scales,
@@ -6155,7 +6153,8 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_wmma_kernel(
   const int v1 = ((cta + 1) * V) / MK_CTAS;
 
   for (int step = 0; step < steps; ++step) {
-    // 1. Load R embedding rows [R, 256] as FP16 into s_emb (+ zero-pad up to m_pad)
+    // 1. Load R embedding rows [R, 256] as FP16 into s_emb (+ zero-pad up to
+    // m_pad)
     for (int idx = tid; idx < m_pad * MK_K; idx += 256) {
       const int r = idx >> 8;
       const int k = idx & 255;
@@ -6257,14 +6256,14 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_wmma_kernel(
         float val = -INFINITY;
         int idx = 2147483647;
         if (v_ok) {
-          const float lg =
-              __half2float(local_logits[((size_t)r * steps + step) * V + v_cur]);
+          const float lg = __half2float(
+              local_logits[((size_t)r * steps + step) * V + v_cur]);
           float cand = lg + s_c[r][lane];
           if (c_temps != nullptr) {
             const float tr = c_temps[r];
             if (tr > 0.f) {
-              const uint32_t sd = mk_row_seed((uint64_t)c_keys[r],
-                                              (uint64_t)(c_pos[r] + step));
+              const uint32_t sd =
+                  mk_row_seed((uint64_t)c_keys[r], (uint64_t)(c_pos[r] + step));
               cand = cand / (tr * draft_scale) +
                      mk_gumbel(sd, (uint32_t)(vocab_start + v_cur));
             }
@@ -6341,8 +6340,8 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_wmma_kernel(
 #pragma unroll
             for (int pr = 1; pr < 4; ++pr) {
               v41ll_mk::ll_tile_store(peers.p[(rank + pr) & 3] + ll_base +
-                                       (int64_t)rank * cap + (int64_t)r * 16,
-                                   pkt);
+                                          (int64_t)rank * cap + (int64_t)r * 16,
+                                      pkt);
             }
             r_best_v[r] = out_v;
             r_best_i[r] = out_gid;
@@ -6395,7 +6394,8 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_wmma_kernel(
           st_vol_i32(prev_tok + r, clamped);
         }
         __syncthreads();
-        if (tid == 0) st_vol_i32(state_ctrl + 2, ld_vol_i32(state_ctrl + 2) + 1);
+        if (tid == 0)
+          st_vol_i32(state_ctrl + 2, ld_vol_i32(state_ctrl + 2) + 1);
       }
       __threadfence();
       __syncthreads();
@@ -6413,18 +6413,15 @@ __global__ void __launch_bounds__(256, 1) markov_shard_5step_wmma_kernel(
   }
 }
 
-void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
-                        std::optional<torch::Tensor> w_scales,
-                        torch::Tensor embed, torch::Tensor local_logits,
-                        torch::Tensor anchors, torch::Tensor ws_val,
-                        torch::Tensor ws_idx, torch::Tensor prev_tok,
-                        torch::Tensor state_ctrl, int64_t p0, int64_t p1,
-                        int64_t p2, int64_t p3, int64_t rank, int64_t cap,
-                        int64_t vocab_start, int64_t steps,
-                        std::optional<torch::Tensor> c_keys,
-                        std::optional<torch::Tensor> c_pos,
-                        std::optional<torch::Tensor> c_temps,
-                        double draft_scale) {
+void markov_shard_5step(
+    torch::Tensor out_tokens, torch::Tensor weight,
+    std::optional<torch::Tensor> w_scales, torch::Tensor embed,
+    torch::Tensor local_logits, torch::Tensor anchors, torch::Tensor ws_val,
+    torch::Tensor ws_idx, torch::Tensor prev_tok, torch::Tensor state_ctrl,
+    int64_t p0, int64_t p1, int64_t p2, int64_t p3, int64_t rank, int64_t cap,
+    int64_t vocab_start, int64_t steps, std::optional<torch::Tensor> c_keys,
+    std::optional<torch::Tensor> c_pos, std::optional<torch::Tensor> c_temps,
+    double draft_scale) {
   const bool fp8 = w_scales.has_value();
   const int R = anchors.numel();
   const int V = weight.size(0);
@@ -6432,19 +6429,23 @@ void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
   TORCH_CHECK(R >= 1 && R <= MK_MAX_R && weight.size(1) == MK_K &&
               embed.size(1) == MK_K);
   TORCH_CHECK(local_logits.scalar_type() == torch::kFloat16 &&
-              local_logits.is_contiguous() && local_logits.size(0) == R * steps &&
-              local_logits.size(1) == V);
+              local_logits.is_contiguous() &&
+              local_logits.size(0) == R * steps && local_logits.size(1) == V);
   TORCH_CHECK(out_tokens.scalar_type() == torch::kInt64 &&
               out_tokens.is_contiguous() && out_tokens.numel() == R * steps);
-  TORCH_CHECK((embed.scalar_type() == torch::kFloat16 || embed.scalar_type() == torch::kBFloat16) && embed.is_contiguous());
+  TORCH_CHECK((embed.scalar_type() == torch::kFloat16 ||
+               embed.scalar_type() == torch::kBFloat16) &&
+              embed.is_contiguous());
   TORCH_CHECK(ws_val.numel() >= R * MK_CTAS && ws_idx.numel() >= R * MK_CTAS &&
               prev_tok.numel() >= R && state_ctrl.numel() >= 4);
   if (fp8) {
-    TORCH_CHECK(weight.scalar_type() == torch::kUInt8 && weight.is_contiguous());
+    TORCH_CHECK(weight.scalar_type() == torch::kUInt8 &&
+                weight.is_contiguous());
     TORCH_CHECK(w_scales->scalar_type() == torch::kFloat16 &&
                 w_scales->numel() == V && w_scales->is_contiguous());
   } else {
-    TORCH_CHECK((weight.scalar_type() == torch::kBFloat16 || weight.scalar_type() == torch::kInt16) &&
+    TORCH_CHECK((weight.scalar_type() == torch::kBFloat16 ||
+                 weight.scalar_type() == torch::kInt16) &&
                 weight.is_contiguous());
   }
   const at::cuda::OptionalCUDAGuard guard(device_of(local_logits));
@@ -6472,34 +6473,41 @@ void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
     if (fp8) {
       if (emb_fp16) {
         markov_shard_5step_wmma_kernel<true, true><<<MK_CTAS, 256, 0, stream>>>(
-            weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
-            out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
-            ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
-            state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-            (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
+            weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr,
+            anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+            ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+            prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+            (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr,
+            cp_ptr, ct_ptr, d_sc);
       } else {
-        markov_shard_5step_wmma_kernel<true, false><<<MK_CTAS, 256, 0, stream>>>(
-            weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
-            out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
-            ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
-            state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-            (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
+        markov_shard_5step_wmma_kernel<true, false>
+            <<<MK_CTAS, 256, 0, stream>>>(
+                weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr,
+                anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+                ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+                prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+                (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps,
+                ck_ptr, cp_ptr, ct_ptr, d_sc);
       }
     } else {
       if (emb_fp16) {
-        markov_shard_5step_wmma_kernel<false, true><<<MK_CTAS, 256, 0, stream>>>(
-            weight.data_ptr(), nullptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
-            out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
-            ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
-            state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-            (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
+        markov_shard_5step_wmma_kernel<false, true>
+            <<<MK_CTAS, 256, 0, stream>>>(
+                weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
+                anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+                ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+                prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+                (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps,
+                ck_ptr, cp_ptr, ct_ptr, d_sc);
       } else {
-        markov_shard_5step_wmma_kernel<false, false><<<MK_CTAS, 256, 0, stream>>>(
-            weight.data_ptr(), nullptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
-            out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
-            ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
-            state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-            (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
+        markov_shard_5step_wmma_kernel<false, false>
+            <<<MK_CTAS, 256, 0, stream>>>(
+                weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
+                anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+                ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+                prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+                (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps,
+                ck_ptr, cp_ptr, ct_ptr, d_sc);
       }
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -6508,18 +6516,20 @@ void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
   if (fp8) {
     if (emb_fp16) {
       markov_shard_5step_kernel<true, true><<<MK_CTAS, 256, 0, stream>>>(
-          weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
-          out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
-          ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
-          state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-          (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
+          weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr,
+          anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+          ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+          (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr,
+          cp_ptr, ct_ptr, d_sc);
     } else {
       markov_shard_5step_kernel<true, false><<<MK_CTAS, 256, 0, stream>>>(
-          weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr, anchors.data_ptr<int64_t>(),
-          out_tokens.data_ptr<int64_t>(), ws_val.data_ptr<float>(),
-          ws_idx.data_ptr<int>(), prev_tok.data_ptr<int>(),
-          state_ctrl.data_ptr<int>(), peers, (int)rank, cap, R, V, vocab,
-          (int)vocab_start, (int)steps, ck_ptr, cp_ptr, ct_ptr, d_sc);
+          weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr,
+          anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+          ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+          (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr,
+          cp_ptr, ct_ptr, d_sc);
     }
   } else {
     if (emb_fp16) {
@@ -6527,22 +6537,21 @@ void markov_shard_5step(torch::Tensor out_tokens, torch::Tensor weight,
           weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
           anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
           ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
-          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers, (int)rank,
-          cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr, cp_ptr,
-          ct_ptr, d_sc);
+          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+          (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr,
+          cp_ptr, ct_ptr, d_sc);
     } else {
       markov_shard_5step_kernel<false, false><<<MK_CTAS, 256, 0, stream>>>(
           weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
           anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
           ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
-          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers, (int)rank,
-          cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr, cp_ptr,
-          ct_ptr, d_sc);
+          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+          (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr,
+          cp_ptr, ct_ptr, d_sc);
     }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-
 
 // ---- Phase 3A: Parallel Multi-CTA route_plan_wide_v2 (bitwise identical) ----
 
@@ -6646,7 +6655,8 @@ TORCH_LIBRARY(v41sk, m) {
       "int rank, int cap, Tensor(b!) counter) -> ()");
   m.def(
       "dcp_compact_topk(Tensor(a!) local_topk, Tensor(b!) local_cnt, "
-      "Tensor topk, Tensor positions, Tensor valid, int ratio, int shard) -> ()");
+      "Tensor topk, Tensor positions, Tensor valid, int ratio, int shard) -> "
+      "()");
   m.def(
       "attn_dcp_comp(Tensor(a!) oml_send, Tensor q_all, Tensor cache, "
       "Tensor table, Tensor rows, Tensor positions, Tensor valid, "

@@ -10,6 +10,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from vllm._sm70_flashnext_prefill_ops import maybe_fused_moe_router_shared_prefill
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
@@ -323,11 +324,14 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Leave large HC-prefill contributions separate until the row owner."""
-        router_logits = (
-            hidden_states
-            if self.experts.is_internal_router
-            else self.gate(hidden_states)[0]
-        )
+        if self.experts.is_internal_router:
+            router_logits = hidden_states
+        else:
+            router_logits = maybe_fused_moe_router_shared_prefill(
+                hidden_states, self.gate, self.shared_expert
+            )
+            if router_logits is None:
+                router_logits = self.gate(hidden_states)[0]
         return self.experts.forward_partials(hidden_states, router_logits)
 
 
@@ -514,9 +518,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             block_input = block_input[: positions.shape[-1]]
         if self.layer_type == "linear_attention":
             use_direct_attention_output = (
-                communication_policy().long_prefill_norm
-                and torch.compiler.is_compiling()
-            )
+                hc_sequence_parallel or communication_policy().long_prefill_norm
+            ) and torch.compiler.is_compiling()
             attn_buffer = (
                 None if use_direct_attention_output else torch.empty_like(block_input)
             )
@@ -680,12 +683,17 @@ def enable_sm70_hcx(
             runner = layer.mlp.experts.runner
             runner.output_transform = partial(partial_moe_output, prefix)
             layer.mlp.sm70_hcx_packed_outputs = True
+            layer.mlp.experts._hc_prefill_peer_consumer = True
             register_moe_runner(prefix, runner)
         if previous_moe:
             layer.attn_hyper_connection._hcx_moe_payload = True
             layer.attn_hyper_connection.enable_partial_inputs(prefix + ".attn", runtime)
             status["prepared_modules"] += 1
+        layer.attn_hyper_connection._defer_ag_peers_min_m = 12288
         layer.mlp_hyper_connection.enable_partial_inputs(prefix + ".mlp", runtime)
+        layer.mlp_hyper_connection._defer_ag_peers_min_m = (
+            2048 if isinstance(layer.mlp, Qwen4ExpSparseMoeBlock) else 0
+        )
         status["prepared_modules"] += 1
         previous_moe = isinstance(layer.mlp, Qwen4ExpSparseMoeBlock)
     if previous_moe and model.hyper_connection_mixer is not None:
@@ -858,8 +866,12 @@ class Qwen4ExpModel(nn.Module):
             self.topk_indices_buffer = topk_indices_buffer
             if vllm_config.parallel_config.decode_context_parallel_size == 2:
                 max_tokens, width = topk_indices_buffer.shape
+                max_capture = max(
+                    vllm_config.compilation_config.cudagraph_capture_sizes or [0]
+                )
+                dcp_persist_tokens = min(max_tokens, max(512, max_capture))
                 dcp_local_indices_buffer = torch.empty(
-                    max_tokens, width, dtype=torch.int32
+                    dcp_persist_tokens, width, dtype=torch.int32
                 )
                 gathered_heads = (
                     int(config.num_attention_heads)
@@ -867,13 +879,13 @@ class Qwen4ExpModel(nn.Module):
                     * 2
                 )
                 dcp_partial_output_buffer = torch.empty(
-                    max_tokens,
+                    max(dcp_persist_tokens, 128),
                     gathered_heads,
                     int(config.head_dim),
-                    dtype=torch.float32,
+                    dtype=torch.float16,
                 )
                 dcp_partial_lse_buffer = torch.empty(
-                    max_tokens, gathered_heads, dtype=torch.float32
+                    dcp_persist_tokens, gathered_heads, dtype=torch.float32
                 )
                 self.dcp_local_indices_buffer = dcp_local_indices_buffer
                 self.dcp_partial_output_buffer = dcp_partial_output_buffer
@@ -1269,26 +1281,19 @@ class Qwen4ExpForCausalLM(
             and not is_offload_process()
             and current_platform.is_device_capability(70)
             and self.model_config.dtype == torch.float16
-            # The current accelerated consumer requires unreduced GGUF
-            # expert contributions. Other quantized runners retain the
-            # original backbone until their reduction contract is qualified.
-            and self.model_config.quantization == "gguf"
+            and self.model_config.quantization in ("gguf", "modelopt", "modelopt_fp4")
             and (config.hc_count, config.hidden_size, config.hc_lowrank)
             == (4, 2560, 320)
             and self.vllm_config.kernel_config.hc_weight_storage == "sharded"
             and self.vllm_config.kernel_config.sm70_hcx
             and not self.vllm_config.kernel_config.sm70_hcx_diagnostics
             and self.vllm_config.lora_config is None
-            and self.vllm_config.scheduler_config.max_num_seqs == 1
             and self.vllm_config.compilation_config.dynamic_shapes_config.type
             == DynamicShapesType.BACKED
-            and (
-                self.vllm_config.parallel_config.tensor_parallel_size,
-                self.vllm_config.parallel_config.pipeline_parallel_size,
-                self.vllm_config.parallel_config.decode_context_parallel_size,
-                self.vllm_config.parallel_config.prefill_context_parallel_size,
-            )
-            == (4, 1, 1, 1)
+            and self.vllm_config.parallel_config.tensor_parallel_size == 4
+            and self.vllm_config.parallel_config.pipeline_parallel_size == 1
+            and self.vllm_config.parallel_config.decode_context_parallel_size in (1, 2)
+            and self.vllm_config.parallel_config.prefill_context_parallel_size == 1
         )
 
     def prepare_loaded_linear_weights(self) -> None:
@@ -1304,6 +1309,9 @@ class Qwen4ExpForCausalLM(
             method = getattr(module, "quant_method", None)
             if method is not None and method is not previous.get(module):
                 method.process_weights_after_loading(module)
+        from vllm._sm70_flashnext_prefill_ops import prepack_shared_expert_weights
+
+        prepack_shared_expert_weights(self.model)
         from vllm.model_executor.layers.quantization.sm70_dmv13_projection import (
             share_prepared_banks,
         )
@@ -1438,7 +1446,7 @@ class Qwen4ExpForCausalLM(
         )
         return bool(
             getattr(self, "_hc_prefill_sequence_qualified", False)
-            and 4096 <= rows <= 16384
+            and 1024 <= rows <= 16384
             and intermediate_tensors is None
             and kwargs.get("deepstack_input_embeds") is None
             and (inputs_embeds is None or inputs_embeds.dtype == torch.float16)
@@ -1642,6 +1650,9 @@ class Qwen4ExpForCausalLM(
                     self.vllm_config.kernel_config.qsa_auto_e4m3_active
                 ),
             )
+            from vllm._sm70_flashnext_prefill_ops import prepack_shared_expert_weights
+
+            prepack_shared_expert_weights(self.model)
         _maybe_enable_sm70_peer_paths(self.vllm_config, self.model)
         return loaded
 
@@ -1882,6 +1893,9 @@ class Qwen4ExpForConditionalGeneration(
                 self.language_model.vllm_config.kernel_config.qsa_auto_e4m3_active
             ),
         )
+        from vllm._sm70_flashnext_prefill_ops import prepack_shared_expert_weights
+
+        prepack_shared_expert_weights(self.language_model.model)
         _maybe_enable_sm70_peer_paths(
             self.language_model.vllm_config, self.language_model.model
         )

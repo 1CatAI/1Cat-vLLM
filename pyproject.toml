@@ -189,6 +189,8 @@ wht = "wht"
 WHT = "WHT"
 # Huawei Compute Architecture for Neural Networks
 CANN = "CANN"
+anc = "anc"
+ot = "ot"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]

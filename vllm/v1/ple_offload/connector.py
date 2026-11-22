@@ -147,7 +147,7 @@ class PleOffloadConnector:
         self._ngram_context_source = ngram_context_source
         self._uses_cuda_inputs = self._input_ids_source.is_cuda
         self._validate_input_sources()
-        self.early_prefill = (
+        self.early_prefill = bool(
             vllm_config.kernel_config.ple_prefill_early_request
             and self._uses_cuda_inputs
         )

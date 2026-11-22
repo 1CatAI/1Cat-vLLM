@@ -20,6 +20,10 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 _WORKSPACES: dict[tuple, tuple[torch.Tensor, ...]] = {}
 # Prefill history stages, shared by all QSA layers of a device.
 _STAGES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_STAGE_PLAN_RINGS: dict[
+    tuple, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+] = {}
+_STAGE_PLAN_RING_IDX: dict[tuple, int] = {}
 
 
 @triton.jit
@@ -614,6 +618,7 @@ class HostQSAKV:
         is_speculative_draft: bool = False,
         resolve_rows: int = 32,
         hot_fp8: bool = False,
+        gpu_page_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -682,7 +687,7 @@ class HostQSAKV:
         )
         self.tags = torch.full((self.sets, 4), -1, dtype=torch.int32, device=device)
         self.stamps = torch.zeros_like(self.tags)
-        self.epoch = torch.zeros(1, dtype=torch.int32, device=device)
+        self.epoch = torch.ones(1, dtype=torch.int32, device=device)
         # Independent CLOCK hands; a power of two that divides the slot count
         # and leaves each hand at least one probe window of slots.
         self.num_hands = 1
@@ -752,11 +757,250 @@ class HostQSAKV:
         self._warm_hot_staged_op = (
             getattr(qsa_ns, "warm_hot_staged", None) if qsa_ns is not None else None
         )
+        self._pending_d2h_event: torch.cuda.Event | None = None
+        self._gpu_page_cache_hist: torch.Tensor | None = None
+        self._gpu_page_cache_scales: torch.Tensor | None = None
+        self._gpu_cache_cap = 0
+        self._gpu_cache_slot_of_block = np.zeros(0, dtype=np.int32)
+        self._gpu_cache_block_of_slot = np.zeros(0, dtype=np.int32)
+        self._gpu_cache_clock = 0
+        self._cpu_page_pairs: torch.Tensor | None = None
+        self._cpu_page_pairs_np: np.ndarray | None = None
+        self._gpu_page_pairs: torch.Tensor | None = None
+        from vllm._sm70_flashnext_prefill_ops import has_sm70_flashnext_prefill_ops
+
+        if (
+            not device_reference
+            and not is_speculative_draft
+            and self.fp8
+            and self.dim == 256
+            and has_sm70_flashnext_prefill_ops()
+        ):
+            if gpu_page_cache is not None:
+                pre_hist, pre_scales = gpu_page_cache
+                cap_pages = min(self.blocks, int(pre_hist.shape[0]))
+            else:
+                cap_pages = min(
+                    self.blocks, max(16, min(128, 32768 // max(1, page_size)))
+                )
+                pre_hist = pre_scales = None
+            if cap_pages > 0:
+                self._gpu_cache_cap = cap_pages
+                if pre_hist is not None and pre_scales is not None:
+                    self._gpu_page_cache_hist = pre_hist[:cap_pages]
+                    self._gpu_page_cache_scales = pre_scales[: cap_pages * page_size]
+                else:
+                    self._gpu_page_cache_hist = torch.empty(
+                        (cap_pages, 2, page_size, 1, dim), dtype=dtype, device=device
+                    )
+                    self._gpu_page_cache_scales = torch.empty(
+                        (cap_pages * page_size, 2), dtype=torch.float32, device=device
+                    )
+                self._gpu_cache_slot_of_block = np.full(self.blocks, -1, dtype=np.int32)
+                self._gpu_cache_block_of_slot = np.full(cap_pages, -1, dtype=np.int32)
+                max_pairs = max(self.blocks, 256)
+                self._pair_ring_idx = 0
+                self._cpu_page_pairs = torch.empty(
+                    (16, 3, max_pairs), dtype=torch.int32, pin_memory=True
+                )
+                self._cpu_page_pairs_np = self._cpu_page_pairs.numpy()
+                self._gpu_page_pairs = torch.empty(
+                    (16, 3, max_pairs), dtype=torch.int32, device=device
+                )
+
+    def _copy_page_pairs_async(
+        self,
+        dst_slots: list[int],
+        src_idxs: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n = len(dst_slots)
+        assert (
+            self._cpu_page_pairs is not None
+            and self._cpu_page_pairs_np is not None
+            and self._gpu_page_pairs is not None
+        )
+        if n > self._cpu_page_pairs.shape[2]:
+            new_cap = max(n, self._cpu_page_pairs.shape[2] * 2)
+            self._cpu_page_pairs = torch.empty(
+                (16, 3, new_cap), dtype=torch.int32, pin_memory=True
+            )
+            self._cpu_page_pairs_np = self._cpu_page_pairs.numpy()
+            self._gpu_page_pairs = torch.empty(
+                (16, 3, new_cap), dtype=torch.int32, device=self.history.device
+            )
+        r = self._pair_ring_idx
+        self._pair_ring_idx = (r + 1) & 15
+        self._cpu_page_pairs_np[r, 0, :n] = dst_slots
+        self._cpu_page_pairs_np[r, 1, :n] = src_idxs
+        self._gpu_page_pairs[r, :2, :n].copy_(
+            self._cpu_page_pairs[r, :2, :n], non_blocking=True
+        )
+        return (
+            self._gpu_page_pairs[r, 0, :n],
+            self._gpu_page_pairs[r, 1, :n],
+        )
+
+    def _copy_page_triples_async(
+        self,
+        dst_slots: list[int],
+        src_idxs: list[int],
+        phys_blks: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        n = len(dst_slots)
+        assert (
+            self._cpu_page_pairs is not None
+            and self._cpu_page_pairs_np is not None
+            and self._gpu_page_pairs is not None
+        )
+        if n > self._cpu_page_pairs.shape[2]:
+            new_cap = max(n, self._cpu_page_pairs.shape[2] * 2)
+            self._cpu_page_pairs = torch.empty(
+                (16, 3, new_cap), dtype=torch.int32, pin_memory=True
+            )
+            self._cpu_page_pairs_np = self._cpu_page_pairs.numpy()
+            self._gpu_page_pairs = torch.empty(
+                (16, 3, new_cap), dtype=torch.int32, device=self.history.device
+            )
+        r = self._pair_ring_idx
+        self._pair_ring_idx = (r + 1) & 15
+        self._cpu_page_pairs_np[r, 0, :n] = dst_slots
+        self._cpu_page_pairs_np[r, 1, :n] = src_idxs
+        self._cpu_page_pairs_np[r, 2, :n] = phys_blks
+        self._gpu_page_pairs[r, :, :n].copy_(
+            self._cpu_page_pairs[r, :, :n], non_blocking=True
+        )
+        return (
+            self._gpu_page_pairs[r, 0, :n],
+            self._gpu_page_pairs[r, 1, :n],
+            self._gpu_page_pairs[r, 2, :n],
+        )
+
+    def sync_pending_d2h(self) -> None:
+        ev = self._pending_d2h_event
+        if ev is not None:
+            torch.cuda.current_stream(self.history.device).wait_event(ev)
+            self._pending_d2h_event = None
+
+    def invalidate_gpu_page_cache(self, phys_blocks) -> None:
+        if not self._gpu_cache_cap:
+            return
+        slot_of = self._gpu_cache_slot_of_block
+        blk_of = self._gpu_cache_block_of_slot
+        n_blocks = self.blocks
+        for b in phys_blocks:
+            bi = int(b)
+            if 0 <= bi < n_blocks:
+                sl = int(slot_of[bi])
+                if sl >= 0:
+                    slot_of[bi] = -1
+                    blk_of[sl] = -1
+
+    def clear_gpu_page_cache(self) -> None:
+        if not self._gpu_cache_cap:
+            return
+        self._gpu_cache_slot_of_block.fill(-1)
+        self._gpu_cache_block_of_slot.fill(-1)
+        self._gpu_cache_clock = 0
+
+    def _alloc_gpu_cache_slot(self, phys_blk: int) -> int:
+        slot_of = self._gpu_cache_slot_of_block
+        existing = int(slot_of[phys_blk])
+        if existing >= 0:
+            return existing
+        blk_of = self._gpu_cache_block_of_slot
+        sl = self._gpu_cache_clock
+        self._gpu_cache_clock = (sl + 1) % self._gpu_cache_cap
+        old_blk = int(blk_of[sl])
+        if old_blk >= 0:
+            slot_of[old_blk] = -1
+        slot_of[phys_blk] = sl
+        blk_of[sl] = phys_blk
+        return sl
+
+    def has_all_prefix_pages_on_gpu(self, plan, new_tokens: int) -> bool:
+        if not self._gpu_cache_cap or plan is None or len(plan) < 8:
+            return False
+        prefix = self.prefix_pages(plan, new_tokens)
+        if prefix <= 0:
+            return True
+        sources_np = plan[7]
+        return bool(np.all(self._gpu_cache_slot_of_block[sources_np[:prefix]] >= 0))
+
+    def cache_staged_pages_only(self, plan, history, scales, start_idx: int) -> None:
+        _, k, _, _, _ = plan[:5]
+        if start_idx >= k:
+            return
+        if not self._gpu_cache_cap or self._gpu_page_cache_hist is None:
+            return
+        sources_np = plan[7]
+        dst_slots = []
+        src_idxs = []
+        for idx in range(start_idx, k):
+            phys_blk = int(sources_np[idx])
+            sl = self._alloc_gpu_cache_slot(phys_blk)
+            dst_slots.append(sl)
+            src_idxs.append(idx)
+        dst_t, src_t = self._copy_page_pairs_async(dst_slots, src_idxs)
+        torch.ops.vllm_sm70_fn_prefill.copy_qsa_pages(
+            self._gpu_page_cache_hist,
+            self._gpu_page_cache_scales if self.fp8 else None,
+            history,
+            scales if self.fp8 else None,
+            dst_t,
+            src_t,
+        )
+
+    def cache_and_persist_staged_pages(
+        self, plan, history, scales, start_idx: int, d2h_stream
+    ) -> None:
+        _, k, _, _, _ = plan[:5]
+        if start_idx >= k:
+            return
+        sources_np = plan[7]
+        if not self._gpu_cache_cap or self._gpu_page_cache_hist is None:
+            return
+        dst_slots = []
+        src_idxs = []
+        phys_blks = []
+        for idx in range(start_idx, k):
+            phys_blk = int(sources_np[idx])
+            sl = self._alloc_gpu_cache_slot(phys_blk)
+            dst_slots.append(sl)
+            src_idxs.append(idx)
+            phys_blks.append(phys_blk)
+        dev = history.device
+        dst_t, src_t = self._copy_page_pairs_async(dst_slots, src_idxs)
+        torch.ops.vllm_sm70_fn_prefill.copy_qsa_pages(
+            self._gpu_page_cache_hist,
+            self._gpu_page_cache_scales if self.fp8 else None,
+            history,
+            scales if self.fp8 else None,
+            dst_t,
+            src_t,
+        )
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(dev))
+        if self._pending_d2h_event is not None:
+            d2h_stream.wait_event(self._pending_d2h_event)
+        d2h_stream.wait_event(ready)
+        with torch.cuda.stream(d2h_stream):
+            torch.ops.vllm_sm70_fn_prefill.async_persist_qsa_pages_batch(
+                self.history,
+                self.scales if self.fp8 else None,
+                self._gpu_page_cache_hist,
+                self._gpu_page_cache_scales if self.fp8 else None,
+                phys_blks,
+                dst_slots,
+            )
+            done = torch.cuda.Event()
+            done.record(d2h_stream)
+            self._pending_d2h_event = done
 
     def write(self, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor):
         if key.shape[1:] != (1, self.dim) or value.shape != key.shape:
             raise ValueError("Host KV writer requires one local KV head")
         if slots.numel():
+            self.sync_pending_d2h()
             _write[(slots.numel(),)](
                 key,
                 value,
@@ -787,6 +1031,42 @@ class HostQSAKV:
         back from the host."""
         _, k, _, pages, _ = plan[:5]
         if not slots.numel() or not k:
+            return
+        from vllm._sm70_flashnext_prefill_ops import has_sm70_flashnext_prefill_ops
+
+        if (
+            self.dim == 256
+            and has_sm70_flashnext_prefill_ops()
+            and not torch.cuda.is_current_stream_capturing()
+            and key.dtype == torch.float16
+            and value.dtype == torch.float16
+            and key.stride(-1) == 1
+            and value.stride(-1) == 1
+        ):
+            staged_of_i32 = getattr(self, "_staged_of_i32", None)
+            if staged_of_i32 is None or staged_of_i32.numel() != self.blocks:
+                staged_of_i32 = torch.empty(
+                    (self.blocks,), dtype=torch.int32, device=slots.device
+                )
+                self._staged_of_i32 = staged_of_i32
+            pages_i32 = (
+                pages if pages.dtype == torch.int32 else pages.to(torch.int32)
+            ).contiguous()
+            slots_contig = slots if slots.is_contiguous() else slots.contiguous()
+            torch.ops.vllm_sm70_fn_prefill.build_staged_map(staged_of_i32, pages_i32)
+            torch.ops.vllm_sm70_fn_prefill.write_staged_kv(
+                key[:, 0, :],
+                value[:, 0, :],
+                slots_contig,
+                staged_of_i32,
+                history,
+                scales,
+                self.tags,
+                self.page_slots,
+                self.hot_values,
+                self.hot_scales if self.hot_fp8 else None,
+                self.hot_fp8,
+            )
             return
         page = self.page_size
         staged_of = torch.full(
@@ -1004,16 +1284,40 @@ class HostQSAKV:
         counts = np.diff(np.concatenate((starts, [sources.size])))
         runs = [[int(sources[a]), int(a), int(n)] for a, n in zip(starts, counts)]
         device = self.history.device
-        staged = torch.from_numpy(staged).pin_memory()
-        pages = torch.from_numpy(sources).pin_memory()
+        ring_key = (
+            device.index,
+            max(64, staged.shape[0]),
+            max(self.blocks, staged.shape[1], k),
+        )
+        if ring_key not in _STAGE_PLAN_RINGS:
+            _, max_r, max_c = ring_key
+            _STAGE_PLAN_RINGS[ring_key] = [
+                (
+                    torch.empty((max_r, max_c), dtype=torch.int32, pin_memory=True),
+                    torch.empty((max_r, max_c), dtype=torch.int32, device=device),
+                    torch.empty((max_c,), dtype=torch.int32, pin_memory=True),
+                    torch.empty((max_c,), dtype=torch.int32, device=device),
+                )
+                for _ in range(4)
+            ]
+            _STAGE_PLAN_RING_IDX[ring_key] = 0
+        slot_idx = _STAGE_PLAN_RING_IDX[ring_key]
+        _STAGE_PLAN_RING_IDX[ring_key] = (slot_idx + 1) & 3
+        st_cpu, st_gpu, pg_cpu, pg_gpu = _STAGE_PLAN_RINGS[ring_key][slot_idx]
+        r_n, c_n = staged.shape
+        st_cpu[:r_n, :c_n].numpy()[:] = staged
+        st_gpu[:r_n, :c_n].copy_(st_cpu[:r_n, :c_n], non_blocking=True)
+        pg_cpu[:k].numpy()[:] = sources
+        pg_gpu[:k].copy_(pg_cpu[:k], non_blocking=True)
         return (
             runs,
             k,
-            staged.to(device, non_blocking=True),
-            pages.to(device, non_blocking=True),
+            st_gpu[:r_n, :c_n],
+            pg_gpu[:k],
             lengths_host,
             prefix_k,
             upto_k,
+            sources,
         )
 
     def _stage_capacity(self, capacity_tokens):
@@ -1043,6 +1347,74 @@ class HostQSAKV:
 
     def _stage_range(self, plan, history, scales, first, last):
         """Copy staged pages [first, last) of `plan` into the stage views."""
+        runs, _, _, pages, _ = plan[:5]
+        if last <= first:
+            return
+        if (
+            self._gpu_cache_cap > 0
+            and self._gpu_page_cache_hist is not None
+            and len(plan) >= 8
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            sources_np = plan[7]
+            slot_of = self._gpu_cache_slot_of_block
+            hit_dst = []
+            hit_src = []
+            miss_indices = []
+            for idx in range(first, last):
+                phys_blk = int(sources_np[idx])
+                sl = int(slot_of[phys_blk])
+                if sl >= 0:
+                    hit_dst.append(idx)
+                    hit_src.append(sl)
+                else:
+                    miss_indices.append(idx)
+            if hit_dst:
+                dst_t, src_t = self._copy_page_pairs_async(hit_dst, hit_src)
+                torch.ops.vllm_sm70_fn_prefill.copy_qsa_pages(
+                    history,
+                    scales if self.fp8 else None,
+                    self._gpu_page_cache_hist,
+                    self._gpu_page_cache_scales if self.fp8 else None,
+                    dst_t,
+                    src_t,
+                )
+            if not miss_indices:
+                return
+            self.sync_pending_d2h()
+            # Group contiguous miss indices and populate GPU cache after host copy
+            m_start = miss_indices[0]
+            m_prev = m_start
+            miss_ranges = []
+            for mi in miss_indices[1:]:
+                if mi == m_prev + 1:
+                    m_prev = mi
+                else:
+                    miss_ranges.append((m_start, m_prev + 1))
+                    m_start = m_prev = mi
+            miss_ranges.append((m_start, m_prev + 1))
+            for m_lo, m_hi in miss_ranges:
+                self._stage_range_from_host(plan, history, scales, m_lo, m_hi)
+            inst_dst = []
+            inst_src = []
+            for mi in miss_indices:
+                sl = self._alloc_gpu_cache_slot(int(sources_np[mi]))
+                inst_dst.append(sl)
+                inst_src.append(mi)
+            dst_c, src_c = self._copy_page_pairs_async(inst_dst, inst_src)
+            torch.ops.vllm_sm70_fn_prefill.copy_qsa_pages(
+                self._gpu_page_cache_hist,
+                self._gpu_page_cache_scales if self.fp8 else None,
+                history,
+                scales if self.fp8 else None,
+                dst_c,
+                src_c,
+            )
+            return
+        self.sync_pending_d2h()
+        self._stage_range_from_host(plan, history, scales, first, last)
+
+    def _stage_range_from_host(self, plan, history, scales, first, last):
         runs, _, _, pages, _ = plan[:5]
         if last <= first:
             return
@@ -1185,6 +1557,12 @@ class HostQSAKV:
             or not lengths.is_contiguous()
         ):
             return
+        if (
+            not torch.cuda.is_current_stream_capturing()
+            and hasattr(torch.ops, "vllm_sm70_fn_prefill")
+            and hasattr(torch.ops.vllm_sm70_fn_prefill, "inc_hot_epoch")
+        ):
+            torch.ops.vllm_sm70_fn_prefill.inc_hot_epoch(self.epoch)
         self._warm_hot_staged_op(
             history,
             scales,
@@ -1209,6 +1587,7 @@ class HostQSAKV:
         if block_table.shape[0] != lengths.numel():
             raise ValueError("Host KV request metadata disagrees")
         if rows:
+            self.sync_pending_d2h()
             if (
                 stage == 0
                 and self._resolve_hot_op is not None
