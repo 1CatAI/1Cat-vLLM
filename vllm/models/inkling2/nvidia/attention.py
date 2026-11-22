@@ -13,6 +13,7 @@ from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.cache import CacheDType
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -127,6 +128,16 @@ class Inkling2AttentionBackend(FlashAttentionBackend):
         return capability >= DeviceCapability(7, 0)
 
     @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            return (
+                is_sm70()
+                or current_platform.is_device_capability_family(120)
+                or super().supports_kv_cache_dtype(kv_cache_dtype)
+            )
+        return super().supports_kv_cache_dtype(kv_cache_dtype)
+
+    @classmethod
     def supports_combination(
         cls,
         head_size: int,
@@ -141,16 +152,37 @@ class Inkling2AttentionBackend(FlashAttentionBackend):
         return None
 
 
+def _effective_kv_cache_dtype(
+    vllm_config: VllmConfig,
+    prefix: str,
+    sliding_window: int | None,
+) -> str:
+    cache_config = vllm_config.cache_config
+    cache_dtype = cache_config.cache_dtype
+    skip_layers = getattr(cache_config, "kv_cache_dtype_skip_layers", None)
+    if skip_layers:
+        if sliding_window is not None and "sliding_window" in skip_layers:
+            return "auto"
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        try:
+            if str(extract_layer_index(prefix)) in skip_layers:
+                return "auto"
+        except Exception:
+            pass
+    return cache_dtype
+
+
 def _kv_cache_spec(
     vllm_config: VllmConfig,
     num_kv_heads: int,
     head_dim: int,
     sliding_window: int | None,
+    prefix: str = "",
 ) -> KVCacheSpec:
     block_size = vllm_config.cache_config.block_size
-    dtype = kv_cache_dtype_str_to_dtype(
-        vllm_config.cache_config.cache_dtype, vllm_config.model_config
-    )
+    cache_dtype = _effective_kv_cache_dtype(vllm_config, prefix, sliding_window)
+    dtype = kv_cache_dtype_str_to_dtype(cache_dtype, vllm_config.model_config)
     if sliding_window is not None:
         return SlidingWindowSpec(
             block_size=block_size,
@@ -199,7 +231,11 @@ class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return _kv_cache_spec(
-            vllm_config, self.num_kv_heads, self.head_dim, self.sliding_window
+            vllm_config,
+            self.num_kv_heads,
+            self.head_dim,
+            self.sliding_window,
+            self.prefix,
         )
 
 
@@ -329,10 +365,16 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         self.max_decode_query_len = _max_decode_query_len(vllm_config)
-        cache_dtype = vllm_config.cache_config.cache_dtype
+        cache_dtype = _effective_kv_cache_dtype(
+            vllm_config,
+            prefix,
+            self.sliding_window if self.is_local else None,
+        )
         supported: tuple[str, ...] = ("auto", "bfloat16")
         if is_sm70():
-            supported += ("float16",)
+            # SM70 has no native e4m3; ops/e4m3.py converts in software
+            # (e4m3_arg / cast_store / _e4m3_f16), as on SM89-.
+            supported += ("float16", "fp8", "fp8_e4m3")
         if current_platform.is_device_capability_family(120):
             supported += ("float16", "fp8", "fp8_e4m3")
         if cache_dtype not in supported:
@@ -366,6 +408,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             self.num_kv_heads,
             self.head_dim,
             self.sliding_window if self.is_local else None,
+            self.prefix,
         )
 
     def _pass_cache(self, pass_idx: int) -> tuple[str, torch.Tensor]:

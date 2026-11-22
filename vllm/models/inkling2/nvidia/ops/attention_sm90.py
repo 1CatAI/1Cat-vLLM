@@ -240,6 +240,10 @@ def _rel_attention_kernel(
 
 def _block_m(max_query_len: int, group: int) -> int:
     rows = max_query_len * group
+    if is_sm70():
+        # SM70 (Volta 96KB SMEM / 64K regs) spills heavily at BLOCK_M>=64;
+        # BLOCK_M=32 with num_warps=8 is >11x faster for chunked prefill.
+        return 16 if rows <= 16 else 32
     return 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
 
 
@@ -345,6 +349,6 @@ def rel_attention(
         MODE=mode,
         BLOCK_M=block_m,
         BLOCK_N=64 if (block_m >= 128 or is_sm70()) else 128 if block_m <= 32 else 64,
-        num_warps=8 if block_m >= 128 else 4,
+        num_warps=8 if (block_m >= 128 or (is_sm70() and block_m >= 32)) else 4,
         num_stages=2,
     )

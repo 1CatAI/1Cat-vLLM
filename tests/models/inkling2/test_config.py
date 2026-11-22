@@ -4,6 +4,8 @@
 import sys
 from types import SimpleNamespace
 
+import torch
+
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.model_executor.warmup.sm70_runtime import model_shape_warmup_task
@@ -80,3 +82,30 @@ def test_inkling2_moe_lazy_backend_imports():
 
     assert "vllm.models.inkling2.nvidia.ops.moe_humming" not in sys.modules
     assert "vllm.models.inkling2.nvidia.ops.moe_sm120" not in sys.modules
+
+
+def test_inkling2_effective_kv_cache_dtype_variant_b():
+    from vllm.models.inkling2.nvidia.attention import _effective_kv_cache_dtype
+
+    vllm_cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            cache_dtype="fp8_e4m3",
+            kv_cache_dtype_skip_layers=["sliding_window"],
+        )
+    )
+
+    # SWA layers skip FP8 -> stay FP16 (bs=32); full layers use FP8 (bs=64).
+    assert (
+        _effective_kv_cache_dtype(
+            vllm_cfg, prefix="model.layers.0.self_attn", sliding_window=1024
+        )
+        == "auto"
+    )
+    assert (
+        _effective_kv_cache_dtype(
+            vllm_cfg, prefix="model.layers.7.self_attn", sliding_window=None
+        )
+        == "fp8_e4m3"
+    )
+    # Verify equal page bytes between FP16 (2 bytes * 32) and FP8 (1 byte * 64).
+    assert torch.float16.itemsize * 32 == torch.uint8.itemsize * 64

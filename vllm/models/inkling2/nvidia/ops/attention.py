@@ -8,7 +8,7 @@ import torch
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.platform_utils import num_compute_units
 
-from . import use_pdl, use_sm100_kernels
+from . import is_sm70, use_pdl, use_sm100_kernels
 from .attention_sm90 import MODE_GATED, MODE_PARTIAL, rel_attention
 from .pdl import gdc_wait
 
@@ -221,6 +221,9 @@ def plan_decode_attention(
         if work <= (16 if max_query_len <= 2 else 8):
             return triton.cdiv(rel_extent - 1, _FA4_BLOCK_N) + 1
         return 5 if work <= 16 else 3 if work <= 32 else 2 if work <= 64 else 1
+    if is_sm70():
+        # Target >= 2 CTAs/SM for full layers on V100 to hide DRAM/FP8 latency.
+        return max(min(64, 2 * num_sms // work), min(num_sms // 4, 6 * num_sms // work))
     return max(num_sms // work, min(num_sms // 8, 6 * num_sms // work))
 
 
