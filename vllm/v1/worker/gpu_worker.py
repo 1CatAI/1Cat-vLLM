@@ -1725,6 +1725,19 @@ class Worker(WorkerBase):
                     value.numel() * value.element_size() <= (4 << 20)
                 ):
                     tensor_dict[key] = tp.all_reduce(value)
+                elif (
+                    key == "v41_topk"
+                    and value.dtype == torch.int32
+                    and value.numel() * 4 <= (4 << 20)
+                ):
+                    vf = (
+                        value.to(torch.float32)
+                        if tp.rank_in_group == 0
+                        else torch.zeros(
+                            value.shape, dtype=torch.float32, device=value.device
+                        )
+                    )
+                    value.copy_(tp.all_reduce(vf).to(torch.int32))
                 else:
                     tp.broadcast(value, src=0)
 
