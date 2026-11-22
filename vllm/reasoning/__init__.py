@@ -76,6 +76,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "hy_v3_reasoning_parser",
         "HYV3ReasoningParser",
     ),
+    "inkling2": (
+        "inkling2_reasoning_parser",
+        "Inkling2ReasoningParser",
+    ),
     "kimi_k2": (
         "kimi_k2_reasoning_parser",
         "KimiK2ReasoningParser",

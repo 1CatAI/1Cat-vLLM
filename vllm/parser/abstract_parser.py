@@ -659,13 +659,36 @@ class DelegatingParser(Parser):
             return input_ids
         return self._reasoning_parser.extract_content_ids(input_ids)
 
-    def _in_reasoning_phase(self, state: StreamState) -> bool:
+    def _has_active_tool_parser(
+        self, request: ChatCompletionRequest | ResponsesRequest | None = None
+    ) -> bool:
+        if self._tool_parser is None:
+            return False
+        return not (
+            request is not None
+            and getattr(request, "tool_choice", None) == "none"
+            and getattr(self._reasoning_parser, "parses_content_delimiters", False)
+        )
+
+    def _in_reasoning_phase(
+        self,
+        state: StreamState,
+        request: ChatCompletionRequest | ResponsesRequest | None = None,
+    ) -> bool:
         if self._reasoning_parser is None:
             return False
+        if not self._has_active_tool_parser(request) and getattr(
+            self._reasoning_parser, "parses_content_delimiters", False
+        ):
+            return True
         return not state.reasoning_ended
 
-    def _in_tool_call_phase(self, state: StreamState) -> bool:
-        if self._tool_parser is None:
+    def _in_tool_call_phase(
+        self,
+        state: StreamState,
+        request: ChatCompletionRequest | ResponsesRequest | None = None,
+    ) -> bool:
+        if not self._has_active_tool_parser(request):
             return False
         return state.reasoning_ended
 
@@ -691,7 +714,11 @@ class DelegatingParser(Parser):
 
         # Reasoning extraction
         transitioned_from_reasoning = False
-        if self._in_reasoning_phase(state):
+        if self._in_reasoning_phase(state, request):
+            if hasattr(self._reasoning_parser, "_emit_tool_json_marker"):
+                self._reasoning_parser._emit_tool_json_marker = (
+                    self._has_active_tool_parser(request)
+                )
             delta_message = self.extract_reasoning_streaming(
                 previous_text=state.previous_text,
                 current_text=current_text,
@@ -700,7 +727,9 @@ class DelegatingParser(Parser):
                 current_token_ids=current_token_ids,
                 delta_token_ids=delta_token_ids,
             )
-            if self.is_reasoning_end_streaming(current_token_ids, delta_token_ids):
+            if not state.reasoning_ended and self.is_reasoning_end_streaming(
+                current_token_ids, delta_token_ids
+            ):
                 state.reasoning_ended = True
                 transitioned_from_reasoning = True
                 state.post_reasoning_newlines_remaining = int(
@@ -711,14 +740,20 @@ class DelegatingParser(Parser):
                     )
                     or 0
                 )
-                current_token_ids = self.extract_content_ids(delta_token_ids)
-                current_text = (
-                    delta_message.content
-                    if delta_message and delta_message.content
-                    else ""
-                )
-                delta_text = current_text
-                delta_token_ids = current_token_ids
+                if not (
+                    not self._has_active_tool_parser(request)
+                    and getattr(
+                        self._reasoning_parser, "parses_content_delimiters", False
+                    )
+                ):
+                    current_token_ids = self.extract_content_ids(delta_token_ids)
+                    current_text = (
+                        delta_message.content
+                        if delta_message and delta_message.content
+                        else ""
+                    )
+                    delta_text = current_text
+                    delta_token_ids = current_token_ids
         elif (
             state.post_reasoning_newlines_remaining > 0
             and not state.previous_text
@@ -736,7 +771,7 @@ class DelegatingParser(Parser):
                 return None
 
         # Tool call extraction
-        if self._in_tool_call_phase(state):
+        if self._in_tool_call_phase(state, request):
             if not state.tool_call_text_started:
                 state.tool_call_text_started = True
                 state.previous_text = ""
@@ -779,8 +814,8 @@ class DelegatingParser(Parser):
         # No phase active: pass through as content
         if (
             delta_message is None
-            and not self._in_reasoning_phase(state)
-            and not self._in_tool_call_phase(state)
+            and not self._in_reasoning_phase(state, request)
+            and not self._in_tool_call_phase(state, request)
         ):
             if transitioned_from_reasoning and not delta_text:
                 delta_message = None
@@ -821,3 +856,18 @@ class _WrappedParser(DelegatingParser):
             )
         if self.__class__.tool_parser_cls is not None:
             self._tool_parser = self.__class__.tool_parser_cls(tokenizer, tools)
+        if (
+            self._reasoning_parser is not None
+            and self._tool_parser is not None
+            and getattr(self._reasoning_parser, "parses_content_delimiters", False)
+        ):
+            if not getattr(self._tool_parser, "supports_content_delimiters", False):
+                raise ValueError(
+                    f"Reasoning parser {type(self._reasoning_parser).__name__} "
+                    "preserves content delimiter tokens and cannot be combined "
+                    f"with tool parser {type(self._tool_parser).__name__}. "
+                    "Use a compatible tool parser (such as '--tool-call-parser "
+                    "inkling2') or disable tool call parsing."
+                )
+            if hasattr(self._reasoning_parser, "_emit_tool_json_marker"):
+                self._reasoning_parser._emit_tool_json_marker = True
