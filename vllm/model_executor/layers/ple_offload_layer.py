@@ -236,17 +236,23 @@ def _ple_offload_wait_impl(
             <= min(cpu_output_buffer.shape[0], gpu_output_buffer.shape[0])
         ):
             raise ValueError("PLE copy exceeds result buffer capacity")
-        _cuda_check(
-            cuda_driver.cuMemcpyHtoDAsync(
-                cuda_driver.CUdeviceptr(gpu_output_buffer.data_ptr()),
-                cpu_output_buffer.data_ptr(),
-                num_tokens
-                * gpu_output_buffer.shape[1]
-                * gpu_output_buffer.element_size(),
-                cuda_stream,
-            ),
-            "cuMemcpyHtoDAsync(PLE consumer result)",
+        row_bytes = gpu_output_buffer.shape[1] * gpu_output_buffer.element_size()
+        from vllm import _prefill_custom_ops as prefill_ops
+
+        copy_start, copy_rows = prefill_ops.ple_prefill_slice_range(
+            hidden_states, num_tokens
         )
+        if copy_rows > 0:
+            byte_off = copy_start * row_bytes
+            _cuda_check(
+                cuda_driver.cuMemcpyHtoDAsync(
+                    cuda_driver.CUdeviceptr(gpu_output_buffer.data_ptr() + byte_off),
+                    cpu_output_buffer.data_ptr() + byte_off,
+                    copy_rows * row_bytes,
+                    cuda_stream,
+                ),
+                "cuMemcpyHtoDAsync(PLE consumer result)",
+            )
         release_state = _early_result_releases.get(sem_flag_tensor.data_ptr())
         if release_state is not None and not torch.cuda.is_current_stream_capturing():
             # The consumer copy above is the only read of the mapped result.

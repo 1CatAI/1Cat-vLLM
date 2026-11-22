@@ -59,10 +59,10 @@ def _fc_shard_ready(layer) -> bool:
     return layer.weight.dtype == torch.float16 and layer.weight.shape == expected
 
 
-def _can_combine_fc(model, embedding, hidden):
+def _can_combine_fc(model, embedding, hidden, *, allow_eager: bool = False):
     if (
         envs.VLLM_BATCH_INVARIANT
-        or not is_sm70_decode_graph_compiling()
+        or (not allow_eager and not is_sm70_decode_graph_compiling())
         or embedding.ndim != 2
         or hidden.ndim != 2
         or embedding.shape[-1] != 2560
@@ -79,12 +79,28 @@ def _can_combine_fc(model, embedding, hidden):
     )
 
 
-def maybe_combine_fc(model, embedding, hidden):
-    if not _can_combine_fc(model, embedding, hidden):
+def maybe_combine_fc(model, embedding, hidden, *, allow_eager: bool = False):
+    if not _can_combine_fc(model, embedding, hidden, allow_eager=allow_eager):
         return None
     rows = embedding.shape[0]
-    e = model.pre_fc_norm_embedding(embedding)
-    h = model.pre_fc_norm_hidden(hidden).view(rows, 4, 2560)
+    if allow_eager and not is_sm70_decode_graph_compiling() and rows >= 64:
+        from .ops.hc import grouped_gemma_rmsnorm
+
+        e = grouped_gemma_rmsnorm(
+            embedding.contiguous(),
+            model.pre_fc_norm_embedding.weight,
+            model.pre_fc_norm_embedding.variance_epsilon,
+            1,
+        )
+        h = grouped_gemma_rmsnorm(
+            hidden.contiguous(),
+            model.pre_fc_norm_hidden.weight,
+            model.pre_fc_norm_hidden.variance_epsilon,
+            4,
+        ).view(rows, 4, 2560)
+    else:
+        e = model.pre_fc_norm_embedding(embedding)
+        h = model.pre_fc_norm_hidden(hidden).view(rows, 4, 2560)
     el = model.fc_embedding.quant_method.apply(model.fc_embedding, e)
     hl = model.fc_hidden.quant_method.apply(model.fc_hidden, h)
     # Addition commutes with the feature gather, with exactly the same FP16

@@ -1359,6 +1359,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
+        input_batch._block_tables_cpu = self.block_tables.gather_block_tables_cpu(  # type: ignore[attr-defined]
+            input_batch.idx_mapping_np,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
         slot_mappings = self.block_tables.compute_slot_mappings(

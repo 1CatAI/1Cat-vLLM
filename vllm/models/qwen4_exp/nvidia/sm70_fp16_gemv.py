@@ -18,6 +18,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm._sm70_flashnext_prefill_ops import has_sm70_flashnext_prefill_ops
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.config.execution_policy import layer_policy
@@ -83,11 +84,15 @@ def _qwen38_gdn_projection_split_kernel(
     COPY_QKV: tl.constexpr,
 ):
     row = tl.program_id(0)
-    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    value = tl.load(qkvz + row * (QKV + Z) + col, col < QKV + Z, other=0)
     if COPY_QKV:
+        col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        value = tl.load(qkvz + row * (QKV + Z) + col, col < QKV + Z, other=0)
         tl.store(qkv + row * QKV + col, value, col < QKV)
-    tl.store(z + row * Z + col - QKV, value, (col >= QKV) & (col < QKV + Z))
+        tl.store(z + row * Z + col - QKV, value, (col >= QKV) & (col < QKV + Z))
+    else:
+        z_col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        value = tl.load(qkvz + row * (QKV + Z) + QKV + z_col, z_col < Z, other=0)
+        tl.store(z + row * Z + z_col, value, z_col < Z)
     if tl.program_id(1) == 0:
         tl.static_assert(B + A <= BLOCK)
         gate_col = tl.arange(0, BLOCK)
@@ -126,7 +131,7 @@ def _split_gdn_projection_tails(qkvz, ba, z_out):
     qkv_width = qkvz.shape[1] - z_width
     qkv = qkvz[:, :qkv_width]
     b, a = (qkvz.new_empty((m, heads)) for _ in range(2))
-    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(qkvz.shape[1], 256))](
+    _qwen38_gdn_projection_split_kernel[(m, max(1, triton.cdiv(z_width, 256)))](
         qkvz,
         ba,
         qkv,
@@ -540,6 +545,22 @@ def _qwen38_sm70_shared_down_gated(
     ):
         torch.ops._C.qwen38_shared_gate_dot_mul_sm70_out(down_out, x, gate_weight)
         return down_out
+    if (
+        aligned_ok
+        and m > 64
+        and down_out.is_contiguous()
+        and down_out.data_ptr() % 16 == 0
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        from vllm._sm70_flashnext_prefill_ops import (
+            has_sm70_flashnext_prefill_ops,
+        )
+
+        if has_sm70_flashnext_prefill_ops():
+            torch.ops.vllm_sm70_fn_prefill.shared_gate_dot_mul_inplace(
+                down_out, x, gate_weight
+            )
+            return down_out
     gate_logits = torch.nn.functional.linear(x, gate_weight)
     return _qwen38_sm70_shared_gate_mul(gate_logits, down_out)
 
@@ -997,6 +1018,21 @@ def _make_qsa_side_projection(qkv_proj: nn.Module, idx_proj: nn.Module):
                 getattr(qkv_proj, "_sm70_qwen38_qsa_packed", None),
                 getattr(idx_proj, "_sm70_qwen38_qsa_packed", None),
             )
+        if (
+            getattr(qkv_proj, "_fn_packed_4224", False)
+            and getattr(qkv_proj, "bias", None) is None
+            and getattr(idx_proj, "bias", None) is None
+        ):
+            qkv_w = qkv_proj.weight
+            idx_w = idx_proj.weight
+            if has_sm70_flashnext_prefill_ops() and qkv_w.is_cuda:
+                return torch.ops.vllm.qwen38_fn_qsa_input_prefill(
+                    hidden_states, qkv_w, idx_w
+                )
+        if not torch.compiler.is_compiling():
+            from vllm._sm70_flashnext_prefill_ops import wait_hc_ag_peers_if_needed
+
+            wait_hc_ag_peers_if_needed(hidden_states)
         qkv_out, _ = qkv_proj(hidden_states)
         idx_out, _ = idx_proj(hidden_states)
         return qkv_out, idx_out

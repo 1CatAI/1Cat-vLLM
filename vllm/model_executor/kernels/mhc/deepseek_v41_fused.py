@@ -944,7 +944,7 @@ def _hc_transition_side(
                     hc_eps,
                     iters,
                 )
-                keep = (dots, res_sq)
+                keep: object = (dots, res_sq)
             else:
                 torch.ops.v41sk.hc_mix(
                     residual,

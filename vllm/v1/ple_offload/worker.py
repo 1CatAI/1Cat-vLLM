@@ -518,6 +518,12 @@ class PleOffloadWorker:
         """Load PLE weights, accept registrations, and run the request loop."""
         decorate_logs("PleOffloadWorker")
         _configure_ple_numa_locality(vllm_config)
+        with contextlib.suppress(Exception):
+            get_aff = getattr(os, "sched_getaffinity", None)
+            avail_cpus = len(get_aff(0)) if callable(get_aff) else (os.cpu_count() or 4)
+            ple_threads = max(1, min(4, avail_cpus))
+            if torch.get_num_threads() < ple_threads:
+                torch.set_num_threads(ple_threads)
         ready_reader, ready_writer = ready_pipe
         ready_reader.close()
         shutdown_event = threading.Event()
@@ -907,6 +913,9 @@ class PleOffloadRunner:
                     )
                 targets.sort(key=lambda target: target.tp_rank)
                 if all(t.cpu_output_buffer is not None for t in targets):
+                    for t in targets:
+                        assert t.cpu_output_buffer is not None
+                        t.cpu_output_buffer.zero_()
                     self._pinned_bufs[dp_rank][layer_name] = targets[
                         0
                     ].cpu_output_buffer

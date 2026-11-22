@@ -563,6 +563,17 @@ class MambaHybridModelState(DefaultModelState):
             prepared_dflash2_gdn_metadata=prepared_dflash2_gdn_metadata,
             prepared_dflash2_smallq_metadata=prepared_dflash2_smallq_metadata,
         )
+        if (
+            for_capture
+            or input_batch.is_dummy_batch
+            or cudagraph_mode == CUDAGraphMode.FULL
+            or num_reqs <= 0
+        ):
+            bound_max_seq_len = self.max_model_len
+        else:
+            bound_max_seq_len = int(
+                input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+            )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -571,7 +582,7 @@ class MambaHybridModelState(DefaultModelState):
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,
             seq_lens=input_batch.seq_lens,
-            max_seq_len=self.max_model_len,
+            max_seq_len=bound_max_seq_len,
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
@@ -581,6 +592,14 @@ class MambaHybridModelState(DefaultModelState):
             for_cudagraph_capture=for_capture,
             is_dummy_batch=input_batch.is_dummy_batch or for_capture,
             prefix_anchor_lens=input_batch.prefix_anchor_lens,
+            block_tables_cpu=getattr(input_batch, "_block_tables_cpu", None),
+            is_all_prefilling=(
+                not for_capture
+                and not input_batch.is_dummy_batch
+                and input_batch.num_reqs > 0
+                and input_batch.num_draft_tokens == 0
+                and bool(input_batch.is_prefilling_np[: input_batch.num_reqs].all())
+            ),
         )
         if common_gdn_metadata is not None:
             assert common_gdn_metadata.spec_query_start_loc.numel() == (

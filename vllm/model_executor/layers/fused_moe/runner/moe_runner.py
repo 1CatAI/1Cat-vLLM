@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from vllm import _prefill_custom_ops as prefill_ops
 from vllm.config.diagnostic_dump import parse_int_filter
 from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.diagnostics import (
@@ -613,6 +614,7 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        precomputed_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -623,6 +625,8 @@ class MoERunner(MoERunnerInterface):
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
+        if not torch.compiler.is_compiling():
+            prefill_ops.wait_peer_prefill_if_needed(hidden_states)
 
         if self._quant_method.is_monolithic:
             fused_out = self._quant_method.apply_monolithic(
@@ -632,11 +636,14 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
         else:
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            if precomputed_topk is not None:
+                topk_weights, topk_ids = precomputed_topk
+            else:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
             topk_weights = _sm70_dump_moe_runner_tensor(
                 topk_weights,
                 "moe_topk_weights",
@@ -982,17 +989,24 @@ class MoERunner(MoERunnerInterface):
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
+        precomputed_topk: tuple[torch.Tensor, torch.Tensor] | None = None
         if self.gate is not None:
-            if self._fse_fuse_gate:
-                self._maybe_fuse_gate_weights()
-                router_logits = F.linear(hidden_states, self._combined_gate_weight)
-            else:
-                router_logits, _ = self.gate(hidden_states)
-            router_logits = _sm70_dump_moe_runner_tensor(
-                router_logits,
-                "moe_router_logits",
-                self.layer_name,
+            precomputed_topk = prefill_ops.maybe_tp_sharded_router_topk(
+                self, layer, hidden_states, input_ids
             )
+            if precomputed_topk is None:
+                if not torch.compiler.is_compiling():
+                    prefill_ops.wait_peer_prefill_if_needed(hidden_states)
+                if self._fse_fuse_gate:
+                    self._maybe_fuse_gate_weights()
+                    router_logits = F.linear(hidden_states, self._combined_gate_weight)
+                else:
+                    router_logits, _ = self.gate(hidden_states)
+                router_logits = _sm70_dump_moe_runner_tensor(
+                    router_logits,
+                    "moe_router_logits",
+                    self.layer_name,
+                )
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
@@ -1010,6 +1024,7 @@ class MoERunner(MoERunnerInterface):
                 router_logits=router_logits,
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
+                precomputed_topk=precomputed_topk,
             )
 
             return self._maybe_combine(

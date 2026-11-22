@@ -8,10 +8,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
-from vllm.utils.torch_utils import (
-    async_tensor_h2d,
-    get_accelerator_view_from_cpu_tensor,
-)
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 # Default round-robin depth for the UVA buffer pools. Must cover every
 # concurrently in-flight engine batch.
@@ -152,6 +149,10 @@ class StagedWriteTensor:
         self.write_indices = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_starts = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_cu_lens = new_buffer(self.num_rows, dtype=torch.int32)
+        self._inline_contents_cap = 4096
+        self.write_contents_pool = new_buffer(
+            self._inline_contents_cap, dtype=self.dtype
+        )
 
     def get_cpu_view(self) -> torch.Tensor:
         """Return the host view when this tensor is backed by mapped memory."""
@@ -183,14 +184,47 @@ class StagedWriteTensor:
         if n == 0:
             return
 
+        total_contents = len(self._staged_write_contents)
+        if (
+            hasattr(self, "_uva_buf")
+            and total_contents > self._inline_contents_cap
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            dst_np = self._uva_buf.np
+            src_np = np.asarray(self._staged_write_contents, dtype=dst_np.dtype)
+            cu_start = 0
+            for row_idx, start_idx, cu_end in zip(
+                self._staged_write_indices,
+                self._staged_write_starts,
+                self._staged_write_cu_lens,
+            ):
+                seg_len = cu_end - cu_start
+                if dst_np.ndim == 1:
+                    dst_np[start_idx : start_idx + seg_len] = src_np[cu_start:cu_end]
+                else:
+                    dst_np[row_idx, start_idx : start_idx + seg_len] = src_np[
+                        cu_start:cu_end
+                    ]
+                cu_start = cu_end
+            self.clear_staged_writes()
+            return
+
         indices_uva = self.write_indices.copy_to_uva(self._staged_write_indices)
         starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
 
-        # Special handling for write_contents
-        write_contents = async_tensor_h2d(
-            self._staged_write_contents, self.dtype, self.device
-        )
+        if total_contents <= self._inline_contents_cap:
+            write_contents = self.write_contents_pool.copy_to_uva(
+                self._staged_write_contents
+            )
+        else:
+            # Avoid pin_memory=True (cudaHostAlloc) per tensor across TP workers:
+            # 4 workers x 17 StagedWriteTensors = 68 concurrent cudaHostAlloc calls
+            # contend on the global CUDA driver lock (~35-40 ms stall on arrival).
+            cpu_contents = torch.tensor(
+                self._staged_write_contents, dtype=self.dtype, device="cpu"
+            )
+            write_contents = async_copy_to_gpu(cpu_contents, device=self.device)
 
         # Write diffs to the GPU buffer
         _apply_write_kernel[(n,)](

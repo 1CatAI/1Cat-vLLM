@@ -420,6 +420,7 @@ def _expand_qsa_indices_kernel(
     TOKEN_TOPK: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
     COLUMN_BLOCK: tl.constexpr,
+    FOLDED8: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
@@ -446,8 +447,18 @@ def _expand_qsa_indices_kernel(
     block_rank = columns // COMPRESS_RATIO
     offset = columns % COMPRESS_RATIO
     safe_rank = tl.minimum(block_rank, BLOCK_TOPK - 1)
+    if FOLDED8:
+        h_step = rows >> 3
+        seg = row // h_step
+        seg_off = row - seg * h_step
+        folded_seg = tl.where(seg < 4, seg * 2, (7 - seg) * 2 + 1)
+        src_row = folded_seg * h_step + seg_off
+    else:
+        src_row = row
     block = tl.load(
-        block_indices_ptr + row * stride_blocks_row + safe_rank * stride_blocks_column,
+        block_indices_ptr
+        + src_row * stride_blocks_row
+        + safe_rank * stride_blocks_column,
         mask=(row < rows) & is_expanded,
         other=-1,
     )
@@ -1526,6 +1537,8 @@ def expand_qsa_block_indices_cuda(
     compress_ratio: int,
     token_topk: int,
     out: torch.Tensor | None = None,
+    *,
+    folded8: bool = False,
 ) -> torch.Tensor:
     """Expand compressed blocks and compact the causal tail of the open group."""
 
@@ -1571,6 +1584,7 @@ def expand_qsa_block_indices_cuda(
         TOKEN_TOPK=token_topk,
         OUTPUT_WIDTH=output_width,
         COLUMN_BLOCK=column_block,
+        FOLDED8=bool(folded8),
         num_warps=4,
     )
     return out
@@ -1614,6 +1628,7 @@ def _qsa_select_by_request(
     shared_key_scoring: bool = False,
     max_seq_len: int | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    tp_group=None,
 ) -> bool:
     """Select a multi-request batch one long request at a time.
 
@@ -1695,6 +1710,7 @@ def _qsa_select_by_request(
                 out[start:end],
                 shared_key_scoring=shared_key_scoring,
                 max_seq_len=req_max_seq_len,
+                tp_group=tp_group,
             )
     return True
 
@@ -1714,6 +1730,7 @@ def qsa_select_paged_tokens(
     max_seq_len: int | None = None,
     tp_group=None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    q_already_folded8: bool = False,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization.
 
@@ -1722,7 +1739,7 @@ def qsa_select_paged_tokens(
     reading the device.
     """
 
-    rows = q.shape[0]
+    rows = q.shape[0] * 4 if q_already_folded8 else q.shape[0]
     output_width = token_topk + compress_ratio - 1
     if out is None:
         out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
@@ -1730,20 +1747,25 @@ def qsa_select_paged_tokens(
         raise ValueError("QSA selection output has an invalid shape")
     if not rows:
         return out
-    if query_start_loc_cpu is not None and _qsa_select_by_request(
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        sequence_lengths,
-        token_topk,
-        compress_ratio,
-        out,
-        query_start_loc_cpu,
-        shared_key_scoring=shared_key_scoring,
-        max_seq_len=max_seq_len,
-        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+    if (
+        not q_already_folded8
+        and query_start_loc_cpu is not None
+        and _qsa_select_by_request(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            token_topk,
+            compress_ratio,
+            out,
+            query_start_loc_cpu,
+            shared_key_scoring=shared_key_scoring,
+            max_seq_len=max_seq_len,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            tp_group=tp_group,
+        )
     ):
         return out
 
@@ -1759,8 +1781,8 @@ def qsa_select_paged_tokens(
     all_visible: torch.Tensor | None = None
     if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
         all_visible = _qsa_visible_blocks(
-            token_to_req,
-            query_positions,
+            token_to_req[:rows],
+            query_positions[:rows],
             sequence_lengths,
             compress_ratio,
         )
@@ -1797,10 +1819,11 @@ def qsa_select_paged_tokens(
     # Keep small work, mixed requests, other topologies and graph capture on
     # the existing selector. Cache writes have already completed on every rank.
     tp_step = 0
+    tp_folded8 = False
     if (
         tp_group is not None
         and tp_group.world_size == 4
-        and 4096 <= rows <= 9216
+        and 1024 <= rows <= 16384
         and q.shape[1:] == (4, 128)
         and token_topk == 2048
         and compress_ratio == 4
@@ -1813,12 +1836,23 @@ def qsa_select_paged_tokens(
             "qsa_cublas_min_rows"
         ) and _qsa_indexer_cublas_work_supported(smallest_partition, score_columns):
             tp_step = step
-            first = tp_group.rank_in_group * step
-            last = min(first + step, rows)
-            q = q[first:last]
             assert all_visible is not None
-            all_visible = all_visible[first:last]
-            rows = last - first
+            if (rows & 7) == 0 and rows >= 2048:
+                tp_folded8 = True
+                h_step = rows >> 3
+                rk = tp_group.rank_in_group
+                s0 = slice(rk * h_step, (rk + 1) * h_step)
+                s1 = slice((7 - rk) * h_step, (8 - rk) * h_step)
+                if not q_already_folded8:
+                    q = torch.cat((q[s0], q[s1]), dim=0)
+                all_visible = torch.cat((all_visible[s0], all_visible[s1]), dim=0)
+                rows = 2 * h_step
+            else:
+                first = tp_group.rank_in_group * step
+                last = min(first + step, rows)
+                q = q[first:last]
+                all_visible = all_visible[first:last]
+                rows = last - first
             logger.info_once(
                 "Using SM70 QSA TP4 prefill row partition with block-index AllGather."
             )
@@ -1955,15 +1989,32 @@ def qsa_select_paged_tokens(
         # Gather the compressed block IDs, not the four-times wider expanded
         # token matrix. Padding is confined to the last rank and discarded.
         blocks_buffer[rows:].fill_(-1)
-        gathered = tp_group.all_gather(blocks_buffer, dim=0)
+        from vllm.runtime_resources import current_runtime_resources
+
+        resources = current_runtime_resources()
+        peer_owner = resources.get("hc_prefill_peer") if resources is not None else None
+        if (
+            peer_owner is not None
+            and peer_owner.group is tp_group
+            and peer_owner.can_allgather_ag(blocks_buffer)
+        ):
+            gathered_blocks = torch.empty(
+                (out.shape[0], block_topk),
+                dtype=torch.int32,
+                device=blocks_buffer.device,
+            )
+            peer_owner.allgather_ag_into(gathered_blocks, blocks_buffer)
+        else:
+            gathered_blocks = tp_group.all_gather(blocks_buffer, dim=0)[: out.shape[0]]
         expand_qsa_block_indices_cuda(
-            gathered[: out.shape[0]],
+            gathered_blocks,
             query_positions,
             sequence_lengths,
             token_to_req,
             compress_ratio,
             token_topk,
             out,
+            folded8=tp_folded8,
         )
     return out
 

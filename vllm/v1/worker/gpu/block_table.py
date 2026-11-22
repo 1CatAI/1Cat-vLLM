@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -51,12 +52,16 @@ class BlockTables:
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
+        self.cpu_block_tables: list[np.ndarray] = []
         for i in range(self.num_kv_cache_groups):
             max_num_blocks = max_num_blocks_per_group[i] * self.blocks_per_kv_block[i]
             block_table = StagedWriteTensor(
                 (self.max_num_reqs, max_num_blocks), dtype=torch.int32, device=device
             )
             self.block_tables.append(block_table)
+            self.cpu_block_tables.append(
+                np.zeros((self.max_num_reqs, max_num_blocks), dtype=np.int32)
+            )
 
         self.num_blocks = UvaBackedTensor(
             (self.num_kv_cache_groups, self.max_num_reqs),
@@ -67,6 +72,9 @@ class BlockTables:
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.input_block_tables: list[torch.Tensor] = [
             torch.zeros_like(b.gpu) for b in self.block_tables
+        ]
+        self.input_block_tables_cpu: list[np.ndarray] = [
+            np.zeros_like(t) for t in self.cpu_block_tables
         ]
 
         self.slot_mappings = torch.zeros(
@@ -116,13 +124,39 @@ class BlockTables:
         overwrite: bool,
     ) -> None:
         for i in range(self.num_kv_cache_groups):
-            start = self.num_blocks.np[i, req_index] if not overwrite else 0
+            start = int(self.num_blocks.np[i, req_index]) if not overwrite else 0
             block_ids = new_block_ids[i]
             bpk = self.blocks_per_kv_block[i]
             if bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
             self.block_tables[i].stage_write(req_index, start, block_ids)
-            self.num_blocks.np[i, req_index] = start + len(block_ids)
+            end = start + len(block_ids)
+            if block_ids:
+                self.cpu_block_tables[i][req_index, start:end] = block_ids
+            self.num_blocks.np[i, req_index] = end
+
+    def gather_block_tables_cpu(
+        self,
+        idx_mapping_np: np.ndarray,
+        num_reqs_padded: int,
+    ) -> tuple[np.ndarray, ...]:
+        num_reqs = int(idx_mapping_np.shape[0])
+        out_list: list[np.ndarray] = []
+        for i in range(self.num_kv_cache_groups):
+            src = self.cpu_block_tables[i]
+            dst = self.input_block_tables_cpu[i]
+            nb_row = self.num_blocks.np[i]
+            for b_idx in range(num_reqs):
+                r_idx = int(idx_mapping_np[b_idx])
+                nb = int(nb_row[r_idx])
+                if nb > 0:
+                    dst[b_idx, :nb] = src[r_idx, :nb]
+                if nb < dst.shape[1]:
+                    dst[b_idx, nb:] = 0
+            if num_reqs_padded > num_reqs:
+                dst[num_reqs:num_reqs_padded] = 0
+            out_list.append(dst[:num_reqs_padded])
+        return tuple(out_list)
 
     def apply_staged_writes(self) -> None:
         # TODO(woosuk): This can be inefficient since it launches one kernel per

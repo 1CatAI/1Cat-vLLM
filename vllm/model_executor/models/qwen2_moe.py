@@ -218,6 +218,51 @@ class Qwen2MoeMLP(nn.Module):
         x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
         fused_act = getattr(self.gate_up_proj, "forward_fused_silu_and_mul", None)
         out = fused_act(x) if fused_act is not None else None
+        if (
+            out is None
+            and not use_sm70_decode_graph_semantics()
+            and self._sm70_exact_shared_expert_gate
+            and type(getattr(self.down_proj, "quant_method", None))
+            is UnquantizedLinearMethod
+            and getattr(self.gate_up_proj, "bias", None) is None
+            and getattr(self.down_proj, "bias", None) is None
+            and getattr(self.expert_gate, "bias", None) is None
+            and not torch.backends.cuda.matmul.allow_fp16_accumulation
+            and not capture_runtime_trace().qwen_mlp_internals
+            and x.ndim == 2
+            and x.shape[1] == 2560
+            and x.is_cuda
+            and x.dtype == torch.float16
+        ):
+            gu_w = getattr(self.gate_up_proj, "weight", None)
+            dn_w = getattr(self.down_proj, "weight", None)
+            gt_w = (
+                getattr(self.expert_gate, "weight", None)
+                if self.expert_gate is not None
+                else None
+            )
+            if (
+                isinstance(gu_w, torch.Tensor)
+                and isinstance(dn_w, torch.Tensor)
+                and isinstance(gt_w, torch.Tensor)
+                and gu_w.shape == (320, 2560)
+                and dn_w.shape == (2560, 160)
+                and gt_w.shape == (1, 2560)
+                and gu_w.dtype == dn_w.dtype == gt_w.dtype == torch.float16
+            ):
+                from vllm._sm70_flashnext_prefill_ops import (
+                    has_sm70_flashnext_prefill_ops,
+                )
+
+                if has_sm70_flashnext_prefill_ops():
+                    return torch.ops.vllm.qwen38_fn_shared_expert_prefill(
+                        x,
+                        gu_w,
+                        dn_w,
+                        gt_w,
+                        bool(self._sm70_batch_shared_expert_gate),
+                        bool(getattr(self, "_fn_defer_gate_to_moe", False)),
+                    )
         if out is None:
             gate_up, _ = self.gate_up_proj(x)
             gate_up = _sm70_dump_qwen_mlp_tensor("mlp_gate_up", self.layer_idx, gate_up)
@@ -306,6 +351,38 @@ class Qwen2MoeMLP(nn.Module):
                 logger.info_once("SM70 Qwen3.8 exact shared-expert gate path enabled.")
                 sm70_ops.qwen38_shared_gate_exact_out(out, x, gate_weight)
                 used_exact_gate = True
+        if (
+            self.expert_gate is not None
+            and not used_exact_gate
+            and x.shape[0] > 1
+            and not capture_runtime_trace().qwen_mlp_internals
+            and x.is_cuda
+            and out.is_cuda
+            and x.ndim == 2
+            and out.ndim == 2
+            and x.shape[1] == 2560
+            and out.shape == x.shape
+            and x.dtype == out.dtype == torch.float16
+            and getattr(self.expert_gate, "bias", None) is None
+            and isinstance(getattr(self.expert_gate, "weight", None), torch.Tensor)
+            and self.expert_gate.weight.shape == (1, 2560)
+            and self.expert_gate.weight.dtype == torch.float16
+            and self.expert_gate.weight.is_cuda
+        ):
+            from vllm._sm70_flashnext_prefill_ops import (
+                has_sm70_flashnext_prefill_ops,
+            )
+
+            if has_sm70_flashnext_prefill_ops():
+                out = torch.ops.vllm.qwen38_fn_shared_gate_dot_mul(
+                    out.contiguous(),
+                    x.contiguous(),
+                    self.expert_gate.weight.contiguous(),
+                )
+                out = _sm70_dump_qwen_mlp_tensor(
+                    "mlp_after_expert_gate", self.layer_idx, out
+                )
+                used_exact_gate = True
         if self.expert_gate is not None and not used_exact_gate:
             expert_gate = self.expert_gate(x)[0]
             expert_gate = _sm70_dump_qwen_mlp_tensor(
@@ -333,6 +410,26 @@ class Qwen2MoeMLP(nn.Module):
             ):
                 out = torch.ops.vllm.qwen38_sm70_shared_gate_mul(expert_gate, out)
                 used_batch_epilogue = True
+            if (
+                not used_batch_epilogue
+                and x.shape[0] > 1
+                and out.is_cuda
+                and out.ndim == 2
+                and out.shape[1] == 2560
+                and out.dtype == torch.float16
+                and expert_gate.ndim == 2
+                and expert_gate.shape[1] == 1
+                and expert_gate.dtype == torch.float16
+            ):
+                from vllm._sm70_flashnext_prefill_ops import (
+                    has_sm70_flashnext_prefill_ops,
+                )
+
+                if has_sm70_flashnext_prefill_ops():
+                    out = torch.ops.vllm.qwen38_fn_shared_gate_mul(
+                        out.contiguous(), expert_gate.contiguous()
+                    )
+                    used_batch_epilogue = True
             if not used_batch_epilogue:
                 expert_gate = F.sigmoid(expert_gate)
                 expert_gate = _sm70_dump_qwen_mlp_tensor(

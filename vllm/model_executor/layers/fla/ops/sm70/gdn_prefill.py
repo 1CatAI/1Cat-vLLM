@@ -3,9 +3,11 @@
 """FlashQLA prefill/decode bindings with explicit layout and gate semantics."""
 
 import functools
+import os
 
 import torch
 
+from vllm._sm70_flashnext_prefill_ops import has_sm70_flashnext_prefill_ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fla.ops.gdn_profiling import GdnPrefillProfiler
 from vllm.model_executor.layers.fla.ops.gdn_stages import normalize_qk
@@ -48,12 +50,12 @@ def select_original_prefill_threads(
         256
         if requested == 256
         and (
-            (indices is not None and indices.numel() == 1)
+            (indices is not None and indices.numel() >= 1)
             or (
                 indices is None
-                and state.shape[0] == 1
+                and state.shape[0] >= 1
                 and cu_seqlens is not None
-                and cu_seqlens.numel() == 2
+                and cu_seqlens.numel() >= 2
             )
         )
         and q.is_cuda
@@ -62,7 +64,7 @@ def select_original_prefill_threads(
         and g.dtype == torch.float32
         and beta.dtype == torch.float32
         and q.shape[0] == 1
-        and 4096 <= q.shape[1] <= 8192
+        and 1024 <= q.shape[1] <= 32768
         and q.shape[2:] == (4, 128)
         and v.shape[2:] == (12, 128)
         and current_platform.is_device_capability(70)
@@ -187,27 +189,137 @@ def flashqla_sm70_chunk_gated_delta_rule(
                 "emit raw g for best performance."
             )
             g_arg = torch.log(g_arg)
-        _, _, out, _, final_state = chunk_gated_delta_rule_fwd_sm70_tilelang(
-            q=q_arg,
-            k=k_arg,
-            v=v_arg,
-            g=g_arg,
-            beta=beta_arg,
-            cu_seqlens=cu_arg,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            state_indices=state_indices,
-            has_initial_state=has_initial_state,
-            initial_state=state_arg,
-            scale=q.shape[-1] ** -0.5,
-            output_final_state=output_final_state,
-            output_h=False,
-            auto_cp=False,
-            state_layout_vlk=True,
-            output=output,
-            inplace_final_state=inplace_final_state,
-            sm70_threads=threads,
+        use_fn_custom_gdn = (
+            os.getenv("FN_DISABLE_CUSTOM_GDN", "0") != "1"
+            and has_sm70_flashnext_prefill_ops()
+            and current_platform.is_device_capability(70)
+            and q_arg.shape[0] == 1
+            and q_arg.shape[1] >= 256
+            and q_arg.shape[2:] == (4, 128)
+            and k_arg.shape == q_arg.shape
+            and v_arg.shape == (1, q_arg.shape[1], 12, 128)
+            and q_arg.dtype == k_arg.dtype == v_arg.dtype == torch.float16
+            and g_arg.dtype == torch.float32
+            and beta_arg.dtype in (torch.float16, torch.float32)
+            and state_arg.dtype == torch.float32
+            and not torch.cuda.is_current_stream_capturing()
         )
+        if use_fn_custom_gdn:
+            from flash_qla.utils import prepare_chunk_indices
+
+            ci_arg = (
+                prepare_chunk_indices(cu_arg, 64)
+                if chunk_indices is None
+                else chunk_indices.to(cu_arg.dtype).contiguous()
+            )
+            t_len = int(q_arg.shape[1])
+            a_bar_buf = torch.empty(
+                (1, t_len, 12, 64), dtype=torch.float16, device=q_arg.device
+            )
+            p_buf = torch.empty(
+                (1, t_len, 12, 64), dtype=torch.float16, device=q_arg.device
+            )
+            g_cs_buf = torch.empty_like(g_arg)
+            out = torch.empty_like(v_arg) if output is None else output
+            need_store = bool(output_final_state or inplace_final_state)
+            final_state = (
+                None
+                if (inplace_final_state or not output_final_state)
+                else torch.empty(
+                    (cu_arg.numel() - 1, 12, 128, 128),
+                    dtype=torch.float32,
+                    device=q_arg.device,
+                )
+            )
+            st_idx_arg = (
+                state_indices.to(torch.int32).contiguous()
+                if state_indices is not None
+                else None
+            )
+            has_init_arg = (
+                has_initial_state.to(torch.bool).contiguous()
+                if has_initial_state is not None
+                else None
+            )
+            if os.getenv("FN_DISABLE_FUSED_KKT", "0") == "1":
+                from flash_qla.ops.gated_delta_rule.chunk import _load_hopper_backend
+
+                chunk_local_cumsum, _, _, _, _, kkt_solve, _ = _load_hopper_backend()
+                g_cs_buf = chunk_local_cumsum(
+                    g_arg, chunk_size=64, cu_seqlens=cu_arg, chunk_indices=ci_arg
+                )
+                a_bar_buf = kkt_solve(
+                    k=k_arg, b=beta_arg, cu_seqlens=cu_arg, chunk_indices=ci_arg
+                )
+                torch.ops.vllm_sm70_fn_prefill.gdn_chunk_fwd_sm70(
+                    q_arg,
+                    k_arg,
+                    v_arg,
+                    a_bar_buf,
+                    p_buf,
+                    g_cs_buf,
+                    beta_arg,
+                    state_arg,
+                    cu_arg,
+                    ci_arg,
+                    st_idx_arg,
+                    has_init_arg,
+                    out,
+                    final_state,
+                    float(q.shape[-1] ** -0.5),
+                    True,
+                    True,
+                    bool(inplace_final_state),
+                    need_store,
+                )
+            else:
+                torch.ops.vllm_sm70_fn_prefill.gdn_chunk_fwd_fused_sm70(
+                    q_arg,
+                    k_arg,
+                    v_arg,
+                    a_bar_buf,
+                    p_buf,
+                    g_cs_buf,
+                    g_arg,
+                    beta_arg,
+                    state_arg,
+                    cu_arg,
+                    ci_arg,
+                    st_idx_arg,
+                    has_init_arg,
+                    out,
+                    final_state,
+                    float(q.shape[-1] ** -0.5),
+                    True,
+                    True,
+                    bool(inplace_final_state),
+                    need_store,
+                )
+            log_runtime_route_once(
+                "Using native SM70 80-CTA HMMA GDN chunk prefill path."
+            )
+        else:
+            _, _, out, _, final_state = chunk_gated_delta_rule_fwd_sm70_tilelang(
+                q=q_arg,
+                k=k_arg,
+                v=v_arg,
+                g=g_arg,
+                beta=beta_arg,
+                cu_seqlens=cu_arg,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                state_indices=state_indices,
+                has_initial_state=has_initial_state,
+                initial_state=state_arg,
+                scale=q.shape[-1] ** -0.5,
+                output_final_state=output_final_state,
+                output_h=False,
+                auto_cp=False,
+                state_layout_vlk=True,
+                output=output,
+                inplace_final_state=inplace_final_state,
+                sm70_threads=threads,
+            )
     else:
         out, final_state = chunk_gated_delta_rule_fwd_sm70_vlk_varlen(
             q=q_arg,

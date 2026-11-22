@@ -475,6 +475,14 @@ def clear_sm70_nvfp4_moe_workspaces() -> None:
     """Release this engine's Qwen raw-scale and decode scratch workspace ownership."""
     workspace_pool("nvfp4_moe_raw_scale", _qwen38_raw_scale_workspaces).clear()
     workspace_pool("nvfp4_moe_decode_scratch", _nvfp4_decode_scratch_workspaces).clear()
+    try:
+        from vllm.model_executor.layers.quantization import nvfp4_sm70_moe
+
+        ws_cache = getattr(nvfp4_sm70_moe, "_FN_PREFILL_WS_CACHE", None)
+        if isinstance(ws_cache, dict):
+            ws_cache.clear()
+    except Exception:
+        pass
 
 
 def _get_qwen38_raw_scale_workspace(device: torch.device) -> torch.Tensor:

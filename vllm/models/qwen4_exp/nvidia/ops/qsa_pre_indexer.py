@@ -83,6 +83,7 @@ def _norm_rope(
 @triton.jit(
     do_not_specialize=[
         "num_tokens",
+        "q_num_tokens",
         "num_state_blocks",
         "num_compressed_blocks",
         "num_k_work",
@@ -119,9 +120,13 @@ def _qsa_pre_indexer_kernel(
     compressed_cache_stride_block,
     compressed_cache_stride_token,
     num_tokens,
+    q_num_tokens,
     num_state_blocks,
     num_compressed_blocks,
     num_k_work,
+    q_pos_ptr,
+    q_pos_stride_axis,
+    q_pos_stride_token,
     HQ: tl.constexpr,
     D: tl.constexpr,
     TILE_T_Q: tl.constexpr,
@@ -147,7 +152,7 @@ def _qsa_pre_indexer_kernel(
         head_tile = q_pid % num_head_tiles
         tokens = token_tile * TILE_T_Q + tl.arange(0, TILE_T_Q)
         heads = head_tile * TILE_H_Q + tl.arange(0, TILE_H_Q)
-        valid_tokens = tokens < num_tokens
+        valid_tokens = tokens < q_num_tokens
         valid_heads = heads < HQ
         dims = tl.arange(0, D)
         mask = valid_tokens[:, None, None] & valid_heads[None, :, None]
@@ -159,15 +164,17 @@ def _qsa_pre_indexer_kernel(
             mask=mask,
             other=0.0,
         )
-        pos_t = tl.load(pos_ptr + tokens * pos_stride_token, mask=valid_tokens, other=0)
+        pos_t = tl.load(
+            q_pos_ptr + tokens * q_pos_stride_token, mask=valid_tokens, other=0
+        )
         if IS_2D_POSITIONS:
             pos_h = tl.load(
-                pos_ptr + pos_stride_axis + tokens * pos_stride_token,
+                q_pos_ptr + q_pos_stride_axis + tokens * q_pos_stride_token,
                 mask=valid_tokens,
                 other=0,
             )
             pos_w = tl.load(
-                pos_ptr + 2 * pos_stride_axis + tokens * pos_stride_token,
+                q_pos_ptr + 2 * q_pos_stride_axis + tokens * q_pos_stride_token,
                 mask=valid_tokens,
                 other=0,
             )
@@ -433,14 +440,17 @@ def qsa_pre_indexer(
     compress_ratio: int,
     mrope_section: tuple[int, int, int] | None,
     rope_pos_offset: int | None,
+    q_positions: torch.Tensor | None = None,
 ) -> None:
     """Normalize Q, compress K, then update the circular raw state."""
-    num_tokens = q.shape[0]
+    num_tokens = k.shape[0]
     if num_tokens == 0:
         return
+    q_num_tokens = q.shape[0]
     num_q_heads, head_dim = q_out.shape[1:]
     assert cos_sin_cache.shape[-1] * 2 == head_dim
-    assert q.shape == (num_tokens, num_q_heads * head_dim)
+    assert q.shape == (q_num_tokens, num_q_heads * head_dim)
+    assert q_out.shape[0] == q_num_tokens
     assert k.shape == (num_tokens, head_dim)
     assert q.stride(-1) == 1
     assert k.stride(-1) == 1
@@ -456,22 +466,31 @@ def qsa_pre_indexer(
     is_k_mrope = bool(mrope_section)
     cache_has_rope_pos = rope_pos_offset is not None
     assert rope_pos_offset is None or rope_pos_offset == head_dim
+    q_pos = positions if q_positions is None else q_positions
     if is_2d_positions:
         assert positions.shape == (3, num_tokens)
+        assert q_pos.shape == (3, q_num_tokens)
         assert is_k_mrope
         pos_stride_axis, pos_stride_token = positions.stride()
+        q_pos_stride_axis, q_pos_stride_token = q_pos.stride()
     else:
         assert positions.shape == (num_tokens,)
+        assert q_pos.shape == (q_num_tokens,)
         pos_stride_axis, pos_stride_token = 0, positions.stride(0)
+        q_pos_stride_axis, q_pos_stride_token = 0, q_pos.stride(0)
     section = mrope_section if mrope_section is not None else (0, 0, 0)
     assert len(section) == 3
 
-    if num_tokens <= 4096:
+    if q_num_tokens <= 4096:
         TILE_T_Q, TILE_H_Q = 2, 2
     else:
         TILE_T_Q, TILE_H_Q = 2, 4
     num_k_work = k_work_metadata.shape[0]
-    num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
+    num_q_work = (
+        triton.cdiv(q_num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
+        if q_num_tokens > 0
+        else 0
+    )
     _qsa_pre_indexer_kernel[(num_k_work + num_q_work,)](
         q,
         q.stride(0),
@@ -502,9 +521,13 @@ def qsa_pre_indexer(
         compressed_cache.stride(0),
         compressed_cache.stride(1),
         num_tokens,
+        q_num_tokens,
         state_cache.shape[0],
         compressed_cache.shape[0],
         num_k_work,
+        q_pos,
+        q_pos_stride_axis,
+        q_pos_stride_token,
         HQ=num_q_heads,
         D=head_dim,
         TILE_T_Q=TILE_T_Q,
