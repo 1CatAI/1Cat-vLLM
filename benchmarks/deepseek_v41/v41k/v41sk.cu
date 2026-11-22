@@ -4483,12 +4483,15 @@ void ll_allreduce(torch::Tensor out, torch::Tensor inp, int64_t p0, int64_t p1,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// ---- Ultra-Fused TP4 KV-Sharded DCP=4 v2 (3 Launches/Layer, 16-Warp GQA-64 + Overlapped Window + Direct NVLink P2P) ----
+// ---- Ultra-Fused TP4 KV-Sharded DCP=4 v2 (3 Launches/Layer, 16-Warp GQA-64 +
+// Overlapped Window + Direct NVLink P2P) ----
 constexpr int DCP_MAX_T = 384;
-constexpr int DCP_OML_ROW = 260;  // 256 uint32 (512 FP16) + 4 float32 (M, L, pad, pad) = 65 uint4s
-constexpr int64_t DCP_Q_CAP = (int64_t)DCP_MAX_T * 16 * 512 * 2;       // 6,291,456 B
-constexpr int64_t DCP_OML_CAP = (int64_t)DCP_MAX_T * 16 * 65 * 16;     // 6,389,760 B
-constexpr int64_t DCP_SLOT_CAP = DCP_Q_CAP + DCP_OML_CAP;              // 12,681,216 B
+constexpr int DCP_OML_ROW =
+    260;  // 256 uint32 (512 FP16) + 4 float32 (M, L, pad, pad) = 65 uint4s
+constexpr int64_t DCP_Q_CAP = (int64_t)DCP_MAX_T * 16 * 512 * 2;  // 6,291,456 B
+constexpr int64_t DCP_OML_CAP =
+    (int64_t)DCP_MAX_T * 16 * 65 * 16;                     // 6,389,760 B
+constexpr int64_t DCP_SLOT_CAP = DCP_Q_CAP + DCP_OML_CAP;  // 12,681,216 B
 
 struct DCPFusedWorkspace {
   torch::Tensor oml_local;  // [DCP_MAX_T * 16 * 260] FP32 (6.1 MiB)
@@ -4504,7 +4507,8 @@ static DCPFusedWorkspace& get_dcp_fused_ws(
       at::cuda::currentStreamCaptureStatusMayInitCtx() ==
           at::cuda::CaptureStatus::None) {
     auto f32_opts = half_opts.dtype(torch::kFloat32);
-    w.oml_local = torch::empty({(int64_t)DCP_MAX_T * 16 * DCP_OML_ROW}, f32_opts);
+    w.oml_local =
+        torch::empty({(int64_t)DCP_MAX_T * 16 * DCP_OML_ROW}, f32_opts);
     w.oml_win = torch::empty({(int64_t)DCP_MAX_T * 16 * DCP_OML_ROW}, f32_opts);
   }
   return w;
@@ -4516,11 +4520,12 @@ void dcp_fused_warmup(torch::Tensor sample_half) {
                    sample_half.options().dtype(torch::kFloat16));
 }
 
-// Zero-stack peer pointer selector & register-only half2->uint32 packer (prevents nvcc local-memory STACK spills)
+// Zero-stack peer pointer selector & register-only half2->uint32 packer
+// (prevents nvcc local-memory STACK spills)
 __device__ __forceinline__ char* dcp_peer_ptr(const LLPeers& peers, int idx) {
-  return idx == 0 ? peers.p[0]
-                  : (idx == 1 ? peers.p[1]
-                              : (idx == 2 ? peers.p[2] : peers.p[3]));
+  return idx == 0
+             ? peers.p[0]
+             : (idx == 1 ? peers.p[1] : (idx == 2 ? peers.p[2] : peers.p[3]));
 }
 
 __device__ __forceinline__ uint32_t dcp_pack_h2(float a, float b) {
@@ -4541,16 +4546,14 @@ __device__ __forceinline__ float2 dcp_unpack_h2(uint32_t u) {
   return __half22float2(cvt.h);
 }
 
-// Launch 1: CUDA attn_prep (query RoPE + kv_norm/RoPE/FP8-QDQ) + optional direct NVLink Q push.
-__global__ void __launch_bounds__(128)
-    attn_prep_dcp_kernel(half* __restrict__ q_out, half* __restrict__ window,
-                         const half* __restrict__ q_in,
-                         const half* __restrict__ kv_in,
-                         const float* __restrict__ kv_weight,
-                         const int64_t* __restrict__ positions,
-                         const float* __restrict__ rope, int rope_length,
-                         float eps, LLPeers peers, int rank, int64_t slot_cap,
-                         const int* __restrict__ dcp_cnt) {
+// Launch 1: CUDA attn_prep (query RoPE + kv_norm/RoPE/FP8-QDQ) + optional
+// direct NVLink Q push.
+__global__ void __launch_bounds__(128) attn_prep_dcp_kernel(
+    half* __restrict__ q_out, half* __restrict__ window,
+    const half* __restrict__ q_in, const half* __restrict__ kv_in,
+    const float* __restrict__ kv_weight, const int64_t* __restrict__ positions,
+    const float* __restrict__ rope, int rope_length, float eps, LLPeers peers,
+    int rank, int64_t slot_cap, const int* __restrict__ dcp_cnt) {
   using namespace attn;
   __shared__ float w_sq[4];
   __shared__ float inv_rms;
@@ -4611,8 +4614,7 @@ __global__ void __launch_bounds__(128)
   const float ww[4] = {w4.x, w4.y, w4.z, w4.w};
   float sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3];
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1)
-    sq += __shfl_xor_sync(0xffffffffu, sq, o);
+  for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
   if (lane == 0) w_sq[warp] = sq;
   __syncthreads();
   if (tid == 0) {
@@ -4664,9 +4666,8 @@ __global__ void __launch_bounds__(128)
 void attn_prep_dcp(torch::Tensor q_out, torch::Tensor window, torch::Tensor q,
                    torch::Tensor kv, torch::Tensor kv_weight,
                    torch::Tensor positions, torch::Tensor rope, double eps,
-                   int64_t p0, int64_t p1, int64_t p2, int64_t p3,
-                   int64_t rank, int64_t slot_cap,
-                   std::optional<torch::Tensor> dcp_cnt) {
+                   int64_t p0, int64_t p1, int64_t p2, int64_t p3, int64_t rank,
+                   int64_t slot_cap, std::optional<torch::Tensor> dcp_cnt) {
   using namespace attn;
   const int T = q.size(0);
   if (T <= 0) return;
@@ -4694,11 +4695,11 @@ void attn_prep_dcp(torch::Tensor q_out, torch::Tensor window, torch::Tensor q,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// Dynamic SMEM layout for dcp_gqa64_win_p2p_kernel (74,240 B + 1,288 B static < 96 KiB):
-// [0 .. 33280):     half ks[32][520]
-// [33280 .. 69120): union { half qs_half[64][264]; float sc[2][64][36];
-//                           struct { half qs_win[16][520]; float sc_win[8][16][36]; };
-//                           float st[16][256]; }
+// Dynamic SMEM layout for dcp_gqa64_win_p2p_kernel (74,240 B + 1,288 B static <
+// 96 KiB): [0 .. 33280):     half ks[32][520] [33280 .. 69120): union { half
+// qs_half[64][264]; float sc[2][64][36];
+//                           struct { half qs_win[16][520]; float
+//                           sc_win[8][16][36]; }; float st[16][256]; }
 // [69120 .. 74240): half ps_sh[64][40]
 namespace dcp_p2p {
 constexpr int KLD2 = 520;
@@ -4711,11 +4712,16 @@ constexpr size_t PS_OFF = 69120;
 constexpr size_t TOTAL_SMEM = 74240;
 }  // namespace dcp_p2p
 
-// Launch 2 (Zero-Spill True GQA-64 + Wave-Aligned Split-K + Overlapped Window + Direct NVLink P2P):
-// - blockIdx.y in [0, CSPLIT): cs = blockIdx.y. Covers ALL 4 Q-groups (64 heads) in ONE CTA so every
-//   compressed key is read ONCE from HBM. Uses #pragma unroll 1 on D-loops + sequential pa0/pa1 PV passes
-//   + dcp_peer_ptr (~96 regs, 0 STACK, 0 STL/LDL!), reading remote Q directly from local L2 IPC buffer.
-// - blockIdx.y in [CSPLIT, CSPLIT + WSPLIT): ws_idx = blockIdx.y - CSPLIT, local sliding window.
+// Launch 2 (Zero-Spill True GQA-64 + Wave-Aligned Split-K + Overlapped Window +
+// Direct NVLink P2P):
+// - blockIdx.y in [0, CSPLIT): cs = blockIdx.y. Covers ALL 4 Q-groups (64
+// heads) in ONE CTA so every
+//   compressed key is read ONCE from HBM. Uses #pragma unroll 1 on D-loops +
+//   sequential pa0/pa1 PV passes
+//   + dcp_peer_ptr (~96 regs, 0 STACK, 0 STL/LDL!), reading remote Q directly
+//   from local L2 IPC buffer.
+// - blockIdx.y in [CSPLIT, CSPLIT + WSPLIT): ws_idx = blockIdx.y - CSPLIT,
+// local sliding window.
 template <int CSPLIT, int WSPLIT>
 __global__ void __launch_bounds__(512)
     dcp_gqa64_win_p2p_kernel(const half* __restrict__ q_local,
@@ -4744,7 +4750,8 @@ __global__ void __launch_bounds__(512)
   char* my_ipc = dcp_peer_ptr(peers, rank);
 
   if (bid_y < CSPLIT) {
-    // ---- Branch 0: Sharded Compressed True GQA-64 (All 4 Q-groups = 64 heads in 1 CTA!) ----
+    // ---- Branch 0: Sharded Compressed True GQA-64 (All 4 Q-groups = 64 heads
+    // in 1 CTA!) ----
     const int cs = bid_y;
     const int slot_t = cs * T + t;
 
@@ -4755,14 +4762,15 @@ __global__ void __launch_bounds__(512)
     const int cnt = tvalid ? rg_comp.key_counts[t] : 0;
     const bool has_work = (cs * KC < cnt);
 
-    // Ensure all 3 remote peers' Q rows have arrived in local IPC memory (warm in L2!).
-    // cs == 0 always waits even when !has_work so Launch 3 can safely re-arm mine_Q.
+    // Ensure all 3 remote peers' Q rows have arrived in local IPC memory (warm
+    // in L2!). cs == 0 always waits even when !has_work so Launch 3 can safely
+    // re-arm mine_Q.
     if (has_work || cs == 0) {
 #pragma unroll
       for (int r = 1; r < 4; ++r) {
         const int src = (rank + r) & 3;
-        char* peer_q = my_ipc + q_base + (int64_t)src * slot_cap +
-                       (int64_t)t * H * 1024;
+        char* peer_q =
+            my_ipc + q_base + (int64_t)src * slot_cap + (int64_t)t * H * 1024;
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
           char* a = peer_q + (int64_t)(tid + u * 512) * 16;
@@ -4782,9 +4790,11 @@ __global__ void __launch_bounds__(512)
           loc[0] = -1e30f;
           loc[1] = 0.f;
         } else {
-          uint4 hdr = make_uint4(ll_escape<false>(__float_as_uint(-1e30f)),
-                                 ll_escape<false>(__float_as_uint(0.f)), 0u, 0u);
-          ll_store(dcp_peer_ptr(peers, g) + oml_base + (int64_t)rank * slot_cap +
+          uint4 hdr =
+              make_uint4(ll_escape<false>(__float_as_uint(-1e30f)),
+                         ll_escape<false>(__float_as_uint(0.f)), 0u, 0u);
+          ll_store(dcp_peer_ptr(peers, g) + oml_base +
+                       (int64_t)rank * slot_cap +
                        ((int64_t)(slot_t * H + h) * 65 + 64) * 16,
                    hdr);
         }
@@ -4816,10 +4826,9 @@ __global__ void __launch_bounds__(512)
           live ? rg_comp.table[(size_t)row * rg_comp.table_stride + index / per]
                : -1;
       live &= page >= 0;
-      srcs[slot][lane] = live
-                             ? (rg_comp.cache + page * rg_comp.stride +
-                                ((index % per) >> rg_comp.cshard_shift) * D)
-                             : nullptr;
+      srcs[slot][lane] = live ? (rg_comp.cache + page * rg_comp.stride +
+                                 ((index % per) >> rg_comp.cshard_shift) * D)
+                              : nullptr;
       const unsigned m = __ballot_sync(0xffffffffu, live);
       if (lane == 0) live_mask[slot] = m;
     };
@@ -4884,9 +4893,9 @@ __global__ void __launch_bounds__(512)
             const half* src_q =
                 (gs == rank)
                     ? (q_local + ((size_t)t * H + hs) * D + hd * 256 + c8)
-                    : (reinterpret_cast<const half*>(
-                           my_ipc + q_base + (int64_t)gs * slot_cap +
-                           (int64_t)t * H * 1024) +
+                    : (reinterpret_cast<const half*>(my_ipc + q_base +
+                                                     (int64_t)gs * slot_cap +
+                                                     (int64_t)t * H * 1024) +
                        hs * D + hd * 256 + c8);
             *reinterpret_cast<uint4*>(qs_half + gh * QLD_H + c8) =
                 __ldg(reinterpret_cast<const uint4*>(src_q));
@@ -4897,8 +4906,8 @@ __global__ void __launch_bounds__(512)
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
             wmma::load_matrix_sync(a, qs_half + g_qk * H * QLD_H + d, QLD_H);
-            wmma::load_matrix_sync(
-                b, ks + n_tile * 16 * KLD2 + hd * 256 + d, KLD2);
+            wmma::load_matrix_sync(b, ks + n_tile * 16 * KLD2 + hd * 256 + d,
+                                   KLD2);
             wmma::mma_sync(acc_qk, a, b, acc_qk);
           }
           __syncthreads();
@@ -4956,7 +4965,8 @@ __global__ void __launch_bounds__(512)
           wmma::load_matrix_sync(pa0, ps_sh + g_pv * H * PLD2, PLD2);
 #pragma unroll
           for (int u = 0; u < 8; ++u) {
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
+                b0;
             wmma::load_matrix_sync(b0, ks + (w_sub * 8 + u) * 16, KLD2);
             wmma::mma_sync(acc_o[u], pa0, b0, acc_o[u]);
           }
@@ -4966,9 +4976,10 @@ __global__ void __launch_bounds__(512)
           wmma::load_matrix_sync(pa1, ps_sh + g_pv * H * PLD2 + 16, PLD2);
 #pragma unroll
           for (int u = 0; u < 8; ++u) {
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b1;
-            wmma::load_matrix_sync(
-                b1, ks + 16 * KLD2 + (w_sub * 8 + u) * 16, KLD2);
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
+                b1;
+            wmma::load_matrix_sync(b1, ks + 16 * KLD2 + (w_sub * 8 + u) * 16,
+                                   KLD2);
             wmma::mma_sync(acc_o[u], pa1, b1, acc_o[u]);
           }
         }
@@ -4991,16 +5002,15 @@ __global__ void __launch_bounds__(512)
       __syncwarp();
       if (rl_ep > 0.f) {
         const float* row_f = st_warp + h_ep * 16 + c8_ep;
-        uint4 pkt = make_uint4(
-            dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
-            dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
-            dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
-            dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
+        uint4 pkt =
+            make_uint4(dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
+                       dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
+                       dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
+                       dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
         const int u4_idx = (w_sub * 8 + u) * 2 + (lane & 1);
         if (g_ep == rank) {
-          reinterpret_cast<uint4*>(
-              oml_local + ((size_t)slot_t * H + h_ep) * DCP_OML_ROW)[u4_idx] =
-              pkt;
+          reinterpret_cast<uint4*>(oml_local + ((size_t)slot_t * H + h_ep) *
+                                                   DCP_OML_ROW)[u4_idx] = pkt;
         } else {
           pkt.x = ll_escape<true>(pkt.x);
           pkt.y = ll_escape<true>(pkt.y);
@@ -5031,7 +5041,8 @@ __global__ void __launch_bounds__(512)
     return;
   }
 
-  // ---- Branch 1: Local Sliding Window Attention (Split-WSPLIT, Overlapped) ----
+  // ---- Branch 1: Local Sliding Window Attention (Split-WSPLIT, Overlapped)
+  // ----
   const int ws_idx = bid_y - CSPLIT;
   const int wslot_t = ws_idx * T + t;
   const int nchunk_w = (rg_win.window + KC - 1) / KC;
@@ -5077,10 +5088,9 @@ __global__ void __launch_bounds__(512)
     if (!rg_win.paged_all_cached && at >= start) {
       if (live) src = rg_win.values + (vbase + at - start) * D;
     } else {
-      const int page =
-          live ? rg_win.wtable[(size_t)row * rg_win.wtable_stride +
-                               at / rg_win.wblock]
-               : -1;
+      const int page = live ? rg_win.wtable[(size_t)row * rg_win.wtable_stride +
+                                            at / rg_win.wblock]
+                            : -1;
       live &= page >= 0;
       if (live)
         src = rg_win.wcache + page * rg_win.wstride + (at % rg_win.wblock) * D;
@@ -5143,20 +5153,18 @@ __global__ void __launch_bounds__(512)
         wmma::load_matrix_sync(b, ks + n_tile * 16 * KLD2 + d, KLD2);
         wmma::mma_sync(acc_qk, a, b, acc_qk);
       }
-      wmma::store_matrix_sync(sc_win + (part_d * H) * SLD2 + n_tile * 16, acc_qk,
-                              SLD2, wmma::mem_row_major);
+      wmma::store_matrix_sync(sc_win + (part_d * H) * SLD2 + n_tile * 16,
+                              acc_qk, SLD2, wmma::mem_row_major);
       __syncthreads();
 
       const int h = warp;
       const bool live = (lm >> lane) & 1u;
       const int o_idx = h * SLD2 + lane;
-      const float raw = sc_win[o_idx] + sc_win[H * SLD2 + o_idx] +
-                        sc_win[2 * H * SLD2 + o_idx] +
-                        sc_win[3 * H * SLD2 + o_idx] +
-                        sc_win[4 * H * SLD2 + o_idx] +
-                        sc_win[5 * H * SLD2 + o_idx] +
-                        sc_win[6 * H * SLD2 + o_idx] +
-                        sc_win[7 * H * SLD2 + o_idx];
+      const float raw =
+          sc_win[o_idx] + sc_win[H * SLD2 + o_idx] +
+          sc_win[2 * H * SLD2 + o_idx] + sc_win[3 * H * SLD2 + o_idx] +
+          sc_win[4 * H * SLD2 + o_idx] + sc_win[5 * H * SLD2 + o_idx] +
+          sc_win[6 * H * SLD2 + o_idx] + sc_win[7 * H * SLD2 + o_idx];
       const float sv = live ? raw * scale : -INFINITY;
       float m = sv;
 #pragma unroll
@@ -5168,8 +5176,7 @@ __global__ void __launch_bounds__(512)
       const float e = live ? __expf(sv - m_new) : 0.f;
       float l = e;
 #pragma unroll
-      for (int o = 16; o > 0; o >>= 1)
-        l += __shfl_xor_sync(0xffffffffu, l, o);
+      for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
       ps_sh[h * PLD2 + lane] = __float2half(e);
       if (lane == 0) {
         const float a = l_prev > 0.f ? __expf(m_old - m_new) : 0.f;
@@ -5182,8 +5189,7 @@ __global__ void __launch_bounds__(512)
       if (witer > 0) {
         float a_elem[8];
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
-          a_elem[i] = alpha[(rmap >> (4 * i)) & 15u];
+        for (int i = 0; i < 8; ++i) a_elem[i] = alpha[(rmap >> (4 * i)) & 15u];
 #pragma unroll
         for (int u = 0; u < 2; ++u)
 #pragma unroll
@@ -5205,8 +5211,8 @@ __global__ void __launch_bounds__(512)
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
           wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b1;
-          wmma::load_matrix_sync(
-              b1, ks + 16 * KLD2 + (warp * 2 + u) * 16, KLD2);
+          wmma::load_matrix_sync(b1, ks + 16 * KLD2 + (warp * 2 + u) * 16,
+                                 KLD2);
           wmma::mma_sync(acc_w[u], pa1, b1, acc_w[u]);
         }
       }
@@ -5225,14 +5231,13 @@ __global__ void __launch_bounds__(512)
     __syncwarp();
     if (rl_ep > 0.f) {
       const float* row_f = st_warp + h_ep * 16 + c8_ep;
-      uint4 pkt = make_uint4(
-          dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
-          dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
-          dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
-          dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
+      uint4 pkt = make_uint4(dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
+                             dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
+                             dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
+                             dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
       const int u4_idx = (warp * 2 + u) * 2 + (lane & 1);
-      reinterpret_cast<uint4*>(
-          oml_win + ((size_t)wslot_t * H + h_ep) * DCP_OML_ROW)[u4_idx] = pkt;
+      reinterpret_cast<uint4*>(oml_win + ((size_t)wslot_t * H + h_ep) *
+                                             DCP_OML_ROW)[u4_idx] = pkt;
     }
     __syncwarp();
   }
@@ -5243,7 +5248,8 @@ __global__ void __launch_bounds__(512)
   }
 }
 
-// Launch 3: 64-thread uint4-vectorized NVLink P2P OML Combine + Q Re-arm + Inverse RoPE + FP8 QDQ + Window Insert
+// Launch 3: 64-thread uint4-vectorized NVLink P2P OML Combine + Q Re-arm +
+// Inverse RoPE + FP8 QDQ + Window Insert
 template <bool POST, int CSPLIT, int WSPLIT>
 __global__ void __launch_bounds__(64)
     dcp_p2p_combine_kernel(const float* __restrict__ oml_local,
@@ -5268,9 +5274,9 @@ __global__ void __launch_bounds__(64)
     if (h == H) {
       const int64_t position = rg_win.positions[t];
       if (rg_win.valid[t] && position >= 0) {
-        const int page = rg_win.wtable[(size_t)rg_win.rows[t] *
-                                           rg_win.wtable_stride +
-                                       position / rg_win.wblock];
+        const int page =
+            rg_win.wtable[(size_t)rg_win.rows[t] * rg_win.wtable_stride +
+                          position / rg_win.wblock];
         if (page < 0) return;
         const half* source = rg_win.values + (size_t)t * D;
         half* destination = const_cast<half*>(rg_win.wcache) +
@@ -5303,7 +5309,8 @@ __global__ void __launch_bounds__(64)
     const int slot_t = cs * T + t;
     float ms, ls;
     if (s == rank) {
-      const float* loc = oml_local + ((size_t)slot_t * H + h) * DCP_OML_ROW + 256;
+      const float* loc =
+          oml_local + ((size_t)slot_t * H + h) * DCP_OML_ROW + 256;
       ms = loc[0];
       ls = loc[1];
     } else {
@@ -5342,8 +5349,7 @@ __global__ void __launch_bounds__(64)
       L = w;
     }
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-      L += __shfl_xor_sync(0xffffffffu, L, o);
+    for (int o = 16; o > 0; o >>= 1) L += __shfl_xor_sync(0xffffffffu, L, o);
     if (tid == 0) sh_inv_l = 1.f / (L + __expf(sink[h] - M));
   }
   __syncthreads();
@@ -5451,8 +5457,9 @@ __global__ void __launch_bounds__(64)
   if (tid == 0) dcp_cnt[t * H + h] = parity ^ 1;
 }
 
-// Small-batch (T <= 12, N=1..2) Zero-Spill SMEM-Resident GQA-32 + Split-K + Overlapped Window:
-// Stages 2 Q-groups (32 heads x 512 dims) ONCE in SMEM (87,552 B dynamic SMEM), 1-pass QK, 4 PV tiles/warp.
+// Small-batch (T <= 12, N=1..2) Zero-Spill SMEM-Resident GQA-32 + Split-K +
+// Overlapped Window: Stages 2 Q-groups (32 heads x 512 dims) ONCE in SMEM
+// (87,552 B dynamic SMEM), 1-pass QK, 4 PV tiles/warp.
 template <int CSPLIT, int WSPLIT>
 __global__ void __launch_bounds__(512)
     dcp_gqa32_win_p2p_kernel(const half* __restrict__ q_local,
@@ -5509,8 +5516,8 @@ __global__ void __launch_bounds__(512)
           }
         }
       } else if (has_work || cs == 0) {
-        char* peer_q = my_ipc + q_base + (int64_t)g * slot_cap +
-                       (int64_t)t * H * 1024;
+        char* peer_q =
+            my_ipc + q_base + (int64_t)g * slot_cap + (int64_t)t * H * 1024;
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
           const int idx = tid + u * 512;
@@ -5536,9 +5543,11 @@ __global__ void __launch_bounds__(512)
           loc[0] = -1e30f;
           loc[1] = 0.f;
         } else {
-          uint4 hdr = make_uint4(ll_escape<false>(__float_as_uint(-1e30f)),
-                                 ll_escape<false>(__float_as_uint(0.f)), 0u, 0u);
-          ll_store(dcp_peer_ptr(peers, g) + oml_base + (int64_t)rank * slot_cap +
+          uint4 hdr =
+              make_uint4(ll_escape<false>(__float_as_uint(-1e30f)),
+                         ll_escape<false>(__float_as_uint(0.f)), 0u, 0u);
+          ll_store(dcp_peer_ptr(peers, g) + oml_base +
+                       (int64_t)rank * slot_cap +
                        ((int64_t)(slot_t * H + h) * 65 + 64) * 16,
                    hdr);
         }
@@ -5569,10 +5578,9 @@ __global__ void __launch_bounds__(512)
           live ? rg_comp.table[(size_t)row * rg_comp.table_stride + index / per]
                : -1;
       live &= page >= 0;
-      srcs[slot][lane] = live
-                             ? (rg_comp.cache + page * rg_comp.stride +
-                                ((index % per) >> rg_comp.cshard_shift) * D)
-                             : nullptr;
+      srcs[slot][lane] = live ? (rg_comp.cache + page * rg_comp.stride +
+                                 ((index % per) >> rg_comp.cshard_shift) * D)
+                              : nullptr;
       const unsigned m = __ballot_sync(0xffffffffu, live);
       if (lane == 0) live_mask[slot] = m;
     };
@@ -5682,7 +5690,8 @@ __global__ void __launch_bounds__(512)
           wmma::load_matrix_sync(pa0, ps_sh + sub_g * H * PLD2, PLD2);
 #pragma unroll
           for (int u = 0; u < 4; ++u) {
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
+                b0;
             wmma::load_matrix_sync(b0, ks + (w_sub * 4 + u) * 16, KLD2);
             wmma::mma_sync(acc_o[u], pa0, b0, acc_o[u]);
           }
@@ -5692,9 +5701,10 @@ __global__ void __launch_bounds__(512)
           wmma::load_matrix_sync(pa1, ps_sh + sub_g * H * PLD2 + 16, PLD2);
 #pragma unroll
           for (int u = 0; u < 4; ++u) {
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b1;
-            wmma::load_matrix_sync(
-                b1, ks + 16 * KLD2 + (w_sub * 4 + u) * 16, KLD2);
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
+                b1;
+            wmma::load_matrix_sync(b1, ks + 16 * KLD2 + (w_sub * 4 + u) * 16,
+                                   KLD2);
             wmma::mma_sync(acc_o[u], pa1, b1, acc_o[u]);
           }
         }
@@ -5717,16 +5727,15 @@ __global__ void __launch_bounds__(512)
       __syncwarp();
       if (rl_ep > 0.f) {
         const float* row_f = st_warp + h_ep * 16 + c8_ep;
-        uint4 pkt = make_uint4(
-            dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
-            dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
-            dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
-            dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
+        uint4 pkt =
+            make_uint4(dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
+                       dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
+                       dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
+                       dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
         const int u4_idx = (w_sub * 4 + u) * 2 + (lane & 1);
         if (g_ep == rank) {
-          reinterpret_cast<uint4*>(
-              oml_local + ((size_t)slot_t * H + h_ep) * DCP_OML_ROW)[u4_idx] =
-              pkt;
+          reinterpret_cast<uint4*>(oml_local + ((size_t)slot_t * H + h_ep) *
+                                                   DCP_OML_ROW)[u4_idx] = pkt;
         } else {
           pkt.x = ll_escape<true>(pkt.x);
           pkt.y = ll_escape<true>(pkt.y);
@@ -5802,10 +5811,9 @@ __global__ void __launch_bounds__(512)
     if (!rg_win.paged_all_cached && at >= start) {
       if (live) src = rg_win.values + (vbase + at - start) * D;
     } else {
-      const int page =
-          live ? rg_win.wtable[(size_t)row * rg_win.wtable_stride +
-                               at / rg_win.wblock]
-               : -1;
+      const int page = live ? rg_win.wtable[(size_t)row * rg_win.wtable_stride +
+                                            at / rg_win.wblock]
+                            : -1;
       live &= page >= 0;
       if (live)
         src = rg_win.wcache + page * rg_win.wstride + (at % rg_win.wblock) * D;
@@ -5868,20 +5876,18 @@ __global__ void __launch_bounds__(512)
         wmma::load_matrix_sync(b, ks + n_tile * 16 * KLD2 + d, KLD2);
         wmma::mma_sync(acc_qk, a, b, acc_qk);
       }
-      wmma::store_matrix_sync(sc_win + (part_d * H) * SLD2 + n_tile * 16, acc_qk,
-                              SLD2, wmma::mem_row_major);
+      wmma::store_matrix_sync(sc_win + (part_d * H) * SLD2 + n_tile * 16,
+                              acc_qk, SLD2, wmma::mem_row_major);
       __syncthreads();
 
       const int h = warp;
       const bool live = (lm >> lane) & 1u;
       const int o_idx = h * SLD2 + lane;
-      const float raw = sc_win[o_idx] + sc_win[H * SLD2 + o_idx] +
-                        sc_win[2 * H * SLD2 + o_idx] +
-                        sc_win[3 * H * SLD2 + o_idx] +
-                        sc_win[4 * H * SLD2 + o_idx] +
-                        sc_win[5 * H * SLD2 + o_idx] +
-                        sc_win[6 * H * SLD2 + o_idx] +
-                        sc_win[7 * H * SLD2 + o_idx];
+      const float raw =
+          sc_win[o_idx] + sc_win[H * SLD2 + o_idx] +
+          sc_win[2 * H * SLD2 + o_idx] + sc_win[3 * H * SLD2 + o_idx] +
+          sc_win[4 * H * SLD2 + o_idx] + sc_win[5 * H * SLD2 + o_idx] +
+          sc_win[6 * H * SLD2 + o_idx] + sc_win[7 * H * SLD2 + o_idx];
       const float sv = live ? raw * scale : -INFINITY;
       float m = sv;
 #pragma unroll
@@ -5893,8 +5899,7 @@ __global__ void __launch_bounds__(512)
       const float e = live ? __expf(sv - m_new) : 0.f;
       float l = e;
 #pragma unroll
-      for (int o = 16; o > 0; o >>= 1)
-        l += __shfl_xor_sync(0xffffffffu, l, o);
+      for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
       ps_sh[h * PLD2 + lane] = __float2half(e);
       if (lane == 0) {
         const float a = l_prev > 0.f ? __expf(m_old - m_new) : 0.f;
@@ -5907,8 +5912,7 @@ __global__ void __launch_bounds__(512)
       if (witer > 0) {
         float a_elem[8];
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
-          a_elem[i] = alpha[(rmap >> (4 * i)) & 15u];
+        for (int i = 0; i < 8; ++i) a_elem[i] = alpha[(rmap >> (4 * i)) & 15u];
 #pragma unroll
         for (int u = 0; u < 2; ++u)
 #pragma unroll
@@ -5930,8 +5934,8 @@ __global__ void __launch_bounds__(512)
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
           wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b1;
-          wmma::load_matrix_sync(
-              b1, ks + 16 * KLD2 + (warp * 2 + u) * 16, KLD2);
+          wmma::load_matrix_sync(b1, ks + 16 * KLD2 + (warp * 2 + u) * 16,
+                                 KLD2);
           wmma::mma_sync(acc_w[u], pa1, b1, acc_w[u]);
         }
       }
@@ -5950,14 +5954,13 @@ __global__ void __launch_bounds__(512)
     __syncwarp();
     if (rl_ep > 0.f) {
       const float* row_f = st_warp + h_ep * 16 + c8_ep;
-      uint4 pkt = make_uint4(
-          dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
-          dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
-          dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
-          dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
+      uint4 pkt = make_uint4(dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
+                             dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
+                             dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
+                             dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
       const int u4_idx = (warp * 2 + u) * 2 + (lane & 1);
-      reinterpret_cast<uint4*>(
-          oml_win + ((size_t)wslot_t * H + h_ep) * DCP_OML_ROW)[u4_idx] = pkt;
+      reinterpret_cast<uint4*>(oml_win + ((size_t)wslot_t * H + h_ep) *
+                                             DCP_OML_ROW)[u4_idx] = pkt;
     }
     __syncwarp();
   }
@@ -5994,10 +5997,10 @@ static inline void launch_dcp_fused_impl(
   } else {
     static bool smem_set64 = false;
     if (!smem_set64) {
-      C10_CUDA_CHECK(cudaFuncSetAttribute(
-          dcp_gqa64_win_p2p_kernel<CSPLIT, WSPLIT>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          (int)dcp_p2p::TOTAL_SMEM));
+      C10_CUDA_CHECK(
+          cudaFuncSetAttribute(dcp_gqa64_win_p2p_kernel<CSPLIT, WSPLIT>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               (int)dcp_p2p::TOTAL_SMEM));
       smem_set64 = true;
     }
     dcp_gqa64_win_p2p_kernel<CSPLIT, WSPLIT>
@@ -6012,29 +6015,27 @@ static inline void launch_dcp_fused_impl(
             ws.oml_local.data_ptr<float>(), ws.oml_win.data_ptr<float>(),
             sink.data_ptr<float>(),
             reinterpret_cast<half*>(out.data_ptr<at::Half>()), peers, rank,
-            slot_cap, dcp_cnt.data_ptr<int>(), rg_win,
-            rope->data_ptr<float>(), (int)rope->size(0) - 1);
+            slot_cap, dcp_cnt.data_ptr<int>(), rg_win, rope->data_ptr<float>(),
+            (int)rope->size(0) - 1);
   } else {
-    dcp_p2p_combine_kernel<false, CSPLIT, WSPLIT><<<dim3(T, H), 64, 0, stream>>>(
-        ws.oml_local.data_ptr<float>(), ws.oml_win.data_ptr<float>(),
-        sink.data_ptr<float>(),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()), peers, rank,
-        slot_cap, dcp_cnt.data_ptr<int>(), rg_win, nullptr, 0);
+    dcp_p2p_combine_kernel<false, CSPLIT, WSPLIT>
+        <<<dim3(T, H), 64, 0, stream>>>(
+            ws.oml_local.data_ptr<float>(), ws.oml_win.data_ptr<float>(),
+            sink.data_ptr<float>(),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()), peers, rank,
+            slot_cap, dcp_cnt.data_ptr<int>(), rg_win, nullptr, 0);
   }
 }
 
-void attn_dcp_fused(torch::Tensor out, torch::Tensor q_local,
-                    torch::Tensor values, torch::Tensor wcache,
-                    torch::Tensor wtable, torch::Tensor ccache,
-                    torch::Tensor ctable, torch::Tensor rows,
-                    torch::Tensor bases, torch::Tensor positions,
-                    torch::Tensor valid, torch::Tensor local_topk,
-                    torch::Tensor local_cnt, torch::Tensor sink, double scale,
-                    int64_t wblock, int64_t cblock, int64_t ratio,
-                    int64_t window, bool paged_fused,
-                    std::optional<torch::Tensor> rope, int64_t p0, int64_t p1,
-                    int64_t p2, int64_t p3, int64_t rank, int64_t slot_cap,
-                    torch::Tensor dcp_cnt) {
+void attn_dcp_fused(
+    torch::Tensor out, torch::Tensor q_local, torch::Tensor values,
+    torch::Tensor wcache, torch::Tensor wtable, torch::Tensor ccache,
+    torch::Tensor ctable, torch::Tensor rows, torch::Tensor bases,
+    torch::Tensor positions, torch::Tensor valid, torch::Tensor local_topk,
+    torch::Tensor local_cnt, torch::Tensor sink, double scale, int64_t wblock,
+    int64_t cblock, int64_t ratio, int64_t window, bool paged_fused,
+    std::optional<torch::Tensor> rope, int64_t p0, int64_t p1, int64_t p2,
+    int64_t p3, int64_t rank, int64_t slot_cap, torch::Tensor dcp_cnt) {
   using namespace attn;
   const int T = q_local.size(0);
   if (T <= 0) return;
@@ -6067,9 +6068,9 @@ void attn_dcp_fused(torch::Tensor out, torch::Tensor q_local,
   rg_comp.cshard_shift = 2;
 
   RingGather rg_win{};
-  rg_win.values = paged_fused
-                      ? reinterpret_cast<const half*>(values.data_ptr<at::Half>())
-                      : nullptr;
+  rg_win.values =
+      paged_fused ? reinterpret_cast<const half*>(values.data_ptr<at::Half>())
+                  : nullptr;
   rg_win.positions = positions.data_ptr<int64_t>();
   rg_win.valid = valid.data_ptr<bool>();
   rg_win.window = (int)window;
@@ -6087,10 +6088,14 @@ void attn_dcp_fused(torch::Tensor out, torch::Tensor q_local,
                  reinterpret_cast<char*>(p2), reinterpret_cast<char*>(p3)}};
 
   // Hybrid wave-aligned dispatch on V100 (80 SMs, 0 STL/LDL spills):
-  // - T <= 6  (N=1):  GQA-32<4, 4> -> 6 * 12 = 72 CTAs <= 80 SMs (1 wave, SMEM-resident qs, 1-pass QK!)
-  // - T <= 12 (N=2):  GQA-32<2, 2> -> 12 * 6 = 72 CTAs <= 80 SMs (1 wave, SMEM-resident qs, 1-pass QK!)
-  // - T <= 24 (N=4):  GQA-64<2, 1> -> 24 * 3 = 72 CTAs <= 80 SMs (1 wave, 1x KV HBM read!)
-  // - T > 24  (N>=8): GQA-64<1, 1> -> T * 2  = 2T CTAs (1x KV HBM read + minimum NVLink traffic!)
+  // - T <= 6  (N=1):  GQA-32<4, 4> -> 6 * 12 = 72 CTAs <= 80 SMs (1 wave,
+  // SMEM-resident qs, 1-pass QK!)
+  // - T <= 12 (N=2):  GQA-32<2, 2> -> 12 * 6 = 72 CTAs <= 80 SMs (1 wave,
+  // SMEM-resident qs, 1-pass QK!)
+  // - T <= 24 (N=4):  GQA-64<2, 1> -> 24 * 3 = 72 CTAs <= 80 SMs (1 wave, 1x KV
+  // HBM read!)
+  // - T > 24  (N>=8): GQA-64<1, 1> -> T * 2  = 2T CTAs (1x KV HBM read +
+  // minimum NVLink traffic!)
   if (T <= 6) {
     launch_dcp_fused_impl<true, 4, 4>(out, q_local, ws, sink, paged_fused, rope,
                                       peers, (int)rank, slot_cap, dcp_cnt,
