@@ -639,6 +639,10 @@ _SPECULATIVE_DECODING_MODELS = {
         "vllm.models.deepseek_v41.dspark",
         "DSparkDeepseekV41ForCausalLM",
     ),
+    "Inkling2DSparkModel": (
+        "vllm.models.inkling2",
+        "Inkling2DSparkModel",
+    ),
     "PEagleDraftModel": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
     "PeagleLlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
     "Eagle3LlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),

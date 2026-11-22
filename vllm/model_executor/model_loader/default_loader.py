@@ -163,6 +163,10 @@ class DefaultModelLoader(BaseModelLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
+        sidecar_weight_file: str | None = None
+        """If defined, load exclusively this standalone sidecar weight file
+        (bypassing the main checkpoint index and failing closed if missing)."""
+
         skip_weight: Callable[[str], bool] | None = None
         """If defined, tensors whose checkpoint name (before *prefix*) it
         accepts are skipped before they are read from disk."""
@@ -207,6 +211,7 @@ class DefaultModelLoader(BaseModelLoader):
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
+        sidecar_weight_file: str | None = None,
     ) -> tuple[str, list[str], bool, dict[str, set[str]] | None]:
         """Prepare weights for the model.
 
@@ -217,6 +222,34 @@ class DefaultModelLoader(BaseModelLoader):
         )
 
         is_local = os.path.isdir(model_name_or_path)
+        if sidecar_weight_file is not None:
+            if not is_local:
+                hf_folder = download_weights_from_hf(
+                    model_name_or_path,
+                    self.load_config.download_dir,
+                    [sidecar_weight_file],
+                    revision,
+                    subfolder=subfolder,
+                    ignore_patterns=self.load_config.ignore_patterns,
+                )
+            else:
+                hf_folder = model_name_or_path
+            sidecar_path = (
+                os.path.join(hf_folder, subfolder, sidecar_weight_file)
+                if subfolder
+                else os.path.join(hf_folder, sidecar_weight_file)
+            )
+            if not os.path.isfile(sidecar_path):
+                raise FileNotFoundError(
+                    f"Required sidecar weight file `{sidecar_weight_file}` not found "
+                    f"in `{hf_folder}` (no fallback to main checkpoint shards)."
+                )
+            return (
+                hf_folder,
+                [sidecar_path],
+                sidecar_path.endswith(".safetensors"),
+                None,
+            )
         load_format = self.load_config.load_format
         use_safetensors = False
         index_file = SAFE_WEIGHTS_INDEX_NAME
@@ -368,6 +401,7 @@ class DefaultModelLoader(BaseModelLoader):
             source.revision,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
+            sidecar_weight_file=source.sidecar_weight_file,
         )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
@@ -525,6 +559,7 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            sidecar_weight_file=getattr(model, "sidecar_weight_file", None),
             skip_weight=skip_weight,
             map_weight=getattr(model, "map_checkpoint_weight", None),
         )

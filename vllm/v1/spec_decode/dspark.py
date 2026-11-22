@@ -7,6 +7,7 @@ from typing_extensions import override
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode import coupled_draw
 from vllm.v1.spec_decode.dflash import DFlashProposer
@@ -34,6 +35,20 @@ class DSparkProposer(DFlashProposer):
             torch.arange(self.max_batch_size, dtype=torch.int64, device=device)
             * self.num_query_per_req
         )
+        if not self.sample_from_anchor:
+            num_aux_layers = len(
+                getattr(
+                    self.draft_model_config.hf_config,
+                    "dspark_target_layer_ids",
+                    (),
+                )
+            )
+            if num_aux_layers > 1:
+                self.hidden_states = torch.zeros(
+                    (self.max_num_tokens, num_aux_layers * self.hidden_size),
+                    dtype=self.dtype,
+                    device=device,
+                )
         self._confidence_threshold = self.speculative_config.dspark_confidence_threshold
         self._confidence_temperatures: torch.Tensor | None = None
         if self._confidence_threshold > 0.0:
@@ -75,10 +90,61 @@ class DSparkProposer(DFlashProposer):
     @override
     def load_model(self, target_model: torch.nn.Module) -> None:
         super().load_model(target_model)
+        attach = getattr(self.model, "attach_target", None)
+        if attach is not None:
+            attach(target_model)
         # V4.1 VLLM_V41_MARKOV_SHARD: checked against the head shared above.
         prepare = getattr(self.model, "prepare_markov_shard", None)
         if prepare is not None:
             prepare()
+
+    @override
+    def set_inputs_first_pass(
+        self,
+        target_token_ids: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        cad: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
+        prepare_anchor = getattr(self.model, "prepare_context_anchor", None)
+        if prepare_anchor is not None:
+            batch_size = cad.batch_size()
+            anchor_locs = cad.query_start_loc[1 : batch_size + 1] - 1
+            if num_rejected_tokens_gpu is not None:
+                anchor_locs = anchor_locs - num_rejected_tokens_gpu[:batch_size]
+            prepare_anchor(target_hidden_states[anchor_locs])
+        return super().set_inputs_first_pass(
+            target_token_ids=target_token_ids,
+            next_token_ids=next_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            token_indices_to_sample=token_indices_to_sample,
+            cad=cad,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        )
+
+    @override
+    @torch.inference_mode()
+    def dummy_run(
+        self,
+        num_tokens: int,
+        use_cudagraphs: bool = True,
+        is_graph_capturing: bool = False,
+        slot_mappings: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        prepare_anchor = getattr(self.model, "prepare_context_anchor", None)
+        if prepare_anchor is not None:
+            n_anchors = min(num_tokens, self.max_batch_size)
+            prepare_anchor(self.hidden_states[:n_anchors])
+        super().dummy_run(
+            num_tokens=num_tokens,
+            use_cudagraphs=use_cudagraphs,
+            is_graph_capturing=is_graph_capturing,
+            slot_mappings=slot_mappings,
+        )
 
     def take_last_confidence_logits(self) -> torch.Tensor | None:
         confidence_logits = self._last_confidence_logits
@@ -173,6 +239,36 @@ class DSparkProposer(DFlashProposer):
                 "DSpark sample rows must be divisible by "
                 f"num_speculative_tokens={self.num_speculative_tokens}, got {num_rows}."
             )
+        sample_block = getattr(self.model, "sample_block_tokens", None)
+        if sample_block is not None:
+            anchors = self.input_ids[self._anchor_indices[:batch_size]]
+            active_steps = (
+                self._max_verification_tokens
+                if self._confidence_threshold <= 0.0
+                and self._max_verification_tokens < self.num_speculative_tokens
+                else None
+            )
+            flat_tokens, flat_probs = sample_block(
+                hidden_states,
+                anchors,
+                batch_size,
+                self.num_speculative_tokens,
+                self._sample_from_logits,
+                sampling_metadata,
+                active_steps=active_steps,
+            )
+            self._last_confidence_logits = None
+            self._last_verification_lengths = (
+                torch.full(
+                    (batch_size,),
+                    self._max_verification_tokens,
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+                if self.confidence_scheduling_enabled
+                else None
+            )
+            return flat_tokens, flat_probs
         greedy_graph = getattr(self.model, "greedy_draft_tokens", None)
         if (
             greedy_graph is not None

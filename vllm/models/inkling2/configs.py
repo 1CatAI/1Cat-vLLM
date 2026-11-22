@@ -258,6 +258,8 @@ class Inkling2DSparkConfig(PreTrainedConfig):
         self.draft_block_size = block_size
         self.dspark_block_size = block_size - 1
         self.sample_from_anchor = False
+        self.sm70_force_fp16_draft_kv = True
+        self.dspark_allow_pp1_all_layers = True
         self.is_causal = False
         self.mask_token_id = 0
         self.dspark_noise_token_id = 0

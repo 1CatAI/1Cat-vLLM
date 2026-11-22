@@ -842,7 +842,15 @@ class SpeculativeConfig:
                     raise ValueError("target_model_config must be present for dspark")
                 self.model = self.target_model_config.model
                 if not self.quantization:
-                    self.quantization = self.target_model_config.quantization
+                    target_model_type = getattr(
+                        self.target_model_config.hf_config, "model_type", None
+                    )
+                    if target_model_type in ("inkling2", "inkling2_loop"):
+                        # Inkling2 MTP sidecar weights (mtp.safetensors) are
+                        # unquantized BF16/FP16 even when the target is NVFP4.
+                        self.quantization = None
+                    else:
+                        self.quantization = self.target_model_config.quantization
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
             elif self.method == "ngram_gpu":
@@ -1057,6 +1065,18 @@ class SpeculativeConfig:
                     draft_hf_config = self.draft_model_config.hf_config
                     if draft_hf_config.model_type == "deepseek_v41_text":
                         draft_hf_config.architectures = ["DSparkDeepseekV41ForCausalLM"]
+                    elif draft_hf_config.model_type in ("inkling2", "inkling2_loop"):
+                        from vllm.models.inkling2.configs import Inkling2DSparkConfig
+
+                        draft_hf_config = Inkling2DSparkConfig.from_target(
+                            draft_hf_config
+                        )
+                        self.draft_model_config.hf_config = draft_hf_config
+                        self.draft_model_config.hf_text_config = draft_hf_config
+                        self.draft_model_config.quantization = None
+                        self.quantization = None
+                        if self.kv_cache_dtype is None:
+                            self.kv_cache_dtype = "auto"
                     else:
                         draft_hf_config.model_type = "deepseek_v4"
                         draft_hf_config.architectures = ["DSparkDraftModel"]
@@ -1254,6 +1274,24 @@ class SpeculativeConfig:
                 (),
             )
         )
+        if (
+            getattr(
+                self.draft_model_config.hf_config,
+                "dspark_allow_pp1_all_layers",
+                False,
+            )
+            and pp_size == 1
+            and layer_ids
+        ):
+            # Looped targets (e.g., Inkling2Loop) index taps by logical layer
+            # visit [0, num_layer_visits], where num_layer_visits is final_out.
+            max_visit = getattr(
+                self.target_model_config.hf_text_config,
+                "num_layer_visits",
+                last_end,
+            )
+            if all(0 <= layer_id <= max_visit for layer_id in layer_ids):
+                return
         outside_last_stage = [
             layer_id for layer_id in layer_ids if not last_start <= layer_id < last_end
         ]
