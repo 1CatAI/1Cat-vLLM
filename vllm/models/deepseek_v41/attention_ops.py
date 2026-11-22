@@ -2541,10 +2541,13 @@ def attend_dcp_latents_batch(
     window=128,
     paged_fused=False,
     rope=None,
+    q_pushed=False,
     chunk_tokens=240,
 ):
     """TP4 KV-sharded DCP attention with single-round-trip packed NVLink P2P A2A."""
     from vllm.models.deepseek_v41.native import (
+        _LL_AR,
+        _ll_dcp_state,
         load_v41sk,
         tp_all_gather,
         tp_all_to_all,
@@ -2561,6 +2564,44 @@ def attend_dcp_latents_batch(
             topk, pos64, valid_tokens, ratio, shard
         )
     result = torch.empty_like(q_local)
+    if (
+        q_pushed
+        and _LL_AR
+        and tokens <= 384
+        and q_local.shape[1] == 16
+        and hasattr(torch.ops.v41sk, "attn_dcp_fused")
+    ):
+        st = _ll_dcp_state()
+        if st is not None:
+            ptrs, rank, slot_cap, dcp_cnt = st
+            torch.ops.v41sk.attn_dcp_fused(
+                result,
+                q_local,
+                window_values.contiguous() if paged_fused else q_local,
+                window_cache,
+                window_table,
+                compressed_cache,
+                compressed_table,
+                layout.rows[:tokens],
+                layout.bases[:tokens] if paged_fused else layout.rows[:tokens],
+                pos64,
+                valid_tokens,
+                local_topk_all,
+                local_cnt_all,
+                attn_sink,
+                512**-0.5,
+                window_block,
+                compressed_block,
+                ratio,
+                window,
+                paged_fused,
+                rope,
+                *ptrs,
+                rank,
+                slot_cap,
+                dcp_cnt,
+            )
+            return result
     step = tokens if paged_fused or tokens <= chunk_tokens else chunk_tokens
     for first in range(0, tokens, step):
         last = min(first + step, tokens)

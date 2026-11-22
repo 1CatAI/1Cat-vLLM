@@ -162,3 +162,36 @@ def test_v41_dcp4_pp4_kv_capacity_6_4x_gain():
     assert tokens_s > tokens_u * 6.0, (
         f"Expected >6x KV capacity, got {tokens_s} vs {tokens_u}"
     )
+
+
+def test_v41_dcp_p2p_slot_geometry_and_fallback():
+    from vllm.models.deepseek_v41.attn_fuse import attn_prep
+    from vllm.models.deepseek_v41.native import _LL_DCP_MAX_T, _LL_DCP_SLOT_CAP
+
+    assert _LL_DCP_MAX_T == 384
+    q_cap = _LL_DCP_MAX_T * 16 * 512 * 2
+    oml_cap = _LL_DCP_MAX_T * 16 * 65 * 16
+    assert q_cap + oml_cap == _LL_DCP_SLOT_CAP
+    assert q_cap % 16 == 0
+    assert oml_cap % 16 == 0
+    # Non-CUDA / empty inputs cleanly return None without touching CUDA IPC
+    q_cpu = torch.zeros(0, 16, 512, dtype=torch.float16)
+    kv_cpu = torch.zeros(0, 512, dtype=torch.float16)
+    w_cpu = torch.ones(512, dtype=torch.float32)
+    pos_cpu = torch.zeros(0, dtype=torch.int64)
+    rope_cpu = torch.zeros(16, 64, dtype=torch.float32)
+    assert (
+        attn_prep(q_cpu, kv_cpu, w_cpu, 1e-6, pos_cpu, rope_cpu, dcp_p2p=True) is None
+    )
+
+
+def test_v41_topk_int32_float32_allreduce_roundtrip_exact():
+    # Verify exact IEEE-754 float32 round-trip for v41_topk indices in [-1, 1048576]
+    vals = torch.tensor(
+        [-1, 0, 1, 127, 128, 2048, 16384, 262144, 1048575, 1048576],
+        dtype=torch.int32,
+    )
+    rank0_f = vals.to(torch.float32)
+    other_f = torch.zeros_like(rank0_f)
+    reduced = (rank0_f + other_f + other_f + other_f).to(torch.int32)
+    assert torch.equal(reduced, vals)

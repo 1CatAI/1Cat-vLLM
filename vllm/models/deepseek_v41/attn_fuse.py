@@ -327,7 +327,7 @@ def _rope_ok(x, positions, table):
     )
 
 
-def attn_prep(q, kv, kv_weight, eps, positions, table):
+def attn_prep(q, kv, kv_weight, eps, positions, table, dcp_p2p=False):
     """(query, window) as apply_rope(q) and attention_qdq(apply_rope(kv_norm(kv)))
     compute them, in one launch; None if this call is not decode-shaped."""
     tokens = q.shape[0]
@@ -350,6 +350,50 @@ def attn_prep(q, kv, kv_weight, eps, positions, table):
         "VLLM_V41_FUSE_ATTN_PREP=1: query RoPE + kv_norm/RoPE/FP8 QDQ in one "
         "launch per layer.",
     )
+    if _PREP_REGS and q.shape[1] == 16 and positions.dtype == torch.int64:
+        from .native import _LL_AR, _ll_dcp_state, load_v41sk
+
+        load_v41sk()
+        if hasattr(torch.ops.v41sk, "attn_prep_dcp"):
+            q_out = torch.empty_like(q)
+            window = torch.empty_like(kv)
+            if dcp_p2p and _LL_AR and tokens <= 384:
+                st = _ll_dcp_state()
+                if st is not None:
+                    ptrs, rank, slot_cap, dcp_cnt = st
+                    torch.ops.v41sk.attn_prep_dcp(
+                        q_out,
+                        window,
+                        q,
+                        kv,
+                        kv_weight,
+                        positions,
+                        table,
+                        eps,
+                        *ptrs,
+                        rank,
+                        slot_cap,
+                        dcp_cnt,
+                    )
+                    return q_out, window
+            torch.ops.v41sk.attn_prep_dcp(
+                q_out,
+                window,
+                q,
+                kv,
+                kv_weight,
+                positions,
+                table,
+                eps,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+            )
+            return q_out, window
     return _prep_launch(q, kv, kv_weight, eps, positions, table)
 
 

@@ -87,7 +87,13 @@ from .attention_ops import (
     select_compressed_positions_batch,
     select_packed_positions,
 )
-from .attn_fuse import FUSE_ATTN_POST, FUSE_ATTN_PREP, attn_post, attn_prep
+from .attn_fuse import (
+    _PREP_REGS,
+    FUSE_ATTN_POST,
+    FUSE_ATTN_PREP,
+    attn_post,
+    attn_prep,
+)
 from .cache import BATCH as _BATCH
 from .cache import V41LatentCache
 from .contract import kv_source_of, pp_split_problem, validate_runtime_geometry
@@ -881,8 +887,38 @@ class V41Attention(nn.Module):
         pair = dense_tm.fused(self.wq_a, x)
         q_low, kv_low = pair if pair is not None else (self.wq_a(x), self.wkv(x))
         qr = self.q_norm(q_low)
+        metadata = (
+            self.shared.metadata if self.ring_window else self.window_cache.metadata()
+        )
+        dcp_p2p = (
+            FUSE_ATTN_PREP
+            and _PREP_REGS
+            and FUSE_ATTN_POST
+            and _BATCH_ATTN_FUSED
+            and _LL_AR
+            and self.heads == 16
+            and bool(self.ratio)
+            and metadata is not None
+            and self.shared.layout is not None
+            and short_rows(tokens)
+            and tokens <= 384
+            and positions.dtype == torch.int64
+            and not _PACKED_KV
+            and self.source in self.shared.layers
+            and bool(
+                getattr(
+                    self.shared.layers[self.source].compressor.cache, "sharded", False
+                )
+            )
+        )
+        if dcp_p2p:
+            from .native import _ll_dcp_state
+
+            dcp_p2p = _ll_dcp_state() is not None
         if FUSE_ATTN_PREP:
-            query, window = self._prep_fused(tokens, qr, kv_low, positions, table)
+            query, window = self._prep_fused(
+                tokens, qr, kv_low, positions, table, dcp_p2p=dcp_p2p
+            )
         else:
             query = apply_rope(
                 self.wq_b(qr).view(tokens, self.heads, 512), positions, table
@@ -890,16 +926,15 @@ class V41Attention(nn.Module):
             window = attention_qdq(apply_rope(self.kv_norm(kv_low), positions, table))
         if FUSE_ATTN_POST:
             ring_values = None
-        metadata = (
-            self.shared.metadata if self.ring_window else self.window_cache.metadata()
-        )
         if metadata is None:
             # Profile computes the dense paths but has no allocated KV pages.
             if hasattr(self, "compressor"):
                 self.compressor(x, positions, profile=True)
             output = torch.zeros_like(query)
         elif self.shared.layout is not None:
-            output = self._attend_batch(x, qr, positions, table, query, window)
+            output = self._attend_batch(
+                x, qr, positions, table, query, window, q_pushed=dcp_p2p
+            )
             if isinstance(output, tuple):  # fused post: QDQ'd output
                 _tmark("a.out_proj", tokens)
                 return self._project_quantized(output[0])
@@ -1031,7 +1066,7 @@ class V41Attention(nn.Module):
         output = apply_rope(output, positions, table, inverse=True)
         return self.project_output(output)
 
-    def _attend_batch(self, x, qr, positions, table, query, window):
+    def _attend_batch(self, x, qr, positions, table, query, window, q_pushed=False):
         """VLLM_V41_BATCH: window insert, compressor, indexer and attention for
         several requests (paged window caches; rings are not used)."""
         if self.ring_window or self.anchor_ring or self.shared.store is not None:
@@ -1140,6 +1175,7 @@ class V41Attention(nn.Module):
                 dcp_topk=getattr(self.shared, "dcp_topk", None),
                 paged_fused=fused,
                 rope=table if fused else None,
+                q_pushed=q_pushed,
             )
             if fused:
                 return (out_dcp.view(tokens, 2, 4096),)
@@ -1225,12 +1261,18 @@ class V41Attention(nn.Module):
 
         return tp_all_reduce(self.wo_b(projected))
 
-    def _prep_fused(self, tokens, qr, kv_low, positions, table):
+    def _prep_fused(self, tokens, qr, kv_low, positions, table, dcp_p2p=False):
         # VLLM_V41_FUSE_ATTN_PREP: forward's query and window lines, one launch.
         q_high = self.wq_b(qr).view(tokens, self.heads, 512)
         hc_kick()  # pending mixes overlap the latency-bound attention kernels
         prepared = attn_prep(
-            q_high, kv_low, self.kv_norm.weight, self.kv_norm.eps, positions, table
+            q_high,
+            kv_low,
+            self.kv_norm.weight,
+            self.kv_norm.eps,
+            positions,
+            table,
+            dcp_p2p=dcp_p2p,
         )
         if prepared is not None:
             return prepared
@@ -1623,6 +1665,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     compressor.state_batch = V41C2StateBatch(
                         compressor.state, self.max_slots + 1
                     )
+            if _LL_AR and envs.VLLM_V41_KV_SHARD == "1":
+                from .native import _ll_dcp_state
+
+                _ll_dcp_state()
         # Engram, its hash state and the sidecar reader belong to the stages
         # that hold Engram layers; the others never open the Engram tables.
         if self.hash_state is not None or not self.engram_channels:

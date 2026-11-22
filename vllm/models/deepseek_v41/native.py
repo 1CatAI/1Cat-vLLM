@@ -235,6 +235,48 @@ _LL_CAP = int(envs.VLLM_V41_LL_CAP)
 _LL_STATE: list = []
 _LL_MARKOV_CAP = 4096
 _LL_MARKOV_STATE: list = []
+_LL_DCP_MAX_T = 384
+_LL_DCP_SLOT_CAP = _LL_DCP_MAX_T * 16 * (512 * 2 + 65 * 16)
+_LL_DCP_STATE: list = []
+
+
+def _ll_dcp_state():
+    """Dedicated TP4 NVLink P2P buffer for fused DCP=4 Q push + OML combine."""
+    if not _LL_DCP_STATE:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        import torch.distributed as dist
+
+        from vllm import _custom_ops as ops
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        if group.world_size != 4:
+            _LL_DCP_STATE.append(None)
+            return None
+        load_v41sk()
+        size = 2 * 4 * _LL_DCP_SLOT_CAP
+        pointer, handle = ops.allocate_shared_buffer_and_handle(size)
+        torch.ops.v41sk.ll_arm(pointer, size)
+        sample = torch.empty(1, dtype=torch.float16, device="cuda")
+        torch.ops.v41sk.dcp_fused_warmup(sample)
+        torch.accelerator.synchronize()
+        handles = [None] * 4
+        dist.all_gather_object(handles, handle, group=group.cpu_group)
+        rank = group.rank_in_group
+        ptrs = [
+            pointer if i == rank else ops.open_mem_handle(h)
+            for i, h in enumerate(handles)
+        ]
+        dist.barrier(group=group.cpu_group)
+        dcp_cnt = torch.zeros(_LL_DCP_MAX_T * 16, dtype=torch.int32, device="cuda")
+        _LL_DCP_STATE.append((ptrs, rank, _LL_DCP_SLOT_CAP, dcp_cnt))
+        logger.info(
+            "V4.1 native: TP4 fused DCP=4 P2P buffer (%d KiB/slot, max T=%d)",
+            _LL_DCP_SLOT_CAP // 1024,
+            _LL_DCP_MAX_T,
+        )
+    return _LL_DCP_STATE[0]
 
 
 def _ll_markov_state():
