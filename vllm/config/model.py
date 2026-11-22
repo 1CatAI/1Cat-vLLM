@@ -1055,6 +1055,7 @@ class ModelConfig:
                 "awq_marlin",
                 "inc",
                 "moe_wna16",
+                "inkling2",
                 "modelopt",
                 "modelopt_fp4",
                 "modelopt_mxfp8",

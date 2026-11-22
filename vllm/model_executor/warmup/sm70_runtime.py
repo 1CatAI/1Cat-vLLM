@@ -40,6 +40,13 @@ def model_convolution_warmup_task(model) -> WarmupTask:
     return warmup_boolean("gdn_causal_conv1d", run)
 
 
+def model_shape_warmup_task(model, runner) -> WarmupTask | None:
+    warm = getattr(model, "warmup_sm70_shapes", None)
+    if warm is None:
+        return None
+    return warmup_boolean("model_sm70_shapes", lambda: bool(warm(runner)))
+
+
 def warmup_bound_convolution(forward_context, *, enabled: bool) -> bool:
     if not enabled:
         return False

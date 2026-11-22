@@ -279,6 +279,7 @@ from vllm.model_executor.warmup.plan import (
 from vllm.model_executor.warmup.sm70_runtime import (
     auxiliary_warmup_enabled,
     model_convolution_warmup_task,
+    model_shape_warmup_task,
     proposer_warmup_tasks,
 )
 from vllm.v1.spec_decode.profiling import create_step_profiler
@@ -2335,6 +2336,9 @@ class GPUModelRunner(
                 )
             )
         tasks.append(model_convolution_warmup_task(self.model))
+        shape_task = model_shape_warmup_task(self.model, self)
+        if shape_task is not None:
+            tasks.append(shape_task)
         warmed = run_warmup_tasks(tasks)
         if warmed:
             logger.info_once("SM70 auxiliary kernel warmup finished: %s", warmed)
@@ -11800,6 +11804,7 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         batch_descriptor_override: BatchDescriptor | None = None,
+        single_req: bool = False,
     ) -> tuple[
         torch.Tensor | IntermediateTensors,
         torch.Tensor | None,
@@ -11903,7 +11908,7 @@ class GPUModelRunner(
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
         else:
-            num_reqs = min(num_tokens, max_num_reqs)
+            num_reqs = 1 if single_req else min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
             num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
             num_scheduled_tokens_list[-1] += num_tokens % num_reqs

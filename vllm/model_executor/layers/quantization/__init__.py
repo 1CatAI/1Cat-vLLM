@@ -34,6 +34,7 @@ QuantizationMethods = Literal[
     "mxfp4",
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
+    "inkling2",
     "online",
     # Below are online quant shorthand names (see vllm.config.quantization).
     # Listed here as strings to avoid a circular import; kept in sync with
@@ -170,6 +171,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from vllm.config.quantization import _ONLINE_SHORTHANDS
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
     from vllm.models.deepseek_v4 import DeepseekV4FP8Config
+    from vllm.models.inkling2.quant_config import Inkling2QuantConfig
 
     from .auto_gptq import AutoGPTQConfig
     from .awq import AWQConfig
@@ -220,6 +222,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp4": Mxfp4Config,
         "gpt_oss_mxfp4": GptOssMxfp4Config,
         "deepseek_v4_fp8": DeepseekV4FP8Config,
+        "inkling2": Inkling2QuantConfig,
         "online": OnlineQuantizationConfig,
     }
 
