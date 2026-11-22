@@ -1494,7 +1494,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 ws = self._get_fn_prefill_raw_workspace(x.device, num_tokens)
                 slots = num_tokens * 10
                 if (
-                    num_tokens >= 1024
+                    num_tokens >= 320
                     and shared_experts is not None
                     and getattr(layer, "_hc_prefill_peer_consumer", False)
                 ):

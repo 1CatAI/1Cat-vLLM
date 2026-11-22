@@ -738,7 +738,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             return False
         layer = self.layers[0]
         num_tokens = input_ids.shape[0]
-        if num_tokens >= 1024 and get_tp_group().world_size == 4:
+        if num_tokens >= 320 and get_tp_group().world_size == 4:
             from .sm70_hc_prefill_peer import (
                 hc_sequence_allgather_rows,
                 hc_sequence_shard_rows,
@@ -786,7 +786,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         num_tokens = input_ids.shape[0]
         hidden_sel_pre: torch.Tensor | None = None
         combined_hidden: torch.Tensor | None = None
-        if num_tokens >= 1024 and get_tp_group().world_size == 4:
+        if num_tokens >= 320 and get_tp_group().world_size == 4:
             from .sm70_hc_prefill_peer import (
                 hc_sequence_allgather_rows,
                 hc_sequence_shard_rows,
@@ -1092,7 +1092,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def _use_hc_prefill_sequence_rows(self, positions, hidden_states, intermediate):
         return bool(
             getattr(self, "_hc_prefill_sequence_qualified", False)
-            and 4096 <= positions.shape[-1] <= 16384
+            and 320 <= positions.shape[-1] <= 16384
             and hidden_states is not None
             and hidden_states.dtype == torch.float16
             and hidden_states.shape == (positions.shape[-1], 10240)

@@ -1446,7 +1446,7 @@ class Qwen4ExpForCausalLM(
         )
         return bool(
             getattr(self, "_hc_prefill_sequence_qualified", False)
-            and 1024 <= rows <= 16384
+            and 320 <= rows <= 16384
             and intermediate_tensors is None
             and kwargs.get("deepstack_input_embeds") is None
             and (inputs_embeds is None or inputs_embeds.dtype == torch.float16)

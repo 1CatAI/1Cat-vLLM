@@ -67,7 +67,7 @@ def maybe_tp_sharded_router_topk(
         or runner._quant_method.is_monolithic
         or isinstance(runner.router, ZeroExpertRouter)
         or hidden_states.ndim != 2
-        or hidden_states.shape[0] < 1024
+        or hidden_states.shape[0] < 320
         or not hidden_states.is_cuda
         or not hidden_states.is_contiguous()
         or is_sm70_decode_graph_compiling()
@@ -238,7 +238,7 @@ def ple_prefill_slice_range(
     copy_rows = num_tokens
     local_rows = (num_tokens + 3) // 4
     if (
-        num_tokens >= 1024
+        num_tokens >= 320
         and hidden_states.ndim == 2
         and hidden_states.shape[0] == local_rows
         and local_rows < num_tokens

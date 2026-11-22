@@ -855,13 +855,22 @@ class Scheduler(SchedulerInterface):
                         ),
                         default=0,
                     )
+                    # Preserve full-block chunk alignment on large-block hybrid
+                    # KV/state pools (e.g. block_size=2048) so long concurrent
+                    # prefills avoid sub-block 1024/512 fragmentation.
+                    _block_aligned_floor = max(
+                        self.cache_config.block_size,
+                        self.mamba_state_block_size or 0,
+                    )
                     if _max_prefill_computed >= 49152:
                         _concurrent_cap = min(
-                            self._split_mtp_concurrent_prefill_cap, 512
+                            self._split_mtp_concurrent_prefill_cap,
+                            max(512, _block_aligned_floor),
                         )
                     elif _max_prefill_computed >= 16384:
                         _concurrent_cap = min(
-                            self._split_mtp_concurrent_prefill_cap, 1024
+                            self._split_mtp_concurrent_prefill_cap,
+                            max(1024, _block_aligned_floor),
                         )
                     else:
                         _concurrent_cap = self._split_mtp_concurrent_prefill_cap
@@ -1867,7 +1876,13 @@ class Scheduler(SchedulerInterface):
                     ):
                         self._split_mtp_decode_steps_due = 2
                     else:
-                        self._split_mtp_decode_steps_due = 8
+                        _block_aligned_floor = max(
+                            self.cache_config.block_size,
+                            self.mamba_state_block_size or 0,
+                        )
+                        self._split_mtp_decode_steps_due = (
+                            4 if _block_aligned_floor >= 2048 else 8
+                        )
                     self._split_mtp_prefill_burst_tokens = 0
                 else:
                     self._split_mtp_decode_steps_due = 2
