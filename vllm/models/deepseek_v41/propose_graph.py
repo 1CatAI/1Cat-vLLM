@@ -26,7 +26,7 @@ from vllm.distributed import graph_capture
 
 logger = logging.getLogger(__name__)
 
-_WARMUP = 3
+_WARMUP = 1
 # relaxed: the round's host-side helpers may allocate pinned memory or query
 # events while the stream captures.
 _MODE = envs.VLLM_V41_PROPOSE_GRAPH_MODE

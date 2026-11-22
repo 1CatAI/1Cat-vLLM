@@ -287,7 +287,15 @@ class MarkovShardGreedy:
         self._score(logits, self.slots[0])
         self._pick(self.slots[0], token)
 
-    def _run_cuda_5step(self, local_logits, anchors):
+    def _run_cuda_5step(
+        self,
+        local_logits,
+        anchors,
+        c_keys=None,
+        c_pos=None,
+        c_temps=None,
+        draft_scale: float = 0.5,
+    ):
         r = anchors.numel()
         ptrs, rank, cap = self._ll_mk
         lg16 = (
@@ -313,13 +321,27 @@ class MarkovShardGreedy:
             cap,
             self.start,
             self.steps,
+            c_keys,
+            c_pos,
+            c_temps,
+            draft_scale,
         )
         return out
 
-    def __call__(self, local_logits, anchor):
+    def __call__(
+        self,
+        local_logits,
+        anchor,
+        c_keys=None,
+        c_pos=None,
+        c_temps=None,
+        draft_scale: float = 0.5,
+    ):
         """local_logits: this rank's [steps, n] logits; anchor: [1] token id."""
         if self._cuda_ready:
-            return self._run_cuda_5step(local_logits, anchor.reshape(1))
+            return self._run_cuda_5step(
+                local_logits, anchor.reshape(1), c_keys, c_pos, c_temps, draft_scale
+            )
         tokens = torch.empty(self.steps, dtype=torch.int64, device=local_logits.device)
         logits = local_logits.float().contiguous()
         # Non-sampling steps may carry an unfilled anchor; clamp as upstream.
@@ -330,14 +352,24 @@ class MarkovShardGreedy:
             self._pick(self.exchange(self.slots[step]), tokens[step : step + 1])
         return tokens
 
-    def call_batch(self, local_logits, anchors):
+    def call_batch(
+        self,
+        local_logits,
+        anchors,
+        c_keys=None,
+        c_pos=None,
+        c_temps=None,
+        draft_scale: float = 0.5,
+    ):
         """VLLM_V41_BATCH: R requests at once. local_logits: [R * steps, n]
         (request-major), anchors: [R]. Same tokens as R single calls (each
         request's scores, exchange and pick are independent); returns
         [R * steps] request-major."""
         r = anchors.numel()
         if self._cuda_ready and 1 <= r <= 64:
-            return self._run_cuda_5step(local_logits, anchors)
+            return self._run_cuda_5step(
+                local_logits, anchors, c_keys, c_pos, c_temps, draft_scale
+            )
         if r == 1:
             return self(local_logits, anchors)
         device = local_logits.device

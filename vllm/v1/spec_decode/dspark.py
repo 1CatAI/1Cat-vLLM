@@ -192,8 +192,17 @@ class DSparkProposer(DFlashProposer):
             and not self.collect_confidence_logits
             and self._static_draft_vocab is None
         ):
+            c_keys = c_pos = c_temps = None
+            coupled = self._coupled_inputs(sampling_metadata, batch_size)
             if batch_size == 1:
-                tokens = greedy_graph(hidden_states, self.input_ids[:1])
+                if coupled is not None:
+                    t_c, k_c, p_c = coupled
+                    c_keys = k_c[:1].contiguous()
+                    c_pos = p_c[:1, 0].contiguous()
+                    c_temps = t_c[:1].contiguous()
+                tokens = greedy_graph(
+                    hidden_states, self.input_ids[:1], c_keys, c_pos, c_temps
+                )
             else:
                 # Pad to a power-of-two request count: a few captured graphs
                 # instead of one per count (each capture stalls serving).
@@ -205,7 +214,20 @@ class DSparkProposer(DFlashProposer):
                     hidden[:num_rows].copy_(hidden_states)
                 else:
                     hidden = hidden_states
-                tokens = greedy_graph(hidden, anchors)
+                if coupled is not None:
+                    t_c, k_c, p_c = coupled
+                    if padded != batch_size:
+                        c_keys = k_c.new_zeros(padded)
+                        c_keys[:batch_size].copy_(k_c)
+                        c_pos = p_c.new_zeros(padded)
+                        c_pos[:batch_size].copy_(p_c[:, 0])
+                        c_temps = t_c.new_zeros(padded)
+                        c_temps[:batch_size].copy_(t_c)
+                    else:
+                        c_keys = k_c.contiguous()
+                        c_pos = p_c[:, 0].contiguous()
+                        c_temps = t_c.contiguous()
+                tokens = greedy_graph(hidden, anchors, c_keys, c_pos, c_temps)
                 if tokens is not None:
                     tokens = tokens[:num_rows]
             if tokens is not None:

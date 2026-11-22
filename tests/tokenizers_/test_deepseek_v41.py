@@ -85,7 +85,7 @@ def test_numeric_reasoning_effort_has_the_official_v41_prefix(effort, budget):
 @pytest.mark.parametrize("budget", [0, 101, True, "unknown"])
 def test_invalid_numeric_effort_is_rejected(budget):
     tokenizer = get_deepseek_v41_tokenizer(_Tokenizer())
-    with pytest.raises(AssertionError, match="Invalid reasoning effort"):
+    with pytest.raises(ValueError, match="Invalid reasoning effort"):
         tokenizer.apply_chat_template(
             [{"role": "user", "content": "问题"}], reasoning_effort=budget
         )
@@ -137,5 +137,42 @@ def test_tool_history_keeps_spaced_tags_typed_parameters_and_result_order():
 )
 def test_first_text_profile_rejects_multimodal_inputs(content):
     tokenizer = get_deepseek_v41_tokenizer(_Tokenizer())
-    with pytest.raises(ValueError, match="V4.1 first profile"):
+    with pytest.raises(ValueError, match="V4.1"):
         tokenizer.apply_chat_template([{"role": "user", "content": content}])
+
+
+def test_incremental_prefix_tokenization_cache_exact_and_fast():
+    class _CountingTokenizer(_Tokenizer):
+        def __init__(self):
+            self.chars_encoded = 0
+
+        def encode(self, text, **kwargs):
+            assert kwargs.get("add_special_tokens", False) is False
+            self.chars_encoded += len(text)
+            return list(text.encode())
+
+        def get_added_vocab(self):
+            return {BOS: 0, EOS: 1, USER: 2, ASSISTANT: 3}
+
+    base = _CountingTokenizer()
+    wrapped = get_deepseek_v41_tokenizer(base)
+    ref_tok = get_deepseek_v41_tokenizer(_Tokenizer())
+
+    messages = [
+        {"role": "system", "content": "System instructions: " + ("S" * 3000)},
+        {"role": "user", "content": "Turn 1 request: " + ("U" * 2000)},
+        {"role": "assistant", "content": "Turn 1 answer: " + ("A" * 2000)},
+        {"role": "user", "content": "Turn 2 short follow-up"},
+    ]
+    ids1 = wrapped.apply_chat_template(messages)
+    assert ids1 == ref_tok.apply_chat_template(messages)
+
+    base.chars_encoded = 0
+    messages_t3 = messages + [
+        {"role": "assistant", "content": "Turn 2 answer"},
+        {"role": "user", "content": "Turn 3 tool result"},
+    ]
+    ids2 = wrapped.apply_chat_template(messages_t3)
+    assert ids2 == ref_tok.apply_chat_template(messages_t3)
+    # Turn 3 must NOT re-encode the 7000+ char prefix from Turn 1!
+    assert base.chars_encoded < 500

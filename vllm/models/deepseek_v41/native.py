@@ -343,6 +343,36 @@ def tp_all_gather(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return tensor_model_parallel_all_gather(x, dim)
 
 
+def tp_all_to_all(x: torch.Tensor) -> torch.Tensor:
+    """TP4 [4, ...] all-to-all on the one-shot push slots, else NCCL."""
+    import torch.distributed as dist
+
+    from vllm.distributed import get_tp_group
+
+    x = x.contiguous()
+    assert x.shape[0] == 4
+    slice_bytes = (x.numel() // 4) * x.element_size()
+    if (
+        _LL_AR
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.float32)
+        and slice_bytes > 0
+        and slice_bytes <= _LL_CAP
+        and slice_bytes % 16 == 0
+    ):
+        state = _ll_state()
+        if state is not None:
+            ptrs, rank, counter = state
+            out = torch.empty_like(x)
+            torch.ops.v41sk.ll_alltoall(
+                out.view(4, -1), x.view(4, -1), *ptrs, rank, _LL_CAP, counter
+            )
+            return out
+    out = torch.empty_like(x)
+    dist.all_to_all_single(out, x, group=get_tp_group().device_group)
+    return out
+
+
 # Checkpoint dense projections stored as FP8 E4M3 with 32x32 UE8M0 scales.
 _FP8_SUFFIXES = (
     ".attn.wq_a",

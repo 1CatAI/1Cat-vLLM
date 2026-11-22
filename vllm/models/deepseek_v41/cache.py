@@ -46,6 +46,7 @@ class V41BatchLayout:
 
 # Several requests per step (default off: the model admits exactly one).
 BATCH = envs.VLLM_V41_BATCH == "1"
+KV_SHARD = envs.VLLM_V41_KV_SHARD == "1"
 
 
 _HOST_RING = 16
@@ -259,6 +260,7 @@ class V41LatentCache(nn.Module, AttentionLayerBase):
         super().__init__()
         self.prefix, self.head_dim, self.ratio = prefix, head_dim, ratio
         self.sliding_window = sliding_window
+        self.sharded = KV_SHARD and sliding_window is None
         self.kv_cache = torch.empty(0, dtype=torch.float16)
         context = get_current_vllm_config().compilation_config.static_forward_context
         if prefix in context or head_dim not in (128, 512) or ratio not in (1, 2):
@@ -272,19 +274,37 @@ class V41LatentCache(nn.Module, AttentionLayerBase):
         block = vllm_config.cache_config.block_size
         if block % self.ratio:
             raise ValueError("V4.1 cache block must cover complete compression groups")
-        kwargs = dict(
+        if self.sliding_window is not None:
+            return SlidingWindowMLASpec(
+                sliding_window=self.sliding_window,
+                block_size=block,
+                num_kv_heads=1,
+                head_size=self.head_dim,
+                dtype=torch.float16,
+                compress_ratio=self.ratio,
+                alignment=block * 512 * 2,
+            )
+        if self.sharded:
+            tp = vllm_config.parallel_config.tensor_parallel_size
+            if tp != 4:
+                raise ValueError("VLLM_V41_KV_SHARD=1 requires tensor_parallel_size=4")
+            mla_block = block * tp
+            return MLAAttentionSpec(
+                block_size=mla_block,
+                num_kv_heads=1,
+                head_size=self.head_dim,
+                dtype=torch.float16,
+                compress_ratio=self.ratio * tp,
+                alignment=(mla_block // tp) * self.head_dim * 2,
+            )
+        return MLAAttentionSpec(
             block_size=block,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.float16,
             compress_ratio=self.ratio,
-            # One page size across window, compressed and index pools. The
-            # engine exposes padded physical-page strides to the gather ops.
             alignment=block * 512 * 2,
         )
-        if self.sliding_window is not None:
-            return SlidingWindowMLASpec(sliding_window=self.sliding_window, **kwargs)
-        return MLAAttentionSpec(**kwargs)
 
     def metadata(self):
         metadata = get_forward_context().attn_metadata

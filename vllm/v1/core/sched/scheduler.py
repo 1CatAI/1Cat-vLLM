@@ -331,6 +331,9 @@ class Scheduler(SchedulerInterface):
         # may be scheduled again (any earlier step, not only the previous one),
         # so each micro-batch's next step is queued before its round returns.
         self.v41_ahead = self.v41_micro and envs.VLLM_V41_PP_AHEAD == "1"
+        self.v41_decode_protect = self.v41_micro and envs.VLLM_V41_DECODE_PROTECT == "1"
+        self._v41_interleave_turn = 0
+        self._v41_force_decode_once = False
         self._v41_inflight: dict[str, int] = {}
         self._v41_last_step: dict[str, int] = {}  # step id of the latest launch
         self._v41_step = 0
@@ -1021,6 +1024,44 @@ class Scheduler(SchedulerInterface):
             and decoders >= self.parallel_config.pipeline_parallel_size
         ):
             decoder_limit = 1
+        active_decoders = sum(
+            1 for r in self.running if prefill_remaining[r.request_id] == 0
+        )
+        _v41_both_active = False
+        if (
+            self.v41_decode_protect
+            and phase is None
+            and self._pause_state == PauseState.UNPAUSED
+        ):
+            _force_dec = self._v41_force_decode_once
+            self._v41_force_decode_once = False
+            pp_size = self.parallel_config.pipeline_parallel_size
+            pf_limit = pp_size if _V41_PREFILL_PIPELINE else decoder_limit
+            has_elig_prefill_running = any(
+                prefill_remaining[r.request_id] > 0
+                and self.current_step >= r.next_decode_eligible_step
+                and (
+                    not self.v41_ahead
+                    or self._v41_inflight.get(r.request_id, 0) < pf_limit
+                )
+                for r in self.running
+            )
+            has_elig_waiting = (
+                bool(self.waiting or self.skipped_waiting)
+                and len(self.running) < self.max_num_running_reqs
+            )
+            has_prefill = has_elig_prefill_running or has_elig_waiting
+            _v41_both_active = active_decoders > 0 and has_prefill
+            if _force_dec or not has_prefill:
+                phase = Phase.DECODE
+                _phase_filter = True
+            else:
+                # Strict Prefill-First Pure Phase: complete all prefills at full
+                # 4-stage pipeline budget without mixing decode, then run pure
+                # FULL-graph decode at peak throughput.
+                phase = Phase.PREFILL
+                _phase_filter = True
+
         if self.v41_ahead and micro_cap:
             # Strict round robin over the decoders: each step takes the
             # micro_cap decoders whose latest launch is oldest (fewer than
@@ -1073,7 +1114,12 @@ class Scheduler(SchedulerInterface):
                 )
                 if (
                     inflight >= limit
-                    or (ahead_allowed is None and inflight == 1 and idle_decoders)
+                    or (
+                        decoder
+                        and ahead_allowed is None
+                        and inflight == 1
+                        and idle_decoders
+                    )
                     or (
                         ahead_allowed is not None
                         and decoder
@@ -1406,6 +1452,16 @@ class Scheduler(SchedulerInterface):
                 if req.lora_request and req.lora_request.lora_int_id > 0
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
+
+        # Work-conserving safety net: if a pure DECODE interleaved slot found
+        # no runnable decoder (e.g. KV block pressure), allow waiting/prefill.
+        if (
+            self.v41_decode_protect
+            and phase is Phase.DECODE
+            and not num_scheduled_tokens
+            and active_decoders == 0
+        ):
+            phase = Phase.PREFILL
 
         # Next, schedule the WAITING requests.
         # A pure DECODE phase admits **no** new requests: letting one in turns
@@ -1753,6 +1809,17 @@ class Scheduler(SchedulerInterface):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+
+        if (
+            self.v41_decode_protect
+            and _v41_both_active
+            and phase is Phase.PREFILL
+            and not num_scheduled_tokens
+            and not preempted_reqs
+        ):
+            self._split_mtp_skip_kv_step_advance = True
+            self._v41_force_decode_once = True
+            return self.schedule()
 
         if (
             _split_mtp_both_active

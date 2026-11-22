@@ -4,8 +4,44 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.ops.fast_argmax import _argmax_parts
+from vllm.v1.spec_decode.coupled_draw import gumbel, row_seed
+
+_COUPLED = envs.VLLM_V41_COUPLED_DRAFTS == "1"
+
+
+@triton.jit
+def _keyed_argmax_parts(
+    logits,
+    stride,
+    valid_columns,
+    temperatures,
+    keys,
+    positions,
+    values,
+    indices,
+    START: tl.constexpr,
+    PARTS: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    part = tl.program_id(1)
+    col = part * CHUNK + tl.arange(0, CHUNK)
+    valid = col < valid_columns
+    x = tl.load(logits + row.to(tl.int64) * stride + col, valid, float("-inf")).to(
+        tl.float32
+    )
+    t = tl.load(temperatures + row)
+    if t > 0:
+        seed = row_seed(tl.load(keys + row), tl.load(positions + row))
+        x = x / t + gumbel(seed, (START + col).to(tl.int64))
+    x = tl.where(valid, x, float("-inf"))
+    m = tl.max(x, 0)
+    idx = tl.min(tl.where(x == m, col, 16777215), 0)
+    tl.store(values + row * PARTS + part, m)
+    tl.store(indices + row * PARTS + part, idx)
 
 
 @triton.jit
@@ -129,6 +165,48 @@ def greedy_top_tokens(head, hidden):
     return output
 
 
+def keyed_top_tokens(head, hidden, temperatures, keys, positions):
+    """Exact TP4-local Gumbel-max target draw via 4-float pair exchange."""
+    hidden = hidden.contiguous()
+    from .native import tp_all_gather
+
+    logits = head.quant_method.apply(head, hidden, bias=None)
+    rows, columns = logits.shape
+    valid_columns = columns - head.shard_indices.num_org_vocab_padding
+    parts = triton.cdiv(valid_columns, 1024)
+    width = triton.next_power_of_2(parts)
+    values = torch.empty((rows, width), dtype=torch.float32, device=hidden.device)
+    indices = torch.empty((rows, width), dtype=torch.int32, device=hidden.device)
+    _keyed_argmax_parts[(rows, parts)](
+        logits,
+        logits.stride(0),
+        valid_columns,
+        temperatures.contiguous(),
+        keys.contiguous(),
+        positions.contiguous(),
+        values,
+        indices,
+        START=head.shard_indices.org_vocab_start_index,
+        PARTS=width,
+        CHUNK=1024,
+        num_warps=4,
+    )
+    pairs = torch.empty((rows, 4), dtype=torch.float32, device=hidden.device)
+    _local_pair[(rows,)](
+        values,
+        indices,
+        pairs,
+        parts,
+        START=head.shard_indices.org_vocab_start_index,
+        PARTS=width,
+        num_warps=1,
+    )
+    gathered = tp_all_gather(pairs)
+    output = torch.empty(rows, dtype=torch.int64, device=hidden.device)
+    _global_top1[(rows,)](gathered, output, RANKS=4, num_warps=1)
+    return output
+
+
 def can_verify_top_tokens(runner, scheduler_output, spec_decode_metadata):
     """Keep the native DSpark eligibility contract with its implementation."""
     config = runner.speculative_config
@@ -158,6 +236,22 @@ def can_verify_top_tokens(runner, scheduler_output, spec_decode_metadata):
         and hasattr(runner.model, "get_v41_top_tokens")
     ):
         return False
-    return runner._ddtree_greedy_sampling_supported(
-        runner.input_batch.sampling_metadata
-    )
+    sm = runner.input_batch.sampling_metadata
+    if runner._ddtree_greedy_sampling_supported(sm):
+        return True
+    if (
+        _COUPLED
+        and sm.temperature is not None
+        and sm.top_k is None
+        and sm.top_p is None
+        and getattr(sm, "min_p", None) is None
+        and not getattr(runner.drafter, "_enable_probabilistic_draft_probs", False)
+        and runner._ddtree_stochastic_sampling_supported(sm)
+    ):
+        num_reqs = len(spec_decode_metadata.num_draft_tokens)
+        num_rows = sum(spec_decode_metadata.num_draft_tokens) + num_reqs
+        return (
+            spec_decode_metadata.logits_indices.numel() == num_rows
+            and spec_decode_metadata.bonus_logits_indices.numel() == num_reqs
+        )
+    return False
