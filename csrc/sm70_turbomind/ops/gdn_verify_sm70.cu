@@ -51,6 +51,8 @@ struct P {
   const int* rmap;
   // Current-round token index whose state is also stored to state slot
   // cks[n] (an aligned prefix checkpoint inside the round), -1 for none.
+  // ckt[n] == -1 with cks[n] >= 0 stores the replayed state instead (the
+  // round starts on the checkpoint boundary).
   const int* ckt;
   const int* cks;
 };
@@ -252,12 +254,23 @@ __global__ __launch_bounds__(WARPS * 32, (WARPS <= 4 ? 8 : 4)) void gdn_verify(
       }
     }
     if (R0 > 0) {
+      // ckt == -1 with a checkpoint slot: the round starts on a Mamba block
+      // boundary, so the replayed state is that block's checkpoint (the
+      // previous round ended on the boundary and stored none, its slot being
+      // the running one).
+      const int rcs = p.ckt && p.ckt[n] < 0 ? p.cks[n] : -1;
 #pragma unroll
       for (int j = 0; j < ROWS; ++j) {
-        __stcg(reinterpret_cast<float4*>(p.state + slot0 * p.s_state +
-                                         ((long long)hv * KD + row0 + j) * KD) +
-                   lane,
-               make_float4(hs[j][0], hs[j][1], hs[j][2], hs[j][3]));
+        const float4 v4 = make_float4(hs[j][0], hs[j][1], hs[j][2], hs[j][3]);
+        const long long off = ((long long)hv * KD + row0 + j) * KD;
+        __stcg(
+            reinterpret_cast<float4*>(p.state + slot0 * p.s_state + off) + lane,
+            v4);
+        if (rcs >= 0) {
+          __stcg(
+              reinterpret_cast<float4*>(p.state + rcs * p.s_state + off) + lane,
+              v4);
+        }
       }
     }
   }
