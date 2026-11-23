@@ -127,6 +127,7 @@ from vllm.v1.worker.gpu.pp_pack import (
     PackedHandoverLayout,
     handover_inputs,
     pp_pack_enabled,
+    verify_handover_layouts,
 )
 from vllm.v1.worker.gpu.pp_utils import PPHandler, scatter_draft_tokens
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -1001,6 +1002,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                 pp_pack_recv=self.pp_pack_recv,
             )
+            if pp_pack_enabled(self.vllm_config):
+                verify_handover_layouts(
+                    get_pp_group(),
+                    self.pp_pack_recv,
+                    self.cudagraph_manager.pp_pack_send,
+                )
             if self.speculator is not None:
                 # Target warmup leaves eager allocator blocks outside its graph
                 # pool. Release them before allocating the draft's separate

@@ -598,7 +598,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.intermediate_tensors: IntermediateTensors | None = None
         # Packed send blocks of a non-last PP stage; the layout comes from the
         # first captured output.
-        self._pp_pack_send: PackedHandoverBuffers | None = None
+        self.pp_pack_send: PackedHandoverBuffers | None = None
         self._pp_pack_enabled = pp_pack_enabled(vllm_config)
         self._long_attention_graphs: dict[
             BatchExecutionDescriptor, BatchExecutionDescriptor
@@ -854,8 +854,8 @@ class ModelCudaGraphManager(CudaGraphManager):
                     assert isinstance(model_output, IntermediateTensors)
                     intermediate_tensors = model_output
                     if self._pp_pack_enabled and packs_handover(desc):
-                        if self._pp_pack_send is None:
-                            self._pp_pack_send = PackedHandoverBuffers(
+                        if self.pp_pack_send is None:
+                            self.pp_pack_send = PackedHandoverBuffers(
                                 PackedHandoverLayout.from_tensors(
                                     intermediate_tensors.tensors
                                 ),
@@ -863,7 +863,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                             )
                         # The graph writes the stage output into the block that
                         # is sent as one message.
-                        send_views = self._pp_pack_send.block(num_tokens).tensors
+                        send_views = self.pp_pack_send.block(num_tokens).tensors
                         for k, v in intermediate_tensors.tensors.items():
                             send_views[k].copy_(v)
                         return
@@ -888,9 +888,9 @@ class ModelCudaGraphManager(CudaGraphManager):
         super().run_fullgraph(desc)
         if not self.is_last_pp_rank:
             if self._pp_pack_enabled and packs_handover(desc):
-                assert self._pp_pack_send is not None
+                assert self.pp_pack_send is not None
                 return PackedIntermediateTensors(
-                    self._pp_pack_send.block(desc.num_tokens)
+                    self.pp_pack_send.block(desc.num_tokens)
                 )
             assert self.intermediate_tensors is not None
             return self.intermediate_tensors[: desc.num_tokens]

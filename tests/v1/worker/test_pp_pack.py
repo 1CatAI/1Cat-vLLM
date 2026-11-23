@@ -17,6 +17,7 @@ from vllm.config.kernel import KernelConfig
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker import gpu_worker
+from vllm.v1.worker.gpu import pp_pack
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
@@ -30,6 +31,7 @@ from vllm.v1.worker.gpu.pp_pack import (
     handover_inputs,
     packs_handover,
     pp_pack_enabled,
+    verify_handover_layouts,
 )
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -179,7 +181,7 @@ def test_graph_manager_returns_the_send_block_for_packed_steps() -> None:
     manager.is_last_pp_rank = False
     manager._pp_pack_enabled = True
     block_source = _buffers()
-    manager._pp_pack_send = block_source
+    manager.pp_pack_send = block_source
     manager.intermediate_tensors = IntermediateTensors(_stage_tensors(16))
     manager.graphs = {DECODE: SimpleNamespace(replay=lambda: None)}
     with patch("vllm.v1.worker.gpu.cudagraph_utils.get_offloader"):
@@ -282,6 +284,78 @@ def test_one_message_crosses_the_group_and_lands_in_the_views() -> None:
         proc.join(timeout=60)
         assert proc.exitcode == 0
     assert results == {"messages": 1, "equal": True}
+
+
+def test_block_allocation_is_refused_while_capturing_a_graph() -> None:
+    buffers = _buffers()
+    buffers.block(5)
+    with patch.object(pp_pack, "_is_capturing", return_value=True):
+        assert buffers.block(5) is buffers.block(5)  # cached: no allocation
+        with pytest.raises(AssertionError, match="while capturing"):
+            buffers.block(10)
+    assert buffers.captured_rows == (5,)
+
+
+def _buffers_with(rows: int, dtype: torch.dtype | None, device="cpu"):
+    tensors = _stage_tensors(rows)
+    if dtype is not None:
+        tensors["hidden_states"] = tensors["hidden_states"].to(dtype)
+    buffers = PackedHandoverBuffers(
+        PackedHandoverLayout.from_tensors(tensors), torch.device(device)
+    )
+    buffers.block(rows)
+    return buffers
+
+
+def _handshake(rank: int, port: int, case: str, result_queue) -> None:
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    dist.init_process_group("gloo", rank=rank, world_size=2)
+    group = GroupCoordinator.__new__(GroupCoordinator)
+    group.world_size, group.rank_in_group, group.ranks = 2, rank, [0, 1]
+    group.cpu_group = dist.group.WORLD
+    sender_dtype = torch.float32 if case == "dtype" else None
+    sender = None if case == "sender_missing" else _buffers_with(5, sender_dtype)
+    try:
+        if rank == 0:
+            verify_handover_layouts(group, None, sender)
+            outcome = "sent"
+        else:
+            verify_handover_layouts(group, _buffers_with(5, None), None)
+            outcome = "ok"
+    except RuntimeError as error:
+        outcome = f"raised: {error}"
+    result_queue.put((rank, outcome))
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _run_handshake(case: str) -> dict[int, str]:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    procs = [
+        ctx.Process(target=_handshake, args=(r, port, case, queue)) for r in (0, 1)
+    ]
+    for proc in procs:
+        proc.start()
+    results = dict(queue.get(timeout=120) for _ in procs)
+    for proc in procs:
+        proc.join(timeout=60)
+        assert proc.exitcode == 0
+    return results
+
+
+def test_layout_handshake_passes_for_matching_neighbours() -> None:
+    assert _run_handshake("match") == {0: "sent", 1: "ok"}
+
+
+@pytest.mark.parametrize("case", ["dtype", "sender_missing"])
+def test_layout_handshake_raises_on_the_receiver_for_a_mismatch(case: str) -> None:
+    results = _run_handshake(case)
+    assert results[0] == "sent"
+    assert results[1].startswith("raised: PP packed handover layout mismatch")
 
 
 if __name__ == "__main__":
