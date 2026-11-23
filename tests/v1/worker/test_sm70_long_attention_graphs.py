@@ -149,6 +149,14 @@ def test_tail_capture_and_dispatch_from_real_initialization(
     monkeypatch.setenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", str(int(enabled)))
     monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0")
     monkeypatch.delenv("VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", raising=False)
+    # This test covers the legacy tail option only. Adaptive MTP depth
+    # ("auto": on for k >= 5 on a real SM70 device, which the capability patch
+    # below does not reach) adds its own tails and has its own test; pin it
+    # off so the result does not depend on the GPU of the host.
+    monkeypatch.setattr(
+        "vllm.config.speculative_sampling.resolve_sampling_policy",
+        lambda _config: SimpleNamespace(adaptive_mtp="off", adaptive_mtp_min_k=None),
+    )
     monkeypatch.setattr(cg.current_platform, "is_cuda", lambda: True)
     # The gate asks the worker's own device; answer for it only.
     monkeypatch.setattr(
