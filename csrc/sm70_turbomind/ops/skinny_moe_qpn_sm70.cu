@@ -547,9 +547,14 @@ __device__ __forceinline__ uint32_t packed_scale_word(uint32_t base4,
   return __vadd4(base4, offsets);
 }
 
+// Decode (one row tile, 256 threads) streams the weights at a per-SM rate that
+// grows with the loads in flight: three CTAs per SM need at most 85 registers,
+// which the five-bit instance (91 unbounded) otherwise exceeds.
 template <int SPLITK, int SCALE_MODE, int RB, int NT, int SBITS>
 __global__ void __launch_bounds__(32 * SPLITK,
-                                  (SBITS != 0 && RB > 1 && SPLITK <= 8) ? 2 : 0)
+                                  (SBITS != 0 && RB > 1 && SPLITK <= 8) ? 2
+                                  : (RB == 1 && SPLITK == 8)            ? 3
+                                                                        : 0)
     skinny_nvfp4_moe_m16n8k8(
         const uint8_t* __restrict__ qcodes, const uint8_t* __restrict__ qscales,
         const PackedPlanes packed, const float* __restrict__ gscales,
