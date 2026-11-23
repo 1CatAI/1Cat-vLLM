@@ -18,6 +18,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     CrossAttentionSpec,
+    KpoolTailSpec,
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -61,7 +62,11 @@ def _reserved_block_count(
         specs = tuple(kv_cache_spec.kv_cache_specs.values())
         assert specs
         kv_cache_spec = specs[0]
-    if isinstance(kv_cache_spec, CircularBufferSpec):
+    # The scheduler keeps one block per request for both ring buffers
+    # (KpoolTailManager for the kpool tail). Sized by tokens, a small kpool
+    # tail ring (8 slots for GLM-5.3 at num_speculative_tokens <= 4) took 129
+    # blocks of a 130-block pool and pushed later groups past its end.
+    if isinstance(kv_cache_spec, (CircularBufferSpec, KpoolTailSpec)):
         return 1
     if isinstance(kv_cache_spec, CrossAttentionSpec):
         return cdiv(max_encoder_len, kv_cache_spec.block_size)
@@ -139,7 +144,14 @@ def _warmup_cycle(
             ]
             next_state_id += num_blocks
             return ids
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+        ids = list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+        # Out-of-pool IDs index past the end of the KV tensors and surface as
+        # an illegal memory access on some pipeline stage, not as an error.
+        assert next_block_id <= kv_cache_config.num_blocks, (
+            f"warmup needs block id {next_block_id - 1}, the KV pool has "
+            f"{kv_cache_config.num_blocks} blocks"
+        )
+        return ids
 
     def _new_requests(ids: list[str]) -> list[NewRequestData]:
         return [
