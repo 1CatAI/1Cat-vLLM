@@ -54,20 +54,50 @@ __device__ __forceinline__ half2 e8m0_to_half2(unsigned char b) {
 // kernels take this as a template argument instead of duplicating them.
 enum ScaleMode { SCALE_NVFP4_FP8_16 = 0, SCALE_MXFP4_E8M0_32 = 1 };
 
-// Five-bit expert scales (vllm/model_executor/layers/quantization/utils/
-// s5_scales.py): scale = base + nibble + 16 * high, in the raster's positions.
-struct S5Planes {
+// Five- or six-bit expert scales
+// (vllm/model_executor/layers/quantization/utils/ s5_scales.py): scale = base +
+// nibble + 16 * high0 [+ 32 * high1], in the raster's positions. SBITS (5 or 6)
+// is a template argument of the kernels, 0 means the plain raster; the five-bit
+// instances do not contain the sixth bit.
+struct PackedPlanes {
   const uint8_t* base;  // [E][tile N/32][position 32]
   const uint8_t* nib;   // [E][tile][group K/32][position 32], two groups a byte
-  const int32_t* hi;    // [E][tile][group K/16], bit p = position p's high bit
+  // [E][tile][group K/16][SBITS - 4]: word w of a group holds, as bit p, bit
+  // 4 + w of position p's offset above its base; both words of a group sit
+  // together, so six bits cost one 64-bit load.
+  const int32_t* hi;
 };
 
+// High-bit words per (tile, group): one for five bits, two for six.
+template <int SBITS>
+constexpr int kHighWords = SBITS - 4;
+
+// Both high-bit words of a group (the second is 0 and unused for five bits).
+template <int SBITS>
+__device__ __forceinline__ void load_high_words(const int32_t* group_hi,
+                                                uint32_t& word0,
+                                                uint32_t& word1) {
+  if constexpr (SBITS > 5) {
+    const int2 words = __ldg(reinterpret_cast<const int2*>(group_hi));
+    word0 = static_cast<uint32_t>(words.x);
+    word1 = static_cast<uint32_t>(words.y);
+  } else {
+    word0 = static_cast<uint32_t>(__ldg(group_hi));
+    word1 = 0;
+  }
+}
+
 // The raster byte of position `lane` in group g.
-__device__ __forceinline__ uint8_t s5_scale_byte(uint8_t base, uint8_t nib_byte,
-                                                 uint32_t hi_word, int g,
-                                                 int lane) {
-  return static_cast<uint8_t>(base + ((nib_byte >> ((g & 1) * 4)) & 0xF) +
-                              16 * ((hi_word >> lane) & 1));
+template <int SBITS>
+__device__ __forceinline__ uint8_t packed_scale_byte(uint8_t base,
+                                                     uint8_t nib_byte,
+                                                     uint32_t hi_word0,
+                                                     uint32_t hi_word1, int g,
+                                                     int lane) {
+  int scale = base + ((nib_byte >> ((g & 1) * 4)) & 0xF) +
+              16 * ((hi_word0 >> lane) & 1);
+  if constexpr (SBITS > 5) scale += 32 * ((hi_word1 >> lane) & 1);
+  return static_cast<uint8_t>(scale);
 }
 
 // Raw scale byte of group g and its decode, split so a caller can issue the
@@ -217,19 +247,24 @@ __global__ void skinny_nvfp4_qpn(const uint8_t* __restrict__ qcodes,
 // activation fragment. Every row keeps its own accumulators and the same K
 // order, so the result depends on neither RB nor NT.
 
-template <int SPLITK, int SCALE_MODE, int RB, int NT, bool S5>
+template <int SPLITK, int SCALE_MODE, int RB, int NT, int SBITS>
 __global__ void __launch_bounds__(32 * SPLITK,
-                                  (S5 && RB > 1 && SPLITK <= 8) ? 2 : 0)
+                                  (SBITS != 0 && RB > 1 && SPLITK <= 8) ? 2 : 0)
     skinny_nvfp4_moe_qpn(const uint8_t* __restrict__ qcodes,
-                         const uint8_t* __restrict__ qscales, const S5Planes s5,
+                         const uint8_t* __restrict__ qscales,
+                         const PackedPlanes packed,
                          const float* __restrict__ gscales,
                          const half* __restrict__ x, half* __restrict__ y_slots,
                          const int* __restrict__ perm,
                          const int* __restrict__ gids,
                          const int* __restrict__ goff, int N, int K, int topk,
                          int x_slot_major) {
-  static_assert(!S5 || SCALE_MODE == SCALE_NVFP4_FP8_16,
-                "five-bit scales carry fp8-e4m3 bytes");
+  static_assert(SBITS == 0 || SBITS == 5 || SBITS == 6,
+                "packed scales are five or six bits");
+  static_assert(SBITS == 0 || SCALE_MODE == SCALE_NVFP4_FP8_16,
+                "packed scales carry fp8-e4m3 bytes");
+  constexpr bool PACKED = SBITS != 0;
+  constexpr int HW = PACKED ? kHighWords<SBITS> : 1;
   constexpr int MMAX = 8;
   constexpr int ROWS = RB * MMAX;
   // Activations are staged per warp, XCH groups at a time: the four
@@ -270,17 +305,17 @@ __global__ void __launch_bounds__(32 * SPLITK,
   const int SG = (SCALE_MODE == SCALE_MXFP4_E8M0_32) ? (G >> 1) : G;
   const uint8_t* sb = qscales + ((size_t)e * (N >> 5) + tile0) * SG * 32 + lane;
   const half2 gm2 = __float2half2_rn(gscales[e] * 16384.f);
-  // Five-bit scales: this lane's position in each of the CTA's tiles.
-  uint8_t s5_base[NT];
-  const uint8_t* s5_nib[NT];
-  const int32_t* s5_hi[NT];
-  if constexpr (S5) {
+  // Packed scales: this lane's position in each of the CTA's tiles.
+  uint8_t packed_base[NT];
+  const uint8_t* packed_nib[NT];
+  const int32_t* packed_hi[NT];
+  if constexpr (PACKED) {
 #pragma unroll
     for (int nt = 0; nt < NT; nt++) {
-      const size_t tile_s5 = (size_t)e * (N >> 5) + tile0 + nt;
-      s5_base[nt] = __ldg(s5.base + tile_s5 * 32 + lane);
-      s5_nib[nt] = s5.nib + tile_s5 * (G >> 1) * 32 + lane;
-      s5_hi[nt] = s5.hi + tile_s5 * G;
+      const size_t tile_packed = (size_t)e * (N >> 5) + tile0 + nt;
+      packed_base[nt] = __ldg(packed.base + tile_packed * 32 + lane);
+      packed_nib[nt] = packed.nib + tile_packed * (G >> 1) * 32 + lane;
+      packed_hi[nt] = packed.hi + tile_packed * G * HW;
     }
   }
 
@@ -320,13 +355,15 @@ __global__ void __launch_bounds__(32 * SPLITK,
         for (int nt = 0; nt < NT; nt++) {
           const uint2 q2 = __ldcs(cb + ((size_t)nt * G + g) * 32);
           half2 sc2;
-          if constexpr (S5)
-            sc2 = __hmul2(
-                decode_scale<SCALE_MODE>(s5_scale_byte(
-                    s5_base[nt], __ldg(s5_nib[nt] + (size_t)(g >> 1) * 32),
-                    static_cast<uint32_t>(__ldg(s5_hi[nt] + g)), g, lane)),
-                gm2);
-          else
+          if constexpr (PACKED) {
+            uint32_t high0, high1;
+            load_high_words<SBITS>(packed_hi[nt] + g * HW, high0, high1);
+            sc2 = __hmul2(decode_scale<SCALE_MODE>(packed_scale_byte<SBITS>(
+                              packed_base[nt],
+                              __ldg(packed_nib[nt] + (size_t)(g >> 1) * 32),
+                              high0, high1, g, lane)),
+                          gm2);
+          } else
             sc2 = __hmul2(group_scale<SCALE_MODE>(sb + (size_t)nt * SG * 32, g),
                           gm2);
           dequant8_tm(q2.x, sc2, bq[nt] + 0);
@@ -360,8 +397,9 @@ __global__ void __launch_bounds__(32 * SPLITK,
       // so every read of a chunk's second group is bounded by gend. The guards
       // are uniform across the warp and fall away when Gq is even.
       uint2 qv[XCH][NT];
-      uint8_t sv[XCH][NT];   // raster scale bytes, or the nibble bytes of S5
-      uint32_t hv[XCH][NT];  // S5 only: high-bit words
+      uint8_t sv[XCH][NT];    // raster scale bytes, or the nibble bytes
+      uint32_t hv[XCH][NT];   // packed only: high-bit words (first plane)
+      uint32_t hv2[XCH][NT];  // packed only: second plane (six bits)
       auto load_weights = [&](int gc) {
 #pragma unroll
         for (int gi = 0; gi < XCH; gi++) {
@@ -369,9 +407,11 @@ __global__ void __launch_bounds__(32 * SPLITK,
 #pragma unroll
           for (int nt = 0; nt < NT; nt++) {
             qv[gi][nt] = __ldcs(cb + ((size_t)nt * G + gc + gi) * 32);
-            if constexpr (S5) {
-              sv[gi][nt] = __ldg(s5_nib[nt] + (size_t)((gc + gi) >> 1) * 32);
-              hv[gi][nt] = static_cast<uint32_t>(__ldg(s5_hi[nt] + gc + gi));
+            if constexpr (PACKED) {
+              sv[gi][nt] =
+                  __ldg(packed_nib[nt] + (size_t)((gc + gi) >> 1) * 32);
+              load_high_words<SBITS>(packed_hi[nt] + (gc + gi) * HW, hv[gi][nt],
+                                     hv2[gi][nt]);
             } else {
               sv[gi][nt] = group_scale_byte<SCALE_MODE>(
                   sb + (size_t)nt * SG * 32, gc + gi);
@@ -401,9 +441,10 @@ __global__ void __launch_bounds__(32 * SPLITK,
 #pragma unroll
           for (int nt = 0; nt < NT; nt++) {
             q[gi][nt] = qv[gi][nt];
-            if constexpr (S5)
-              s[gi][nt] = s5_scale_byte(s5_base[nt], sv[gi][nt], hv[gi][nt],
-                                        gc + gi, lane);
+            if constexpr (PACKED)
+              s[gi][nt] = packed_scale_byte<SBITS>(packed_base[nt], sv[gi][nt],
+                                                   hv[gi][nt], hv2[gi][nt],
+                                                   gc + gi, lane);
             else
               s[gi][nt] = sv[gi][nt];
           }
@@ -488,29 +529,40 @@ __global__ void __launch_bounds__(32 * SPLITK,
 // ---------------------------------------------------------------------------
 
 // The four raster bytes (positions 4 row_group .. 4 row_group + 3) of group g.
-__device__ __forceinline__ uint32_t s5_scale_word(uint32_t base4,
-                                                  uint32_t nib_word,
-                                                  uint32_t hi_word, int g,
-                                                  int row_group) {
+template <int SBITS>
+__device__ __forceinline__ uint32_t packed_scale_word(uint32_t base4,
+                                                      uint32_t nib_word,
+                                                      uint32_t hi_word0,
+                                                      uint32_t hi_word1, int g,
+                                                      int row_group) {
   const uint32_t nibbles = (nib_word >> ((g & 1) * 4)) & 0x0F0F0F0Fu;
-  const uint32_t high = (hi_word >> (4 * row_group)) & 0xFu;
+  const uint32_t high = (hi_word0 >> (4 * row_group)) & 0xFu;
   // one bit per byte: bit j of `high` to bit 8 j
   const uint32_t per_byte = (high * 0x00204081u) & 0x01010101u;
-  return __vadd4(base4, nibbles | (per_byte << 4));
+  uint32_t offsets = nibbles | (per_byte << 4);
+  if constexpr (SBITS > 5) {
+    const uint32_t high1 = (hi_word1 >> (4 * row_group)) & 0xFu;
+    offsets |= ((high1 * 0x00204081u) & 0x01010101u) << 5;
+  }
+  return __vadd4(base4, offsets);
 }
 
-template <int SPLITK, int SCALE_MODE, int RB, int NT, bool S5>
+template <int SPLITK, int SCALE_MODE, int RB, int NT, int SBITS>
 __global__ void __launch_bounds__(32 * SPLITK,
-                                  (S5 && RB > 1 && SPLITK <= 8) ? 2 : 0)
+                                  (SBITS != 0 && RB > 1 && SPLITK <= 8) ? 2 : 0)
     skinny_nvfp4_moe_m16n8k8(
         const uint8_t* __restrict__ qcodes, const uint8_t* __restrict__ qscales,
-        const S5Planes s5, const float* __restrict__ gscales,
+        const PackedPlanes packed, const float* __restrict__ gscales,
         const half* __restrict__ x, half* __restrict__ y_slots,
         const int* __restrict__ perm, const int* __restrict__ gids,
         const int* __restrict__ goff, int N, int K, int topk,
         int x_slot_major) {
-  static_assert(!S5 || SCALE_MODE == SCALE_NVFP4_FP8_16,
-                "five-bit scales carry fp8-e4m3 bytes");
+  static_assert(SBITS == 0 || SBITS == 5 || SBITS == 6,
+                "packed scales are five or six bits");
+  static_assert(SBITS == 0 || SCALE_MODE == SCALE_NVFP4_FP8_16,
+                "packed scales carry fp8-e4m3 bytes");
+  constexpr bool PACKED = SBITS != 0;
+  constexpr int HW = PACKED ? kHighWords<SBITS> : 1;
   constexpr int ROWS = RB * 8;
   // 36-float rows put the C fragment stores of a warp into 32 distinct banks.
   constexpr int CS_ROW = 36;
@@ -538,22 +590,22 @@ __global__ void __launch_bounds__(32 * SPLITK,
   const uint32_t* sb = reinterpret_cast<const uint32_t*>(qscales) +
                        tile_index * SG * 8 + row_group;
   const half2 gm2 = __float2half2_rn(gscales[e] * 16384.f);
-  // Five-bit scales: the lane's four rows keep one base word for the kernel;
-  // the nibble and high words of a group come with its codes.
+  // Packed scales: the lane's four rows keep one base word for the kernel; the
+  // nibble and high words of a group come with its codes.
   uint32_t base4[NT];
   const uint32_t* nib_ptr[NT];
   const int32_t* hi_ptr[NT];
-  if constexpr (S5) {
+  if constexpr (PACKED) {
 #pragma unroll
     for (int nt = 0; nt < NT; nt++) {
-      const size_t tile_s5 = (size_t)e * (N >> 5) + tile0 + nt;
-      base4[nt] =
-          __ldg(reinterpret_cast<const uint32_t*>(s5.base + tile_s5 * 32) +
-                row_group);
-      nib_ptr[nt] =
-          reinterpret_cast<const uint32_t*>(s5.nib + tile_s5 * (G >> 1) * 32) +
-          row_group;
-      hi_ptr[nt] = s5.hi + tile_s5 * G;
+      const size_t tile_packed = (size_t)e * (N >> 5) + tile0 + nt;
+      base4[nt] = __ldg(
+          reinterpret_cast<const uint32_t*>(packed.base + tile_packed * 32) +
+          row_group);
+      nib_ptr[nt] = reinterpret_cast<const uint32_t*>(
+                        packed.nib + tile_packed * (G >> 1) * 32) +
+                    row_group;
+      hi_ptr[nt] = packed.hi + tile_packed * G * HW;
     }
   }
 
@@ -584,14 +636,15 @@ __global__ void __launch_bounds__(32 * SPLITK,
           for (int i = 0; i < 4; i++) c[nt][bl][t][i] = 0.f;
 
     uint2 q_next[NT], a_next[RB];
-    uint32_t s_next[NT], nib_next[NT], hi_next[NT];
+    uint32_t s_next[NT], nib_next[NT], hi_next[NT], hi2_next[NT];
     auto load_group = [&](int g) {
 #pragma unroll
       for (int nt = 0; nt < NT; nt++) {
         q_next[nt] = __ldcs(cb + ((size_t)nt * G + g) * 32);
-        if constexpr (S5) {
+        if constexpr (PACKED) {
           nib_next[nt] = __ldg(nib_ptr[nt] + (size_t)(g >> 1) * 8);
-          hi_next[nt] = static_cast<uint32_t>(__ldg(hi_ptr[nt] + g));
+          load_high_words<SBITS>(hi_ptr[nt] + g * HW, hi_next[nt],
+                                 hi2_next[nt]);
         } else {
           s_next[nt] =
               __ldg(sb + ((size_t)nt * SG +
@@ -612,9 +665,9 @@ __global__ void __launch_bounds__(32 * SPLITK,
 #pragma unroll
       for (int nt = 0; nt < NT; nt++) {
         q[nt] = q_next[nt];
-        if constexpr (S5)
-          s[nt] =
-              s5_scale_word(base4[nt], nib_next[nt], hi_next[nt], g, row_group);
+        if constexpr (PACKED)
+          s[nt] = packed_scale_word<SBITS>(base4[nt], nib_next[nt], hi_next[nt],
+                                           hi2_next[nt], g, row_group);
         else
           s[nt] = s_next[nt];
       }
@@ -720,13 +773,16 @@ torch::Tensor skinny_qpn_gemm_sm70(torch::Tensor x, torch::Tensor qcodes,
   return y;
 }
 
-void skinny_moe_qpn_sm70(
-    torch::Tensor x, torch::Tensor qcodes, torch::Tensor qscales,
-    torch::Tensor gscales, torch::Tensor perm, torch::Tensor gids,
-    torch::Tensor goff, int64_t topk, torch::Tensor y_slots, bool x_slot_major,
-    int64_t num_tokens, int64_t splitk, int64_t scale_mode,
-    int64_t fragment_order, std::optional<torch::Tensor> s5_base,
-    std::optional<torch::Tensor> s5_nib, std::optional<torch::Tensor> s5_hi) {
+void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+                         torch::Tensor qscales, torch::Tensor gscales,
+                         torch::Tensor perm, torch::Tensor gids,
+                         torch::Tensor goff, int64_t topk,
+                         torch::Tensor y_slots, bool x_slot_major,
+                         int64_t num_tokens, int64_t splitk, int64_t scale_mode,
+                         int64_t fragment_order,
+                         std::optional<torch::Tensor> packed_base,
+                         std::optional<torch::Tensor> packed_nib,
+                         std::optional<torch::Tensor> packed_hi) {
   TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous());
   const c10::cuda::CUDAGuard device_guard(x.device());
   TORCH_CHECK(fragment_order == ORDER_M8N8K4 || fragment_order == ORDER_M16N8K8,
@@ -772,8 +828,8 @@ void skinny_moe_qpn_sm70(
       "scale_mode 0 (NVFP4 fp8/16) or 1 (MXFP4 e8m0/32)");
   // One scale per 16 codes for NVFP4, per 32 for MXFP4.
   const int64_t sh = 4 + scale_mode;
-  // Five-bit scale planes replace the raster: then `qscales` may be empty.
-  TORCH_CHECK(s5_base.has_value() || qscales.numel() == E * N * (K >> sh),
+  // Packed scale planes replace the raster: then `qscales` may be empty.
+  TORCH_CHECK(packed_base.has_value() || qscales.numel() == E * N * (K >> sh),
               "qpn scales size");
   TORCH_CHECK(gids.size(0) == S && goff.size(0) == S + 1,
               "compact routing size");
@@ -794,56 +850,71 @@ void skinny_moe_qpn_sm70(
   // Experts average more than one 8-row tile in prefill chunks.
   const bool prefill = (S + E - 1) / E > 8;
 
-  // Five-bit scale planes replace the raster the kernels read; they decode the
-  // planes in place, in decode and in prefill.
-  S5Planes s5{};
-  const bool s5_in_place = s5_base.has_value();
-  if (s5_base.has_value()) {
-    TORCH_CHECK(s5_nib.has_value() && s5_hi.has_value(),
-                "five-bit scales come as base, nibble and high planes");
+  // Packed scale planes replace the raster the kernels read; they decode the
+  // planes in place, in decode and in prefill. The width (5 or 6 bits) is the
+  // number of high-bit words per (tile, group) plus four.
+  PackedPlanes packed{};
+  int scale_bits = 0;  // 0: raster
+  if (packed_base.has_value()) {
+    TORCH_CHECK(packed_nib.has_value() && packed_hi.has_value(),
+                "packed scales come as base, nibble and high planes");
     TORCH_CHECK(scale_mode == SCALE_NVFP4_FP8_16,
-                "five-bit scales carry fp8-e4m3 bytes (NVFP4 mode)");
+                "packed scales carry fp8-e4m3 bytes (NVFP4 mode)");
     const int64_t tiles = N >> 5, groups = K >> 4;
-    TORCH_CHECK(s5_base->is_cuda() && s5_base->dtype() == torch::kUInt8 &&
-                    s5_base->is_contiguous() &&
-                    s5_base->numel() == E * tiles * 32,
-                "S5 base plane");
-    TORCH_CHECK(s5_nib->is_cuda() && s5_nib->dtype() == torch::kUInt8 &&
-                    s5_nib->is_contiguous() &&
-                    s5_nib->numel() == E * tiles * (groups >> 1) * 32,
-                "S5 nibble plane");
-    TORCH_CHECK(s5_hi->is_cuda() && s5_hi->dtype() == torch::kInt &&
-                    s5_hi->is_contiguous() &&
-                    s5_hi->numel() == E * tiles * groups,
-                "S5 high plane");
-    s5 = S5Planes{s5_base->data_ptr<uint8_t>(), s5_nib->data_ptr<uint8_t>(),
-                  s5_hi->data_ptr<int32_t>()};
+    TORCH_CHECK(packed_base->is_cuda() &&
+                    packed_base->dtype() == torch::kUInt8 &&
+                    packed_base->is_contiguous() &&
+                    packed_base->numel() == E * tiles * 32,
+                "packed scale base plane");
+    TORCH_CHECK(packed_nib->is_cuda() && packed_nib->dtype() == torch::kUInt8 &&
+                    packed_nib->is_contiguous() &&
+                    packed_nib->numel() == E * tiles * (groups >> 1) * 32,
+                "packed scale nibble plane");
+    const int64_t high_words = packed_hi->numel() / (E * tiles * groups);
+    TORCH_CHECK(packed_hi->is_cuda() && packed_hi->dtype() == torch::kInt &&
+                    packed_hi->is_contiguous() &&
+                    packed_hi->numel() == E * tiles * groups * high_words &&
+                    (high_words == 1 || high_words == 2),
+                "packed scale high planes: one word (5 bits) or two (6 bits) "
+                "per tile and group");
+    scale_bits = 4 + (int)high_words;
+    packed = PackedPlanes{packed_base->data_ptr<uint8_t>(),
+                          packed_nib->data_ptr<uint8_t>(),
+                          packed_hi->data_ptr<int32_t>()};
   }
 
   if (fragment_order == ORDER_M16N8K8) {
     // RTX 8000: four 8-row tiles per weight decode in prefill cut the GEMMs
     // to 0.59-0.68 of the m8n8k4 kernel on the same card; decode (one row
     // tile) stays at parity. Deeper load rings measured slower.
-#define LAUNCH_MOE_M16N8K8_R(SPv, SMv, RBv)                                    \
-  skinny_nvfp4_moe_m16n8k8<SPv, SMv, RBv, kColumnTiles, false>                 \
-      <<<grid, dim3(32 * SPv), 0, stream>>>(                                   \
-          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(), S5Planes{}, \
-          gscales.data_ptr<float>(),                                           \
-          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),               \
-          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),               \
-          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(),    \
+#define LAUNCH_MOE_M16N8K8_R(SPv, SMv, RBv)                                 \
+  skinny_nvfp4_moe_m16n8k8<SPv, SMv, RBv, kColumnTiles, 0>                  \
+      <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
+          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),          \
+          PackedPlanes{}, gscales.data_ptr<float>(),                        \
+          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
+          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
+          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
           (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
 
-    // Five-bit scales: the kernel decodes them from the planes.
-#define LAUNCH_MOE_M16N8K8_S5(SPv, RBv)                                      \
-  skinny_nvfp4_moe_m16n8k8<SPv, SCALE_NVFP4_FP8_16, RBv, kColumnTiles, true> \
-      <<<grid, dim3(32 * SPv), 0, stream>>>(                                 \
-          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(), s5,       \
-          gscales.data_ptr<float>(),                                         \
-          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),             \
-          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),             \
-          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(),  \
+    // Packed scales: the kernel decodes them from the planes.
+#define LAUNCH_MOE_M16N8K8_PACKED(SPv, RBv, SBv)                            \
+  skinny_nvfp4_moe_m16n8k8<SPv, SCALE_NVFP4_FP8_16, RBv, kColumnTiles, SBv> \
+      <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
+          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(), packed,  \
+          gscales.data_ptr<float>(),                                        \
+          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
+          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
+          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
           (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
+
+#define LAUNCH_MOE_M16N8K8_BITS(SPv, RBv)     \
+  do {                                        \
+    if (scale_bits == 6)                      \
+      LAUNCH_MOE_M16N8K8_PACKED(SPv, RBv, 6); \
+    else                                      \
+      LAUNCH_MOE_M16N8K8_PACKED(SPv, RBv, 5); \
+  } while (0)
 
 #define LAUNCH_MOE_M16N8K8_S(SPv, SMv)   \
   do {                                   \
@@ -865,21 +936,21 @@ void skinny_moe_qpn_sm70(
       // 4 serves short reductions (K < 2048), whose warps would otherwise get
       // fewer than 16 groups (grouped_splitk in skinny_sm70_moe.py).
       case 4:
-        if (s5_in_place) {
+        if (scale_bits) {
           if (prefill)
-            LAUNCH_MOE_M16N8K8_S5(4, 4);
+            LAUNCH_MOE_M16N8K8_BITS(4, 4);
           else
-            LAUNCH_MOE_M16N8K8_S5(4, 1);
+            LAUNCH_MOE_M16N8K8_BITS(4, 1);
         } else {
           LAUNCH_MOE_M16N8K8(4);
         }
         break;
       case 8:
-        if (s5_in_place) {
+        if (scale_bits) {
           if (prefill)
-            LAUNCH_MOE_M16N8K8_S5(8, 4);
+            LAUNCH_MOE_M16N8K8_BITS(8, 4);
           else
-            LAUNCH_MOE_M16N8K8_S5(8, 1);
+            LAUNCH_MOE_M16N8K8_BITS(8, 1);
         } else {
           LAUNCH_MOE_M16N8K8(8);
         }
@@ -888,7 +959,8 @@ void skinny_moe_qpn_sm70(
         TORCH_CHECK(false, "m16n8k8 MoE splitk in {4, 8}");
     }
 #undef LAUNCH_MOE_M16N8K8
-#undef LAUNCH_MOE_M16N8K8_S5
+#undef LAUNCH_MOE_M16N8K8_PACKED
+#undef LAUNCH_MOE_M16N8K8_BITS
 #undef LAUNCH_MOE_M16N8K8_S
 #undef LAUNCH_MOE_M16N8K8_R
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -898,25 +970,33 @@ void skinny_moe_qpn_sm70(
   // V100: two 8-row blocks per weight load in prefill (four helped DSv4 by 1 %
   // and slowed GLM-5.3 by 6 %), with two column tiles 0.87-0.98 of the
   // one-tile kernel in prefill and 0.80-0.97 in decode.
-#define LAUNCH_MOE_QPN_R(SPv, SMv, RBv)                                        \
-  skinny_nvfp4_moe_qpn<SPv, SMv, RBv, kColumnTiles, false>                     \
-      <<<grid, dim3(32 * SPv), 0, stream>>>(                                   \
-          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(), S5Planes{}, \
-          gscales.data_ptr<float>(),                                           \
-          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),               \
-          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),               \
-          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(),    \
+#define LAUNCH_MOE_QPN_R(SPv, SMv, RBv)                                     \
+  skinny_nvfp4_moe_qpn<SPv, SMv, RBv, kColumnTiles, 0>                      \
+      <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
+          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),          \
+          PackedPlanes{}, gscales.data_ptr<float>(),                        \
+          reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
+          reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
+          perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
           (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
 
-#define LAUNCH_MOE_QPN_S5(SPv, RBv)                                         \
-  skinny_nvfp4_moe_qpn<SPv, SCALE_NVFP4_FP8_16, RBv, kColumnTiles, true>    \
+#define LAUNCH_MOE_QPN_PACKED(SPv, RBv, SBv)                                \
+  skinny_nvfp4_moe_qpn<SPv, SCALE_NVFP4_FP8_16, RBv, kColumnTiles, SBv>     \
       <<<grid, dim3(32 * SPv), 0, stream>>>(                                \
-          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(), s5,      \
+          qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(), packed,  \
           gscales.data_ptr<float>(),                                        \
           reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
           reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
           perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
           (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
+
+#define LAUNCH_MOE_QPN_BITS(SPv, RBv)     \
+  do {                                    \
+    if (scale_bits == 6)                  \
+      LAUNCH_MOE_QPN_PACKED(SPv, RBv, 6); \
+    else                                  \
+      LAUNCH_MOE_QPN_PACKED(SPv, RBv, 5); \
+  } while (0)
 
 #define LAUNCH_MOE_QPN_S(SPv, SMv)   \
   do {                               \
@@ -936,11 +1016,11 @@ void skinny_moe_qpn_sm70(
 
   switch (splitk) {
     case 8:
-      if (s5_in_place) {
+      if (scale_bits) {
         if (prefill)
-          LAUNCH_MOE_QPN_S5(8, 2);
+          LAUNCH_MOE_QPN_BITS(8, 2);
         else
-          LAUNCH_MOE_QPN_S5(8, 1);
+          LAUNCH_MOE_QPN_BITS(8, 1);
       } else {
         LAUNCH_MOE_QPN(8);
       }
@@ -949,21 +1029,21 @@ void skinny_moe_qpn_sm70(
     // e.g. a 640-wide expert intermediate split over TP2, which 8 and 16
     // cannot divide.
     case 10:
-      if (s5_in_place) {
+      if (scale_bits) {
         if (prefill)
-          LAUNCH_MOE_QPN_S5(10, 2);
+          LAUNCH_MOE_QPN_BITS(10, 2);
         else
-          LAUNCH_MOE_QPN_S5(10, 1);
+          LAUNCH_MOE_QPN_BITS(10, 1);
       } else {
         LAUNCH_MOE_QPN(10);
       }
       break;
     case 16:
-      if (s5_in_place) {
+      if (scale_bits) {
         if (prefill)
-          LAUNCH_MOE_QPN_S5(16, 2);
+          LAUNCH_MOE_QPN_BITS(16, 2);
         else
-          LAUNCH_MOE_QPN_S5(16, 1);
+          LAUNCH_MOE_QPN_BITS(16, 1);
       } else {
         LAUNCH_MOE_QPN(16);
       }
@@ -974,7 +1054,8 @@ void skinny_moe_qpn_sm70(
       TORCH_CHECK(false, "m8n8k4 MoE splitk in {8, 10, 16}");
   }
 #undef LAUNCH_MOE_QPN
-#undef LAUNCH_MOE_QPN_S5
+#undef LAUNCH_MOE_QPN_PACKED
+#undef LAUNCH_MOE_QPN_BITS
 #undef LAUNCH_MOE_QPN_S
 #undef LAUNCH_MOE_QPN_R
   C10_CUDA_KERNEL_LAUNCH_CHECK();
