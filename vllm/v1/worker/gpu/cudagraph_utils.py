@@ -19,7 +19,7 @@ from vllm.compilation.sm70_decode_graph import (
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.execution_policy import graph_policy
-from vllm.config.kernel import is_adaptive_mtp_enabled
+from vllm.config.kernel import resolve_adaptive_verify
 from vllm.config.speculative import (
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
@@ -253,10 +253,16 @@ class CudaGraphManager:
                 self.decode_query_lens,
             )
 
+        adaptive_plan = (
+            resolve_adaptive_verify(
+                speculative_config, vllm_config.kernel_config, decode_query_len - 1
+            )
+            if speculative_config is not None and decode_query_len >= 4
+            else None
+        )
         self._adaptive_mtp_tail_graphs = bool(
-            speculative_config is not None
-            and decode_query_len >= 4
-            and is_adaptive_mtp_enabled(speculative_config, decode_query_len - 1)
+            adaptive_plan is not None
+            and adaptive_plan.rule == "mtp_bands"
             and not self.compilation_config.pass_config.enable_sp
         )
         if self._adaptive_mtp_tail_graphs:

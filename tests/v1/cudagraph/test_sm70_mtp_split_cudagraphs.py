@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm.config import AttentionConfig, CompilationConfig, CUDAGraphMode
+from vllm.config import AttentionConfig, CompilationConfig, CUDAGraphMode, KernelConfig
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 
@@ -32,6 +32,7 @@ def _make_config(max_num_seqs: int, verifier_sizes: list[int]):
         ),
         compilation_config=compilation_config,
         attention_config=AttentionConfig(),
+        kernel_config=KernelConfig(),
         speculative_config=speculative_config,
     )
 
@@ -129,6 +130,7 @@ def test_dflash_lookup_captures_b1_q8_and_q16(monkeypatch) -> None:
             max_cudagraph_capture_size=16,
         ),
         attention_config=AttentionConfig(),
+        kernel_config=KernelConfig(),
         speculative_config=SimpleNamespace(
             method="dflash",
             ngram_assist=True,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.config.kernel import adaptive_mtp_min_k, is_adaptive_mtp_enabled
+from vllm.config.kernel import ADAPTIVE_MTP_FLOOR_K, resolve_adaptive_verify
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -30,11 +30,13 @@ class AsyncScheduler(Scheduler):
             and draft_model_config.max_model_len is not None
             else self.max_model_len
         )
-        self._adaptive_mtp = self.use_v2_model_runner and is_adaptive_mtp_enabled(
-            speculative_config, self.num_spec_tokens
+        plan = resolve_adaptive_verify(
+            speculative_config, self.vllm_config.kernel_config, self.num_spec_tokens
         )
-        self._adaptive_mtp_min_k = adaptive_mtp_min_k(
-            self.num_spec_tokens, self.vllm_config.speculative_config
+        is_mtp_plan = plan is not None and plan.rule == "mtp_bands"
+        self._adaptive_mtp = self.use_v2_model_runner and is_mtp_plan
+        self._adaptive_mtp_min_k = (
+            plan.min_tokens if plan is not None else ADAPTIVE_MTP_FLOOR_K
         )
         # req_id -> [ema_successes, ema_trials, cur_k]
         self._adaptive_mtp_state: dict[str, list[float]] = {}
