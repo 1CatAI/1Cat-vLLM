@@ -41,6 +41,14 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.pp_pack import (
+    PackedHandoverBuffers,
+    PackedHandoverLayout,
+    PackedIntermediateTensors,
+    handover_inputs,
+    packs_handover,
+    pp_pack_enabled,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -588,6 +596,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        # Packed send blocks of a non-last PP stage; the layout comes from the
+        # first captured output.
+        self._pp_pack_send: PackedHandoverBuffers | None = None
+        self._pp_pack_enabled = pp_pack_enabled(vllm_config)
         self._long_attention_graphs: dict[
             BatchExecutionDescriptor, BatchExecutionDescriptor
         ] = {}
@@ -746,6 +758,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        pp_pack_recv: PackedHandoverBuffers | None = None,
     ) -> dict[BatchExecutionDescriptor, CapturedAttentionState]:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -774,7 +787,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                 model_inputs["input_ids"] = None
                 model_inputs["inputs_embeds"] = None
                 assert intermediate_tensors is not None
-                model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
+                model_inputs["intermediate_tensors"] = IntermediateTensors(
+                    handover_inputs(desc, intermediate_tensors, pp_pack_recv)
+                )
 
             attn_metadata, slot_mappings = prepare_inputs_to_capture(
                 num_reqs,
@@ -838,6 +853,20 @@ class ModelCudaGraphManager(CudaGraphManager):
                     # Non-last PP rank.
                     assert isinstance(model_output, IntermediateTensors)
                     intermediate_tensors = model_output
+                    if self._pp_pack_enabled and packs_handover(desc):
+                        if self._pp_pack_send is None:
+                            self._pp_pack_send = PackedHandoverBuffers(
+                                PackedHandoverLayout.from_tensors(
+                                    intermediate_tensors.tensors
+                                ),
+                                self.device,
+                            )
+                        # The graph writes the stage output into the block that
+                        # is sent as one message.
+                        send_views = self._pp_pack_send.block(num_tokens).tensors
+                        for k, v in intermediate_tensors.tensors.items():
+                            send_views[k].copy_(v)
+                        return
                     if self.intermediate_tensors is None:
                         self.intermediate_tensors = IntermediateTensors.empty_like(
                             intermediate_tensors
@@ -858,6 +887,11 @@ class ModelCudaGraphManager(CudaGraphManager):
         """Replay a captured FULL cudagraph and return hidden states."""
         super().run_fullgraph(desc)
         if not self.is_last_pp_rank:
+            if self._pp_pack_enabled and packs_handover(desc):
+                assert self._pp_pack_send is not None
+                return PackedIntermediateTensors(
+                    self._pp_pack_send.block(desc.num_tokens)
+                )
             assert self.intermediate_tensors is not None
             return self.intermediate_tensors[: desc.num_tokens]
 

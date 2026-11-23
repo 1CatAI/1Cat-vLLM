@@ -808,6 +808,14 @@ class KernelConfig:
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
+    pp_pack_handover: bool = False
+    """Send the intermediate tensors of a pipeline stage boundary as one NCCL
+    message on fixed-shape decode and verify steps (FULL uniform-decode CUDA
+    graphs; MRV2 runner, TP1, no data parallelism). The sender's graph writes
+    into one packed block and the receiver's graph reads from the block it
+    receives into, so the per-tensor sends, the step metadata and the receiver
+    copies disappear. Other steps keep the per-tensor transfer."""
+
     sm70_packed_topk_gather: bool = True
     """Gather SM70 TP2/TP4 compact candidates in one lossless message."""
 
@@ -1446,6 +1454,8 @@ class KernelConfig:
             "qsa_host_kv_allocator_headroom_mib",  # Process resource limit only.
             # Collective transport chosen outside the compiled graph.
             "host_reduce",
+            # Handover buffers around the same compiled graph.
+            "pp_pack_handover",
         }
         if not self.qsa_host_kv_prefill_stage_tokens or not (
             self.qsa_host_kv or self.qsa_host_kv_active
