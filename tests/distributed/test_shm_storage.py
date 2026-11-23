@@ -150,6 +150,98 @@ class TestShmObjectStorageReferenceCounting(unittest.TestCase):
 
         self.assertEqual(bytes(self.writer.ring_buffer.shared_memory.buf), before)
 
+    def test_release_balances_a_put_that_is_never_fetched(self):
+        """The request that wrote the item was rejected before any reader
+        saw it; another request's reference on it is fetched normally."""
+        unread = self.writer.put("image", _dummy_item({"pixels": 64}))
+        read = self.writer.get_cached("image")
+        generation = self.writer.generation
+
+        for reader in self.readers:
+            reader.get(*read)
+        self.assertFalse(self._is_evictable("image"))
+
+        self.assertTrue(self.writer.release("image", unread[1], generation))
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_release_balances_a_get_cached_reference(self):
+        address, monotonic_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        for reader in self.readers:
+            reader.get(address, monotonic_id)
+        self.writer.touch("image")
+        self.assertEqual(self.writer.get_cached("image"), (address, monotonic_id))
+        self.writer.release_touches()
+        self.assertFalse(self._is_evictable("image"))
+
+        self.assertTrue(
+            self.writer.release("image", monotonic_id, self.writer.generation)
+        )
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_release_keeps_the_item_for_another_unfetched_reference(self):
+        """Two concurrent requests reference the same item; only one of them
+        is rejected, the other still has to be fetched by every reader."""
+        first = self.writer.put("image", _dummy_item({"pixels": 64}))
+        second = self.writer.get_cached("image")
+
+        self.assertTrue(self.writer.release("image", first[1], self.writer.generation))
+        self.assertFalse(self._is_evictable("image"))
+        for reader in self.readers[:-1]:
+            reader.get(*second)
+        self.assertFalse(self._is_evictable("image"))
+        self.readers[-1].get(*second)
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_release_of_each_reference_of_an_item_twice_in_one_request(self):
+        first = self.writer.put("image", _dummy_item({"pixels": 64}))
+        second = self.writer.get_cached("image")
+        generation = self.writer.generation
+
+        self.assertTrue(self.writer.release("image", first[1], generation))
+        self.assertFalse(self._is_evictable("image"))
+        self.assertTrue(self.writer.release("image", second[1], generation))
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_release_never_goes_below_zero(self):
+        _, monotonic_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        generation = self.writer.generation
+
+        self.assertTrue(self.writer.release("image", monotonic_id, generation))
+        self.assertFalse(self.writer.release("image", monotonic_id, generation))
+        self.assertEqual(self.writer.writer_flag[monotonic_id], 0)
+
+    def test_release_after_the_item_was_freed_and_written_again_is_ignored(self):
+        """The slot of a freed item is reused, possibly by the same key: a
+        stale reference must not take a count from the new object."""
+        _, old_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        generation = self.writer.generation
+        for reader in self.readers:
+            reader.get(*self.writer.key_index["image"])
+        self.assertTrue(self._is_evictable("image"))
+
+        self.writer.put("other", _dummy_item({"pixels": 64}))
+        _, new_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.assertNotEqual(new_id, old_id)
+
+        self.assertFalse(self.writer.release("image", old_id, generation))
+        self.assertFalse(self.writer.release("missing", old_id, generation))
+        self.assertEqual(self.writer.writer_flag[new_id], 1)
+
+    def test_release_after_clear_is_ignored(self):
+        """clear() restarts monotonic ids, so the same key written again gets
+        the same address and id as the reference handed out before it."""
+        old = self.writer.put("image", _dummy_item({"pixels": 64}))
+        old_generation = self.writer.generation
+
+        self.writer.clear()
+        new = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.assertEqual(new, old)
+        self.assertNotEqual(self.writer.generation, old_generation)
+
+        self.assertFalse(self.writer.release("image", old[1], old_generation))
+        self.assertEqual(self.writer.writer_flag[new[1]], 1)
+        self.assertTrue(self.writer.release("image", new[1], self.writer.generation))
+
 
 class TestShmObjectStorageReaderCopy(unittest.TestCase):
     """A reader decodes into its own copy, since the slot is reused once

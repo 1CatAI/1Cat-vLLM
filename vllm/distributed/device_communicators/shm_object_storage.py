@@ -525,6 +525,10 @@ class SingleWriterShmObjectStorage:
             # monotonic_id -> count. Scoped to one batch, which relies on the
             # single writer thread this storage is designed for.
             self._touched: dict[int, int] = {}
+            # Bumped by clear(), which restarts monotonic ids at 0: a
+            # reference handed out before a clear can carry the same key and
+            # id as an object written after it, so release() checks this.
+            self.generation = 0
         else:
             if reader_lock is None:
                 raise ValueError("Lock must be provided for readers.")
@@ -539,6 +543,7 @@ class SingleWriterShmObjectStorage:
             self.id_index.clear()
             self.writer_flag.clear()
             self._touched.clear()
+            self.generation += 1
             logger.debug("Object storage cleared and reinitialized.")
 
     def copy_to_buffer(
@@ -616,6 +621,35 @@ class SingleWriterShmObjectStorage:
         for monotonic_id, count in self._touched.items():
             self.writer_flag[monotonic_id] -= count
         self._touched.clear()
+
+    def release(self, key: str, monotonic_id: int, generation: int) -> bool:
+        """Give back one writer reference that no reader will ever fetch.
+
+        put() and get_cached() count a reference for every request that will
+        hand the item to the readers. When that request never reaches them
+        (rejected or aborted first), the count stays above what the readers
+        can match, the item is never freed, and since the ring frees in FIFO
+        order nothing written after it is freed either.
+
+        The reference is identified by the `generation`, key and monotonic id
+        it was handed out with. If the item has been freed since (its slot
+        may hold another object now, possibly for the same key) or the
+        storage was cleared, the reference is gone and nothing is changed.
+
+        Returns:
+            Whether a reference was released.
+        """
+        assert self.is_writer, "Only the writer can release references."
+        if generation != self.generation:
+            return False
+        entry = self.key_index.get(key)
+        if entry is None or entry[1] != monotonic_id:
+            return False
+        count = self.writer_flag[monotonic_id]
+        if count <= 0:
+            return False
+        self.writer_flag[monotonic_id] = count - 1
+        return True
 
     def put(self, key: str, value: Any) -> tuple[int, int]:
         """

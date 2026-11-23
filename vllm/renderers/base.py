@@ -6,10 +6,11 @@ import time
 from abc import ABC, abstractmethod
 from array import array
 from collections import OrderedDict
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, overload
 
@@ -34,7 +35,12 @@ from vllm.inputs import (
 )
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY as mm_registry
-from vllm.multimodal.cache import BaseMultiModalProcessorCache
+from vllm.multimodal.cache import (
+    BaseMultiModalProcessorCache,
+    ShmCacheReference,
+    take_cache_references,
+)
+from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.parse import (
     MultiModalDataItems,
     MultiModalUUIDItems,
@@ -199,6 +205,25 @@ class _PrefixTokenizeCache:
                 self._put(digest, full_ids[: delim_locs[s_idx]])
 
 
+@dataclass
+class RenderedMultiModalItems:
+    """What rendering inside `BaseRenderer.track_mm_cache_items` did to the
+    multi-modal processor cache, so that it can be rolled back if the request
+    is rejected before it reaches the engine client."""
+
+    mm_hashes: list[str] = field(default_factory=list)
+    """Hashes of the rendered items (for shadow caches to invalidate)."""
+
+    references: list[ShmCacheReference] = field(default_factory=list)
+    """Cache references handed out (shm cache). The render job appends them
+    on the renderer thread, so they are complete by the time a rollback
+    submitted after it runs, even if the caller stopped waiting for it."""
+
+    submitted: bool = False
+    """Whether a multi-modal render was submitted, i.e. a rollback can have
+    anything to do."""
+
+
 class BaseRenderer(ABC, Generic[_T]):
     def __init__(self, config: "VllmConfig", tokenizer: _T | None) -> None:
         super().__init__()
@@ -208,8 +233,8 @@ class BaseRenderer(ABC, Generic[_T]):
         self.api_process_rank = config.parallel_config._api_process_rank
 
         self.tokenizer = tokenizer
-        self._rendered_mm_hashes: ContextVar[list[str] | None] = ContextVar(
-            "rendered_mm_hashes", default=None
+        self._rendered_mm_items: ContextVar[RenderedMultiModalItems | None] = (
+            ContextVar("rendered_mm_items", default=None)
         )
 
         # Shared thread pool executor for blocking tokenizer and
@@ -235,6 +260,14 @@ class BaseRenderer(ABC, Generic[_T]):
         )
         self._invalidate_mm_cache_items_async = make_async(
             self.invalidate_mm_cache_items, executor=self._mm_executor
+        )
+        # Cache references are counted on the renderer thread; giving them
+        # back there keeps the single-writer cache single-threaded.
+        self._rollback_mm_cache_items_async = make_async(
+            self.rollback_mm_cache_items, executor=self._mm_executor
+        )
+        self._release_mm_cache_references_async = make_async(
+            self.release_mm_cache_references, executor=self._mm_executor
         )
         self._process_multimodal_async = make_async(
             self._process_multimodal, executor=self._mm_executor
@@ -336,6 +369,32 @@ class BaseRenderer(ABC, Generic[_T]):
         for mm_hash in mm_hashes:
             mm_processor_cache.invalidate(mm_hash)
 
+    def rollback_mm_cache_items(self, rendered: RenderedMultiModalItems) -> None:
+        """Undo what rendering did to the sender cache for requests that were
+        rejected before they reached the engine client.
+
+        Shadow entries are invalidated as before. Cache references are given
+        back unless the engine client took them: a request handed to it
+        before the rejection (e.g. a non-streaming request that failed while
+        generating) may have reached the workers, which then balance them.
+        """
+        self.invalidate_mm_cache_items(rendered.mm_hashes)
+
+        mm_processor_cache = self.mm_processor_cache
+        if mm_processor_cache is not None:
+            mm_processor_cache.release_references(
+                take_cache_references(rendered.references)
+            )
+
+    def release_mm_cache_references(
+        self, references: Iterable[ShmCacheReference]
+    ) -> None:
+        """Give back cache references the caller took for a request that
+        never reached the workers (see `take_cache_references`)."""
+        mm_processor_cache = self.mm_processor_cache
+        if mm_processor_cache is not None:
+            mm_processor_cache.release_references(references)
+
     @staticmethod
     def _clear_processor_cache(
         processor: "BaseMultiModalProcessor | None",
@@ -429,15 +488,30 @@ class BaseRenderer(ABC, Generic[_T]):
         runs before any rendering submitted later; awaiting is optional."""
         return self._invalidate_mm_cache_items_async(mm_hashes)
 
+    def rollback_mm_cache_items_async(
+        self, rendered: RenderedMultiModalItems
+    ) -> Awaitable[None]:
+        """Run rollback_mm_cache_items on the multimodal executor. It runs
+        after every render submitted before it, including one the caller
+        stopped waiting for, so it sees all of their references."""
+        return self._rollback_mm_cache_items_async(rendered)
+
+    def release_mm_cache_references_async(
+        self, references: Iterable[ShmCacheReference]
+    ) -> Awaitable[None]:
+        """Run release_mm_cache_references on the multimodal executor. The
+        work is submitted when this is called; awaiting is optional."""
+        return self._release_mm_cache_references_async(references)
+
     @contextmanager
     def track_mm_cache_items(self):
         """Track rendered items until the serving layer accepts the request."""
-        hashes: list[str] = []
-        token = self._rendered_mm_hashes.set(hashes)
+        rendered = RenderedMultiModalItems()
+        token = self._rendered_mm_items.set(rendered)
         try:
-            yield hashes
+            yield rendered
         finally:
-            self._rendered_mm_hashes.reset(token)
+            self._rendered_mm_items.reset(token)
 
     @staticmethod
     def get_mm_hashes(engine_input: EngineInput) -> list[str]:
@@ -448,6 +522,17 @@ class BaseRenderer(ABC, Generic[_T]):
             if inputs is not None and inputs["type"] == "multimodal"
             for hashes in inputs["mm_hashes"].values()
             for mm_hash in hashes
+        ]
+
+    @staticmethod
+    def get_mm_items(engine_input: EngineInput) -> list[MultiModalKwargsItem | None]:
+        encoder, decoder = split_enc_dec_input(engine_input)
+        return [
+            mm_item
+            for inputs in (encoder, decoder)
+            if inputs is not None and inputs["type"] == "multimodal"
+            for mm_items in inputs["mm_kwargs"].values()
+            for mm_item in mm_items
         ]
 
     def shutdown(self) -> None:
@@ -898,7 +983,15 @@ class BaseRenderer(ABC, Generic[_T]):
         tokenization_kwargs: dict[str, Any] | None,
         *,
         skip_mm_cache: bool = False,
+        rendered: RenderedMultiModalItems | None = None,
     ) -> "MultiModalInput":
+        """Run the multi-modal processor (on the renderer thread when called
+        through `_process_multimodal_async`).
+
+        The cache references it hands out are added to `rendered` here rather
+        than by the caller, who may have stopped waiting (client disconnect)
+        while the render still updated the cache.
+        """
         mm_req_id = f"renderer{self.api_process_rank}-mm-{self._mm_req_counter.inc(1)}"
 
         if skip_mm_cache and self._readonly_mm_processor is not None:
@@ -922,8 +1015,26 @@ class BaseRenderer(ABC, Generic[_T]):
         )
         mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
 
+        references: list[ShmCacheReference] = []
+        cache = mm_processor.cache
         with set_default_torch_num_threads():
-            mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
+            if cache is None:
+                mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
+            else:
+                with cache.record_references(references):
+                    try:
+                        mm_inputs = mm_processor.apply(
+                            mm_processor_inputs, mm_timing_ctx
+                        )
+                    except BaseException:
+                        # The processor can fail after it updated the cache
+                        # (e.g. placeholder validation); nothing will send
+                        # these references, so give them back right here.
+                        cache.release_references(take_cache_references(references))
+                        raise
+
+        if rendered is not None:
+            rendered.references.extend(references)
 
         self.update_mm_cache_stats()
 
@@ -942,6 +1053,8 @@ class BaseRenderer(ABC, Generic[_T]):
 
         engine_input: TokensInput | MultiModalInput
         if multi_modal_data := prompt.get("multi_modal_data"):
+            if (rendered := self._rendered_mm_items.get()) is not None:
+                rendered.submitted = True
             engine_input = self._process_multimodal(
                 prompt_token_ids,
                 multi_modal_data,
@@ -949,6 +1062,7 @@ class BaseRenderer(ABC, Generic[_T]):
                 tokenization_kwargs=None,  # Tokenization already done in Step 2
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 skip_mm_cache=skip_mm_cache,
+                rendered=rendered,
             )
         else:
             engine_input = tokens_input(prompt_token_ids)
@@ -1000,6 +1114,10 @@ class BaseRenderer(ABC, Generic[_T]):
 
         engine_input: TokensInput | MultiModalInput
         if multi_modal_data := prompt.get("multi_modal_data"):
+            # Read on the event loop: the render job runs on the renderer
+            # thread, which does not see this context.
+            if (rendered := self._rendered_mm_items.get()) is not None:
+                rendered.submitted = True
             engine_input = await self._process_multimodal_async(
                 prompt_token_ids,
                 multi_modal_data,
@@ -1007,6 +1125,7 @@ class BaseRenderer(ABC, Generic[_T]):
                 tokenization_kwargs=None,
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 skip_mm_cache=skip_mm_cache,
+                rendered=rendered,
             )
         else:
             engine_input = tokens_input(prompt_token_ids)
@@ -1110,8 +1229,8 @@ class BaseRenderer(ABC, Generic[_T]):
 
         engine_input["arrival_time"] = arrival_time
 
-        if (hashes := self._rendered_mm_hashes.get()) is not None:
-            hashes.extend(self.get_mm_hashes(engine_input))
+        if (rendered := self._rendered_mm_items.get()) is not None:
+            rendered.mm_hashes.extend(self.get_mm_hashes(engine_input))
 
         return engine_input
 
@@ -1135,8 +1254,8 @@ class BaseRenderer(ABC, Generic[_T]):
 
         engine_input["arrival_time"] = arrival_time
 
-        if (hashes := self._rendered_mm_hashes.get()) is not None:
-            hashes.extend(self.get_mm_hashes(engine_input))
+        if (rendered := self._rendered_mm_items.get()) is not None:
+            rendered.mm_hashes.extend(self.get_mm_hashes(engine_input))
 
         return engine_input
 

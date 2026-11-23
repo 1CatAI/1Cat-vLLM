@@ -7,7 +7,7 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -25,6 +25,8 @@ from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.multimodal.cache import ShmCacheReference, take_cache_references
+from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.outputs import (
     STREAM_FINISHED,
     STREAM_KEEPALIVE,
@@ -308,86 +310,101 @@ class AsyncLLM(EngineClient):
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
-        if self.errored:
-            raise EngineDeadError()
+        # From here on this request is responsible for the processor-cache
+        # references its prompt carries (shm cache): the serving layer's
+        # rollback leaves them alone, so they are given back here if the
+        # request fails before it is sent to the engine.
+        mm_refs = take_cache_references(self._get_mm_items(prompt))
+        try:
+            if self.errored:
+                raise EngineDeadError()
 
-        is_pooling = isinstance(params, PoolingParams)
+            is_pooling = isinstance(params, PoolingParams)
 
-        if (
-            self.vllm_config.cache_config.kv_sharing_fast_prefill
-            and not is_pooling
-            and params.prompt_logprobs
-        ):
-            raise ValueError(
-                "--kv-sharing-fast-prefill produces incorrect logprobs for "
-                "prompt tokens, please disable it when the requests need "
-                "prompt logprobs"
-            )
-
-        if isinstance(prompt, AsyncGenerator):
-            if reasoning_ended is not None or reasoning_parser_kwargs is not None:
-                raise NotImplementedError
-
-            # Streaming input case.
-            return await self._add_streaming_input_request(
-                request_id,
-                prompt,
-                params,
-                arrival_time,
-                lora_request,
-                tokenization_kwargs,
-                trace_headers,
-                priority,
-                data_parallel_rank,
-            )
-
-        # Convert Input --> Request.
-        if isinstance(prompt, EngineCoreRequest):
-            logger.warning_once(
-                "Passing EngineCoreRequest to AsyncLLM.generate() and .add_requests() "
-                "is deprecated and will be removed in v0.18. You should instead pass "
-                "the outputs of Renderer.render_cmpl() or Renderer.render_chat()."
-            )
-
-            request = prompt
-            if request_id != request.request_id:
-                logger.warning_once(
-                    "AsyncLLM.add_request() was passed a request_id parameter that "
-                    "does not match the EngineCoreRequest.request_id attribute. The "
-                    "latter will be used, and the former will be ignored."
+            if (
+                self.vllm_config.cache_config.kv_sharing_fast_prefill
+                and not is_pooling
+                and params.prompt_logprobs
+            ):
+                raise ValueError(
+                    "--kv-sharing-fast-prefill produces incorrect logprobs for "
+                    "prompt tokens, please disable it when the requests need "
+                    "prompt logprobs"
                 )
-        else:
-            request = self.input_processor.process_inputs(
-                request_id,
-                prompt,
-                params,
-                supported_tasks=await self.get_supported_tasks(),
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank,
+
+            if isinstance(prompt, AsyncGenerator):
+                if reasoning_ended is not None or reasoning_parser_kwargs is not None:
+                    raise NotImplementedError
+
+                # Streaming input case.
+                return await self._add_streaming_input_request(
+                    request_id,
+                    prompt,
+                    params,
+                    arrival_time,
+                    lora_request,
+                    tokenization_kwargs,
+                    trace_headers,
+                    priority,
+                    data_parallel_rank,
+                )
+
+            # Convert Input --> Request.
+            if isinstance(prompt, EngineCoreRequest):
+                logger.warning_once(
+                    "Passing EngineCoreRequest to AsyncLLM.generate() and "
+                    ".add_requests() is deprecated and will be removed in v0.18. "
+                    "You should instead pass the outputs of Renderer.render_cmpl() "
+                    "or Renderer.render_chat()."
+                )
+
+                request = prompt
+                if request_id != request.request_id:
+                    logger.warning_once(
+                        "AsyncLLM.add_request() was passed a request_id parameter "
+                        "that does not match the EngineCoreRequest.request_id "
+                        "attribute. The latter will be used, and the former will "
+                        "be ignored."
+                    )
+            else:
+                request = self.input_processor.process_inputs(
+                    request_id,
+                    prompt,
+                    params,
+                    supported_tasks=await self.get_supported_tasks(),
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                    tokenization_kwargs=tokenization_kwargs,
+                    trace_headers=trace_headers,
+                    priority=priority,
+                    data_parallel_rank=data_parallel_rank,
+                )
+                prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+
+            if reasoning_ended is not None:
+                request.reasoning_ended = reasoning_ended
+            if reasoning_parser_kwargs is not None:
+                request.reasoning_parser_kwargs = reasoning_parser_kwargs
+
+            self.input_processor.assign_request_id(request)
+
+            # We start the output_handler on the first call to add_request() so
+            # we can call __init__ before the event loop, which enables us
+            # to handle startup failure gracefully in the OpenAI server.
+            self._run_output_handler()
+
+            # Create a new output collector for the request.
+            queue = RequestOutputCollector(params.output_kind, request.request_id)
+
+            # Use cloned params that may have been updated in process_inputs()
+            params = request.params
+            # Items rendered inside process_inputs (raw prompts).
+            mm_refs += take_cache_references(
+                feature.data for feature in request.mm_features or ()
             )
-            prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
-
-        if reasoning_ended is not None:
-            request.reasoning_ended = reasoning_ended
-        if reasoning_parser_kwargs is not None:
-            request.reasoning_parser_kwargs = reasoning_parser_kwargs
-
-        self.input_processor.assign_request_id(request)
-
-        # We start the output_handler on the first call to add_request() so
-        # we can call __init__ before the event loop, which enables us
-        # to handle startup failure gracefully in the OpenAI server.
-        self._run_output_handler()
-
-        # Create a new output collector for the request.
-        queue = RequestOutputCollector(params.output_kind, request.request_id)
-
-        # Use cloned params that may have been updated in process_inputs()
-        params = request.params
+        except BaseException:
+            self._release_mm_cache_references(mm_refs)
+            raise
 
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_text, None, 0, queue)
@@ -407,6 +424,21 @@ class AsyncLLM(EngineClient):
                 child_request, prompt_text, parent_request, idx, queue
             )
         return queue
+
+    def _get_mm_items(self, prompt: object) -> list[MultiModalKwargsItem | None]:
+        if isinstance(prompt, EngineCoreRequest):
+            return [feature.data for feature in prompt.mm_features or ()]
+        if isinstance(prompt, dict) and "type" in prompt:
+            return self.renderer.get_mm_items(cast(EngineInput, prompt))
+        # A raw prompt is rendered inside process_inputs, or a stream.
+        return []
+
+    def _release_mm_cache_references(self, references: list[ShmCacheReference]) -> None:
+        """Give back processor-cache references of a request that will never
+        reach the workers. Runs on the renderer thread ahead of any later
+        render; nothing waits for it."""
+        if references:
+            self.renderer.release_mm_cache_references_async(references)
 
     async def _add_request(
         self,

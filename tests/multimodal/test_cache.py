@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import copy
 import multiprocessing as mp
+from contextvars import ContextVar
 from typing import Any
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -24,8 +27,10 @@ from vllm.multimodal.cache import (
     MultiModalProcessorCacheItemMetadata,
     MultiModalProcessorSenderCache,
     MultiModalReceiverCache,
+    ShmCacheReference,
     ShmObjectStoreReceiverCache,
     ShmObjectStoreSenderCache,
+    take_cache_references,
 )
 from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.inputs import (
@@ -38,6 +43,7 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 from vllm.multimodal.processing import PromptInsertion
+from vllm.renderers.base import BaseRenderer, RenderedMultiModalItems
 from vllm.utils.mem_constants import GiB_bytes, MiB_bytes
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -524,6 +530,262 @@ def test_cache_eviction_shm_cache():
     _run_test_cache_eviction_shm(sender_cache, receiver_cache, base_item_size=MiB_bytes)
 
 
+@pytest.fixture
+def shm_sender_cache():
+    # Room for three 5 MiB items, as in test_cache_eviction_shm_cache.
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
+            mm_processor_cache_type="shm",
+            mm_shm_cache_max_object_size_mb=6,
+            mm_processor_cache_gb=15.2 * MiB_bytes / GiB_bytes,
+        ),
+    )
+    cache = ShmObjectStoreSenderCache(vllm_config)
+    yield cache
+    # The ring has a fixed name; unlink it before the next test creates it.
+    cache.close()
+
+
+def _render(
+    cache: BaseMultiModalProcessorCache,
+    mm_hashes: list[str],
+    references: list[ShmCacheReference] | None,
+) -> list[MultiModalKwargsItem | None]:
+    """Update the sender cache for one request, the way the processor does
+    inside `BaseRenderer._process_multimodal` (which records the references
+    itself when `references` is None)."""
+    is_cached = cache.is_cached(mm_hashes)
+    for mm_hash in mm_hashes:
+        cache.touch_sender_cache_item(mm_hash)
+    items: list[MultiModalKwargsItem | None] = []
+    recording = (
+        contextlib.nullcontext()
+        if references is None
+        else cache.record_references(references)
+    )
+    try:
+        with recording:
+            for mm_hash, cached in zip(mm_hashes, is_cached):
+                item = MultiModalKwargsItem.dummy(5 * MiB_bytes)
+                updated, _ = cache.get_and_update_item(
+                    None if cached else (item, []), mm_hash
+                )
+                items.append(updated)
+    finally:
+        cache.release_sender_touches()
+    return items
+
+
+def _is_shm_reference(mm_item: MultiModalKwargsItem | None) -> bool:
+    return isinstance(mm_item, ShmCacheReference)
+
+
+def test_shm_rollback_of_a_rejected_render_frees_the_ring(shm_sender_cache):
+    """A request rendered but rejected before the engine client got it (prompt
+    too long, client disconnect) must not keep the ring from freeing."""
+    cache = shm_sender_cache
+    rejected: list[ShmCacheReference] = []
+    items = _render(cache, ["image_A", "image_B", "image_C"], rejected)
+    assert all(_is_shm_reference(item) for item in items)
+    assert rejected == items
+
+    # The ring is full and nothing in it was handed to the workers.
+    blocked = _render(cache, ["image_D"], [])
+    assert not _is_shm_reference(blocked[0])
+
+    cache.release_references(take_cache_references(rejected))
+
+    accepted: list[ShmCacheReference] = []
+    items = _render(cache, ["image_D"], accepted)
+    assert _is_shm_reference(items[0])
+    assert accepted == items
+
+
+def test_shm_references_taken_by_the_engine_client_stay(shm_sender_cache):
+    """Once the engine client took a reference, the request may reach the
+    workers, whose reads balance it; the serving-layer rollback must leave it
+    alone, and so must a second submission of the same items (beam search)."""
+    cache = shm_sender_cache
+    references: list[ShmCacheReference] = []
+    items = _render(cache, ["image_A"], references)
+
+    taken = take_cache_references(items)
+    assert taken == items
+    assert take_cache_references(items) == []
+    assert take_cache_references(references) == []
+
+    monotonic_id = taken[0]["monotonic_id"].data
+    cache.release_references(take_cache_references(references))
+    assert cache._shm_cache.writer_flag[monotonic_id] == 1
+
+    cache.release_references(taken)
+    assert cache._shm_cache.writer_flag[monotonic_id] == 0
+
+
+def test_shm_rollback_of_an_item_twice_in_one_request(shm_sender_cache):
+    cache = shm_sender_cache
+    references: list[ShmCacheReference] = []
+    items = _render(cache, ["image_A", "image_A"], references)
+    assert references == items
+    assert references[0] is not references[1]
+
+    monotonic_id = references[0]["monotonic_id"].data
+    assert references[1]["monotonic_id"].data == monotonic_id
+    assert cache._shm_cache.writer_flag[monotonic_id] == 2
+
+    cache.release_references(take_cache_references(references))
+    assert cache._shm_cache.writer_flag[monotonic_id] == 0
+
+
+def test_shm_inline_items_carry_no_reference(shm_sender_cache):
+    """Items that did not fit (ring full, or larger than the object limit)
+    are sent inline; no writer reference was counted for them."""
+    cache = shm_sender_cache
+    _render(cache, ["image_A", "image_B", "image_C"], [])
+
+    references: list[ShmCacheReference] = []
+    items = _render(cache, ["image_D"], references)
+    assert not _is_shm_reference(items[0])
+    assert references == []
+    assert take_cache_references(items) == []
+
+    oversize = cache.get_and_update_item(
+        (MultiModalKwargsItem.dummy(7 * MiB_bytes), []), "image_E"
+    )[0]
+    assert not _is_shm_reference(oversize)
+    assert take_cache_references([oversize, None]) == []
+
+
+def test_shm_release_after_clear_cache_is_ignored(shm_sender_cache):
+    """reset_mm_cache clears the ring and restarts its ids: a reference from
+    before must not take a count from the item written again after it."""
+    cache = shm_sender_cache
+    stale: list[ShmCacheReference] = []
+    _render(cache, ["image_A"], stale)
+
+    cache.clear_cache()
+    fresh: list[ShmCacheReference] = []
+    _render(cache, ["image_A"], fresh)
+    monotonic_id = fresh[0]["monotonic_id"].data
+    assert stale[0]["monotonic_id"].data == monotonic_id
+    assert stale[0]["address"].data == fresh[0]["address"].data
+
+    cache.release_references(take_cache_references(stale))
+    assert cache._shm_cache.writer_flag[monotonic_id] == 1
+
+
+def _renderer_stand_in(cache: BaseMultiModalProcessorCache, apply) -> MagicMock:
+    """Just enough of a BaseRenderer to run its own `_process_multimodal` and
+    `rollback_mm_cache_items` against a real sender cache."""
+    renderer = MagicMock()
+    renderer.api_process_rank = 0
+    renderer._readonly_mm_processor = None
+    renderer.mm_processor_cache = cache
+    processor = renderer.get_mm_processor.return_value
+    processor.cache = cache
+    processor.apply.side_effect = apply
+    return renderer
+
+
+def _writer_counts(
+    cache: ShmObjectStoreSenderCache, references: list[ShmCacheReference]
+) -> list[int]:
+    return [
+        cache._shm_cache.writer_flag[reference["monotonic_id"].data]
+        for reference in references
+    ]
+
+
+@pytest.mark.parametrize("engine_client_took_them", [False, True])
+def test_shm_renderer_records_a_render_for_the_rollback(
+    shm_sender_cache, engine_client_took_them: bool
+):
+    """BaseRenderer._process_multimodal adds the references the processor
+    hands out to the request's record; the rollback of a rejected request
+    gives back those the engine client has not taken."""
+    cache = shm_sender_cache
+    renderer = _renderer_stand_in(
+        cache, lambda inputs, timing: _render(cache, ["image_A", "image_B"], None)
+    )
+    rendered = RenderedMultiModalItems(submitted=True)
+
+    BaseRenderer._process_multimodal(
+        renderer, [0], {"image": []}, None, None, None, rendered=rendered
+    )
+    assert len(rendered.references) == 2
+    assert all(isinstance(r, ShmCacheReference) for r in rendered.references)
+    assert _writer_counts(cache, rendered.references) == [1, 1]
+
+    if engine_client_took_them:
+        take_cache_references(rendered.references)
+    BaseRenderer.rollback_mm_cache_items(renderer, rendered)
+    expected = 1 if engine_client_took_them else 0
+    assert _writer_counts(cache, rendered.references) == [expected, expected]
+
+
+@pytest.mark.asyncio
+async def test_shm_renderer_tracks_the_render_of_a_request(shm_sender_cache):
+    """Inside the serving layer's tracking window, `_process_tokens_async`
+    marks the render as submitted and the render job records its references,
+    so the rollback of a rejected request gives them back."""
+    cache = shm_sender_cache
+    renderer = _renderer_stand_in(
+        cache, lambda inputs, timing: _render(cache, ["image_A"], None)
+    )
+    renderer._rendered_mm_items = ContextVar("rendered_mm_items", default=None)
+
+    async def process_multimodal_async(*args, **kwargs):
+        return BaseRenderer._process_multimodal(renderer, *args, **kwargs)
+
+    renderer._process_multimodal_async = process_multimodal_async
+
+    with BaseRenderer.track_mm_cache_items(renderer) as rendered:
+        await BaseRenderer._process_tokens_async(
+            renderer, {"prompt_token_ids": [0], "multi_modal_data": {"image": [None]}}
+        )
+    assert rendered.submitted
+    assert len(rendered.references) == 1
+
+    BaseRenderer.rollback_mm_cache_items(renderer, rendered)
+    assert _writer_counts(cache, rendered.references) == [0]
+
+
+def test_shm_renderer_gives_back_a_render_that_raises(shm_sender_cache):
+    """A processor that fails after updating the cache leaves nothing that
+    will be sent; the render gives its references back itself."""
+    cache = shm_sender_cache
+    handed_out: list[ShmCacheReference] = []
+
+    def apply(inputs, timing):
+        handed_out.extend(_render(cache, ["image_A"], None))
+        raise ValueError("placeholder validation failed")
+
+    renderer = _renderer_stand_in(cache, apply)
+    rendered = RenderedMultiModalItems(submitted=True)
+    with pytest.raises(ValueError):
+        BaseRenderer._process_multimodal(
+            renderer, [0], {"image": []}, None, None, None, rendered=rendered
+        )
+    assert rendered.references == []
+    assert _writer_counts(cache, handed_out) == [0]
+
+
+def test_lru_sender_cache_has_no_references():
+    model_config = ModelConfig(
+        model="llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
+        mm_processor_cache_gb=1,
+    )
+    cache = MultiModalProcessorSenderCache(model_config)
+
+    references: list[ShmCacheReference] = []
+    items = _render(cache, ["image_A"], references)
+    assert references == []
+    assert take_cache_references(items) == []
+    cache.release_references(take_cache_references(items))
+    assert cache.is_cached(["image_A"]) == [True]
+
+
 def test_processor_cache_shared_across_loras():
     """Test that processor cache uses mm_hash to share data across LoRAs."""
     model_config = ModelConfig(
@@ -793,6 +1055,36 @@ def test_shm_worker_drops_a_request_aborted_while_preempted():
 
         shm.step(finished={"req"})
         assert not shm.workers[0]._shm_mm_items
+    finally:
+        shm.close()
+
+
+def test_shm_reference_reaches_the_workers_as_an_address():
+    """P0's ShmCacheReference crosses to the engine through msgspec as a plain
+    address item, which the workers read once, also across a preemption."""
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    image_a = _dummy_item({"pixel_values": 1024}, rng=np.random.RandomState(0))
+    shm = _ShmTPWorkers(tp_size=2)
+    try:
+        address, monotonic_id = shm.writer.put("a", image_a)
+        reference = ShmCacheReference(
+            address, monotonic_id, mm_hash="a", generation=shm.writer.generation
+        )
+        received = MsgpackDecoder(MultiModalKwargsItem).decode(
+            MsgpackEncoder().encode(reference)
+        )
+        assert type(received) is MultiModalKwargsItem
+        assert received["address"].data == address
+        assert received["monotonic_id"].data == monotonic_id
+
+        features = [_image_feature("a", received, offset=0)]
+        shm.step(new_reqs=[("req", features)])
+        shm.step(preempted={"req"})
+        resumed = shm.step(new_reqs=[("req", features)])
+        assert shm.num_gets() == [1, 1]
+        assert all(_resolved_data(out) == [image_a] for out in resumed)
+        assert shm.is_evictable("a")
     finally:
         shm.close()
 

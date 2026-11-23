@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import operator
 import sys
+import threading
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from multiprocessing.synchronize import Lock as LockType
 from typing import TYPE_CHECKING, Generic, TypeAlias, TypeVar, cast
 
@@ -59,6 +61,71 @@ class MultiModalCacheMissError(RuntimeError):
             "the request so the multi-modal data is sent again."
         )
         self.mm_hashes = mm_hashes
+
+
+class ShmCacheReference(MultiModalKwargsItem):
+    """What `ShmObjectStoreSenderCache` sends in place of an item it holds in
+    shared memory: the item's address, plus one writer reference that keeps
+    the item there until every worker has fetched it.
+
+    Each object stands for exactly one reference, which must be balanced
+    exactly once: by the reads of the workers that receive the request, or by
+    `BaseMultiModalProcessorCache.release_references` if no worker ever will.
+    Doing both lets the item be freed while another request still has to
+    fetch it; doing neither pins the item and the ring behind it for good.
+    `taken` records that someone has become responsible for that: the engine
+    client that sends the request, or the rollback of a request rejected
+    before it got there. Only the API server sees these attributes; the
+    engine and workers receive the address fields alone.
+    """
+
+    def __init__(
+        self,
+        address: int,
+        monotonic_id: int,
+        *,
+        mm_hash: str,
+        generation: int,
+    ) -> None:
+        super().__init__(
+            {
+                "address": MultiModalFieldElem(
+                    data=address, field=MultiModalBatchedField()
+                ),
+                "monotonic_id": MultiModalFieldElem(
+                    data=monotonic_id, field=MultiModalBatchedField()
+                ),
+            }
+        )
+
+        self.mm_hash = mm_hash
+        self.generation = generation
+        self.taken = False
+
+
+# References are taken on the event loop (engine client) and on the renderer
+# thread (rollback); the lock makes each one go to a single owner.
+_take_references_lock = threading.Lock()
+
+
+def take_cache_references(
+    mm_items: Iterable[MultiModalKwargsItem | None],
+) -> list[ShmCacheReference]:
+    """Become responsible for the cache references among `mm_items` that
+    nobody has taken yet, and return them.
+
+    The same reference object can reach the engine client more than once
+    (beam search re-sends the rendered items every step, n > 1 children share
+    them) while it was counted once, so only the first taker may release it.
+    Items sent inline carry no reference and are skipped.
+    """
+    taken: list[ShmCacheReference] = []
+    with _take_references_lock:
+        for mm_item in mm_items:
+            if isinstance(mm_item, ShmCacheReference) and not mm_item.taken:
+                mm_item.taken = True
+                taken.append(mm_item)
+    return taken
 
 
 class MultiModalProcessorCacheItem:
@@ -326,6 +393,27 @@ class BaseMultiModalProcessorCache(
         """
         return
 
+    @contextmanager
+    def record_references(self, sink: list[ShmCacheReference]) -> Iterator[None]:
+        """Append to `sink` every cache reference handed out inside the block.
+
+        This lets the renderer give back the references of a render that
+        raised, or whose caller stopped waiting for it. Only caches whose
+        items carry references (the shm cache) record anything.
+        """
+        yield
+
+    def release_references(self, references: Iterable[ShmCacheReference]) -> None:
+        """Give back cache references that no worker will ever fetch, because
+        the request they were handed to never reached the workers.
+
+        The caller must have taken them (`take_cache_references`). Unlike
+        `invalidate`, this changes what the workers can be sent, so it must
+        never be called for a request that may reach them. No-op by default;
+        only caches whose items carry references override this.
+        """
+        return
+
     def close(self) -> None:
         """Close the underlying cache, if needed."""
         pass
@@ -510,6 +598,11 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
         )
         # cache prompt_updates for P0 only
         self._p0_cache: dict[str, Sequence[ResolvedPromptUpdate]] = {}
+        # Where references go while a render runs, see `record_references`.
+        # Per thread: a render outside the renderer thread (raw prompts in
+        # AsyncLLM.add_request) must not record into, or release from, the
+        # list of a render running on it.
+        self._reference_sinks = threading.local()
 
         self._hits = 0
         self._total = 0
@@ -541,7 +634,7 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
 
             address, monotonic_id = self._shm_cache.get_cached(mm_hash)
             prompt_updates = self._p0_cache[mm_hash]
-            return self.address_as_item(address, monotonic_id), prompt_updates
+            return self.address_as_item(address, monotonic_id, mm_hash), prompt_updates
 
         assert mm_item is not None, f"Expected a cached item for {mm_hash=}"
         item, prompt_updates = mm_item
@@ -555,7 +648,7 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
                 self.remove_dangling_items()
 
             self._p0_cache[mm_hash] = prompt_updates
-            return self.address_as_item(address, monotonic_id), prompt_updates
+            return self.address_as_item(address, monotonic_id, mm_hash), prompt_updates
         except ValueError as e:
             # `put` raises ValueError either for an oversize item or for a
             # duplicate key (concurrent insert); the latter is benign so we
@@ -612,6 +705,25 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
         return self._stat(delta=delta)
 
     @override
+    @contextmanager
+    def record_references(self, sink: list[ShmCacheReference]) -> Iterator[None]:
+        previous = getattr(self._reference_sinks, "sink", None)
+        self._reference_sinks.sink = sink
+        try:
+            yield
+        finally:
+            self._reference_sinks.sink = previous
+
+    @override
+    def release_references(self, references: Iterable[ShmCacheReference]) -> None:
+        for reference in references:
+            self._shm_cache.release(
+                reference.mm_hash,
+                cast(int, reference["monotonic_id"].data),
+                reference.generation,
+            )
+
+    @override
     def close(self) -> None:
         self._shm_cache.close()
 
@@ -626,17 +738,19 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
         self,
         address: int,
         monotonic_id: int,
-    ) -> MultiModalKwargsItem:
-        addr_elem = MultiModalFieldElem(
-            data=address,
-            field=MultiModalBatchedField(),
+        mm_hash: str,
+    ) -> ShmCacheReference:
+        """Wrap the writer reference just counted for `mm_hash`."""
+        reference = ShmCacheReference(
+            address,
+            monotonic_id,
+            mm_hash=mm_hash,
+            generation=self._shm_cache.generation,
         )
-        id_elem = MultiModalFieldElem(
-            data=monotonic_id,
-            field=MultiModalBatchedField(),
-        )
-
-        return MultiModalKwargsItem({"address": addr_elem, "monotonic_id": id_elem})
+        sink = getattr(self._reference_sinks, "sink", None)
+        if sink is not None:
+            sink.append(reference)
+        return reference
 
 
 class BaseMultiModalReceiverCache(
