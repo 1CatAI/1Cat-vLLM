@@ -6,6 +6,7 @@ import copy
 import itertools
 import multiprocessing as mp
 import threading
+from collections.abc import Sequence
 from contextvars import ContextVar
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -50,6 +51,7 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 from vllm.multimodal.processing import PromptInsertion
+from vllm.multimodal.processing.processor import ResolvedPromptUpdate
 from vllm.renderers.base import BaseRenderer, RenderedMultiModalItems
 from vllm.sampling_params import BeamSearchParams
 from vllm.utils.mem_constants import GiB_bytes, MiB_bytes
@@ -1116,7 +1118,7 @@ class _ShmSenderCacheStub(ShmObjectStoreSenderCache):
 
     def __init__(self, writer: SingleWriterShmObjectStorage) -> None:
         self._shm_cache = writer
-        self._p0_cache = {}
+        self._p0_cache: dict[str, Sequence[ResolvedPromptUpdate]] = {}
         self._reference_sinks = threading.local()
         self._hits = 0
         self._total = 0
