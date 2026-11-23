@@ -269,6 +269,9 @@ class BaseRenderer(ABC, Generic[_T]):
         self._release_mm_cache_references_async = make_async(
             self.release_mm_cache_references, executor=self._mm_executor
         )
+        self._add_mm_cache_references_async = make_async(
+            self.add_mm_cache_references, executor=self._mm_executor
+        )
         self._process_multimodal_async = make_async(
             self._process_multimodal, executor=self._mm_executor
         )
@@ -395,6 +398,19 @@ class BaseRenderer(ABC, Generic[_T]):
         if mm_processor_cache is not None:
             mm_processor_cache.release_references(references)
 
+    def add_mm_cache_references(
+        self,
+        references: Sequence[ShmCacheReference],
+        sink: list[ShmCacheReference],
+    ) -> bool:
+        """Count one more cache reference to the item of each of `references`
+        for another request that sends them (see
+        `BaseMultiModalProcessorCache.add_references`)."""
+        mm_processor_cache = self.mm_processor_cache
+        if mm_processor_cache is None:
+            return not references
+        return mm_processor_cache.add_references(references, sink)
+
     @staticmethod
     def _clear_processor_cache(
         processor: "BaseMultiModalProcessor | None",
@@ -502,6 +518,17 @@ class BaseRenderer(ABC, Generic[_T]):
         """Run release_mm_cache_references on the multimodal executor. The
         work is submitted when this is called; awaiting is optional."""
         return self._release_mm_cache_references_async(references)
+
+    def add_mm_cache_references_async(
+        self,
+        references: Sequence[ShmCacheReference],
+        sink: list[ShmCacheReference],
+    ) -> Awaitable[bool]:
+        """Run add_mm_cache_references on the multimodal executor, where the
+        cache is written. The work is submitted when this is called, so a
+        release of `sink` submitted later sees every reference it counted,
+        also if the caller was cancelled while waiting."""
+        return self._add_mm_cache_references_async(references, sink)
 
     @contextmanager
     def track_mm_cache_items(self):

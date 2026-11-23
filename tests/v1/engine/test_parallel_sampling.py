@@ -79,7 +79,7 @@ def _references(n: int) -> list[ShmCacheReference]:
 def test_mm_cache_references_of_an_unscheduled_request_are_given_back() -> None:
     ledger = MMCacheReferenceLedger()
     references = _references(2)
-    ledger.hold(references, ["req"])
+    ledger.hold(references, "req")
 
     assert ledger.finish("req", sent_to_workers=False) == references
     # Reported once; a late duplicate gives back nothing.
@@ -91,32 +91,27 @@ def test_mm_cache_references_of_a_scheduled_request_are_kept() -> None:
     """The workers' reads balance them; giving them back too would let the
     items be freed while another request still has to fetch them."""
     ledger = MMCacheReferenceLedger()
-    ledger.hold(_references(1), ["req"])
+    ledger.hold(_references(1), "req")
 
     assert ledger.finish("req", sent_to_workers=True) == []
     assert not ledger
 
 
-def test_mm_cache_references_shared_by_parallel_sampling_children() -> None:
-    """n > 1 children share the prompt's references, counted once: they are
-    given back only if no child reached the workers."""
+def test_mm_cache_references_of_a_reused_request_id_are_not_held() -> None:
+    """A report for the earlier request must not give back the later one's."""
     ledger = MMCacheReferenceLedger()
-    references = _references(1)
-    ledger.hold(references, ["0_req", "1_req", "2_req"])
+    first, second = _references(1), _references(2)[1:]
+    holder = ledger.hold(first, "req")
+    assert holder is not None
+    assert ledger.hold(second, "req") is None
 
-    assert ledger.finish("0_req", sent_to_workers=False) == []
-    assert ledger.finish("1_req", sent_to_workers=False) == []
-    assert ledger.finish("2_req", sent_to_workers=False) == references
-
-    ledger.hold(references, ["0_req", "1_req"])
-    assert ledger.finish("1_req", sent_to_workers=True) == []
-    assert ledger.finish("0_req", sent_to_workers=False) == []
+    assert ledger.finish("req", sent_to_workers=False, holder=holder) == first
     assert not ledger
 
 
 def test_mm_cache_references_unknown_or_empty() -> None:
     ledger = MMCacheReferenceLedger()
-    ledger.hold([], ["req"])
+    ledger.hold([], "req")
     assert not ledger
     assert ledger.finish("req", sent_to_workers=False) == []
     assert ledger.finish("other", sent_to_workers=False) == []

@@ -651,6 +651,31 @@ class SingleWriterShmObjectStorage:
         self.writer_flag[monotonic_id] = count - 1
         return True
 
+    def add_reference(self, key: str, monotonic_id: int, generation: int) -> bool:
+        """Count one more writer reference to an item that is still stored.
+
+        Every request that hands an item to the readers needs a reference of
+        its own, since each reader fetches the item once per request. A
+        request that sends the address of an earlier request (an n > 1 child,
+        a beam search step) takes one here, while the earlier reference still
+        keeps the item from being freed.
+
+        The item is identified like in `release()`. If it has been freed or
+        the storage was cleared since, nothing is counted: the address may
+        name another object by now.
+
+        Returns:
+            Whether a reference was counted.
+        """
+        assert self.is_writer, "Only the writer can add references."
+        if generation != self.generation:
+            return False
+        entry = self.key_index.get(key)
+        if entry is None or entry[1] != monotonic_id:
+            return False
+        self.increment_writer_flag(monotonic_id)
+        return True
+
     def put(self, key: str, value: Any) -> tuple[int, int]:
         """
         Store a key-value pair in the object storage.

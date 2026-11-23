@@ -75,30 +75,42 @@ class InputStreamError(Exception):
         super().__init__(str(cause))
 
 
-class _MMCacheReferences:
-    """The shm processor-cache references of one rendered prompt, held by the
-    engine requests made from it (n > 1 children share them) until EngineCore
-    reports each of them finished."""
+def _references_owned_by_others(
+    sent: list[ShmCacheReference], owned: list[ShmCacheReference]
+) -> list[ShmCacheReference]:
+    """The references in `sent`, one per occurrence, that are not among
+    `owned`: another request took them, so this one needs its own."""
+    unclaimed = list(owned)
+    others: list[ShmCacheReference] = []
+    for reference in sent:
+        for idx, own in enumerate(unclaimed):
+            if own is reference:
+                del unclaimed[idx]
+                break
+        else:
+            others.append(reference)
+    return others
 
-    def __init__(
-        self, references: list[ShmCacheReference], request_ids: Iterable[str]
-    ) -> None:
+
+class _MMCacheReferences:
+    """The shm processor-cache references of one engine request, held until
+    EngineCore reports it finished."""
+
+    def __init__(self, references: list[ShmCacheReference]) -> None:
         self.references = references
-        self.unfinished = set(request_ids)
-        self.sent_to_workers = False
 
 
 class MMCacheReferenceLedger:
     """Processor-cache references (shm cache) of the requests sent to the
     engine, by request id.
 
-    The workers' reads of a request balance its references. EngineCore reports
+    Every engine request, also each n > 1 child, holds references of its own,
+    and the workers' reads of the request balance them. EngineCore reports
     every finished request that carries any, with whether the workers received
-    it (EngineCoreOutputs.finished_mm_requests); if none of the requests that
-    share the references did, nothing else will balance them, so they have to
-    be given back. Giving back a reference the workers read lets the item be
-    freed while another request still has to fetch it, so the default is to
-    keep it.
+    it (EngineCoreOutputs.finished_mm_requests); if they did not, nothing else
+    will balance its references, so they have to be given back. Giving back a
+    reference the workers read lets the item be freed while another request
+    still has to fetch it, so the default is to keep it.
     """
 
     def __init__(self) -> None:
@@ -108,14 +120,14 @@ class MMCacheReferenceLedger:
         return bool(self._by_request)
 
     def hold(
-        self, references: list[ShmCacheReference], request_ids: list[str]
+        self, references: list[ShmCacheReference], request_id: str
     ) -> _MMCacheReferences | None:
-        """Register the references before any of `request_ids` is sent, so a
-        report cannot arrive before them. Returns the holder, or None if
-        nothing was registered."""
+        """Register the references before `request_id` is sent, so a report
+        cannot arrive before them. Returns the holder, or None if nothing was
+        registered."""
         if not references:
             return None
-        if any(request_id in self._by_request for request_id in request_ids):
+        if request_id in self._by_request:
             # Only possible with VLLM_DISABLE_REQUEST_ID_RANDOMIZATION and a
             # reused id. EngineCore reports by id, so a report for the earlier
             # request would give back these references although the workers
@@ -124,12 +136,11 @@ class MMCacheReferenceLedger:
             logger.warning(
                 "Request id %s is already in use; its multimodal cache "
                 "references will not be given back if it is aborted early.",
-                request_ids[0],
+                request_id,
             )
             return None
-        held = _MMCacheReferences(references, request_ids)
-        for request_id in request_ids:
-            self._by_request[request_id] = held
+        held = _MMCacheReferences(references)
+        self._by_request[request_id] = held
         return held
 
     def finish(
@@ -148,11 +159,7 @@ class MMCacheReferenceLedger:
         if held is None or (holder is not None and held is not holder):
             return []
         del self._by_request[request_id]
-        held.unfinished.discard(request_id)
-        held.sent_to_workers |= sent_to_workers
-        if held.unfinished or held.sent_to_workers:
-            return []
-        return held.references
+        return [] if sent_to_workers else held.references
 
 
 class AsyncLLM(EngineClient):
@@ -485,12 +492,49 @@ class AsyncLLM(EngineClient):
             mm_refs += take_cache_references(
                 feature.data for feature in request.mm_features or ()
             )
+
+            # The workers fetch an item once for every engine request that
+            # sends it, so each request needs a reference of its own to each
+            # item. This one owns the references it took. It counts one more
+            # for every reference someone else took (beam search sends the
+            # rendered items again every step), and every n > 1 child after
+            # the first counts a full set.
+            num_requests = 1 if is_pooling or params.n == 1 else params.n
+            sent = [
+                feature.data
+                for feature in request.mm_features or ()
+                if isinstance(feature.data, ShmCacheReference)
+            ]
+            not_owned = _references_owned_by_others(sent, mm_refs)
+            added: list[ShmCacheReference] = []
+            to_add = not_owned + sent * (num_requests - 1)
+            if to_add:
+                try:
+                    if not await self.renderer.add_mm_cache_references_async(
+                        to_add, added
+                    ):
+                        raise RuntimeError(
+                            f"Request {request.request_id} sends multimodal "
+                            "items that are no longer in the shm processor "
+                            "cache (it was reset, or the earlier request "
+                            "that sent them has finished)."
+                        )
+                except BaseException:
+                    # Runs behind the add, so it gives back all it counted.
+                    self.renderer.release_mm_cache_references_async(added)
+                    raise
         except BaseException:
             self._release_mm_cache_references(mm_refs)
             raise
+        # The references of each engine request, in the order of `children`.
+        first = len(not_owned)
+        request_refs = [mm_refs + added[:first]] + [
+            added[first + i * len(sent) : first + (i + 1) * len(sent)]
+            for i in range(num_requests - 1)
+        ]
 
-        if is_pooling or params.n == 1:
-            holder = self._mm_cache_references.hold(mm_refs, [request.request_id])
+        if num_requests == 1:
+            holder = self._mm_cache_references.hold(request_refs[0], request.request_id)
             await self._add_request(request, prompt_text, None, 0, queue, holder)
             return queue
 
@@ -508,20 +552,21 @@ class AsyncLLM(EngineClient):
                 child_request.sampling_params = child_params
                 children.append(child_request)
         except BaseException:
-            self._release_mm_cache_references(mm_refs)
+            self._release_mm_cache_references(mm_refs + added)
             raise
-        # The children share the prompt's items, whose references were
-        # counted once: they are held until every child has finished.
-        holder = self._mm_cache_references.hold(
-            mm_refs, [child.request_id for child in children]
-        )
+        # Each child holds its own references, given back if it alone never
+        # reaches the workers.
+        holders = [
+            self._mm_cache_references.hold(refs, child.request_id)
+            for refs, child in zip(request_refs, children)
+        ]
         for idx, child_request in enumerate(children):
             try:
                 await self._add_request(
-                    child_request, prompt_text, parent_request, idx, queue, holder
+                    child_request, prompt_text, parent_request, idx, queue, holders[idx]
                 )
             except BaseException:
-                for unsent in children[idx + 1 :]:
+                for unsent, holder in zip(children[idx + 1 :], holders[idx + 1 :]):
                     self._finish_mm_cache_references(unsent.request_id, holder)
                 raise
         return queue

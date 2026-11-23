@@ -242,6 +242,53 @@ class TestShmObjectStorageReferenceCounting(unittest.TestCase):
         self.assertEqual(self.writer.writer_flag[new[1]], 1)
         self.assertTrue(self.writer.release("image", new[1], self.writer.generation))
 
+    def test_added_reference_keeps_the_item_for_the_second_request(self):
+        """Every reader fetches an item once per request that sends it, so a
+        second request sending the same reference needs a count of its own."""
+        reference = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.assertTrue(
+            self.writer.add_reference("image", reference[1], self.writer.generation)
+        )
+        # The touches of a later batch must not take it back.
+        self.writer.release_touches()
+
+        for reader in self.readers:
+            reader.get(*reference)
+        self.assertFalse(self._is_evictable("image"))
+        for reader in self.readers:
+            reader.get(*reference)
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_added_reference_is_given_back_like_any_other(self):
+        _, monotonic_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        generation = self.writer.generation
+        self.assertTrue(self.writer.add_reference("image", monotonic_id, generation))
+        self.assertEqual(self.writer.writer_flag[monotonic_id], 2)
+
+        self.assertTrue(self.writer.release("image", monotonic_id, generation))
+        self.assertTrue(self.writer.release("image", monotonic_id, generation))
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_no_reference_is_added_to_a_freed_or_cleared_item(self):
+        """The address may name another object by then."""
+        _, old_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        generation = self.writer.generation
+        for reader in self.readers:
+            reader.get(*self.writer.key_index["image"])
+        self.assertTrue(self._is_evictable("image"))
+        self.assertFalse(self.writer.add_reference("image", old_id, generation))
+
+        self.writer.put("other", _dummy_item({"pixels": 64}))
+        _, new_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.assertFalse(self.writer.add_reference("image", old_id, generation))
+        self.assertEqual(self.writer.writer_flag[new_id], 1)
+
+        self.writer.clear()
+        cleared = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.assertEqual(cleared[1], 0)
+        self.assertFalse(self.writer.add_reference("image", cleared[1], generation))
+        self.assertEqual(self.writer.writer_flag[cleared[1]], 1)
+
 
 class TestShmObjectStorageReaderCopy(unittest.TestCase):
     """A reader decodes into its own copy, since the slot is reused once

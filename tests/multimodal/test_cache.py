@@ -1,22 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
 import contextlib
 import copy
+import itertools
 import multiprocessing as mp
+import threading
 from contextvars import ContextVar
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
 import torch
 
+from vllm import CompletionOutput, RequestOutput, SamplingParams
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
 from vllm.distributed.device_communicators.shm_object_storage import (
     MsgpackSerde,
     SingleWriterShmObjectStorage,
     SingleWriterShmRingBuffer,
 )
+from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
+from vllm.inputs import MultiModalInput, mm_input
+from vllm.logprobs import Logprob
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import (
     BaseMultiModalProcessorCache,
@@ -44,8 +51,11 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.processing import PromptInsertion
 from vllm.renderers.base import BaseRenderer, RenderedMultiModalItems
+from vllm.sampling_params import BeamSearchParams
 from vllm.utils.mem_constants import GiB_bytes, MiB_bytes
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.async_llm import AsyncLLM, MMCacheReferenceLedger
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 pytestmark = pytest.mark.cpu_test
@@ -872,6 +882,7 @@ class _ShmTPWorkers:
             worker.mm_receiver_cache = _ShmReceiverCacheStub(reader)
             self.readers.append(reader)
             self.workers.append(worker)
+        self._fillers = itertools.count()
 
     def close(self) -> None:
         for reader in self.readers:
@@ -932,6 +943,17 @@ class _ShmTPWorkers:
 
     def num_gets(self) -> list[int]:
         return [len(reader.gets) for reader in self.readers]
+
+    def fill_ring(self) -> None:
+        """Write other images until the ring is full, as other requests do
+        while a request waits to be scheduled. The writer frees the oldest
+        items that every reference was read for, and wraps into their slots."""
+        filler = _dummy_item({"pixel_values": 1024}, rng=np.random.RandomState(1))
+        while True:
+            try:
+                self.writer.put(f"filler_{next(self._fillers)}", filler)
+            except MemoryError:
+                return
 
     def is_evictable(self, mm_hash: str) -> bool:
         self.writer.free_unused()
@@ -1084,6 +1106,214 @@ def test_shm_reference_reaches_the_workers_as_an_address():
         resumed = shm.step(new_reqs=[("req", features)])
         assert shm.num_gets() == [1, 1]
         assert all(_resolved_data(out) == [image_a] for out in resumed)
+        assert shm.is_evictable("a")
+    finally:
+        shm.close()
+
+
+class _ShmSenderCacheStub(ShmObjectStoreSenderCache):
+    """P0's shm sender cache around a given writer."""
+
+    def __init__(self, writer: SingleWriterShmObjectStorage) -> None:
+        self._shm_cache = writer
+        self._p0_cache = {}
+        self._reference_sinks = threading.local()
+        self._hits = 0
+        self._total = 0
+
+
+def _done(result: object) -> asyncio.Future:
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(result)
+    return future
+
+
+def _mm_engine_input(references: list[ShmCacheReference]) -> MultiModalInput:
+    return mm_input(
+        prompt_token_ids=[1, 2, 3],
+        mm_kwargs={"image": list(references)},
+        mm_hashes={"image": [reference.mm_hash for reference in references]},
+        mm_placeholders={
+            "image": [
+                PlaceholderRange(offset=4 * idx, length=4)
+                for idx in range(len(references))
+            ]
+        },
+    )
+
+
+def _async_llm_on(cache: BaseMultiModalProcessorCache) -> AsyncLLM:
+    """AsyncLLM with a mocked engine core that records the requests sent to
+    it. Its renderer keeps the books of `cache` with BaseRenderer's own
+    methods, run inline in place of the renderer thread."""
+    renderer = MagicMock()
+    renderer.mm_processor_cache = cache
+    renderer.get_mm_items.side_effect = BaseRenderer.get_mm_items
+    renderer.add_mm_cache_references_async.side_effect = lambda references, sink: (
+        _done(BaseRenderer.add_mm_cache_references(renderer, references, sink))
+    )
+    renderer.release_mm_cache_references_async.side_effect = lambda references: (
+        _done(BaseRenderer.release_mm_cache_references(renderer, references))
+    )
+
+    def process_inputs(request_id, prompt, params, **kwargs) -> EngineCoreRequest:
+        image = zip(
+            prompt["mm_kwargs"]["image"],
+            prompt["mm_hashes"]["image"],
+            prompt["mm_placeholders"]["image"],
+        )
+        # external_req_id as assign_request_id (mocked here) would set it.
+        return EngineCoreRequest(
+            request_id=request_id,
+            external_req_id=request_id,
+            prompt_token_ids=prompt["prompt_token_ids"],
+            mm_features=[
+                _image_feature(mm_hash, item, offset=placeholder.offset)
+                for item, mm_hash, placeholder in image
+            ],
+            sampling_params=params.clone(),
+            pooling_params=None,
+            arrival_time=0.0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+        )
+
+    llm = object.__new__(AsyncLLM)
+    llm.renderer = renderer
+    llm.engine_core = MagicMock()
+    llm.engine_core.resources.engine_dead = False
+    llm.engine_core.add_request_async = AsyncMock()
+    llm.output_handler = None
+    llm.vllm_config = MagicMock()
+    llm.vllm_config.cache_config.kv_sharing_fast_prefill = False
+    llm.model_config = MagicMock(is_encoder_decoder=False)
+    llm.input_processor = MagicMock()
+    llm.input_processor.process_inputs.side_effect = process_inputs
+    llm.output_processor = MagicMock()
+    llm.log_requests = False
+    llm._mm_shadow_hits = {}
+    llm._mm_cache_references = MMCacheReferenceLedger()
+    llm._run_output_handler = MagicMock()
+    llm.get_supported_tasks = AsyncMock(return_value=("generate",))
+    return llm
+
+
+def _sent_request(llm: AsyncLLM, request_id: str) -> EngineCoreRequest:
+    for call in llm.engine_core.add_request_async.call_args_list:
+        if call.args[0].request_id == request_id:
+            return call.args[0]
+    raise AssertionError(f"{request_id} was not sent")
+
+
+@pytest.mark.asyncio
+async def test_shm_parallel_sampling_children_each_count_a_reference():
+    """n > 1 children reach the workers as requests of their own, and every
+    worker fetches the item once per child. With one writer count for all of
+    them, the item is free once the first child was read. Other images then
+    take its slot while the other children wait for a free seat, and their
+    get() raises inside execute_model, which kills EngineCore."""
+    image_a = _dummy_item({"pixel_values": 1024}, rng=np.random.RandomState(0))
+    shm = _ShmTPWorkers(tp_size=2)
+    try:
+        cache = _ShmSenderCacheStub(shm.writer)
+        llm = _async_llm_on(cache)
+        reference, _ = cache.get_and_update_item((image_a, []), "a")
+
+        await llm.add_request("req", _mm_engine_input([reference]), SamplingParams(n=3))
+        children = [
+            call.args[0] for call in llm.engine_core.add_request_async.call_args_list
+        ]
+        assert len(children) == 3
+
+        # One child at a time, as when the others wait for a free seat, while
+        # other requests' images fill the ring.
+        for child in children:
+            shm.fill_ring()
+            outputs = shm.step(new_reqs=[(child.request_id, child.mm_features)])
+            assert all(_resolved_data(out) == [image_a] for out in outputs)
+            shm.step(finished={child.request_id})
+        assert shm.num_gets() == [3, 3]
+        assert shm.is_evictable("a")
+    finally:
+        shm.close()
+
+
+class _BeamSearchServing(BeamSearchOnlineMixin):
+    """Online beam search over an AsyncLLM whose engine requests are read at
+    once by TP workers through the shm cache."""
+
+    def __init__(self, llm: AsyncLLM, shm: _ShmTPWorkers) -> None:
+        self.renderer = llm.renderer
+        tokenizer = self.renderer.get_tokenizer.return_value
+        tokenizer.eos_token_id = 0
+        tokenizer.decode.return_value = ""
+        self.engine_client = MagicMock()
+        self.engine_client.generate = self._generate
+        self._llm = llm
+        self._shm = shm
+        self.reads: list[list[MultiModalKwargsItem | None]] = []
+
+    async def _generate(self, prompt, params, request_id, **kwargs):
+        await self._llm.add_request(request_id, prompt, params)
+        request = _sent_request(self._llm, request_id)
+        # Other requests' images fill the ring before this one is scheduled.
+        self._shm.fill_ring()
+        for output in self._shm.step(new_reqs=[(request_id, request.mm_features)]):
+            self.reads.append(_resolved_data(output))
+        self._shm.step(finished={request_id})
+
+        logprobs = {
+            token: Logprob(logprob=-float(token))
+            for token in range(1, params.logprobs + 1)
+        }
+        yield RequestOutput(
+            request_id=request_id,
+            prompt=None,
+            prompt_token_ids=request.prompt_token_ids,
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="",
+                    token_ids=[1],
+                    cumulative_logprob=-1.0,
+                    logprobs=[logprobs],
+                    finish_reason="length",
+                )
+            ],
+            finished=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_shm_beam_search_steps_each_count_a_reference():
+    """Every beam search step sends the rendered items again, in requests of
+    its own. With the one writer count rendering made, the item is free
+    after the first step's reads; other images take its slot, and the next
+    step's get() raises inside execute_model, which kills EngineCore."""
+    image_a = _dummy_item({"pixel_values": 1024}, rng=np.random.RandomState(0))
+    shm = _ShmTPWorkers(tp_size=2)
+    try:
+        cache = _ShmSenderCacheStub(shm.writer)
+        llm = _async_llm_on(cache)
+        reference, _ = cache.get_and_update_item((image_a, []), "a")
+        serving = _BeamSearchServing(llm, shm)
+
+        outputs = [
+            output
+            async for output in serving.beam_search(
+                _mm_engine_input([reference]),
+                "beam",
+                BeamSearchParams(beam_width=2, max_tokens=2),
+            )
+        ]
+
+        assert len(outputs) == 1
+        assert len(outputs[0].outputs) == 2
+        # One request in the first step, one per beam in the second.
+        assert serving.reads == [[image_a]] * 6
+        assert shm.num_gets() == [3, 3]
         assert shm.is_evictable("a")
     finally:
         shm.close()

@@ -115,9 +115,10 @@ def take_cache_references(
     nobody has taken yet, and return them.
 
     The same reference object can reach the engine client more than once
-    (beam search re-sends the rendered items every step, n > 1 children share
-    them) while it was counted once, so only the first taker may release it.
-    Items sent inline carry no reference and are skipped.
+    (beam search re-sends the rendered items every step) while it was counted
+    once, so only the first taker may release it; every other request that
+    sends it counts one of its own (`add_references`). Items sent inline carry
+    no reference and are skipped.
     """
     taken: list[ShmCacheReference] = []
     with _take_references_lock:
@@ -424,6 +425,24 @@ class BaseMultiModalProcessorCache(
         only caches whose items carry references override this.
         """
         return
+
+    def add_references(
+        self,
+        references: Sequence[ShmCacheReference],
+        sink: list[ShmCacheReference],
+    ) -> bool:
+        """Count one more reference to the item of each of `references`, for
+        another request that sends them to the workers, and append each new
+        reference to `sink` as soon as it is counted. The new references are
+        taken: the caller is responsible for them, also if it stopped waiting
+        for this call.
+
+        Returns whether all of them were counted. If not (an item is no longer
+        cached), the request must not be sent, and the references in `sink`
+        must be given back. Only caches whose items carry references hand any
+        out, so the default has nothing to count.
+        """
+        return not references
 
     def close(self) -> None:
         """Close the underlying cache, if needed."""
@@ -733,6 +752,28 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
                 cast(int, reference["monotonic_id"].data),
                 reference.generation,
             )
+
+    @override
+    def add_references(
+        self,
+        references: Sequence[ShmCacheReference],
+        sink: list[ShmCacheReference],
+    ) -> bool:
+        for reference in references:
+            monotonic_id = cast(int, reference["monotonic_id"].data)
+            if not self._shm_cache.add_reference(
+                reference.mm_hash, monotonic_id, reference.generation
+            ):
+                return False
+            added = ShmCacheReference(
+                cast(int, reference["address"].data),
+                monotonic_id,
+                mm_hash=reference.mm_hash,
+                generation=reference.generation,
+            )
+            added.taken = True
+            sink.append(added)
+        return True
 
     @override
     def close(self) -> None:
