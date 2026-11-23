@@ -21,6 +21,7 @@ from .cumsum import chunk_local_cumsum
 from .fused_recurrent import fused_recurrent_gated_delta_rule_fwd_kernel
 from .gdn_chunk_kernels import resolve_kda_kernels
 from .index import prepare_chunk_indices
+from .kda_glue import kda_gated_rmsnorm, kda_gated_rmsnorm_supported
 from .l2norm import l2norm_fwd
 from .op import exp2, log
 from .solve_tril import solve_tril
@@ -565,6 +566,25 @@ class FusedRMSNormGated(CustomOp):
         residual_in_fp32: bool = False,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        # Two kernels, chosen by the form of the call. The fused kernel is
+        # bit-identical to forward_native for what it covers (sigmoid gate,
+        # affine weight without bias, no residual, rows its kernel supports);
+        # every other call goes to the general rms_norm_gated kernel.
+        if (
+            self.activation == "sigmoid"
+            and self.weight is not None
+            and self.bias is None
+            and residual is None
+            and not prenorm
+            and kda_gated_rmsnorm_supported(x, g, self.weight)
+        ):
+            return kda_gated_rmsnorm(
+                x.contiguous(),
+                g.contiguous(),
+                self.weight,
+                self.eps,
+                out_dtype or x.dtype,
+            )
         return rms_norm_gated(
             x,
             g,
