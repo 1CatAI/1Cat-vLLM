@@ -644,6 +644,117 @@ def test_moe_qpn_packed_scales_give_the_raster_result(
     assert torch.equal(run(scratch, True), expected)
 
 
+@pytest.mark.parametrize(
+    ("scale_mode", "scale_bits"),
+    [(0, 0), (1, 0), (0, 5), (0, 6)],
+    ids=["nvfp4_raster", "mxfp4_raster", "five_bit_planes", "six_bit_planes"],
+)
+@pytest.mark.parametrize(
+    ("cols", "splitk"),
+    [(128, None), (256, None), (384, None), (640, None), (320, None), (768, 16)],
+    ids=str,
+)
+def test_moe_qpn_decode_load_ring_equals_the_prefill_path(
+    device, order, cols, splitk, scale_mode, scale_bits
+):
+    # Decode (at most 8 rows per expert) reads the codes, scales and activation
+    # rows through a load ring (kDecodeRing groups ahead); prefill (more than 8 rows
+    # per expert on average) takes the staged path without it. Both sum every
+    # row over the same groups in the same order, so each decode row must equal
+    # the same row of the prefill run bit for bit. The widths give warp slices
+    # of 1 (K = 128), 2 (256, and 320 on 10 warps), 3 (384, and 768 on 16
+    # warps) and 5 (640) groups: a slice shorter than, or not a multiple of,
+    # the ring depth must neither drop a group nor read one past its end. The
+    # float references at 2e-2 elsewhere would hide a dropped group in the
+    # packed variants, and their widths all give even slices.
+    if splitk is not None and order != QpnFragmentOrder.M8N8K4:
+        pytest.skip("only the m8n8k4 kernel runs 16 warps")
+    if scale_mode == 1 and scale_bits:
+        pytest.skip("packed planes carry NVFP4 scales")
+    generator = torch.Generator().manual_seed(11)
+    decode_counts = [8, 1, 0, 5, 3]
+    experts, rows = len(decode_counts), 128
+    prefill_count = 12  # per expert, empty or not: 12 > 8 rows on average
+    group_size = 32 if scale_mode == 1 else 16
+    codes = torch.randint(0, 256, (experts, rows, cols // 2), generator=generator)
+    codes = codes.to(torch.uint8)
+    if scale_mode == 1:
+        scales = (
+            torch.randint(0, 8, (experts, rows, cols // 32), generator=generator) + 112
+        ).to(torch.uint8)
+        global_scale = rebase_e8m0_for_fp16(scales).to(device)
+    else:
+        scales = torch.stack(
+            [
+                _wide_scales(generator, rows, cols, 40)
+                if scale_bits == 6
+                else _nvfp4_expert(generator, rows, cols)[1]
+                for _ in range(experts)
+            ]
+        )
+        global_scale = (torch.rand(experts, generator=generator) * 0.2 + 0.05).to(
+            device
+        )
+    w = codes.to(device)
+    raster = torch.empty(
+        experts,
+        rows // 32 * (cols // group_size) * 32,
+        dtype=torch.uint8,
+        device=device,
+    )
+    for e in range(experts):
+        qc, qs = qpn_prepack(w[e], scales[e].to(device), group_size, order)
+        w[e].view(-1).copy_(qc)
+        raster[e].copy_(qs.reshape(-1))
+    extra: tuple[torch.Tensor, ...] = ()
+    if scale_bits:
+        planes = encode_scales(raster, cols // 16, scale_bits)
+        extra = (planes.base, planes.nib, planes.hi)
+
+    prefill_tokens = prefill_count * experts
+    hidden = torch.randn(prefill_tokens, cols, generator=generator).to(torch.float16)
+    # Expert e's first rows are its decode rows; the prefill run keeps the rest
+    # of its block as filler.
+    decode_rows = [
+        e * prefill_count + i
+        for e, count in enumerate(decode_counts)
+        for i in range(count)
+    ]
+
+    def run(x, counts):
+        tokens = x.shape[0]
+        gids = torch.zeros(tokens, dtype=torch.int32)
+        goff = torch.full((tokens + 1,), tokens, dtype=torch.int32)
+        group, start = 0, 0
+        for e, count in enumerate(counts):
+            if count:
+                gids[group], goff[group] = e, start
+                group, start = group + 1, start + count
+        out = torch.empty((tokens, rows), dtype=torch.float16, device=device)
+        torch.ops._C.skinny_moe_qpn_sm70(
+            x.to(device),
+            w,
+            raster,
+            global_scale,
+            torch.arange(tokens, dtype=torch.int32, device=device),
+            gids.to(device),
+            goff.to(device),
+            1,
+            out,
+            False,
+            tokens,
+            splitk or grouped_splitk(cols, order),
+            scale_mode,
+            order,
+            *extra,
+        )
+        return out.cpu()
+
+    decode = run(hidden[decode_rows], decode_counts)
+    prefill = run(hidden, [prefill_count] * experts)
+    assert torch.equal(decode, prefill[decode_rows])
+
+
 def _nvfp4_moe(generator, num_experts, hidden_size, intermediate):
     w13, s13, w2, s2 = [], [], [], []
     for _ in range(num_experts):

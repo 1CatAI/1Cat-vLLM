@@ -247,9 +247,18 @@ __global__ void skinny_nvfp4_qpn(const uint8_t* __restrict__ qcodes,
 // activation fragment. Every row keeps its own accumulators and the same K
 // order, so the result depends on neither RB nor NT.
 
+// Groups the decode path (RB == 1) keeps in flight ahead of the one it
+// computes. One slot holds about 10 registers per lane. Depth 1 keeps every
+// SPLITK 8 instance at 80 registers or fewer without spills, so three
+// 256-thread CTAs fit an SM (the launch bound below enforces the cap); depth 2
+// needed 40-72 bytes of local-memory spills to stay under it (nvcc 2026-11-23).
+constexpr int kDecodeRing = 1;
+
 template <int SPLITK, int SCALE_MODE, int RB, int NT, int SBITS>
 __global__ void __launch_bounds__(32 * SPLITK,
-                                  (SBITS != 0 && RB > 1 && SPLITK <= 8) ? 2 : 0)
+                                  (SBITS != 0 && RB > 1 && SPLITK <= 8) ? 2
+                                  : (RB == 1 && SPLITK == 8)            ? 3
+                                                                        : 0)
     skinny_nvfp4_moe_qpn(const uint8_t* __restrict__ qcodes,
                          const uint8_t* __restrict__ qscales,
                          const PackedPlanes packed,
@@ -344,45 +353,81 @@ __global__ void __launch_bounds__(32 * SPLITK,
     if constexpr (RB == 1) {
       // Decode (at most 8 rows per expert): staging costs more than the
       // repeated loads it saves, so A comes straight from global memory.
+      // Codes, scales and A rows go through an explicit load ring
+      // (kDecodeRing groups ahead, like load_group in the m16n8k8 kernel):
+      // left to the compiler, `unroll 4` fetched the codes about one group
+      // ahead and drained the pipeline at every loop edge, which kept the DRAM
+      // stream at 63-67 % of its bandwidth. Slot i is consumed, then refilled
+      // with the group kDecodeRing on, so the next groups' loads are in flight
+      // while this one computes. Math and summation order per group are
+      // unchanged.
       const half* xr = r < rows ? xrows[r] : nullptr;
-#pragma unroll 4
-      for (int g = g0; g < g0 + Gq; g++) {
-        // Weights first, then the activation row: this order keeps the
-        // unrolled iterations' code loads ahead of their use (the reverse
-        // measured 18 % slower at decode on V100).
-        half2 bq[NT][8];
+      const int gend = g0 + Gq;
+      uint2 qv[kDecodeRing][NT];
+      uint8_t sv[kDecodeRing][NT];    // raster scale byte, or the nibble byte
+      uint32_t hv[kDecodeRing][NT];   // packed only: high-bit word
+      uint32_t hv2[kDecodeRing][NT];  // packed only: second plane (six bits)
+      uint4 av0[kDecodeRing], av1[kDecodeRing];
+      // Weights first, then the activation row: the reverse order measured
+      // 18 % slower at decode on V100.
+      auto load_group = [&](int slot, int g) {
 #pragma unroll
         for (int nt = 0; nt < NT; nt++) {
-          const uint2 q2 = __ldcs(cb + ((size_t)nt * G + g) * 32);
-          half2 sc2;
+          qv[slot][nt] = __ldcs(cb + ((size_t)nt * G + g) * 32);
           if constexpr (PACKED) {
-            uint32_t high0, high1;
-            load_high_words<SBITS>(packed_hi[nt] + g * HW, high0, high1);
-            sc2 = __hmul2(decode_scale<SCALE_MODE>(packed_scale_byte<SBITS>(
-                              packed_base[nt],
-                              __ldg(packed_nib[nt] + (size_t)(g >> 1) * 32),
-                              high0, high1, g, lane)),
-                          gm2);
-          } else
-            sc2 = __hmul2(group_scale<SCALE_MODE>(sb + (size_t)nt * SG * 32, g),
-                          gm2);
-          dequant8_tm(q2.x, sc2, bq[nt] + 0);
-          dequant8_tm(q2.y, sc2, bq[nt] + 4);
+            sv[slot][nt] = __ldg(packed_nib[nt] + (size_t)(g >> 1) * 32);
+            load_high_words<SBITS>(packed_hi[nt] + g * HW, hv[slot][nt],
+                                   hv2[slot][nt]);
+          } else {
+            sv[slot][nt] =
+                group_scale_byte<SCALE_MODE>(sb + (size_t)nt * SG * 32, g);
+          }
         }
-        uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+        av0[slot] = make_uint4(0, 0, 0, 0);
+        av1[slot] = make_uint4(0, 0, 0, 0);
         if (xr) {
-          a01 = *reinterpret_cast<const uint4*>(xr + g * 16);
-          a23 = *reinterpret_cast<const uint4*>(xr + g * 16 + 8);
+          av0[slot] = *reinterpret_cast<const uint4*>(xr + g * 16);
+          av1[slot] = *reinterpret_cast<const uint4*>(xr + g * 16 + 8);
         }
-        const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
-        const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+      };
+      // Gq need not be a multiple of kDecodeRing (K = 1280 on SPLITK 16 gives
+      // 5): the priming, the refill and the tail chunk are all bounded by gend,
+      // so nothing is read past the warp's slice.
 #pragma unroll
-        for (int nt = 0; nt < NT; nt++) {
-          const unsigned* B = reinterpret_cast<const unsigned*>(bq[nt]);
-          SKINNY_MMA_8N8K4(c[nt][0], A0[0], A0[1], B[0], B[1]);
-          SKINNY_MMA_8N8K4(c[nt][0], A0[2], A0[3], B[2], B[3]);
-          SKINNY_MMA_8N8K4(c[nt][0], A1[0], A1[1], B[4], B[5]);
-          SKINNY_MMA_8N8K4(c[nt][0], A1[2], A1[3], B[6], B[7]);
+      for (int i = 0; i < kDecodeRing; i++)
+        if (g0 + i < gend) load_group(i, g0 + i);
+      for (int gc = g0; gc < gend; gc += kDecodeRing) {
+#pragma unroll
+        for (int i = 0; i < kDecodeRing; i++) {
+          const int g = gc + i;
+          if (g >= gend) break;  // warp-uniform
+          uint2 q[NT];
+          uint8_t s[NT];
+#pragma unroll
+          for (int nt = 0; nt < NT; nt++) {
+            q[nt] = qv[i][nt];
+            if constexpr (PACKED)
+              s[nt] = packed_scale_byte<SBITS>(packed_base[nt], sv[i][nt],
+                                               hv[i][nt], hv2[i][nt], g, lane);
+            else
+              s[nt] = sv[i][nt];
+          }
+          const uint4 a01 = av0[i], a23 = av1[i];
+          if (g + kDecodeRing < gend) load_group(i, g + kDecodeRing);
+          const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
+          const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+#pragma unroll
+          for (int nt = 0; nt < NT; nt++) {
+            const half2 sc2 = __hmul2(decode_scale<SCALE_MODE>(s[nt]), gm2);
+            half2 bq[8];
+            dequant8_tm(q[nt].x, sc2, bq + 0);
+            dequant8_tm(q[nt].y, sc2, bq + 4);
+            const unsigned* B = reinterpret_cast<const unsigned*>(bq);
+            SKINNY_MMA_8N8K4(c[nt][0], A0[0], A0[1], B[0], B[1]);
+            SKINNY_MMA_8N8K4(c[nt][0], A0[2], A0[3], B[2], B[3]);
+            SKINNY_MMA_8N8K4(c[nt][0], A1[0], A1[1], B[4], B[5]);
+            SKINNY_MMA_8N8K4(c[nt][0], A1[2], A1[3], B[6], B[7]);
+          }
         }
       }
     } else {
