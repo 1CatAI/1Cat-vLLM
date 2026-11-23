@@ -558,8 +558,13 @@ def test_moe_qpn_multi_pass_groups_cover_every_row(device, order, counts):
 
 
 def _wide_scales(generator, rows, cols, spread):
-    """fp8-e4m3 scale bytes (finite, positive) whose rows span exactly `spread`."""
-    low = 56 + torch.randint(0, 4, (rows, 1), generator=generator)
+    """fp8-e4m3 scale bytes (finite, positive) whose rows span exactly `spread`.
+
+    The rows start in the subnormals so that even a span of 63 ends near 2.0
+    (byte 0x41): the kernels fold the global scale times 2^14 into an fp16 scale,
+    which larger scales overflow, and a NaN reference equals nothing.
+    """
+    low = 1 + torch.randint(0, 2, (rows, 1), generator=generator)
     delta = torch.randint(0, spread + 1, (rows, cols // 16), generator=generator)
     delta[:, 0] = 0
     delta[:, 1] = spread
@@ -634,6 +639,7 @@ def test_moe_qpn_packed_scales_give_the_raster_result(
         return out
 
     expected = run(raster, False)
+    assert torch.isfinite(expected).all()
     scratch = torch.zeros_like(raster)  # the op writes the routed experts' rows
     assert torch.equal(run(scratch, True), expected)
 
