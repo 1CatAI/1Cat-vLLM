@@ -407,7 +407,11 @@ def hc_transition(
     if (
         _HC_SIDE
         and mix
-        and 0 < tokens <= _HC_SIDE_MAX
+        # Up to _HC_SIDE_MAX inside decode graphs; eager steps (prefill and
+        # mixed batches) keep the long-validated 64-token bound.
+        and 0
+        < tokens
+        <= (_HC_SIDE_MAX if torch.cuda.is_current_stream_capturing() else 64)
         and residual.is_cuda
         and fn.dtype == torch.float32
         and fn.is_contiguous()
@@ -487,6 +491,49 @@ def hc_transition(
             hc_eps,
             iters,
         )
+    if (
+        tokens > 8
+        and residual.is_cuda
+        and _HC_PARTS_CUDA
+        and (not mix or (fn.dtype == torch.float32 and fn.is_contiguous()))
+    ):
+        from vllm.models.deepseek_v41.native import load_v41sk
+
+        load_v41sk()
+        if hasattr(torch.ops.v41sk, "hc_expand_collapse_norm"):
+            out = torch.empty(tokens, H, dtype=torch.float16, device=device)
+            sq = torch.empty(tokens, dtype=torch.float32, device=device) if mix else out
+            torch.ops.v41sk.hc_expand_collapse_norm(
+                residual,
+                y.contiguous(),
+                post.contiguous(),
+                comb.contiguous(),
+                collapse_pre.contiguous(),
+                norm_weight.contiguous(),
+                out,
+                sq,
+                mix,
+                norm_eps,
+            )
+            if not mix:
+                return out, None
+            dots = torch.mm(residual.view(tokens, 4 * H), fn.view(24, 4 * H).t())
+            pre = torch.empty(tokens, 4, dtype=torch.float32, device=device)
+            post_n = torch.empty_like(pre)
+            comb_n = torch.empty(tokens, 4, 4, dtype=torch.float32, device=device)
+            torch.ops.v41sk.hc_sinkhorn(
+                dots,
+                sq,
+                scale.contiguous(),
+                base.contiguous(),
+                pre,
+                post_n,
+                comb_n,
+                norm_eps,
+                hc_eps,
+                iters,
+            )
+            return out, (pre, post_n, comb_n)
     # Per-token kernels: process bounded windows so the FP32 collapse buffer
     # does not scale with the prefill chunk.
     window = min(tokens, _WINDOW)
@@ -798,8 +845,8 @@ def _hc_transition_cuda(
 # are first used one sublayer later. Consumers call hc_join() (hc_transition
 # does it itself) before reading pre / post / comb.
 _HC_SIDE = envs.VLLM_V41_HC_SIDE == "1"
-# Token counts the side path covers (v41sk.hc_mix loops 8-token chunks; up to
-# 128). Several requests per step stay off the critical path too.
+# Token counts the side path covers (v41sk.hc_mix: 16-token blocks, up to 256).
+# Several requests per step stay off the critical path too.
 _HC_SIDE_MAX = int(envs.VLLM_V41_HC_SIDE_MAX)
 _HC_STREAMS: dict = {}
 _HC_PENDING: list = []
@@ -862,7 +909,8 @@ def _hc_transition_side(
     if state is None:
         state = _HC_STREAMS[key] = (
             torch.cuda.Stream(device=device),
-            torch.zeros(1, dtype=torch.int32, device=device),
+            # One ticket per 16-token block of v41sk.hc_mix (up to 256 tokens).
+            torch.zeros(16, dtype=torch.int32, device=device),
         )
     side, ticket = state
     pre = torch.empty(tokens, 4, dtype=torch.float32, device=device)
