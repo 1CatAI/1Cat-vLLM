@@ -62,12 +62,17 @@ class V41ProposeGraph:
 
     def _capture(self, key, entry, fn, inputs) -> bool:
         static = {name: t.clone() for name, t in inputs.items()}
+        device = next(iter(static.values())).device
+        # Drain pending work on the default stream (including non-blocking
+        # H2D copies and TP P2P markov kernels) before switching to the
+        # capture stream, matching V41QueryGraph / V41GreedyDraftGraph.
+        torch.accelerator.synchronize(device)
         graph = torch.cuda.CUDAGraph()
         try:
             # vLLM's graph_capture: TP custom all-reduce inside the round
             # (sharded draft head) needs its capture-registered buffers.
             with (
-                graph_capture(device=next(iter(static.values())).device) as context,
+                graph_capture(device=device) as context,
                 torch.cuda.graph(
                     graph,
                     pool=self.pool,
