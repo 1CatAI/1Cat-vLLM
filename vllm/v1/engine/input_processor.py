@@ -336,6 +336,10 @@ class InputProcessor:
             )
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
+            if self.use_v2_model_runner:
+                # Reject here: past this point an oversized request fails
+                # inside every worker and the engine dies.
+                sampling_params.verify_v2_sampler_capacity()
         else:
             pooling_params = params.clone()
 
