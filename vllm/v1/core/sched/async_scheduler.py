@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.config.kernel import ADAPTIVE_MTP_FLOOR_K, resolve_adaptive_verify
+from vllm.config.kernel import resolve_adaptive_verify
 from vllm.logger import init_logger
+from vllm.v1.core.sched.adaptive_verify import (
+    VerifyLengthController,
+    VerifyState,
+    build_verify_controller,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
@@ -30,16 +35,12 @@ class AsyncScheduler(Scheduler):
             and draft_model_config.max_model_len is not None
             else self.max_model_len
         )
+        self._verify_controller: VerifyLengthController | None = None
+        # req_id -> controller state of that request
+        self._verify_states: dict[str, VerifyState] = {}
         plan = resolve_adaptive_verify(
             speculative_config, self.vllm_config.kernel_config, self.num_spec_tokens
         )
-        is_mtp_plan = plan is not None and plan.rule == "mtp_bands"
-        self._adaptive_mtp = self.use_v2_model_runner and is_mtp_plan
-        self._adaptive_mtp_min_k = (
-            plan.min_tokens if plan is not None else ADAPTIVE_MTP_FLOOR_K
-        )
-        # req_id -> [ema_successes, ema_trials, cur_k]
-        self._adaptive_mtp_state: dict[str, list[float]] = {}
         # Inkling2 DSpark: draft width (verified tokens) by decode batch size.
         self._dspark_widths = None
         if (
@@ -63,11 +64,19 @@ class AsyncScheduler(Scheduler):
                 "Inkling2 DSpark batch-aware draft widths (B=1,2,...): %s",
                 self._dspark_widths.table,
             )
-        if self._adaptive_mtp:
+        if plan is not None and not self.use_v2_model_runner:
+            # Only the V2 runner honours a per-round verify length, so the
+            # automatic depth stays fixed here; the one method an explicit
+            # adaptive_verify setting admits runs on the V2 runner only.
+            plan = None
+        if plan is not None:
+            self._verify_controller = build_verify_controller(plan)
             logger.info(
-                "Adaptive MTP (EntMTP-Async) enabled: k in [%d, %d].",
-                self._adaptive_mtp_min_k,
-                self.num_spec_tokens,
+                "Adaptive verify length (%s) enabled: n in [%d, %d], first round %d.",
+                plan.rule,
+                plan.min_tokens,
+                plan.max_tokens,
+                plan.initial_tokens,
             )
 
     def _on_spec_decode_feedback(
@@ -81,57 +90,13 @@ class AsyncScheduler(Scheduler):
                 req_id, num_draft_tokens, num_accepted_tokens
             )
             return
-        if not self._adaptive_mtp or num_draft_tokens <= 0:
+        controller = self._verify_controller
+        if controller is None or num_draft_tokens <= 0:
             return
-        k_min = self._adaptive_mtp_min_k
-        k_max = self.num_spec_tokens
-        state = self._adaptive_mtp_state.get(req_id)
+        state = self._verify_states.get(req_id)
         if state is None:
-            # Neutral-optimistic prior: p_hat = 0.80 -> starts at k_max.
-            state = [4.0, 5.0, float(k_max)]
-            self._adaptive_mtp_state[req_id] = state
-        # Geometric-MLE EMA: p_hat = E[accepted] / E[min(accepted + 1, k)].
-        # Invariant to current depth k, so low k never traps the estimate.
-        alpha = 0.28
-        trials = min(num_accepted_tokens + 1, num_draft_tokens)
-        s = (1.0 - alpha) * state[0] + alpha * float(num_accepted_tokens)
-        n = (1.0 - alpha) * state[1] + alpha * float(trials)
-        p_hat = s / max(n, 1e-6)
-        cur_k = int(state[2])
-
-        # Instant ramp-up when the current depth saturates (100% accepted).
-        if num_accepted_tokens >= num_draft_tokens and cur_k < k_max:
-            new_k = min(k_max, cur_k + 1)
-        else:
-            # Measured throughput-optimal k*(p) with hysteresis (+/-0.025).
-            # Boundaries: k=2 (<0.62), k=3 (0.62..0.74), k=4 (0.74..0.82),
-            #             k=5 (0.82..0.89), k=6 (>=0.89).
-            if p_hat < 0.62:
-                target_k = 2
-            elif p_hat < 0.74:
-                target_k = 3
-            elif p_hat < 0.82:
-                target_k = 4
-            elif p_hat < 0.89:
-                target_k = 5
-            else:
-                target_k = 6
-            target_k = max(k_min, min(k_max, target_k))
-            # Apply 0.025 downward hysteresis to prevent step-to-step chatter.
-            down_thresh = {3: 0.595, 4: 0.715, 5: 0.795, 6: 0.865}
-            if target_k < cur_k:
-                if p_hat < down_thresh.get(cur_k, 0.0):
-                    new_k = max(k_min, cur_k - 1)
-                else:
-                    new_k = cur_k
-            elif target_k > cur_k:
-                new_k = min(k_max, cur_k + 1)
-            else:
-                new_k = cur_k
-
-        state[0] = s
-        state[1] = n
-        state[2] = float(new_k)
+            state = self._verify_states[req_id] = controller.new_state()
+        controller.update(state, num_draft_tokens, num_accepted_tokens)
 
     def _select_adaptive_batch_k(self, decode_req_ids: list[str]) -> int:
         if self._dspark_widths is not None and decode_req_ids:
@@ -139,16 +104,17 @@ class AsyncScheduler(Scheduler):
             if len(decode_req_ids) == 1 and width > 0:
                 width = self._dspark_adaptive.width(decode_req_ids[0], width)
             return width
-        if not self._adaptive_mtp or not decode_req_ids:
+        controller = self._verify_controller
+        if controller is None or not decode_req_ids:
             return self.num_spec_tokens
         if len(decode_req_ids) > 1:
             # Concurrent batches (c >= 2) have tiny marginal verify cost per
             # token (~2-4%) and require uniform qlen for pre-captured graphs.
-            return self.num_spec_tokens
-        state = self._adaptive_mtp_state.get(decode_req_ids[0])
+            return controller.max_length
+        state = self._verify_states.get(decode_req_ids[0])
         if state is None:
-            return self.num_spec_tokens
-        return max(self._adaptive_mtp_min_k, min(self.num_spec_tokens, int(state[2])))
+            return controller.initial_length
+        return state.length
 
     def schedule(self) -> SchedulerOutput:
         if self._dspark_widths is not None:
@@ -180,14 +146,13 @@ class AsyncScheduler(Scheduler):
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
-        if self._adaptive_mtp:
-            if scheduler_output.finished_req_ids:
-                for finished_id in scheduler_output.finished_req_ids:
-                    self._adaptive_mtp_state.pop(finished_id, None)
-            if len(self._adaptive_mtp_state) > len(self.requests):
-                for stale_id in list(self._adaptive_mtp_state):
+        if self._verify_controller is not None:
+            for finished_id in scheduler_output.finished_req_ids:
+                self._verify_states.pop(finished_id, None)
+            if len(self._verify_states) > len(self.requests):
+                for stale_id in list(self._verify_states):
                     if stale_id not in self.requests:
-                        del self._adaptive_mtp_state[stale_id]
+                        del self._verify_states[stale_id]
         decode_req_ids = [
             req_id
             for req_id in scheduler_output.num_scheduled_tokens
@@ -196,7 +161,9 @@ class AsyncScheduler(Scheduler):
         if self._dspark_widths is not None:
             self._dspark_adaptive.forget(self.requests)
         next_k = self._select_adaptive_batch_k(decode_req_ids)
-        if (self._adaptive_mtp or self._dspark_widths is not None) and decode_req_ids:
+        if (
+            self._verify_controller is not None or self._dspark_widths is not None
+        ) and decode_req_ids:
             scheduler_output.next_spec_steps = next_k
         placeholders = (
             self._spec_token_placeholders
