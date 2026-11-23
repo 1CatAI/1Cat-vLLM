@@ -82,12 +82,13 @@ def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
     warmup_kernels(runner, executions.append, samples.append)
 
     tokens = [output.total_num_scheduled_tokens for output in executions]
-    # Full batch, then the 33-token kernel profile and a full prefill chunk
-    # (capped so the decode step fits max_model_len), one request each.
-    assert tokens[:9] == [24, 20, 0, 33, 5, 0, 59, 5, 0]
+    # Full batch, then the 16-token prefill (added under speculation when the
+    # default prompt is shorter), the 33-token kernel profile and a full prefill
+    # chunk (capped so the decode step fits max_model_len), one request each.
+    assert tokens[:12] == [24, 20, 0, 16, 5, 0, 33, 5, 0, 59, 5, 0]
     # Every smaller request count: a pure decode step, then a decode step
     # that also admits a 6-token prefill.
-    assert tokens[9:] == [
+    assert tokens[12:] == [
         *(18, 15, 0, 18, 21, 0),
         *(12, 10, 0, 12, 16, 0),
         *(6, 5, 0, 6, 11, 0),
@@ -100,16 +101,18 @@ def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
     finished = set().union(*(output.finished_req_ids for output in executions))
     assert started == finished
     assert connector_states == [True, False]
-    assert len(samples) == 6 + 6 * 2
-    # Only the short prompts ask for prompt logprobs: on the kernel profile and
-    # the full chunk they would build logits for every prompt token.
+    # The extra 16-token prefill cycle adds two samples.
+    assert len(samples) == 6 + 2 + 6 * 2
+    # Only the default batch asks for prompt logprobs: the kernel profiles, the
+    # full chunk and the smaller request counts would build logits for every
+    # prompt token and keep that memory reserved.
     prompt_logprobs = [
         {r.sampling_params.prompt_logprobs for r in output.scheduled_new_reqs}
         for output in executions
         if output.scheduled_new_reqs
     ]
-    assert prompt_logprobs[:3] == [{1}, {None}, {None}]
-    assert all(entry == {1} for entry in prompt_logprobs[3:])
+    assert prompt_logprobs[0] == {1}
+    assert all(entry == {None} for entry in prompt_logprobs[1:])
 
 
 def _speculative_config(method: str) -> SpeculativeConfig:
