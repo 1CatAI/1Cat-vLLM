@@ -19,7 +19,7 @@ from vllm.compilation.sm70_decode_graph import (
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.execution_policy import graph_policy
-from vllm.config.kernel import resolve_adaptive_verify
+from vllm.config.kernel import ADAPTIVE_MTP_FLOOR_K, resolve_adaptive_verify
 from vllm.config.speculative import (
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
@@ -204,6 +204,54 @@ def get_uniform_decode_token_count(
     return get_uniform_token_count(num_reqs, num_tokens, max_query_len)
 
 
+def _legacy_tail_graphs_enabled(
+    vllm_config: VllmConfig, decode_query_len: int, is_target_manager: bool
+) -> bool:
+    """Legacy tail option: q1..q7 tails of the q8 target verifier."""
+    speculative_config = vllm_config.speculative_config
+    return bool(
+        vllm_config.attention_config.flash_v100.options.value("tail_cudagraphs")
+        and is_target_manager
+        and speculative_config is not None
+        and speculative_config.method == "dflash"
+        and decode_query_len == 8
+        and _worker_device_is_pre_ampere()
+        and not vllm_config.compilation_config.pass_config.enable_sp
+    )
+
+
+def tail_query_lens(
+    vllm_config: VllmConfig, decode_query_len: int, is_target_manager: bool
+) -> tuple[int, ...]:
+    """Query lengths below the full verifier that get their own graphs.
+
+    The single source for every mechanism that verifies fewer draft tokens
+    than the full block: the legacy tail option, adaptive MTP depth and the
+    adaptive verify length of block drafters. Only single-request tails are
+    captured.
+    """
+    if vllm_config.compilation_config.pass_config.enable_sp:
+        return ()
+    lens: list[int] = []
+    if _legacy_tail_graphs_enabled(vllm_config, decode_query_len, is_target_manager):
+        lens.extend(range(7, 0, -1))
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or decode_query_len < 4:
+        return tuple(lens)
+    if not is_target_manager and speculative_config.method != "mtp":
+        # A block drafter's width is its trained one, not a verify length.
+        return tuple(lens)
+    plan = resolve_adaptive_verify(
+        speculative_config, vllm_config.kernel_config, decode_query_len - 1
+    )
+    if plan is not None and plan.rule == "mtp_bands":
+        lens.extend(range(decode_query_len - 1, ADAPTIVE_MTP_FLOOR_K, -1))
+    elif plan is not None:
+        # Length 1 + n for every n the scheduler may pick below the full block.
+        lens.extend(range(decode_query_len - 1, plan.min_tokens, -1))
+    return tuple(dict.fromkeys(lens))
+
+
 class CudaGraphManager:
     def __init__(
         self,
@@ -232,48 +280,21 @@ class CudaGraphManager:
                     "query lengths %s.",
                     self.decode_query_lens,
                 )
-        self._sm70_dflash2_tail_graphs = bool(
-            vllm_config.attention_config.flash_v100.options.value("tail_cudagraphs")
-            and isinstance(self, ModelCudaGraphManager)
-            and speculative_config is not None
-            and speculative_config.method == "dflash"
-            and decode_query_len == 8
-            and _worker_device_is_pre_ampere()
-            and not self.compilation_config.pass_config.enable_sp
+        self._sm70_dflash2_tail_graphs = _legacy_tail_graphs_enabled(
+            vllm_config, decode_query_len, isinstance(self, ModelCudaGraphManager)
         )
-        if self._sm70_dflash2_tail_graphs:
+        self.tail_query_lens = tail_query_lens(
+            vllm_config, decode_query_len, isinstance(self, ModelCudaGraphManager)
+        )
+        if self.tail_query_lens:
             # Target verifier tails are independent of adaptive lookup. The
             # drafter always produces its trained block width and must not
             # capture these target-only shapes.
             self.decode_query_lens = tuple(
-                dict.fromkeys((*self.decode_query_lens, *range(7, 0, -1)))
+                dict.fromkeys((*self.decode_query_lens, *self.tail_query_lens))
             )
             logger.info_once(
-                "Capturing SM70 DFlash2 target tail query lengths %s.",
-                self.decode_query_lens,
-            )
-
-        adaptive_plan = (
-            resolve_adaptive_verify(
-                speculative_config, vllm_config.kernel_config, decode_query_len - 1
-            )
-            if speculative_config is not None and decode_query_len >= 4
-            else None
-        )
-        self._adaptive_mtp_tail_graphs = bool(
-            adaptive_plan is not None
-            and adaptive_plan.rule == "mtp_bands"
-            and not self.compilation_config.pass_config.enable_sp
-        )
-        if self._adaptive_mtp_tail_graphs:
-            self.decode_query_lens = tuple(
-                dict.fromkeys(
-                    (*self.decode_query_lens, *range(decode_query_len - 1, 2, -1))
-                )
-            )
-            logger.info_once(
-                "Capturing adaptive MTP single-request query lengths %s.",
-                self.decode_query_lens,
+                "Capturing target tail query lengths %s.", self.decode_query_lens
             )
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -293,7 +314,7 @@ class CudaGraphManager:
                 vllm_config,
                 decode_query_len,
             )
-            if self._adaptive_mtp_tail_graphs and len(self.decode_query_lens) > 1:
+            if self.tail_query_lens and len(self.decode_query_lens) > 1:
                 for query_len in self.decode_query_lens:
                     if query_len not in self._capture_sizes:
                         self._capture_sizes.append(query_len)
@@ -382,10 +403,7 @@ class CudaGraphManager:
                         and num_tokens % query_len == 0
                     ):
                         if (
-                            (
-                                self._sm70_dflash2_tail_graphs
-                                or self._adaptive_mtp_tail_graphs
-                            )
+                            self.tail_query_lens
                             and query_len < self.decode_query_len
                             and num_tokens != query_len
                         ):
