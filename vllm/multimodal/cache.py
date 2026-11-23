@@ -128,6 +128,17 @@ def take_cache_references(
     return taken
 
 
+def has_cache_references(
+    mm_features: Iterable[MultiModalFeatureSpec] | None,
+) -> bool:
+    """Whether a request, as the engine received it, carries shm cache
+    references (items sent as their address in shared memory)."""
+    return any(
+        feature.data is not None and "address" in feature.data
+        for feature in mm_features or ()
+    )
+
+
 class MultiModalProcessorCacheItem:
     """
     The data to store inside `MultiModalProcessorOnlyCache`.

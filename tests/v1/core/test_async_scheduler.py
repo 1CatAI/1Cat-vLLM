@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections import deque
+from collections import defaultdict, deque
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -377,6 +377,8 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.kv_event_publisher = Mock()
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None
+    # No shm processor-cache reports pending, as __init__ sets it.
+    scheduler.finished_mm_requests = defaultdict(dict)
     scheduler.vllm_config = Mock()
     scheduler.vllm_config.model_config.enable_return_routed_experts = False
     scheduler.enable_return_routed_experts = False

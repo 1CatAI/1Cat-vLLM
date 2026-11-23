@@ -186,6 +186,13 @@ class Request:
 
         # Multi-modal related
         self.mm_features = mm_features or []
+        # Whether its items arrived as shm processor-cache references; set by
+        # the scheduler when the request is added.
+        self.carries_mm_cache_references = False
+        # Whether a SchedulerOutput carried this request to the workers as a
+        # new request, i.e. they fetched its shm processor-cache items. Kept
+        # across preemption: those fetches balance the items' references.
+        self.sent_to_workers = False
 
         # Read-only views
         # Prevent directly appending to these lists since

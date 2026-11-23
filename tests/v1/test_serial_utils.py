@@ -448,3 +448,21 @@ def test_multiple_senders_single_receiver_ipc():
         assert torch.allclose(decoded.prompt_embeds, original_tensor), (
             f"Value mismatch for sender {sender_idx} msg {msg_idx}"
         )
+
+
+def test_engine_core_outputs_finished_mm_requests():
+    """The field is optional and last: the other fields keep their positions
+    in the array-like encoding, and outputs without it decode as before."""
+    from vllm.v1.engine import EngineCoreOutputs
+
+    encoder = MsgpackEncoder()
+    decoder = MsgpackDecoder(EngineCoreOutputs)
+
+    outputs = EngineCoreOutputs(finished_mm_requests={"a": False, "b": True})
+    decoded = decoder.decode(encoder.encode(outputs))
+    assert decoded.finished_mm_requests == {"a": False, "b": True}
+
+    plain = EngineCoreOutputs(finished_requests={"a"}, timestamp=1.0)
+    decoded = decoder.decode(encoder.encode(plain))
+    assert decoded.finished_mm_requests is None
+    assert decoded.finished_requests == {"a"}

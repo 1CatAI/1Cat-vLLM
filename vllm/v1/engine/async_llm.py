@@ -75,6 +75,86 @@ class InputStreamError(Exception):
         super().__init__(str(cause))
 
 
+class _MMCacheReferences:
+    """The shm processor-cache references of one rendered prompt, held by the
+    engine requests made from it (n > 1 children share them) until EngineCore
+    reports each of them finished."""
+
+    def __init__(
+        self, references: list[ShmCacheReference], request_ids: Iterable[str]
+    ) -> None:
+        self.references = references
+        self.unfinished = set(request_ids)
+        self.sent_to_workers = False
+
+
+class MMCacheReferenceLedger:
+    """Processor-cache references (shm cache) of the requests sent to the
+    engine, by request id.
+
+    The workers' reads of a request balance its references. EngineCore reports
+    every finished request that carries any, with whether the workers received
+    it (EngineCoreOutputs.finished_mm_requests); if none of the requests that
+    share the references did, nothing else will balance them, so they have to
+    be given back. Giving back a reference the workers read lets the item be
+    freed while another request still has to fetch it, so the default is to
+    keep it.
+    """
+
+    def __init__(self) -> None:
+        self._by_request: dict[str, _MMCacheReferences] = {}
+
+    def __bool__(self) -> bool:
+        return bool(self._by_request)
+
+    def hold(
+        self, references: list[ShmCacheReference], request_ids: list[str]
+    ) -> _MMCacheReferences | None:
+        """Register the references before any of `request_ids` is sent, so a
+        report cannot arrive before them. Returns the holder, or None if
+        nothing was registered."""
+        if not references:
+            return None
+        if any(request_id in self._by_request for request_id in request_ids):
+            # Only possible with VLLM_DISABLE_REQUEST_ID_RANDOMIZATION and a
+            # reused id. EngineCore reports by id, so a report for the earlier
+            # request would give back these references although the workers
+            # may read them. Leave them unmanaged instead: at worst they keep
+            # their items in the cache.
+            logger.warning(
+                "Request id %s is already in use; its multimodal cache "
+                "references will not be given back if it is aborted early.",
+                request_ids[0],
+            )
+            return None
+        held = _MMCacheReferences(references, request_ids)
+        for request_id in request_ids:
+            self._by_request[request_id] = held
+        return held
+
+    def finish(
+        self,
+        request_id: str,
+        sent_to_workers: bool,
+        holder: _MMCacheReferences | None = None,
+    ) -> list[ShmCacheReference]:
+        """Record that `request_id` finished (or was never sent, with
+        `sent_to_workers=False`), and return the references to give back.
+
+        EngineCore's reports pass no `holder`. A failure in this process
+        passes the holder its own `hold()` returned, so that it cannot finish
+        another request registered under the same id."""
+        held = self._by_request.get(request_id)
+        if held is None or (holder is not None and held is not holder):
+            return []
+        del self._by_request[request_id]
+        held.unfinished.discard(request_id)
+        held.sent_to_workers |= sent_to_workers
+        if held.unfinished or held.sent_to_workers:
+            return []
+        return held.references
+
+
 class AsyncLLM(EngineClient):
     """An asynchronous wrapper for the vLLM engine."""
 
@@ -179,6 +259,9 @@ class AsyncLLM(EngineClient):
         # because the frontend's sender cache said the engine had them. If such
         # a request fails, those entries may have drifted and are dropped.
         self._mm_shadow_hits: dict[str, list[str]] = {}
+        # Processor-cache references (shm cache) of the requests sent to the
+        # engine, until it reports whether the workers received them.
+        self._mm_cache_references = MMCacheReferenceLedger()
 
         self.output_handler: asyncio.Task | None = None
         try:
@@ -407,23 +490,51 @@ class AsyncLLM(EngineClient):
             raise
 
         if is_pooling or params.n == 1:
-            await self._add_request(request, prompt_text, None, 0, queue)
+            holder = self._mm_cache_references.hold(mm_refs, [request.request_id])
+            await self._add_request(request, prompt_text, None, 0, queue, holder)
             return queue
 
         parent_params = params
         assert isinstance(parent_params, SamplingParams)
 
         # Fan out child requests (for n>1).
-        parent_request = ParentRequest(request)
-        for idx in range(parent_params.n):
-            request_id, child_params = parent_request.get_child_info(idx)
-            child_request = request if idx == parent_params.n - 1 else copy(request)
-            child_request.request_id = request_id
-            child_request.sampling_params = child_params
-            await self._add_request(
-                child_request, prompt_text, parent_request, idx, queue
-            )
+        try:
+            parent_request = ParentRequest(request)
+            children: list[EngineCoreRequest] = []
+            for idx in range(parent_params.n):
+                request_id, child_params = parent_request.get_child_info(idx)
+                child_request = request if idx == parent_params.n - 1 else copy(request)
+                child_request.request_id = request_id
+                child_request.sampling_params = child_params
+                children.append(child_request)
+        except BaseException:
+            self._release_mm_cache_references(mm_refs)
+            raise
+        # The children share the prompt's items, whose references were
+        # counted once: they are held until every child has finished.
+        holder = self._mm_cache_references.hold(
+            mm_refs, [child.request_id for child in children]
+        )
+        for idx, child_request in enumerate(children):
+            try:
+                await self._add_request(
+                    child_request, prompt_text, parent_request, idx, queue, holder
+                )
+            except BaseException:
+                for unsent in children[idx + 1 :]:
+                    self._finish_mm_cache_references(unsent.request_id, holder)
+                raise
         return queue
+
+    def _finish_mm_cache_references(
+        self, request_id: str, holder: _MMCacheReferences | None
+    ) -> None:
+        """`request_id` failed in this process before it was sent. Only the
+        references this call registered (`holder`) are affected."""
+        if holder is not None:
+            self._release_mm_cache_references(
+                self._mm_cache_references.finish(request_id, False, holder)
+            )
 
     def _get_mm_items(self, prompt: object) -> list[MultiModalKwargsItem | None]:
         if isinstance(prompt, EngineCoreRequest):
@@ -447,9 +558,14 @@ class AsyncLLM(EngineClient):
         parent_req: ParentRequest | None,
         index: int,
         queue: RequestOutputCollector,
+        mm_cache_references: _MMCacheReferences | None = None,
     ):
         # Add the request to OutputProcessor (this process).
-        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        try:
+            self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        except Exception:
+            self._finish_mm_cache_references(request.request_id, mm_cache_references)
+            raise
 
         # Remember items sent without data (sender-cache hits), so they can be
         # dropped from the sender cache if the engine fails the request.
@@ -465,8 +581,14 @@ class AsyncLLM(EngineClient):
         # Add the EngineCoreRequest to EngineCore (separate process).
         try:
             await self.engine_core.add_request_async(request)
-        except BaseException:
+        except BaseException as e:
             self._mm_shadow_hits.pop(request.request_id, None)
+            # Not sent. A send cancelled while it is awaited may already be on
+            # its way, though; EngineCore then reports the request as usual.
+            if isinstance(e, Exception):
+                self._finish_mm_cache_references(
+                    request.request_id, mm_cache_references
+                )
             raise
 
         if self.log_requests:
@@ -723,6 +845,7 @@ class AsyncLLM(EngineClient):
         renderer = self.renderer
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
         mm_shadow_hits = self._mm_shadow_hits
+        mm_cache_references = self._mm_cache_references
 
         async def output_handler():
             try:
@@ -748,6 +871,18 @@ class AsyncLLM(EngineClient):
                                 drifted.extend(hits)
                         if drifted:
                             renderer.invalidate_mm_cache_items_async(drifted)
+
+                    # 1c) Shm processor cache: give back the references of
+                    # requests that finished without ever reaching the workers
+                    # (aborted while waiting, failed before scheduling), whose
+                    # reads would have balanced them. Runs on the renderer
+                    # thread ahead of later renders.
+                    if outputs.finished_mm_requests and mm_cache_references:
+                        released: list[ShmCacheReference] = []
+                        for req_id, sent in outputs.finished_mm_requests.items():
+                            released += mm_cache_references.finish(req_id, sent)
+                        if released:
+                            renderer.release_mm_cache_references_async(released)
 
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None
@@ -806,6 +941,8 @@ class AsyncLLM(EngineClient):
         all_request_ids = self.output_processor.abort_requests(request_ids, internal)
         for req_id in all_request_ids:
             self._mm_shadow_hits.pop(req_id, None)
+        # _mm_cache_references stays: only EngineCore knows whether the
+        # workers received an aborted request, and it reports that.
         await self.engine_core.abort_requests_async(all_request_ids)
 
         if self.log_requests:

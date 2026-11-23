@@ -237,6 +237,13 @@ class EngineCoreOutputs(
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
 
+    # Requests carrying shm processor-cache references that finished since
+    # the last outputs (including aborts, which send no output of their own):
+    # request id -> whether the workers received the request. The frontend
+    # gives back the references of the ones they never received. Kept last
+    # so that the array-like encoding of the fields above is unchanged.
+    finished_mm_requests: dict[str, bool] | None = None
+
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()
