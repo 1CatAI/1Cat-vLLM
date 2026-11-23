@@ -4,7 +4,7 @@
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -21,6 +21,7 @@ from vllm.v1.worker.ubatch_utils import UBatchSlices
 logger = init_logger(__name__)
 
 CUDAGRAPH_VARIANT_DEFAULT = 0
+V41_BATCH_VERIFY_ROWS = (6, 12, 18, 24, 36, 48, 72, 96)
 CUDAGRAPH_VARIANT_LONG_CONTEXT = -1
 
 track_batchsize: bool = envs.VLLM_LOG_BATCHSIZE_INTERVAL >= 0
@@ -74,6 +75,33 @@ class BatchDescriptor:
     ``None`` denotes the existing full-context graph. A replay must only select
     a bucket whose capacity covers every active request.
     """
+    # Sole active DP owner in the V4.1 six-row verification graph.
+    sole_dp_owner: int | None = None
+    # Local KV bound for exact V4.1 compressed indices, including draft rows.
+    sole_dp_bound: int | None = None
+
+    def supports_v41_batch_short(self) -> bool:
+        return (
+            self.uniform
+            and not self.has_lora
+            and self.sole_dp_owner is None
+            and self.graph_variant == CUDAGRAPH_VARIANT_DEFAULT
+            and self.num_tokens in V41_BATCH_VERIFY_ROWS
+        )
+
+    def with_v41_batch_short(self) -> "BatchDescriptor":
+        # The twelve sole-owner variants use -2 through -13. All DP groups
+        # retain their ordinary dispatch/combine shapes in the batched variant.
+        return replace(self, graph_variant=-14, sole_dp_bound=512)
+
+    def with_v41_solo_owner(self, owner: int, bound: int | None = None) -> "BatchDescriptor":
+
+        # Four DP owners per length bucket. -1 is reserved by the dispatcher.
+        bucket = (None, 128, 512).index(bound)
+        return replace(
+            self, sole_dp_owner=owner, sole_dp_bound=bound,
+            graph_variant=-2 - owner - 4 * bucket,
+        )
 
 
 def _compute_sp_num_tokens(

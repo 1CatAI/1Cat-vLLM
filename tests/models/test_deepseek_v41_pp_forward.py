@@ -98,6 +98,8 @@ def _namespace(sim):
         _tmark=lambda name, tokens: None,
         _treport=lambda tokens: None,
         _ATT_T={"on": False},
+        _HC_PF_TP4=False,
+        probe=SimpleNamespace(set_active=lambda *args: None),
         _PRED_STATS=False,
         _PREFETCH_HINTS=False,
         _PP_BOUNDARY_SIM=sim,

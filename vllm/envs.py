@@ -524,6 +524,7 @@ if TYPE_CHECKING:
     VLLM_V41_ATTN_DEC: str = "0"
     VLLM_V41_ATTN_RING: str = "0"
     VLLM_V41_ATTN_RING_PREFILL: str = "0"
+    VLLM_DP_PREFIX_AFFINITY: str = "0"
     VLLM_V41_BATCH: str = "0"
     VLLM_V41_BATCH_ATTN_FUSED: str = "1"
     VLLM_V41_BATCH_DEBUG: str = "0"
@@ -544,6 +545,10 @@ if TYPE_CHECKING:
     VLLM_V41_HC_SIDE: str = "0"
     VLLM_V41_HC_SIDE_MAX: str = "64"
     VLLM_V41_INDEX_SHARD: str = "0"
+    VLLM_V41_INDEX_PREFILL_CUDA: str = "0"
+    VLLM_V41_EP_RS_COMBINE: str = "0"
+    VLLM_V41_MOE_PF_GEMM: str = "0"
+    VLLM_V41_ATTN_H64: str = "0"
     VLLM_V41_INLINE_DRAFTS: str = "0"
     VLLM_V41_LATE_GATHER: str = "0"
     VLLM_V41_LAZY_OUTPUT_IDS: str = "0"
@@ -572,6 +577,24 @@ if TYPE_CHECKING:
     VLLM_V41_Q8_ROWS_MAX: str = "64"
     VLLM_V41_RING_PREP: str = "0"
     VLLM_V41_ROUTE_CUDA: str = "0"
+    VLLM_V41_TM_CODES: str = "0"
+    VLLM_V41_PROBE: str = "0"
+    VLLM_V41_PROBE_LAYERS: str = "0"
+    VLLM_V41_PROBE_ROUTES: str = "0"
+    VLLM_V41_EXPERT_PLACEMENT: str | None = None
+    VLLM_V41_EP4_TP4: str = "0"
+    VLLM_V41_SOLO_DP_GRAPH: str = "0"
+    VLLM_V41_BATCH_SHORT_GRAPH: str = "0"
+    VLLM_V41_EXPERT_REPLICAS: str | None = None
+    VLLM_V41_COMBINE_TP: str = "0"
+    VLLM_V41_COMBINE_SPARSE: str = "0"
+    VLLM_V41_PACKED_KV_PAGES: str = "0"
+    VLLM_V41_SWA_FP8: str = "0"
+    VLLM_V41_DENSE_SINGLE: str = "0"
+    VLLM_V41_PREFILL_DEC_ATTN: str = "0"
+    VLLM_V41_PACKED_KV_BLOCK: str = "64"
+    VLLM_V41_BATCH_GREEDY_VERIFY: str = "0"
+    VLLM_V41_DENSE_TM_ROWS: str = "0"
     VLLM_V41_SHARED_STREAM: str = "0"
     VLLM_V41_SKIP_EMPTY: str = "0"
     VLLM_V41_STAGED_PREP: str = "0"
@@ -8172,6 +8195,58 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
+    "VLLM_V41_ATTN_H64": env_var(
+        lambda: os.getenv("VLLM_V41_ATTN_H64", "0"),
+        description=(
+            "DS-V4.1 TP4 prefill attention: token/head all-to-all, all 64 heads "
+            "of a token quarter per rank (v41sk.attn_sparse64)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_MOE_PF_GEMM": env_var(
+        lambda: os.getenv("VLLM_V41_MOE_PF_GEMM", "0"),
+        description=(
+            "DS-V4.1 EP prefill experts: grouped WMMA MXFP4 GEMMs over the "
+            "owned slots (v41sk.moe_pf_gemm)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EP_RS_COMBINE": env_var(
+        lambda: os.getenv("VLLM_V41_EP_RS_COMBINE", "0"),
+        description=(
+            "DS-V4.1 EP16 prefill combine: shared expert folded into own rows, "
+            "one EP reduce-scatter + all-gather (no TP all-reduce)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_INDEX_PREFILL_CUDA": env_var(
+        lambda: os.getenv("VLLM_V41_INDEX_PREFILL_CUDA", "0"),
+        description=(
+            "DS-V4.1 prefill: sharded indexer scores with the key-tile-reuse "
+            "CUDA kernel (bitwise-equal)."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_V41_INLINE_DRAFTS": env_var(
         lambda: os.getenv("VLLM_V41_INLINE_DRAFTS", "0"),
         description=(
@@ -8469,6 +8544,247 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: os.getenv("VLLM_V41_RING_PREP", "0"),
         description=("DS-V4.1: prepare window-ring metadata on the host per step."),
         category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DENSE_TM_ROWS": env_var(
+        lambda: os.getenv("VLLM_V41_DENSE_TM_ROWS", "0"),
+        description=(
+            "DS-V4.1 native: dense FP8 projections from this many rows (up "
+            "to 512) on TurboMind's SM70 E4M3 group-32 GEMM; 0 disables."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PROBE_LAYERS": env_var(
+        lambda: os.getenv("VLLM_V41_PROBE_LAYERS", "0"),
+        description=(
+            "DS-V4.1 timing only, with VLLM_V41_PROBE: per-layer keys for "
+            "the MoE expert and combine segments."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PROBE_ROUTES": env_var(
+        lambda: os.getenv("VLLM_V41_PROBE_ROUTES", "0"),
+        description=(
+            "DS-V4.1 timing only, with VLLM_V41_PROBE: count routed slots "
+            "per layer and global expert (/dev/shm/v41routes_0.json)."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EP4_TP4": env_var(
+        lambda: os.getenv("VLLM_V41_EP4_TP4", "0"),
+        description="Shard native target experts over TP4 inside each DP expert owner.",
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SOLO_DP_GRAPH": env_var(
+        lambda: os.getenv("VLLM_V41_SOLO_DP_GRAPH", "0"),
+        description="Capture a compact six-row target graph for each sole active DP owner.",
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_BATCH_SHORT_GRAPH": env_var(
+        lambda: os.getenv("VLLM_V41_BATCH_SHORT_GRAPH", "0"),
+        description="Capture short-context graphs for batched EP4 x TP4 verification.",
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EXPERT_REPLICAS": env_var(
+        lambda: os.getenv("VLLM_V41_EXPERT_REPLICAS"),
+        description=(
+            "DS-V4.1 native DP+EP: JSON file naming, per layer and EP rank, a "
+            "hot expert whose second copy that rank stores; routes alternate."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_EXPERT_PLACEMENT": env_var(
+        lambda: os.getenv("VLLM_V41_EXPERT_PLACEMENT"),
+        description=(
+            "DS-V4.1 native DP+EP: JSON file assigning each layer's experts "
+            "to EP ranks (load balance); unset keeps the linear placement."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_BATCH_GREEDY_VERIFY": env_var(
+        lambda: os.getenv("VLLM_V41_BATCH_GREEDY_VERIFY", "0"),
+        description=(
+            "DS-V4.1 native: TP-local greedy verification for batches (rank "
+            "top-1 + pair exchange, no full-vocabulary logits gather)."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COMBINE_TP": env_var(
+        lambda: os.getenv("VLLM_V41_COMBINE_TP", "0"),
+        description=(
+            "DS-V4.1 native DP+EP: one-push EP16 combine with TP-sliced "
+            "receive (ll_ep_combine16_tp), a quarter of the receive bytes."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_COMBINE_SPARSE": env_var(
+        lambda: os.getenv("VLLM_V41_COMBINE_SPARSE", "0"),
+        description=(
+            "DS-V4.1 native DP+EP with VLLM_V41_COMBINE_TP: skip the rows "
+            "with no route to the source rank in the EP16 combine "
+            "(ll_ep_combine16_tp_sparse; bitwise the same sums)."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PACKED_KV_PAGES": env_var(
+        lambda: os.getenv("VLLM_V41_PACKED_KV_PAGES", "0"),
+        description=(
+            "DS-V4.1 batch: compressed latents and index keys in the official "
+            "packed FP4 byte formats (288 / 68 bytes per row) in the paged KV "
+            "pool; window caches stay FP16."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_DP_PREFIX_AFFINITY": env_var(
+        lambda: os.getenv("VLLM_DP_PREFIX_AFFINITY", "0"),
+        description=(
+            "Data parallel with prefix caching: route a request whose prompt "
+            "continues one an engine served (512-token chunk hashes) to that "
+            "engine unless it carries more than 4 extra in-flight requests."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PREFILL_DEC_ATTN": env_var(
+        lambda: os.getenv("VLLM_V41_PREFILL_DEC_ATTN", "0"),
+        description=(
+            "DS-V4.1 batch prefill: sparse attention on the decode kernel "
+            "(attn_paged_dec / attn_dec_multi) instead of attn_paged_tok."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_DENSE_SINGLE": env_var(
+        lambda: os.getenv("VLLM_V41_DENSE_SINGLE", "0"),
+        description=(
+            "DS-V4.1 dense FP8 without TurboMind rows: keep only the QPN8 copy "
+            "(the checkpoint copy is released; large batches dequantize it)."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_SWA_FP8": env_var(
+        lambda: os.getenv("VLLM_V41_SWA_FP8", "0"),
+        description=(
+            "DS-V4.1 batch: window caches in the official FP8 V41_FORMAT "
+            "(528-byte rows, one UE8M0 scale per 32 values) and the window QDQ "
+            "on 32-value groups as in DeepInfer."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PACKED_KV_BLOCK": env_var(
+        lambda: os.getenv("VLLM_V41_PACKED_KV_BLOCK", "64"),
+        description=(
+            "DS-V4.1 packed KV pages: tokens per page of the packed caches."
+        ),
+        category="tuning",
+        declared_default="'64'",
+        effective_default="'64'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_PROBE": env_var(
+        lambda: os.getenv("VLLM_V41_PROBE", "0"),
+        description=(
+            "DS-V4.1 timing only: graph-safe in-stream segment timers "
+            "written to /dev/shm/v41probe_<rank>.json."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_TM_CODES": env_var(
+        lambda: os.getenv("VLLM_V41_TM_CODES", "0"),
+        description=(
+            "DS-V4.1 native: keep expert codes in TurboMind B/Pack1 order "
+            "(v41sk_tm.so) so the skinny and grouped GEMMs share one copy."
+        ),
+        category="tuning",
         declared_default="'0'",
         effective_default="'0'",
         automatic_conditions=(),
@@ -21558,7 +21874,10 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_COL_BLOCK",
         "VLLM_V41_COL_PROJ",
         "VLLM_V41_COL_W",
+        "VLLM_V41_COMBINE_SPARSE",
+        "VLLM_V41_COMBINE_TP",
         "VLLM_V41_COORD_DEBUG",
+        "VLLM_V41_DENSE_SINGLE",
         "VLLM_V41_DENSE_TM",
         "VLLM_V41_DMA_DEBUG",
         "VLLM_V41_DMA_DEMAND",
@@ -21572,6 +21891,11 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_ENGRAM_READERS",
         "VLLM_V41_EXACT_GEMM",
         "VLLM_V41_EXPERT_FAST_HIT",
+        "VLLM_V41_EXPERT_PLACEMENT",
+        "VLLM_V41_EP4_TP4",
+        "VLLM_V41_SOLO_DP_GRAPH",
+        "VLLM_V41_BATCH_SHORT_GRAPH",
+        "VLLM_V41_EXPERT_REPLICAS",
         "VLLM_V41_FP8_GEMV",
         "VLLM_V41_FREE_SLOTS",
         "VLLM_V41_FUSED_SPARSE",
@@ -21593,10 +21917,12 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_ATTN_RING_PREFILL",
         "VLLM_V41_BATCH",
         "VLLM_V41_BATCH_ATTN_FUSED",
+        "VLLM_V41_BATCH_GREEDY_VERIFY",
         "VLLM_V41_BATCH_DEBUG",
         "VLLM_V41_BATCH_DRAFTS",
         "VLLM_V41_BINDEX_CUDA",
         "VLLM_V41_DELAY_FILE",
+        "VLLM_V41_DENSE_TM_ROWS",
         "VLLM_V41_DEQUANT_MM_ROWS",
         "VLLM_V41_DRAFT_FUSED",
         "VLLM_V41_DRAFT_HEAD_FP8",
@@ -21611,6 +21937,10 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_HC_SIDE",
         "VLLM_V41_HC_SIDE_MAX",
         "VLLM_V41_INDEX_SHARD",
+        "VLLM_V41_INDEX_PREFILL_CUDA",
+        "VLLM_V41_EP_RS_COMBINE",
+        "VLLM_V41_MOE_PF_GEMM",
+        "VLLM_V41_ATTN_H64",
         "VLLM_V41_INLINE_DRAFTS",
         "VLLM_V41_LATE_GATHER",
         "VLLM_V41_LAZY_OUTPUT_IDS",
@@ -21631,7 +21961,11 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_PP_SEND_DEFER",
         "VLLM_V41_PP_SERIAL",
         "VLLM_V41_PP_TOKEN_NCCL",
+        "VLLM_V41_PREFILL_DEC_ATTN",
         "VLLM_V41_PREFILL_PIPELINE",
+        "VLLM_V41_PROBE",
+        "VLLM_V41_PROBE_LAYERS",
+        "VLLM_V41_PROBE_ROUTES",
         "VLLM_V41_PROPOSE_GRAPH",
         "VLLM_V41_PROPOSE_GRAPH_MODE",
         "VLLM_V41_Q8",
@@ -21644,7 +21978,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_STAGED_PREP",
         "VLLM_V41_STAGED_PREP_STAGES",
         "VLLM_V41_STEP_TIMING",
+        "VLLM_V41_SWA_FP8",
         "VLLM_V41_SWITCH_US",
+        "VLLM_V41_TM_CODES",
         "VLLM_V41_TOPP_NO_FENCE",
         "VLLM_V41_TRACE",
         "VLLM_V41_TRACE_NOSYNC",
@@ -21666,6 +22002,8 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_MAX_LEN",
         "VLLM_V41_MISS_HIST",
         "VLLM_V41_PACKED_KV",
+        "VLLM_V41_PACKED_KV_BLOCK",
+        "VLLM_V41_PACKED_KV_PAGES",
         "VLLM_V41_PLAN_STATS",
         "VLLM_V41_PP_BOUNDARY_SIM",
         "VLLM_V41_PRED_STATS",
@@ -21713,6 +22051,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
+        "VLLM_DP_PREFIX_AFFINITY",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",
         "VLLM_RANDOMIZE_DP_DUMMY_INPUTS",
         "VLLM_CI_USE_S3",

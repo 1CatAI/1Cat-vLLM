@@ -58,6 +58,7 @@ from vllm.distributed.parallel_state import (
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import (
+    V41_BATCH_VERIFY_ROWS,
     BatchDescriptor,
     set_forward_context,
 )
@@ -2475,7 +2476,9 @@ class GPUModelRunner(
                 restore = getattr(self.get_model(), "restore_prefix", None)
                 if restore is not None:
                     restore(
-                        new_req_data.num_computed_tokens, new_req_data.prompt_token_ids
+                        new_req_data.num_computed_tokens,
+                        new_req_data.prompt_token_ids,
+                        req_id=req_id,
                     )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
@@ -8504,6 +8507,7 @@ class GPUModelRunner(
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
         attention_context_len: int | None = None,
+        dp_idle: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -8616,6 +8620,8 @@ class GPUModelRunner(
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
+            track_owner = envs.VLLM_V41_SOLO_DP_GRAPH == "1" and envs.VLLM_V41_EP4_TP4 == "1"
+            active = [] if track_owner else None
             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,
@@ -8624,6 +8630,8 @@ class GPUModelRunner(
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode.value,
+                    active_dp_ranks=active,
+                    dp_idle=dp_idle,
                 )
             )
 
@@ -8641,6 +8649,43 @@ class GPUModelRunner(
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+
+                if (
+                    active is not None
+                    and len(active) == 1
+                    and batch_descriptor.uniform
+                    and batch_descriptor.num_tokens == 6
+                    and not batch_descriptor.has_lora
+                    and cudagraph_mode == CUDAGraphMode.FULL
+                ):
+                    bound = None
+                    if not dp_idle and dp_rank == active[0] and num_reqs == 1:
+                        # _prepare_inputs sets this before dispatch. With async
+                        # speculation it assumes every previous draft was accepted.
+                        end = int(self.optimistic_seq_lens_cpu[0])
+                        if 0 < end <= 512:
+                            bound = 128 if end <= 128 else 512
+                    batch_descriptor = batch_descriptor.with_v41_solo_owner(active[0], bound)
+                    logger.info_once(
+                        "V4.1 dispatching solo DP graph, owner %d, bound=%s, idle=%s",
+                        active[0], bound, dp_idle,
+                    )
+                elif (
+                    envs.VLLM_V41_BATCH_SHORT_GRAPH == "1"
+                    and track_owner
+                    and not dp_idle
+                    and num_reqs > 0
+                    and cudagraph_mode == CUDAGraphMode.FULL
+                    and batch_descriptor.supports_v41_batch_short()
+                ):
+                    # All TP peers have the same local requests. The bound
+                    # only changes TP-local attention work; EP collectives
+                    # keep their ordinary padded shape on every DP rank.
+                    end = int(self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max())
+                    if 0 < end <= 512:
+                        batch_descriptor = batch_descriptor.with_v41_batch_short()
+                        logger.info_once("V4.1 batched short-context verification graph active")
+
 
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
@@ -10588,6 +10633,15 @@ class GPUModelRunner(
             # and a graph keeps chunk-sized static copies (~1.5 GB each at
             # 4K tokens) alive, so such steps run eagerly.
             return round_fn(inputs)
+        # Retain the common DSpark5 verification graphs on 32 GiB DGX ranks.
+        # Draining batches produce many transient shapes. Capturing each shape
+        # retains its static inputs and can exhaust one TP peer mid-collective.
+        if envs.VLLM_V41_EP4_TP4 == "1" and self.num_spec_tokens == 5 and (
+            cad.max_query_len != 6
+            or cad.num_actual_tokens != 6 * cad.num_reqs
+            or cad.num_actual_tokens not in V41_BATCH_VERIFY_ROWS
+        ):
+            return round_fn(inputs)
         key = (cad.num_reqs, cad.num_actual_tokens, cad.max_query_len)
         return self._v41_propose_graph(key, round_fn, inputs)
 
@@ -11534,13 +11588,15 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         batch_descriptor_override: BatchDescriptor | None = None,
+        dp_idle: bool = False,
     ) -> tuple[
         torch.Tensor | IntermediateTensors,
         torch.Tensor | None,
     ]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
-        CUDA graph for the model.
+        CUDA graph for the model. dp_idle: an idle data-parallel rank keeping
+        step with its peers (a DP-local drafter then has nothing to match).
 
         Args:
             num_tokens: Number of tokens to run the dummy forward pass.
@@ -11656,6 +11712,7 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens,
                 max_num_scheduled_tokens=max_query_len,
                 use_cascade_attn=False,
+                dp_idle=dp_idle,
                 allow_microbatching=allow_microbatching,
                 force_eager=is_profile
                 or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
@@ -11984,6 +12041,7 @@ class GPUModelRunner(
                     or self.speculative_config.uses_draft_model()
                     or self.speculative_config.uses_extract_hidden_states()
                 )
+                and not (dp_idle and getattr(self.drafter, "dp_local_draft", False))
             ):
                 assert isinstance(
                     self.drafter,
@@ -12783,6 +12841,35 @@ class GPUModelRunner(
                 batch_descriptor_override=batch_desc,
             )
             torch.accelerator.synchronize()
+            if (
+                envs.VLLM_V41_SOLO_DP_GRAPH == "1"
+                and envs.VLLM_V41_EP4_TP4 == "1"
+                and cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and batch_desc.uniform
+                and batch_desc.num_tokens == 6
+                and not batch_desc.has_lora
+            ):
+                for owner in range(self.parallel_config.data_parallel_size):
+                    for bound in (None, 128, 512):
+                        solo = batch_desc.with_v41_solo_owner(owner, bound)
+                        self._warmup_and_capture(
+                            solo, cudagraph_runtime_mode, batch_descriptor_override=solo,
+                            profile_seq_lens=batch_desc.attention_context_bucket,
+                        )
+                        torch.accelerator.synchronize()
+            if (
+                envs.VLLM_V41_BATCH_SHORT_GRAPH == "1"
+                and envs.VLLM_V41_SOLO_DP_GRAPH == "1"
+                and envs.VLLM_V41_EP4_TP4 == "1"
+                and cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and batch_desc.supports_v41_batch_short()
+            ):
+                short = batch_desc.with_v41_batch_short()
+                self._warmup_and_capture(
+                    short, cudagraph_runtime_mode, batch_descriptor_override=short,
+                    profile_seq_lens=batch_desc.attention_context_bucket,
+                )
+                torch.accelerator.synchronize()
         self.maybe_remove_all_loras(self.lora_config)
 
     def _capture_drafter_cudagraphs(self) -> None:

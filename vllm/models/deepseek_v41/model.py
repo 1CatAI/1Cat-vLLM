@@ -7,10 +7,12 @@ pre-mix are not compatible. The initial implementation deliberately admits
 one request and at most 16K total tokens, with prefix caching disabled.
 """
 
+import os
 from collections.abc import Callable, Iterable
 from copy import copy
 from typing import Any
 
+import regex as re
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -19,11 +21,13 @@ import vllm.envs as envs
 from vllm.config import get_current_vllm_config, set_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
+    get_tp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.deepseek_v41_compression import V41C2State
 from vllm.model_executor.kernels.mhc.deepseek_v41 import (
@@ -69,6 +73,7 @@ from vllm.models.deepseek_v41.activations import swiglu
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from . import probe
 from .attention_ops import (
     WINDOW_RING,
     attend_paged_latents,
@@ -85,25 +90,47 @@ from .attention_ops import (
 )
 from .attn_fuse import FUSE_ATTN_POST, FUSE_ATTN_PREP, attn_post, attn_prep
 from .cache import BATCH as _BATCH
+from .cache import PACKED_PAGES as _PACKED_PAGES
+from .cache import SWA_FP8 as _SWA_FP8
+from .cache import WINDOW_QDQ_GROUP as _WINDOW_GROUP
 from .cache import V41LatentCache
 from .contract import kv_source_of, pp_split_problem, validate_runtime_geometry
 from .native import _LL_AR, V41TargetQuantConfig, load_native_weights
 from .native import NATIVE as _NATIVE
-from .norm import set_decode_rows, short_rms_norm, short_rows
+from .norm import rms_norm, set_decode_rows, short_rms_norm, short_rows
 from .pp_commit import StageCommit
 from .quant_rope import apply_rope, attention_qdq, rope_table
 
 logger = init_logger(__name__)
 
+_HC_PF_TP4 = os.environ.get("VLLM_V41_HC_PF_TP4") == "1"
 _HC_FUSED = envs.VLLM_V41_HC_FUSED == "1"
 _ROUTER_FUSED = envs.VLLM_V41_ROUTER_FUSED == "1"
 # Native decode: the shared expert runs on a side stream, overlapped with the
 # gate, routing and routed experts (both are short, latency-bound kernels).
 _SHARED_STREAM = envs.VLLM_V41_SHARED_STREAM == "1"
+_EXPERT_PLACEMENT = envs.VLLM_V41_EXPERT_PLACEMENT
+_EXPERT_REPLICAS = envs.VLLM_V41_EXPERT_REPLICAS
+
+
+def _load_replicas(path, layer):
+    """{"layers": {"<layer>": [logical expert copied on EP rank r, ...]}}"""
+    import json
+
+    with open(path) as f:
+        return json.load(f)["layers"].get(str(layer))
 _BATCH_DEBUG = envs.VLLM_V41_BATCH_DEBUG == "1"
 # VLLM_V41_BATCH_ATTN_FUSED: batched decode attention + post in v41sk.attn_paged_dec.
 _BATCH_ATTN_FUSED = envs.VLLM_V41_BATCH_ATTN_FUSED == "1"
 _SIDE: dict[str, Any] = {}
+
+
+_SOLO_GRAPH = envs.VLLM_V41_EP4_TP4 == "1" and envs.VLLM_V41_SOLO_DP_GRAPH == "1"
+
+
+def _sole_owner():
+    descriptor = get_forward_context().batch_descriptor
+    return descriptor.sole_dp_owner if descriptor is not None else None
 
 
 class V41Norm(nn.Module):
@@ -119,11 +146,11 @@ class V41Norm(nn.Module):
             x.is_cuda
             and x.dtype == torch.float16
             and x.ndim == 2
-            and short_rows(x.shape[0])
+            and x.shape[0] >= 1
             and x.shape[1] in (128, 512, 1280, 5120)
-            and x.is_contiguous()
+            and x.stride(-1) == 1
         ):
-            return short_rms_norm(x, self.weight, self.eps)
+            return rms_norm(x, self.weight, self.eps)
         values = x.float()
         return (
             values
@@ -152,6 +179,11 @@ class V41SharedMLP(nn.Module):
         )
 
     def forward(self, x):
+        gu = dense_tm.fused_raw(self.gate_proj, x)
+        if gu is not None:
+            from .fp8_linear import swiglu_gate_up
+
+            return self.down_proj(swiglu_gate_up(gu))
         pair = dense_tm.fused(self.gate_proj, x)
         gate, up = pair if pair is not None else (self.gate_proj(x), self.up_proj(x))
         activated = swiglu(gate, up)
@@ -178,17 +210,53 @@ class V41Gate(nn.Module):
         return logits if self.temperature == 1.0 else logits / self.temperature
 
 
+def _valid_rows(metadata, tokens):
+    """Rows of this forward that carry a real token (slot >= 0). A graph or
+    DP-padded forward can run more rows than the slot mapping covers (e.g. 54
+    scheduled tokens in a 60-row graph): those rows are padding."""
+    valid = metadata.slot_mapping[:tokens] >= 0
+    if valid.shape[0] < tokens:
+        valid = F.pad(valid, (0, tokens - valid.shape[0]), value=False)
+    return valid
+
+
 class V41MoE(nn.Module):
+    # DP+EP: None joins the data-parallel expert group (EP over DP x TP); the
+    # drafter keeps its experts inside its own TP group (dp_size 1).
+    moe_dp_size: int | None = None
+
     def __init__(self, vllm_config, prefix):
         super().__init__()
         c = vllm_config.model_config.hf_text_config
+        # Per-layer probe keys (VLLM_V41_PROBE_LAYERS): expert-load skew.
+        found = re.search(r"layers\.(\d+)\.", prefix)
+        self._layer_index = int(found.group(1)) if found is not None else None
+        self._probe_tag = (
+            f"@{found.group(1)}" if probe.PER_LAYER and found is not None else ""
+        )
         self.gate = V41Gate(c)
         self.shared_experts = V41SharedMLP(
             c, vllm_config.quant_config, prefix + ".shared_experts"
         )
         self.scale = c.routed_scaling_factor
+        # VLLM_V41_EXPERT_REPLICAS: one extra physical slot per EP rank holds a
+        # second copy of a hot expert (DP+EP target layers only).
+        self._replicas = (
+            _load_replicas(_EXPERT_REPLICAS, self._layer_index)
+            if _EXPERT_REPLICAS
+            and self._layer_index is not None
+            and self.moe_dp_size is None
+            else None
+        )
+        self.hybrid_ep = envs.VLLM_V41_EP4_TP4 == "1" and self.moe_dp_size is None
+        if self.hybrid_ep and (
+            not getattr(vllm_config.quant_config, "v41_native", False)
+            or _EXPERT_PLACEMENT
+        ):
+            raise ValueError("EP4 x TP4 needs native weights and contiguous physical slots")
         self.experts = FusedMoE(
-            num_experts=c.n_routed_experts,
+            num_experts=c.n_routed_experts
+            + (len(self._replicas) if self._replicas is not None else 0),
             top_k=c.num_experts_per_tok,
             hidden_size=c.hidden_size,
             intermediate_size=c.moe_intermediate_size,
@@ -202,11 +270,92 @@ class V41MoE(nn.Module):
             ),
             swiglu_limit=10.0,
             router_logits_dtype=torch.float32,
+            dp_size=self.moe_dp_size,
+            expert_tp_within_dp=self.hybrid_ep,
         )
         self.experts.expert_mapping = FusedMoE.make_expert_params_mapping(
             self, "gate_proj", "down_proj", "up_proj", c.n_routed_experts
         )
         self.native = bool(getattr(vllm_config.quant_config, "v41_native", False))
+        # DP x EP: route this group's own tokens here and gather the routes
+        # (not the 384-wide logits) with the hidden states, so the gate and
+        # top-k run once per token and padded rows reach no expert.
+        self.dp_routes = self.native and self.experts.moe_parallel_config.dp_size > 1
+        if self.dp_routes:
+            from .cache import real_rows
+
+            self._real_rows = real_rows(torch.cuda.current_device())
+            if _EXPERT_PLACEMENT and self._layer_index is not None:
+                self._place_experts(_EXPERT_PLACEMENT)
+            if self._replicas is not None:
+                self._setup_replicas(c.n_routed_experts)
+
+    def _setup_replicas(self, logical):
+        """Physical layout with replicas: rank r owns slots r * L .. r * L + L - 1
+        (L = logical / ranks + 1); its first L - 1 hold logical experts
+        r * (L - 1) .. in order, the last a copy of self._replicas[r]. An
+        expert may be copied on several ranks (a hot prefill expert): its
+        routes then cycle over the primary and its copies by row."""
+        ranks = len(self._replicas)
+        per_rank = logical // ranks
+        slots = per_rank + 1
+        copies: list[list[int]] = [
+            [(e // per_rank) * slots + e % per_rank] for e in range(logical)
+        ]
+        for rank, expert in enumerate(self._replicas):
+            if expert // per_rank == rank:
+                raise ValueError("V4.1 expert replicas: copy on its own rank")
+            copies[expert].append(rank * slots + per_rank)
+        width = max(len(c) for c in copies)
+        table = torch.tensor(
+            [c + [c[0]] * (width - len(c)) for c in copies], dtype=torch.int32
+        )
+        counts = torch.tensor([len(c) for c in copies], dtype=torch.int32)
+        device = torch.cuda.current_device()
+        self._replica_tables = (table.to(device), counts.to(device))
+        # Checkpoint expert e -> its physical slots (weight loading), and the
+        # logical experts each rank stores (the EP weight filter's names).
+        self._physical_targets = {e: copies[e] for e in range(logical)}
+        # The EP owner can hold several adjacent blocks of physical slots.
+        # Select checkpoint IDs including copies by their actual slot ownership.
+        parallel = self.experts.moe_parallel_config
+        local_slots = self.experts.local_num_experts
+        begin = parallel.ep_rank * local_slots
+        end = begin + local_slots
+        self.experts.v41_logical_ids = {
+            e for e, targets in enumerate(copies)
+            if any(begin <= slot < end for slot in targets)
+        }
+
+    def _place_experts(self, path):
+        """VLLM_V41_EXPERT_PLACEMENT: this layer's experts on the EP ranks a
+        JSON file assigns ({"layers": {"<layer>": [owner rank per expert]}},
+        balance_experts.py); before the weights load, so the loader fills
+        the local slots by the new map. Same number of experts per rank."""
+        import json
+
+        with open(path) as f:
+            owners = json.load(f)["layers"].get(str(self._layer_index))
+        if owners is None:
+            return
+        manager = self.experts.expert_map_manager
+        old = manager.expert_map
+        parallel = self.experts.moe_parallel_config
+        local = [e for e, rank in enumerate(owners) if rank == parallel.ep_rank]
+        if old is None or len(owners) != old.numel():
+            raise ValueError("V4.1 expert placement: wrong expert count")
+        if len(local) != self.experts.local_num_experts:
+            raise ValueError(
+                f"V4.1 expert placement: layer {self._layer_index} gives EP rank "
+                f"{parallel.ep_rank} {len(local)} experts, expected "
+                f"{self.experts.local_num_experts}"
+            )
+        expert_map = torch.full_like(old, -1)
+        expert_map[torch.tensor(local, device=old.device)] = torch.arange(
+            len(local), dtype=old.dtype, device=old.device
+        )
+        manager._expert_map = expert_map
+        self.experts.update_expert_map_info()
 
     @staticmethod
     def _own_shared(vllm_config):
@@ -239,6 +388,97 @@ class V41MoE(nn.Module):
         self.experts.v41_shared_join = None
         main.wait_stream(side)
         return routed, None if self.experts.v41_shared_folded else shared
+
+    def _dp_partials(self, x, row_group=None):
+        """Routes here, all-gather over DP, this rank's experts for every
+        gathered token, reduce-scatter back; the shared expert overlaps on a
+        side stream."""
+        main = torch.cuda.current_stream()
+        side = _SIDE.get(x.device)
+        if side is None:
+            side = _SIDE[x.device] = torch.cuda.Stream(device=x.device)
+        _tmark("m.gate", x.shape[0])
+        logits = self._gate_logits(x)
+        if x.shape[0] > 8 and logits.is_cuda:
+            # Batches: top-k per token in parallel (route_topk); the slot plan
+            # of route_and_plan is not used here (the experts plan per rank).
+            probs, ids = route_topk(
+                logits.float(), self.gate.bias, self.experts.top_k, self.scale
+            )
+        else:
+            probs, ids = self._route(x, logits, self.experts.top_k, True)
+        self.experts.v41_plan = None
+        hc_kick()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            shared = self.shared_experts(x)
+        owner = _sole_owner() if _SOLO_GRAPH else None
+        return self._dispatch_and_combine(x, probs, ids, shared, side, owner, row_group)
+
+    def _dispatch_and_combine(self, x, probs, ids, shared, side, owner, row_group=None):
+        from .native import dp_combine, dp_combine_shared, dp_dispatch, ep_combine_rs
+
+        # Each solo graph captures the same sender and the same two collectives
+        # on every rank. Idle groups execute their routed shards for that sender.
+        sizes = (
+            tuple(6 if group == owner else 0 for group in range(4))
+            if owner is not None else None
+        )
+        _tmark("m.dispatch", x.shape[0])
+        fused = None
+        if owner is not None and self._replicas is not None:
+            from .native import solo_dispatch_mapped
+
+            fused = solo_dispatch_mapped(
+                x, probs, ids, self._real_rows, self._replica_tables,
+                self.experts.global_num_experts, owner,
+            )
+        if fused is not None:
+            xs, ps, ids = fused
+        else:
+            xs, ps, ids = dp_dispatch(
+                x, probs, ids, self._real_rows, self.experts.global_num_experts, sizes,
+                replica_tables=self._replica_tables if self._replicas is not None else None,
+            )
+        if probe.ROUTES and self._layer_index is not None:
+            probe.route_count(self._layer_index, ids, self.experts.global_num_experts)
+        _tmark("m.experts" + self._probe_tag, x.shape[0])
+        routed = self.experts.quant_method.apply(self.experts, xs, ps, ids)
+        _tmark("m.shared_wait", x.shape[0])
+        if side is not None:
+            torch.cuda.current_stream().wait_stream(side)
+        _tmark("m.combine" + self._probe_tag, x.shape[0])
+        if row_group is not None and self.hybrid_ep:
+            from vllm.distributed import get_dp_group, get_ep_group
+
+            rows = x.shape[0]
+            metadata = get_forward_context().dp_metadata
+            if (metadata is not None and get_ep_group().world_size == 16
+                and metadata.num_tokens_across_dp_cpu.tolist() == [rows] * 4):
+                # Gathered rows are in DP order. The 16 equal contiguous output
+                # slices coincide with (DP owner, TP token quarter), so one
+                # reduce-scatter finishes both sums, including the shared expert.
+                start = get_dp_group().rank_in_group * rows
+                routed[start:start + rows].add_(shared)
+                return get_ep_group().reduce_scatter(routed.contiguous(), dim=0), None
+        # One push for the DP reduce-scatter, shared add and TP all-reduce.
+        # The sparse push derives a route's owner as id // experts-per-rank,
+        # which a static placement (VLLM_V41_EXPERT_PLACEMENT) breaks.
+        done = dp_combine_shared(
+            routed,
+            shared,
+            None if _EXPERT_PLACEMENT or self.hybrid_ep else ids,
+            self.experts.global_num_experts,
+            solo_sizes=sizes,
+        )
+        if done is not None:
+            return done, None
+        if sizes is not None:
+            raise RuntimeError("solo graph requires the one-shot 16-rank TP combine")
+        done = ep_combine_rs(routed, shared)
+        if done is not None:
+            return done, None
+        return dp_combine(routed), shared
 
     def _gate_logits(self, x):
         """Router logits; with an h16 gate also the routes and slot plan,
@@ -293,11 +533,18 @@ class V41MoE(nn.Module):
         probabilities = probabilities / (probabilities.sum(-1, keepdim=True) + 1e-20)
         return (probabilities * self.scale).contiguous(), indices
 
-    def forward(self, x):
+    def forward(self, x, row_group=None):
         if self.native:
             # Native MXFP4 experts return FP32 routed sums: combine the shared
             # expert and reduce across TP in FP32 (the drafter's contract).
-            if self.experts.shared_experts is None and x.is_cuda:
+            if self.dp_routes:
+                routed, shared = self._dp_partials(x, row_group)
+                if shared is None:
+                    if row_group is not None and routed.shape[0] == x.shape[0]:
+                        return routed.chunk(row_group.world_size)[row_group.rank_in_group]
+                    return routed  # already summed over all 16 ranks
+                _tmark("m.tp_reduce", x.shape[0])
+            elif self.experts.shared_experts is None and x.is_cuda:
                 routed, shared = self._overlapped_partials(x)
             else:
                 routed, shared = self.experts.forward_partials(
@@ -306,6 +553,8 @@ class V41MoE(nn.Module):
             output = routed.float()
             if shared is not None:
                 output = output + shared.float()
+            if row_group is not None:
+                return row_group.reduce_scatter(output, dim=0)
             if _LL_AR:
                 from .native import tp_all_reduce
 
@@ -349,9 +598,15 @@ class V41Engram(nn.Module):
             torch.empty(4, config.hidden_size, dtype=torch.float32), requires_grad=False
         )
 
-    def forward(self, x, io, valid_tokens):
-        embedding = io.runtime.lookup(self.channel, x.shape[0])
-        projected = tensor_model_parallel_all_gather(self.wkv(embedding), dim=-1)
+    def forward(self, x, io, valid_tokens, *, full_rows=None, row_slice=None):
+        embedding = io.runtime.lookup(
+            self.channel, x.shape[0] if full_rows is None else full_rows
+        )
+        projected = _index_all_gather()(self.wkv(embedding), -1)
+        if row_slice is not None:
+            projected = projected[row_slice]
+            if valid_tokens is not None:
+                valid_tokens = valid_tokens[row_slice]
         return apply_engram_gate(
             x, projected, self.q_weight, self.k_weight, valid_tokens, inplace=True
         )
@@ -411,10 +666,11 @@ class V41Compressor(nn.Module):
             and _NATIVE
             and x.is_cuda
             and x.dtype == torch.float16
-            and 8 < x.shape[0] <= 1024
+            and 8 < x.shape[0]
         ):
-            # VLLM_V41_BATCH: the same exact FP16 * 2^s products on cuBLAS
-            # with FP32 accumulation and output.
+            # VLLM_V41_BATCH and prefill chunks: the same exact FP16 * 2^s
+            # products on cuBLAS with FP32 accumulation and output (the FP32
+            # GEMM would run on CUDA cores).
             out = torch.mm(x.contiguous(), state[3], out_dtype=torch.float32)
             out.mul_(state[2])
             return out[:, :512].contiguous(), out[:, 512:].contiguous()
@@ -654,6 +910,7 @@ class _SharedAttention:
     def __init__(self):
         self.layers = {}
         self.topk = None
+        self.short_indices = {}
         # Padding-token mask of the current forward (same for every layer).
         self.valid = None
         # Layer 0's window metadata, shared by the window-ring layers.
@@ -676,6 +933,8 @@ _ATT_T: dict[str, Any] = {
 
 
 def _tmark(name, tokens):
+    if probe.ENABLED:
+        probe.mark(name, tokens)
     if _ATT_T["on"] and tokens > 256:
         e = torch.cuda.Event(enable_timing=True)
         e.record()
@@ -708,6 +967,9 @@ _PP_BOUNDARY_SIM = int(envs.VLLM_V41_PP_BOUNDARY_SIM or 0)
 
 class V41Attention(nn.Module):
     ring_capable = True
+
+    # VLLM_V41_SWA_FP8 window rows (the drafter's subclass keeps FP16).
+    fp8_window = True
 
     def __init__(self, c, quant_config, layer, shared, prefix):
         super().__init__()
@@ -782,7 +1044,9 @@ class V41Attention(nn.Module):
             )
         if not self.ring_window:
             self.window_cache = V41LatentCache(
-                prefix + ".window_cache", sliding_window=c.sliding_window + 6
+                prefix + ".window_cache",
+                fp8_window=self.fp8_window,
+                sliding_window=c.sliding_window + 6,
             )
         self.source = max((i for i in c.kv_source_layer_ids if i <= layer), default=-1)
         owns_kv = layer in c.kv_source_layer_ids
@@ -801,11 +1065,16 @@ class V41Attention(nn.Module):
             loaded[self.rank * self.heads : (self.rank + 1) * self.heads]
         )
 
-    def forward(self, x, positions, table):
+    def forward(self, x, positions, table, row_group=None):
         tokens = x.shape[0]
         _tmark("a.proj", tokens)
-        pair = dense_tm.fused(self.wq_a, x)
-        q_low, kv_low = pair if pair is not None else (self.wq_a(x), self.wkv(x))
+        qkv = dense_tm.fused_raw(self.wq_a, x)
+        if qkv is not None:
+            qw = self.q_norm.weight.shape[0]
+            q_low, kv_low = qkv[:, :qw], qkv[:, qw:]
+        else:
+            pair = dense_tm.fused(self.wq_a, x)
+            q_low, kv_low = pair if pair is not None else (self.wq_a(x), self.wkv(x))
         qr = self.q_norm(q_low)
         if FUSE_ATTN_PREP:
             query, window = self._prep_fused(tokens, qr, kv_low, positions, table)
@@ -813,7 +1082,10 @@ class V41Attention(nn.Module):
             query = apply_rope(
                 self.wq_b(qr).view(tokens, self.heads, 512), positions, table
             )
-            window = attention_qdq(apply_rope(self.kv_norm(kv_low), positions, table))
+            window = attention_qdq(
+                apply_rope(self.kv_norm(kv_low), positions, table),
+                group=_WINDOW_GROUP,
+            )
         if FUSE_ATTN_POST:
             ring_values = None
         metadata = (
@@ -825,14 +1097,15 @@ class V41Attention(nn.Module):
                 self.compressor(x, positions, profile=True)
             output = torch.zeros_like(query)
         elif self.shared.layout is not None:
+            _tmark("a.attend_batch", tokens)
             output = self._attend_batch(x, qr, positions, table, query, window)
             if isinstance(output, tuple):  # fused post: QDQ'd output
                 _tmark("a.out_proj", tokens)
-                return self._project_quantized(output[0])
+                return self._project_quantized(output[0], row_group)
         else:
             valid = self.shared.valid
             if valid is None or valid.shape[0] != tokens:
-                valid = metadata.slot_mapping[:tokens] >= 0
+                valid = _valid_rows(metadata, tokens)
             _tmark("a.window_insert", tokens)
             if self.ring_window:
                 arguments = dict(
@@ -931,7 +1204,7 @@ class V41Attention(nn.Module):
                 )
                 if quantized is not None:
                     _tmark("a.out_proj", tokens)
-                    return self._project_quantized(quantized)
+                    return self._project_quantized(quantized, row_group)
             output = attend_paged_latents(
                 query,
                 positions,
@@ -948,9 +1221,9 @@ class V41Attention(nn.Module):
                     insert_window_ring(self.window_ring, window, positions, valid)
         _tmark("a.out_proj", tokens)
         if FUSE_ATTN_POST:
-            return self._post_fused(output, positions, table, ring_values)
+            return self._post_fused(output, positions, table, ring_values, row_group)
         output = apply_rope(output, positions, table, inverse=True)
-        return self.project_output(output)
+        return self.project_output(output, row_group)
 
     def _attend_batch(self, x, qr, positions, table, query, window):
         """VLLM_V41_BATCH: window insert, compressor, indexer and attention for
@@ -964,7 +1237,7 @@ class V41Attention(nn.Module):
         metadata = self.window_cache.metadata()
         valid = self.shared.valid
         if valid is None or valid.shape[0] != tokens:
-            valid = metadata.slot_mapping[:tokens] >= 0
+            valid = _valid_rows(metadata, tokens)
         # VLLM_V41_BATCH_ATTN_FUSED (decode-only steps, with FUSE_ATTN_POST):
         # v41sk.attn_paged_dec reads the step's window rows from `window` and
         # inserts them, the combine does the inverse RoPE + QDQ.
@@ -989,6 +1262,7 @@ class V41Attention(nn.Module):
         if self.ratio:
             source = self.shared.layers[self.source]
             if hasattr(self, "compressor"):
+                _tmark("a.compressor", tokens)
                 latent = self.compressor.forward_batch(
                     x, positions, valid, layout, slots
                 )
@@ -1013,9 +1287,14 @@ class V41Attention(nn.Module):
                     ratio=self.ratio,
                 )
             if hasattr(self, "indexer"):
-                self.shared.topk = self.indexer.forward_batch(
-                    x, qr, positions, valid, table, source.indexer.k_cache, self.ratio
-                )
+                _tmark("a.indexer", tokens)
+                if fused and self.ratio in self.shared.short_indices:
+                    self.shared.topk = self.shared.short_indices[self.ratio]
+                else:
+                    self.shared.topk = self.indexer.forward_batch(
+                        x, qr, positions, valid, table, source.indexer.k_cache, self.ratio
+                    )
+            _tmark("a.sparse_attn", tokens)
             compressed_metadata = source.compressor.cache.metadata()
             arguments.update(
                 compressed_cache=source.compressor.cache.kv_cache,
@@ -1073,10 +1352,11 @@ class V41Attention(nn.Module):
             metadata.block_table,
             self.attn_sink,
             layout,
+            values=window,
             **arguments,
         )
 
-    def project_output(self, output):
+    def project_output(self, output, row_group=None):
         tokens = output.shape[0]
         output = attention_qdq(output.reshape(tokens, self.groups, 4096))
         # Each O group needs only its own 1024 rows. Grouped kernels read
@@ -1096,9 +1376,12 @@ class V41Attention(nn.Module):
                 ],
                 dim=-1,
             )
-        return self._wo_b(projected)
+        return self._wo_b(projected, row_group)
 
-    def _wo_b(self, projected):
+    def _wo_b(self, projected, row_group=None):
+        if row_group is not None:
+            assert not self.wo_b.reduce_results
+            return row_group.reduce_scatter(self.wo_b(projected), dim=0)
         if self.wo_b.reduce_results:
             return self.wo_b(projected)
         from .native import tp_all_reduce
@@ -1115,10 +1398,12 @@ class V41Attention(nn.Module):
         if prepared is not None:
             return prepared
         query = apply_rope(q_high, positions, table)
-        window = attention_qdq(apply_rope(self.kv_norm(kv_low), positions, table))
+        window = attention_qdq(
+            apply_rope(self.kv_norm(kv_low), positions, table), group=_WINDOW_GROUP
+        )
         return query, window
 
-    def _post_fused(self, output, positions, table, ring_values):
+    def _post_fused(self, output, positions, table, ring_values, row_group=None):
         # VLLM_V41_FUSE_ATTN_POST: the deferred window ring insert, the inverse
         # RoPE and project_output's QDQ in one launch, then its projections.
         values, valid = ring_values if ring_values is not None else (None, None)
@@ -1127,13 +1412,13 @@ class V41Attention(nn.Module):
             output, positions, table, self.groups, ring, values, valid
         )
         if quantized is not None:
-            return self._project_quantized(quantized)
+            return self._project_quantized(quantized, row_group)
         if ring_values is not None:
             insert_window_ring(self.window_ring, values, positions, valid)
         output = apply_rope(output, positions, table, inverse=True)
-        return self.project_output(output)
+        return self.project_output(output, row_group)
 
-    def _project_quantized(self, output):
+    def _project_quantized(self, output, row_group=None):
         # project_output after its attention_qdq. A copy: project_output stays
         # as it was for the knob-off path and V41DraftAttention.
         projected = dense_tm.grouped_wo_a(self.wo_a, output)
@@ -1150,7 +1435,7 @@ class V41Attention(nn.Module):
                 ],
                 dim=-1,
             )
-        return self._wo_b(projected)
+        return self._wo_b(projected, row_group)
 
 
 class V41KVMirror(nn.Module):
@@ -1421,6 +1706,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             self._slot_of: dict[str, int] = {}
             self._free_slots = list(range(slots - 1, -1, -1))
             self._slot_done: dict[int, torch.cuda.Event | None] = {}
+            # Prefix hits of requests not yet in a batch: req id -> (cached
+            # tokens, the 3 prompt tokens before the hit), applied when the
+            # request takes its fresh state slot.
+            self._pending_restore: dict[str, tuple[int, list[int]]] = {}
             self.batch_lengths = torch.zeros(slots, dtype=torch.int64, device=device)
             self.batch_positions = torch.zeros(slots, dtype=torch.int64, device=device)
             self.batch_prefill = torch.zeros(slots, dtype=torch.bool, device=device)
@@ -1523,7 +1812,28 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
         tokens = positions.numel()
+        if _SOLO_GRAPH:
+            owner = _sole_owner()
+            ep_rank = self.layers[self.start_layer].ffn.experts.ep_rank
+            if owner is not None and owner != ep_rank:
+                # This DP group has no sequences. Only the cross-group expert
+                # call per layer is required; no local KV or Engram state moves.
+                hidden = torch.zeros(
+                    (tokens, self.config.hidden_size),
+                    device=positions.device, dtype=torch.float16,
+                )
+                empty = hidden[:0]
+                top_k = self.config.num_experts_per_tok
+                probs = empty.new_empty((0, top_k), dtype=torch.float32)
+                ids = empty.new_empty((0, top_k), dtype=torch.int32)
+                for layer in self.layers:
+                    layer.ffn._dispatch_and_combine(empty, probs, ids, empty, None, owner)
+                aux = [hidden for _ in self.aux_hidden_state_layers]
+                return (hidden, aux) if aux else hidden
         self._intermediate = intermediate_tensors
+        if probe.ENABLED:
+            probe.set_active(True, tokens)
+            probe.mark("start", tokens)
         if (
             _EMPTY_CACHE_TOKENS
             and tokens >= _EMPTY_CACHE_TOKENS
@@ -1536,8 +1846,17 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         anchor = self.layers[self.start_layer].attn
         metadata = anchor.window_cache.metadata()
         anchor.shared.metadata = metadata
-        valid = metadata.slot_mapping[:tokens] >= 0 if metadata is not None else None
+        valid = _valid_rows(metadata, tokens) if metadata is not None else None
         anchor.shared.valid = valid
+        anchor.shared.short_indices = {}
+        if _SOLO_GRAPH and valid is not None and self.config.index_topk == 512:
+            descriptor = get_forward_context().batch_descriptor
+            if descriptor is not None and descriptor.sole_dp_bound is not None:
+                from .short_indices import all_compressed_positions
+
+                anchor.shared.short_indices = all_compressed_positions(
+                    positions, valid, descriptor.sole_dp_bound
+                )
         layout = metadata.layout if metadata is not None else None
         if layout is None:
             set_decode_rows(False)
@@ -1651,11 +1970,19 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
     def v41_set_batch(self, req_ids):
         """Runner hook before each forward: the state slot of every batch row."""
+        probe.tick()
+        if not getattr(self, "_tm_frozen", False):
+            # The first served step: the capture warmups measured the dense
+            # TurboMind plans; later shapes reuse them instead of measuring.
+            from .fp8_linear import freeze_tm_tuning
+
+            freeze_tm_tuning()
+            self._tm_frozen = True
         if not _BATCH:
             return
         # Set here, not in forward: a CUDA graph replay runs no Python.
         self.batch_reqs = len(req_ids)
-        if True:  # batched state checks raise here (recorded on device)
+        if _BATCH_DEBUG:  # recorded failures raise here (else the kernels trap)
             if self.hash_batch is not None:
                 self.hash_batch.check_errors()
             for i in range(self.start_layer, self.end_layer):
@@ -1673,7 +2000,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     raise RuntimeError("V4.1 batch: more live requests than slots")
                 slot = self._free_slots.pop()
                 self._slot_of[req_id] = slot
-                fresh.append(slot)
+                fresh.append((slot, req_id))
         host = self._slot_hosts[self._slot_turn]
         event = self._slot_events[self._slot_turn]
         self._slot_turn = (self._slot_turn + 1) % len(self._slot_hosts)
@@ -1684,11 +2011,14 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         )
         self.req_slots.copy_(host, non_blocking=True)
         event.record()
-        for slot in fresh:
+        for slot, req_id in fresh:
             done = self._slot_done.pop(slot, None)
             if done is not None:
                 torch.cuda.current_stream().wait_event(done)
             self._reset_slot(slot)
+            pending = self._pending_restore.pop(req_id, None)
+            if pending is not None:
+                self._restore_slot(slot, *pending)
 
     def v41_release(self, req_ids, done=None):
         """Runner hook: finished requests give their state slots back. done:
@@ -1701,6 +2031,25 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             if slot is not None:
                 self._free_slots.insert(0, slot)  # reuse the oldest last
                 self._slot_done[slot] = done
+
+    def _restore_slot(self, slot, cached, tail):
+        """A fresh slot at a prefix hit: the C2 pair and the Engram hash
+        history continue at `cached` (an even position: no partial pair)."""
+        for i in range(self.start_layer, self.end_layer):
+            compressor = getattr(self.layers[i].attn, "compressor", None)
+            state = getattr(compressor, "state_batch", None)
+            if state is not None:
+                state.position[slot] = cached
+        if self.hash_batch is None:
+            return
+        device = self.hash_state.history.device
+        ids = torch.tensor(
+            [-1] * (3 - len(tail)) + list(tail), dtype=torch.long, device=device
+        )
+        mapped = self.hash_state.token_map[ids.clamp_min(0)].long()
+        history = self.hash_batch.history[slot]
+        history[:3].copy_(torch.where(ids >= 0, mapped, -1))
+        history[3] = cached
 
     def _reset_slot(self, slot):
         if self.hash_batch is not None:
@@ -1731,6 +2080,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         if i + 1 < self.end_layer:
             return None
         _tmark("end", hidden.shape[0])
+        probe.set_active(False)
         if _ATT_T["on"]:
             _treport(hidden.shape[0])
         tensors = {"hidden": hidden, "pre": pre.contiguous()}
@@ -1792,6 +2142,24 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         # next sublayer's mixes, delayed collapse). A boundary falls back to the
         # reference mixes/collapse when Engram rewrites the residual, and at a
         # pipeline stage boundary (the next layer's parameters are elsewhere).
+        # Prefill on TP4: each rank keeps one consecutive quarter of the
+        # replicated FP32 residual. Attention and MoE still consume all
+        # tokens, so gather just their normalized FP16 inputs at each boundary.
+        tp = None
+        rows = positions.numel()
+        if (
+            _HC_PF_TP4 and _NATIVE and _LL_AR
+            and rows >= 1024 and rows % 4 == 0
+            and get_pp_group().world_size == 1 and not _PP_BOUNDARY_SIM
+            and not (_PREFETCH_HINTS or _PRED_STATS)
+            and not torch.cuda.is_current_stream_capturing()
+            and get_tp_group().world_size == 4
+        ):
+            tp = get_tp_group()
+            size = rows // 4
+            first = tp.rank_in_group * size
+            part = slice(first, first + size)
+            hidden, pre = hidden[part], pre[part]
         state = None
         layers = list(self.layers)
         start, end = self.start_layer, self.end_layer
@@ -1799,11 +2167,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             layer = layers[i]
             _tmark("engram", hidden.shape[0])
             if layer.engram is not None and metadata is not None:
-                hidden = layer.engram(hidden, self.engram_io, valid)
+                if tp is None:
+                    hidden = layer.engram(hidden, self.engram_io, valid)
+                else:
+                    hidden = layer.engram(hidden, self.engram_io, valid,
+                                          full_rows=rows, row_slice=part)
                 state = None
             _tmark("hc_pre", hidden.shape[0])
             if i in self.aux_hidden_state_layers:
-                auxiliary.append(hidden.mean(1).mul_(2.0**-6).half())
+                aux = hidden.mean(1).mul_(2.0**-6).half()
+                auxiliary.append(tp.all_gather(aux, dim=0) if tp is not None else aux)
             if state is None:
                 hc_join()
                 attn_mix = hc_mixes(
@@ -1813,7 +2186,11 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             else:
                 inputs, attn_mix = state
             table = self.compressed_rope if layer.attn.ratio else self.window_rope
-            y = layer.attn(inputs, positions, table)
+            if tp is None:
+                y = layer.attn(inputs, positions, table)
+            else:
+                inputs = tp.all_gather(inputs, dim=0)
+                y = layer.attn(inputs, positions, table, row_group=tp)
             _tmark("hc_mid", hidden.shape[0])
             inputs, ffn_mix = hc_transition(
                 hidden,
@@ -1843,7 +2220,11 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     self._v41_gates = gates
                 publish_prefetch_hints(gates, i, inputs)
             _tmark("ffn(moe+shared)", hidden.shape[0])
-            y = layer.ffn(inputs)
+            if tp is None:
+                y = layer.ffn(inputs)
+            else:
+                inputs = tp.all_gather(inputs, dim=0)
+                y = layer.ffn(inputs, row_group=tp)
             _tmark("hc_post", hidden.shape[0])
             pre = ffn_mix[0]
             boundary = self._stage_boundary(i)
@@ -1877,9 +2258,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     hidden, y, ffn_mix[1], ffn_mix[2], pre, self.norm.weight
                 )
                 _tmark("end", hidden.shape[0])
+                probe.set_active(False)
                 if _ATT_T["on"]:
                     _treport(hidden.shape[0])
-                return result
+                return tp.all_gather(result, dim=0) if tp is not None else result
         raise AssertionError("V4.1 fused forward requires at least one layer")
 
     def _ratio2_states(self):
@@ -2007,13 +2389,21 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         if count is not None:
             self._commit(self.stage_commit_count.fill_(count))
 
-    def restore_prefix(self, cached, prompt_ids):
+    def restore_prefix(self, cached, prompt_ids, req_id=None):
         """Rewind per-sequence device state to a same-session prefix hit.
+
+        VLLM_V41_BATCH: any even hit (paged window caches hold the rows the
+        hit covers); the request's state slot continues at it once assigned.
 
         The scheduler only admits hits that continue the last executed
         sequence at an even position inside the window rings' reach, so the
         rings need no rewind. Later PP stages hold nothing else.
         """
+        if _BATCH and req_id is not None:
+            assert cached % 2 == 0
+            tail = list(prompt_ids[max(0, cached - 3) : cached])
+            self._pending_restore[req_id] = (cached, tail)
+            return
         assert cached % 2 == 0
         if self.stage_commit is not None:
             self.stage_commit.reset()
@@ -2093,9 +2483,22 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
             or vllm_config.model_config.dtype != torch.float16
             or get_tensor_model_parallel_world_size() != 4
             or p.pipeline_parallel_size not in ((1, 2, 4) if _NATIVE else (1, 2))
-            or p.data_parallel_size != 1
-            or p.enable_expert_parallel
+            or (
+                (p.data_parallel_size != 1 or p.enable_expert_parallel)
+                # Native weights: TP4 x DP with the routed experts in EP over
+                # DP x TP (all-gather / reduce-scatter dispatch).
+                and not (
+                    _NATIVE
+                    and p.pipeline_parallel_size == 1
+                    and p.all2all_backend == "allgather_reducescatter"
+                )
+            )
             or (s.max_num_seqs != 1 and not _BATCH)
+            # Packed pages: only the batched kernels read packed rows.
+            or (
+                (_PACKED_PAGES or _SWA_FP8)
+                and (not _BATCH or p.pipeline_parallel_size != 1)
+            )
             or (s.async_scheduling and envs.VLLM_V41_ASYNC != "1")
             or s.max_num_batched_tokens > 16384
             or vllm_config.model_config.max_model_len
@@ -2107,7 +2510,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
         ):
             raise ValueError(
                 "V4.1 requires SM70 FP16 TP4 (PP 1 or 2; native weights also "
-                "PP4), one request unless VLLM_V41_BATCH, <=16K (native batch "
+                "PP4, or TP4 x DP with EP over allgather_reducescatter), one "
+                "request unless VLLM_V41_BATCH, <=16K (native batch "
                 "<=1M, packed KV <=512K), chunks <=16384, synchronous "
                 "scheduling, no prefix caching"
             )
@@ -2228,7 +2632,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
             not isinstance(self.lm_head.quant_method, H16Head)
             or get_tensor_model_parallel_world_size() != 4
             or hidden_states.dtype != torch.float16
-            or not 1 <= hidden_states.shape[0] <= 6
+            or not 1 <= hidden_states.shape[0] <= (192 if _BATCH else 6)
             or self.logits_processor.soft_cap is not None
             or self.logits_processor.scale != 1.0
             or self.lm_head.num_embeddings != self.lm_head.org_vocab_size
@@ -2290,6 +2694,27 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
                 attach_h16_head(self.lm_head)
             torch.accelerator.empty_cache()
         self.model.prepare_postload()
+        if _NATIVE:
+            from .fp8_linear import release_checkpoint_weights
+
+            # After prepare_postload, which may re-prepare (Engram row bias).
+            freed = release_checkpoint_weights(self.model.modules())
+            from .fp8_linear import pretune_tm
+
+            sizes = (
+                get_current_vllm_config().compilation_config.cudagraph_capture_sizes
+                or []
+            )
+            tuned = pretune_tm(self.model.modules(), sizes)
+            if tuned:
+                logger.info_once("V4.1 dense FP8: %d TurboMind plans measured", tuned)
+            if freed:
+                torch.accelerator.empty_cache()
+                logger.info_once(
+                    "V4.1 dense FP8: %.2f GiB of checkpoint-layout weights "
+                    "released (TurboMind + QPN8 copies serve all rows)",
+                    freed / 2**30,
+                )
 
     def commit_speculative_state(self, accepted_counts):
         self.model.commit(accepted_counts)
@@ -2300,8 +2725,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
     def pp_before_forward(self, req_ids, num_computed):
         self.model.pp_before_forward(req_ids, num_computed)
 
-    def restore_prefix(self, cached, prompt_ids):
-        self.model.restore_prefix(cached, prompt_ids)
+    def restore_prefix(self, cached, prompt_ids, req_id=None):
+        self.model.restore_prefix(cached, prompt_ids, req_id)
 
     def stateful_output_budget(self, max_tokens, prompt_tokens):
         return self.model.output_budget(max_tokens, prompt_tokens)

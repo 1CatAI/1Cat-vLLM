@@ -15,6 +15,7 @@ from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
     get_dp_group,
     get_pcp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState, EplbState
@@ -140,6 +141,7 @@ class FusedMoE(PluggableLayer):
         apply_routed_scale_to_output: bool = False,
         zero_expert_type: str | None = None,
         hash_indices_table: torch.Tensor | None = None,
+        expert_tp_within_dp: bool = False,
     ):
         super().__init__()
 
@@ -177,6 +179,22 @@ class FusedMoE(PluggableLayer):
             sp_size_=self.sp_size,
             vllm_parallel_config=vllm_config.parallel_config,
         )
+
+        if expert_tp_within_dp:
+            # Keep the full EP communicator for dispatch/combine. Only weight
+            # ownership changes: DP selects experts and TP slices each expert.
+            parallel = self.moe_parallel_config
+            if not (
+                parallel.use_ag_rs_all2all_kernels
+                and tp_size_ == dp_size_ == 4
+                and pcp_size_ == self.sp_size == 1
+                and not enable_eplb
+            ):
+                raise ValueError("hybrid experts require TP4 x DP4 with AG/RS")
+            parallel.tp_size = tp_size_
+            parallel.tp_rank = get_tensor_model_parallel_rank()
+            parallel.ep_size = dp_size_
+            parallel.ep_rank = parallel.dp_rank
 
         assert self.moe_parallel_config.is_sequence_parallel == is_sequence_parallel
 

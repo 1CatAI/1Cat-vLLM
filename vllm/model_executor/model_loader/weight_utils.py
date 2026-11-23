@@ -1065,7 +1065,7 @@ def _prefetch_all_checkpoints(
 def _keep_weight(
     name: str,
     indexed_weights: set[str] | None,
-    local_expert_ids: set[int] | None,
+    local_expert_ids: set[int] | dict[int, set[int]] | None,
     skip_weight: Callable[[str], bool] | None,
 ) -> bool:
     """Decide from the name alone whether a tensor is read at all."""
@@ -1076,7 +1076,9 @@ def _keep_weight(
     return skip_weight is None or not skip_weight(name)
 
 
-def _direct_io_sharing(local_expert_ids: set[int] | None) -> RunSharing | None:
+def _direct_io_sharing(
+    local_expert_ids: set[int] | dict[int, set[int]] | None,
+) -> RunSharing | None:
     """The tensor-parallel group reads the same decoder tensors, so its first
     rank reads them for all; not under expert parallelism, where each rank
     keeps other experts."""
@@ -1092,7 +1094,7 @@ def _keep_direct_weight(
     name: str,
     *,
     indexed_weights: set[str] | None,
-    local_expert_ids: set[int] | None,
+    local_expert_ids: set[int] | dict[int, set[int]] | None,
     skip_weight: Callable[[str], bool] | None,
     map_weight: Callable[[str], bool] | None,
     read_directly: bool,
@@ -1113,7 +1115,7 @@ def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     safetensors_load_strategy: str | None = None,
-    local_expert_ids: set[int] | None = None,
+    local_expert_ids: set[int] | dict[int, set[int]] | None = None,
     *,
     indexed_weights_by_file: Mapping[str, set[str]] | None = None,
     skip_weight: Callable[[str], bool] | None = None,

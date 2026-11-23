@@ -4,6 +4,7 @@
 import torch
 import torch.distributed as dist
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
@@ -42,6 +43,19 @@ def _run_ar(
 ) -> torch.Tensor:
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
+    if (
+        parallel_config.disable_nccl_for_dp_synchronization
+        and dp_size == 4
+        and envs.VLLM_V41_EP4_TP4 == "1"
+    ):
+        from vllm.models.deepseek_v41.dp_agreement import host_agreement
+
+        exchange = host_agreement(get_dp_group())
+        if exchange is not None:
+            return exchange.exchange(
+                orig_num_tokens_per_ubatch, padded_num_tokens_per_ubatch,
+                should_ubatch, cudagraph_mode,
+            )
     device, group = _get_device_and_group(parallel_config)
     # Populate this rank's contribution on CPU to reduce GPU syncs.
     tensor_cpu = torch.zeros(4, dp_size, dtype=torch.int32)
@@ -104,6 +118,8 @@ def _synchronize_dp_ranks(
     should_attempt_ubatching: bool,
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
+    active_dp_ranks: list[int] | None = None,
+    dp_idle: bool = False,
 ) -> tuple[bool, torch.Tensor | None, int]:
     """
     1. Decides if each DP rank is going to microbatch. Either all ranks
@@ -130,11 +146,23 @@ def _synchronize_dp_ranks(
     # will run and if we are using ubatching or not.
     tensor = _run_ar(
         should_ubatch=should_attempt_ubatching,
-        orig_num_tokens_per_ubatch=num_tokens_unpadded,
+        orig_num_tokens_per_ubatch=(
+            -num_tokens_unpadded if dp_idle and active_dp_ranks is not None
+            else num_tokens_unpadded
+        ),
         padded_num_tokens_per_ubatch=num_tokens_padded,
         cudagraph_mode=cudagraph_mode,
         parallel_config=parallel_config,
     )
+
+    # An idle rank runs a nonempty dummy batch. Reuse the signed count in
+    # the existing all-reduce and restore it before the usual padding rules.
+    if active_dp_ranks is not None:
+        tensor = tensor.cpu()
+        counts = tensor[0].tolist()
+        active_dp_ranks.extend(i for i, count in enumerate(counts) if count > 0)
+        if any(count < 0 for count in counts):
+            tensor[0].abs_()
 
     # Synchronize cudagraph_mode across ranks first (take min).
     # This is needed before DP padding decision since we use the synced
@@ -168,6 +196,8 @@ def coordinate_batch_across_dp(
     num_tokens_padded: int | None = None,
     uniform_decode: bool | None = None,
     cudagraph_mode: int = 0,
+    active_dp_ranks: list[int] | None = None,
+    dp_idle: bool = False,
 ) -> tuple[bool, torch.Tensor | None, int]:
     """
     Coordinates amongst all DP ranks to determine if and how the full batch
@@ -219,6 +249,8 @@ def coordinate_batch_across_dp(
             should_attempt_ubatching,
             cudagraph_mode,
             parallel_config,
+            active_dp_ranks=active_dp_ranks,
+            dp_idle=dp_idle,
         )
     )
 

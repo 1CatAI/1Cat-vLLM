@@ -121,8 +121,11 @@ def determine_expert_placement_strategy(
     enable_eplb: bool,
 ) -> ExpertPlacementStrategy:
     if expert_placement_strategy == "round_robin":
+        # The all-gather / reduce-scatter dispatch hands every rank all routes
+        # and the experts map them through expert_map, so any placement works.
+        ag_rs = moe_parallel_config.use_ag_rs_all2all_kernels
         round_robin_supported = (
-            (num_expert_group is not None and num_expert_group > 1)
+            ((num_expert_group is not None and num_expert_group > 1) or ag_rs)
             and num_redundant_experts == 0
             and not enable_eplb
         )
@@ -136,6 +139,7 @@ def determine_expert_placement_strategy(
             return "linear"
         if (
             moe_parallel_config.use_all2all_kernels
+            and not ag_rs
             and not moe_parallel_config.needs_round_robin_routing_tables
         ):
             logger.warning(

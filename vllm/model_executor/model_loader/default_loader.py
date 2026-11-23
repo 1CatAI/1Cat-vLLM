@@ -177,7 +177,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        self.local_expert_ids: set[int] | None = None
+        self.local_expert_ids: set[int] | dict[int, set[int]] | None = None
 
         extra_config = load_config.model_loader_extra_config
         allowed_keys = {
@@ -609,6 +609,60 @@ class DefaultModelLoader(BaseModelLoader):
                 num_experts,
             )
 
+    def _match_ep_weight_filter(self, model: nn.Module) -> None:
+        """Keep the EP filter consistent with the model's own expert maps.
+
+        The filter derives this rank's experts from the global DP x TP layout.
+        A model whose MoE layers use another layout (e.g. a drafter keeping its
+        experts inside its TP group) would otherwise drop experts it owns, so
+        the layers' ``expert_map`` decides; without one, nothing is filtered.
+        """
+        if self.local_expert_ids is None:
+            return
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
+        import regex as re
+
+        owned: set[int] | dict[int, set[int]] | None = None
+        per_layer: dict[int, set[int]] = {}
+        uniform = True
+        for module in model.modules():
+            if not isinstance(module, FusedMoE):
+                continue
+            expert_map = module.expert_map
+            if expert_map is None:
+                owned = None
+                uniform = False
+                per_layer = {}
+                break
+            # Checkpoint (logical) expert ids this rank stores: a model whose
+            # physical slots differ (expert replicas) names them itself.
+            ids = getattr(module, "v41_logical_ids", None) or set(
+                torch.nonzero(expert_map >= 0).flatten().tolist()
+            )
+            layer = re.search(r"layers\.(\d+)\.", getattr(module, "layer_name", ""))
+            if layer is not None:
+                per_layer[int(layer.group(1))] = ids
+            if owned is not None and ids != owned:
+                uniform = False
+            owned = ids
+        if not uniform:
+            # Per-layer placements filter by each layer's own experts; without
+            # a layer index for every map, load every expert.
+            owned = per_layer or None
+        if owned != self.local_expert_ids:
+            logger.info_once(
+                "EP weight filter follows the model's expert maps: %s",
+                "all experts"
+                if owned is None
+                else (
+                    f"{len(owned)} per-layer sets"
+                    if isinstance(owned, dict)
+                    else f"{len(owned)} experts"
+                ),
+            )
+            self.local_expert_ids = owned
+
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         if model_config.quantization == "torchao":
@@ -621,6 +675,7 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.safetensors_load_strategy = "torchao"
 
         self._init_ep_weight_filter(model_config)
+        self._match_ep_weight_filter(model)
 
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 

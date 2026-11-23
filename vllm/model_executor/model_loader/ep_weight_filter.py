@@ -15,6 +15,7 @@ import regex as re
 # (no numeric id) — those are intentionally left unfiltered so the full
 # tensor is loaded and sliced later by FusedMoE.weight_loader.
 _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+_LAYER_RE = re.compile(r"layers\.(\d+)\.")
 
 
 def parse_expert_id(weight_name: str) -> int | None:
@@ -63,12 +64,22 @@ def compute_local_expert_ids(
 
 def should_skip_weight(
     weight_name: str,
-    local_expert_ids: set[int] | None,
+    local_expert_ids: set[int] | dict[int, set[int]] | None,
 ) -> bool:
     """Return ``True`` if *weight_name* is an expert weight that does not
-    belong to the local rank and should be skipped during loading."""
+    belong to the local rank and should be skipped during loading.
+
+    ``local_expert_ids`` may map a layer index to that layer's experts
+    (per-layer placements); weights of unlisted layers are kept."""
     if local_expert_ids is None:
         return False
+    if isinstance(local_expert_ids, dict):
+        layer = _LAYER_RE.search(weight_name)
+        local_expert_ids = (
+            local_expert_ids.get(int(layer.group(1))) if layer is not None else None
+        )
+        if local_expert_ids is None:
+            return False
     eid = parse_expert_id(weight_name)
     if eid is None:
         # Not an expert weight (dense / shared-expert / embedding) → keep.
