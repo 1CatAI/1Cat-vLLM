@@ -32,8 +32,14 @@ def _gguf_metadata(path):
     reader = gguf.GGUFReader(path)
     meta = {}
     for key, field in reader.fields.items():
-        if key.startswith(("inkling2.", "general.architecture", "tokenizer.ggml.eos",
-                           "tokenizer.ggml.padding")):
+        if key.startswith(
+            (
+                "inkling2.",
+                "general.architecture",
+                "tokenizer.ggml.eos",
+                "tokenizer.ggml.padding",
+            )
+        ):
             meta[key] = field.contents()
     return meta
 

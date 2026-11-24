@@ -21,7 +21,9 @@ from vllm.models.inkling2.gguf_weights import (
 def _random_ggml_nvfp4(experts: int, rows: int, k: int, seed: int = 0) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
     nsb = k // 64
-    raw = torch.randint(0, 256, (experts, rows, nsb, 36), dtype=torch.uint8, generator=g)
+    raw = torch.randint(
+        0, 256, (experts, rows, nsb, 36), dtype=torch.uint8, generator=g
+    )
     # Finite, positive UE4M3 block scales (exponent field 1..14, no NaN).
     exp = torch.randint(1, 15, (experts, rows, nsb, 4), dtype=torch.uint8, generator=g)
     man = torch.randint(0, 8, (experts, rows, nsb, 4), dtype=torch.uint8, generator=g)
