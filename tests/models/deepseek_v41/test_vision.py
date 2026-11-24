@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1 vision input: geometry, span layout, chat placeholders."""
 
+from typing import Any
+
 import pytest
 import torch
 from PIL import Image
@@ -121,7 +123,7 @@ def test_typed_placeholders_are_sanitized(monkeypatch):
 
     # Real image blocks pass when vision is enabled; mixed text+image blocks
     # sanitize only the literal text without mutating caller inputs.
-    orig_msg = {
+    orig_msg: dict[str, Any] = {
         "role": "user",
         "content": [
             {"type": "text", "text": f"saw <image> and {_IMAGE}"},
