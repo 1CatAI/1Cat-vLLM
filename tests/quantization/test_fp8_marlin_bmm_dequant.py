@@ -3,7 +3,8 @@
 """Grouped (is_bmm) block-FP8 weights on a Marlin-backed Fp8LinearMethod.
 
 Marlin cannot serve DeepSeek-V4's grouped wo_a, so on cards that take Marlin
-for block FP8 (Turing) the weight is dequantized at load and applied per group.
+for block FP8 the weight is dequantized at load and applied per group. The QPN8
+kernel (Turing) serves the grouped layer itself: test_qpn8_grouped_bmm.py.
 """
 
 import pytest
@@ -69,24 +70,6 @@ def test_marlin_bmm_apply_multiplies_each_group_by_its_rows(num_tokens) -> None:
         torch.testing.assert_close(
             out[:, group].float(), expected, rtol=2e-3, atol=2e-2
         )
-
-
-def test_late_grouped_turing_metadata_discards_dense_qpn8_selection():
-    from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
-        QPN8Fp8BlockScaledMMLinearKernel,
-    )
-
-    layer, reference = _grouped_layer()
-    method = _marlin_method()
-    method.use_marlin = False
-    method.use_sm70_fp8_turbomind = False
-    method.fp8_linear = QPN8Fp8BlockScaledMMLinearKernel.__new__(
-        QPN8Fp8BlockScaledMMLinearKernel
-    )
-    method.process_weights_after_loading(layer)
-    assert layer.dequantized_bmm
-    assert torch.equal(layer.weight, reference.half())
-    assert not hasattr(method, "fp8_linear")
 
 
 def test_late_grouped_volta_metadata_reselects_grouped_kernel(monkeypatch):

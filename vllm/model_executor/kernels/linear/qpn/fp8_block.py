@@ -367,6 +367,109 @@ def _qpn8_native_linear_out(
     )
 
 
+def _qpn8_native_grouped_linear_write(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    native_policy: list[str] | None = None,
+    sm75_mma: bool = False,
+) -> None:
+    """``out[:, g] = x[:, g] @ W_g^T`` for the stacked packs of a grouped BMM.
+
+    x is [M, G * K], codes [G, K, N_g], group_scales [G, K / 128, N_g / 32] and
+    out [M, G * N_g]. Decode rows (M <= 8) are one launch over all groups, so
+    the groups' weights stream together at the bandwidth of a single large
+    linear. Larger M runs each group through the ordinary M ladder of the dense
+    linears (Turing tensor-core GEMM, then dense FP16 prefill on a per-group
+    scratch); the M decision stays inside this opaque op like in
+    ``_qpn8_native_linear_write``.
+    """
+    groups, k_dim, n_group = codes.shape
+    rows = x.shape[0]
+    if rows == 0:
+        return
+    if rows <= _QPN8_MAX_M:
+        call_native(
+            sm70_ops.fp8_qpn8_gemm_sm70_out,
+            native_policy,
+            out,
+            x,
+            codes,
+            group_scales,
+            split_k,
+            accumulator_chains,
+            True,
+            prefetch_codes,
+        )
+        return
+    x_by_group = x.view(rows, groups, k_dim)
+    out_by_group = out.view(rows, groups, n_group)
+    for group in range(groups):
+        group_out = x.new_empty((rows, n_group))
+        _qpn8_native_linear_write(
+            group_out,
+            x_by_group[:, group].contiguous(),
+            codes[group],
+            group_scales[group],
+            split_k,
+            accumulator_chains,
+            prefetch_codes,
+            native_policy=native_policy,
+            sm75_mma=sm75_mma,
+        )
+        out_by_group[:, group].copy_(group_out)
+
+
+@custom_op(
+    "sm70_fp8::qpn8_native_grouped_linear",
+    mutates_args=(),
+    schema="(Tensor x, Tensor codes, Tensor group_scales, int split_k, "
+    "int accumulator_chains, bool prefetch_codes, "
+    "str[]? native_policy=None, bool sm75_mma=False) -> Tensor",
+)
+def _qpn8_native_grouped_linear(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    native_policy: list[str] | None = None,
+    sm75_mma: bool = False,
+) -> torch.Tensor:
+    out = x.new_empty((x.shape[0], codes.shape[0] * codes.shape[2]))
+    _qpn8_native_grouped_linear_write(
+        out,
+        x,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        native_policy,
+        sm75_mma,
+    )
+    return out
+
+
+@_qpn8_native_grouped_linear.register_fake
+def _qpn8_native_grouped_linear_fake(
+    x,
+    codes,
+    group_scales,
+    split_k,
+    accumulator_chains,
+    prefetch_codes,
+    native_policy=None,
+    sm75_mma=False,
+):
+    return x.new_empty((x.shape[0], codes.shape[0] * codes.shape[2]))
+
+
 @custom_op(
     "sm70_fp8::qpn8_native_gated_silu",
     mutates_args=(),
@@ -665,6 +768,39 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             return fits
         return True
 
+    @staticmethod
+    def _bmm_groups(layer: torch.nn.Module, n_dim: int) -> int:
+        """Group count of a grouped BMM layer (DeepSeek-V4 wo_a), else 0."""
+        if not getattr(layer, "is_bmm", False):
+            return 0
+        groups = int(getattr(layer, "bmm_batch_size", 0))
+        if groups <= 0 or n_dim % (groups * 128) != 0:
+            raise ValueError(
+                f"QPN8 grouped BMM: {groups} groups do not split {n_dim} output "
+                "rows into multiples of the 128-row scale block"
+            )
+        return groups
+
+    @staticmethod
+    def _split_groups(
+        codes: torch.Tensor, group_scales: torch.Tensor, groups: int, k_dim: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stack the pack of the whole [N, K] weight into one pack per group.
+
+        The pack is tile-major over 32 output rows, so the rows of one group are
+        one contiguous run of bytes and ``codes`` only needs a new shape. The
+        block scales are [K / 128, N / 32] over all tiles; each group takes its
+        own run of tiles as a contiguous [K / 128, N_g / 32] plane.
+        """
+        n_group = codes.shape[1] // groups
+        scale_rows = k_dim // 128
+        group_scales = (
+            group_scales.view(scale_rows, groups, n_group // 32)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+        return codes.view(groups, k_dim, n_group), group_scales
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         weight = layer.weight.data
         n, k = weight.shape
@@ -685,6 +821,10 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             weight, block_scales
         )
         k_dim, n_dim = (int(dim) for dim in codes.shape)
+        groups = self._bmm_groups(layer, n_dim)
+        if groups:
+            codes, group_scales = self._split_groups(codes, group_scales, groups, k_dim)
+        layer._qpn8_bmm_groups = groups
         layer.register_buffer(
             "_sm70_block_fp8_qpn8_packed_codes", codes, persistent=False
         )
@@ -694,7 +834,8 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         capability = current_platform.get_device_capability(codes.device.index)
         layer._qpn8_sm75_mma = capability is not None and capability.to_int() == 75
         if (
-            capability is not None
+            not groups
+            and capability is not None
             and capability.to_int() in (70, 72)
             and self._keep_volta_turbomind_copy(codes.device)
         ):
@@ -734,7 +875,9 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
                 and not torch.cuda.is_current_stream_capturing()
                 and _graphs_capture_dense_prefill(_QPN8_MAX_M)
             ):
-                _ensure_block_qpn8_prefill_workspace(codes.device, k_dim * n_dim)
+                _ensure_block_qpn8_prefill_workspace(
+                    codes.device, k_dim * n_dim // max(groups, 1)
+                )
             logger.info_once(
                 "Block FP8 QPN8 native GEMM supports M=1..128; larger M uses the "
                 "FP16 prefill, which needs no second copy of the weights (a "
@@ -775,7 +918,38 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         raise RuntimeError("unreachable: QPN8 overrides apply_weights")
 
     def supports_direct_output(self, layer: torch.nn.Module) -> bool:
-        return hasattr(layer, "_sm70_block_fp8_qpn8_packed_codes")
+        return (
+            hasattr(layer, "_sm70_block_fp8_qpn8_packed_codes")
+            and not layer._qpn8_bmm_groups
+        )
+
+    def _apply_grouped(
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        """x ends in [groups, K]; group g multiplies its own rows of the weight."""
+        codes = layer._sm70_block_fp8_qpn8_packed_codes
+        groups, k_dim, n_group = codes.shape
+        if tuple(x.shape[-2:]) != (groups, k_dim):
+            raise ValueError(
+                f"QPN8 grouped input must end in [{groups}, {k_dim}], "
+                f"got {tuple(x.shape)}"
+            )
+        split_k, accumulator_chains, prefetch_codes = layer._qpn8_cfg
+        y = self.native_ops.invoke(
+            torch.ops.sm70_fp8.qpn8_native_grouped_linear,
+            x.reshape(-1, groups * k_dim),
+            codes,
+            layer._sm70_block_fp8_qpn8_packed_scales,
+            split_k,
+            accumulator_chains,
+            prefetch_codes,
+            self.native_ops.arguments,
+            layer._qpn8_sm75_mma,
+        )
+        out = y.view(*x.shape[:-2], groups, n_group)
+        if bias is not None:
+            out = out + bias.view(groups, n_group)
+        return out
 
     def apply_weights(
         self,
@@ -785,6 +959,9 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         output: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        if layer._qpn8_bmm_groups:
+            assert output is None, "grouped BMM has no direct output buffer"
+            return self._apply_grouped(layer, x, bias)
         codes = layer._sm70_block_fp8_qpn8_packed_codes
         split_k, accumulator_chains, prefetch_codes = layer._qpn8_cfg
         x_2d = flatten_linear_input(x, codes.shape[0]).contiguous()
