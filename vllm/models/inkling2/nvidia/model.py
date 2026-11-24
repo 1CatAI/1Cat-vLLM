@@ -26,6 +26,9 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -158,7 +161,7 @@ class Inkling2DecoderLayer(nn.Module):
         self,
         config: Inkling2ModelConfig,
         layer_id: int,
-        quant_config: Inkling2QuantConfig | None,
+        quant_config: QuantizationConfig | None,
         prefix: str,
         num_passes: int = 1,
     ) -> None:
@@ -245,7 +248,7 @@ class Inkling2Model(nn.Module):
     def __init__(
         self,
         config: Inkling2ModelConfig,
-        quant_config: Inkling2QuantConfig | None,
+        quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -291,7 +294,7 @@ class Inkling2Model(nn.Module):
         self,
         config: Inkling2ModelConfig,
         layer_id: int,
-        quant_config: Inkling2QuantConfig | None,
+        quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> Inkling2DecoderLayer:
         return Inkling2DecoderLayer(config, layer_id, quant_config, prefix)
