@@ -96,6 +96,15 @@ def _get_dflash2_checkpoint_draft_tokens(hf_config: Any) -> int | None:
     return block_size - 1
 
 
+def _is_inkling2_target(target_model_config: Any) -> bool:
+    architectures = getattr(target_model_config, "architectures", None) or []
+    return any(str(a).startswith("Inkling2") for a in architectures)
+
+
+def _is_inkling2_draft(hf_config: Any) -> bool:
+    return getattr(hf_config, "model_type", None) == "inkling2_dspark"
+
+
 def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
     """Return the block width produced by the DFlash checkpoint itself.
 
@@ -841,7 +850,11 @@ class SpeculativeConfig:
                 if self.target_model_config is None:
                     raise ValueError("target_model_config must be present for dspark")
                 self.model = self.target_model_config.model
-                if not self.quantization:
+                # The Inkling2 drafter (`mtp.safetensors`) is BF16: it does
+                # not carry the target's NVFP4/MXFP8 experts quantization.
+                if not self.quantization and not _is_inkling2_target(
+                    self.target_model_config
+                ):
                     self.quantization = self.target_model_config.quantization
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
@@ -1053,7 +1066,9 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.use_dspark():
+                if self.use_dspark() and not _is_inkling2_draft(
+                    self.draft_model_config.hf_config
+                ):
                     draft_hf_config = self.draft_model_config.hf_config
                     if draft_hf_config.model_type == "deepseek_v41_text":
                         draft_hf_config.architectures = ["DSparkDeepseekV41ForCausalLM"]
@@ -1148,7 +1163,8 @@ class SpeculativeConfig:
                                 "dspark_confidence_temperatures entries must be "
                                 f"finite and positive; got {temperatures}."
                             )
-                    self._verify_dspark_final_stage_ownership()
+                    if not _is_inkling2_draft(self.draft_model_config.hf_config):
+                        self._verify_dspark_final_stage_ownership()
 
                 if self.use_dflash_ddtree() and self.ddtree_budget is None:
                     self.ddtree_budget = self.num_speculative_tokens

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
 
 import numpy as np
 import torch
@@ -20,6 +21,12 @@ from vllm.v1.worker.cp_utils import get_total_cp_world_size
 # max_model_len / block_size width. At a 1M max length the full width is
 # 256 KiB per request and KV group, staged and copied every step a row grows.
 _LIVE_TABLE = envs.VLLM_V41_LIVE_TABLE == "1"
+
+# VLLM_INKLING2_SM70_BLOCKTABLE=1 (default): commit only the block-table entries
+# that changed since the last commit (see block_table_delta.py), in one H2D copy
+# plus one scatter kernel for all KV groups, instead of whole rows per group.
+# =0 restores the full-row copy.
+_BT_DELTA = os.environ.get("VLLM_INKLING2_SM70_BLOCKTABLE", "1") == "1"
 
 logger = init_logger(__name__)
 
@@ -105,6 +112,10 @@ class BlockTable:
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
         self._block_table_dirty_until = 0
         self._block_table_committed_until = 0
+        # Dirty column range [lo, hi) per row since the last commit (delta commit).
+        self._row_lo = np.zeros(max_num_reqs, dtype=np.int32)
+        self._row_hi = np.zeros(max_num_reqs, dtype=np.int32)
+        self._dirty_rows: set[int] = set()
 
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens, dtype=torch.int64
@@ -141,6 +152,36 @@ class BlockTable:
     def _mark_dirty(self, row_idx: int) -> None:
         self._block_table_dirty_until = max(self._block_table_dirty_until, row_idx + 1)
 
+    def _mark_cols(self, row_idx: int, lo: int, hi: int) -> None:
+        if hi <= lo:
+            return
+        if row_idx not in self._dirty_rows:
+            self._dirty_rows.add(row_idx)
+            self._row_lo[row_idx] = lo
+            self._row_hi[row_idx] = hi
+        elif self._row_hi[row_idx] <= self._row_lo[row_idx]:
+            self._row_lo[row_idx] = lo
+            self._row_hi[row_idx] = hi
+        else:
+            self._row_lo[row_idx] = min(self._row_lo[row_idx], lo)
+            self._row_hi[row_idx] = max(self._row_hi[row_idx], hi)
+
+    def _clear_ranges(self, num_reqs: int) -> None:
+        if not self._dirty_rows:
+            return
+        for row in [r for r in self._dirty_rows if r < num_reqs]:
+            self._row_lo[row] = 0
+            self._row_hi[row] = 0
+            self._dirty_rows.discard(row)
+
+    def _finish_delta_commit(self, num_reqs: int) -> None:
+        self._clear_ranges(num_reqs)
+        self._block_table_committed_until = max(
+            self._block_table_committed_until, num_reqs
+        )
+        if self._block_table_dirty_until <= num_reqs:
+            self._block_table_dirty_until = 0
+
     def append_row(
         self,
         block_ids: list[int],
@@ -159,6 +200,7 @@ class BlockTable:
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
         self._mark_dirty(row_idx)
+        self._mark_cols(row_idx, int(start), int(start) + num_blocks)
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
@@ -178,6 +220,7 @@ class BlockTable:
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
         self._mark_dirty(tgt)
+        self._mark_cols(tgt, 0, int(num_blocks))
 
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
@@ -185,6 +228,9 @@ class BlockTable:
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
         self._mark_dirty(src)
         self._mark_dirty(tgt)
+        both = int(self.num_blocks_per_row[src_tgt].max())
+        self._mark_cols(src, 0, both)
+        self._mark_cols(tgt, 0, both)
 
     def compute_slot_mapping(
         self,
@@ -326,6 +372,7 @@ class BlockTable:
             )
         else:
             self.block_table.copy_to_gpu(num_reqs)
+        self._clear_ranges(num_reqs)
         self._block_table_committed_until = max(
             self._block_table_committed_until, num_reqs
         )
@@ -346,6 +393,7 @@ class BlockTable:
             )
         else:
             self.block_table.copy_to_gpu_staged(num_reqs)
+        self._clear_ranges(num_reqs)
         self._block_table_committed_until = max(
             self._block_table_committed_until, num_reqs
         )
@@ -357,6 +405,7 @@ class BlockTable:
         self._slot_mapping_last_num_tokens = 0
         self.block_table.gpu.fill_(0)
         self.block_table.cpu.fill_(0)
+        self._clear_ranges(self.max_num_reqs)
         self._block_table_dirty_until = 0
         self._block_table_committed_until = self.max_num_reqs
 
@@ -478,6 +527,17 @@ class MultiGroupBlockTable:
                 block_sizes, kernel_block_sizes, max_num_blocks, dcp_sharded
             )
         ]
+        self._delta = None
+        if (
+            _BT_DELTA
+            and not _LIVE_TABLE
+            and pin_memory
+            and torch.device(device).type == "cuda"
+            and all(bt.block_table.gpu.is_contiguous() for bt in self.block_tables)
+        ):
+            from vllm.v1.worker.block_table_delta import BlockTableDelta
+
+            self._delta = BlockTableDelta(self.block_tables, device)
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
@@ -513,6 +573,8 @@ class MultiGroupBlockTable:
             block_table.warmup_slot_mapping_kernel()
 
     def commit_block_table(self, num_reqs: int) -> None:
+        if self._delta is not None and self._delta.commit(num_reqs):
+            return
         for block_table in self.block_tables:
             block_table.commit_block_table(num_reqs)
 

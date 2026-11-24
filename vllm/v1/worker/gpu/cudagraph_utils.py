@@ -308,6 +308,7 @@ class CudaGraphManager:
             self._capture_sizes = list(
                 self.compilation_config.cudagraph_capture_sizes or []
             )
+            self._add_dspark_width_graphs()
             # The sizes above are normalized around the widest target query
             # (q16 for LABD). Preserve the checkpoint-native q8 shape so a
             # B1 short verification can still replay a graph when
@@ -318,6 +319,38 @@ class CudaGraphManager:
                         self._capture_sizes.append(query_len)
                 self._capture_sizes.sort()
         self._init_candidates()
+
+    def _add_dspark_width_graphs(self) -> None:
+        """Inkling2 DSpark shrinks the draft width with the batch (see
+        `widths.py`): capture the target's decode graphs for every verify
+        shape `B x q` (q = 1 + width) up to `VLLM_INKLING2_SM70_DSPARK_GRAPH_TOKENS`
+        tokens (default 16), so a batch whose size just changed still
+        replays a graph."""
+        spec = self.vllm_config.speculative_config
+        if (
+            spec is None
+            or spec.method != "dspark"
+            or not isinstance(self, ModelCudaGraphManager)
+            or self.decode_query_len <= 1
+        ):
+            return
+        max_tokens = int(os.environ.get("VLLM_INKLING2_SM70_DSPARK_GRAPH_TOKENS", "16"))
+        query_lens = list(self.decode_query_lens)
+        for query_len in range(1, self.decode_query_len + 1):
+            if query_len not in query_lens:
+                query_lens.append(query_len)
+            for num_reqs in range(1, self.max_num_reqs + 1):
+                size = num_reqs * query_len
+                if size <= max_tokens and size not in self._capture_sizes:
+                    self._capture_sizes.append(size)
+        self.decode_query_lens = tuple(query_lens)
+        self._capture_sizes.sort()
+        logger.info_once(
+            "Capturing DSpark target decode graphs for query lengths %s, "
+            "token counts %s.",
+            self.decode_query_lens,
+            tuple(self._capture_sizes),
+        )
 
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""

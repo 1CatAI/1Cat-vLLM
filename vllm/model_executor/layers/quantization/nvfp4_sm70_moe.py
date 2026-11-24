@@ -83,6 +83,7 @@ _SUPPORTED_CONTRACTS: Final = {
     (2560, 640, 512, 10),  # Qwen3.8-Flash-Next
     (4096, 2048, 288, 8),  # GLM-5.3-Flash
     (2816, 704, 128, 8),  # Gemma-4-26B-A4B
+    (2304, 1152, 128, 8),  # Inkling-2-Mini (softcapped SwiGLU, sm70_moe_activation)
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
@@ -1257,6 +1258,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             swiglu_limit=getattr(layer, "swiglu_limit", None),
             bindings=self.native_ops,
             raw_fast_qpn=raw_fast_qpn,
+            activation=getattr(layer, "sm70_moe_activation", None),
         )
         self._allocate_graph_safe_decode_buffers(layer)
         if (
@@ -1280,6 +1282,22 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 self._get_fn_prefill_raw_workspace(
                     layer.w13_tm_weight.device, max_batched
                 )
+        # Shape-generic M<=16 decode route (custom-activation contracts only,
+        # e.g. Inkling2); None keeps every other model on its existing routes.
+        from vllm.model_executor.layers.fused_moe.sm70.fp4_decode_gemv import (
+            Fp4DecodeGemv,
+        )
+
+        layer.sm70_fp4_decode_gemv = Fp4DecodeGemv.create(layer, raw_scale=raw_scale)
+        # Grouped M>16 prefill route (same admission rules;
+        # VLLM_INKLING2_SM70_MOE_PREFILL=0 disables).
+        from vllm.model_executor.layers.fused_moe.sm70.fp4_prefill_grouped import (
+            Fp4PrefillGrouped,
+        )
+
+        layer.sm70_fp4_prefill_grouped = Fp4PrefillGrouped.create(
+            layer, raw_scale=raw_scale
+        )
 
         del layer.w13_weight
         del layer.w13_weight_scale
@@ -1440,6 +1458,16 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         num_tokens = x.shape[0]
         if num_tokens == 0:
             return x.new_empty((0, hidden))
+        fast_decode = getattr(layer, "sm70_fp4_decode_gemv", None)
+        if fast_decode is not None:
+            fast_out = fast_decode(layer, x, topk_weights, topk_ids)
+            if fast_out is not None:
+                return fast_out
+        grouped_prefill = getattr(layer, "sm70_fp4_prefill_grouped", None)
+        if grouped_prefill is not None:
+            prefill_out = grouped_prefill(layer, x, topk_weights, topk_ids)
+            if prefill_out is not None:
+                return prefill_out
         interleaved_w13 = bool(
             getattr(layer, "sm70_nvfp4_qwen38_fused_swiglu_prefill", False)
         )

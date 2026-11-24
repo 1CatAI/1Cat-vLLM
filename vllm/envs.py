@@ -469,6 +469,85 @@ if TYPE_CHECKING:
     VLLM_TP_ALLREDUCE_TRACE: bool = False
     VLLM_EXPERT_CACHE_MEMLOG: bool = False
     VLLM_INPLACE_AR_MIN: str = "0"
+    VLLM_INKLING2_ROUTER_BUILD: str | None = None
+    VLLM_INKLING2_SM70_ATTN2_2CTA: str | None = None
+    VLLM_INKLING2_SM70_ATTN2_GLOBAL1: str | None = None
+    VLLM_INKLING2_SM70_ATTN2_PREFETCH: str | None = None
+    VLLM_INKLING2_SM70_ATTN2_WARPS: str | None = None
+    VLLM_INKLING2_SM70_ATTN_V2: str | None = None
+    VLLM_INKLING2_SM70_BLEND_MODE: str | None = None
+    VLLM_INKLING2_SM70_BLEND_NT: str | None = None
+    VLLM_INKLING2_SM70_BLEND_ONE: str | None = None
+    VLLM_INKLING2_SM70_BLEND_ONE_MAX_CTAS: str | None = None
+    VLLM_INKLING2_SM70_BLEND_ONE_POLICY: str | None = None
+    VLLM_INKLING2_SM70_BLEND_PREFETCH: str | None = None
+    VLLM_INKLING2_SM70_BLOCKTABLE: str | None = None
+    VLLM_INKLING2_SM70_CONV_MIX_REHEARSE: str | None = None
+    VLLM_INKLING2_SM70_CONV_MIX_V2: str | None = None
+    VLLM_INKLING2_SM70_CONV_MIX_V2_VERIFY_AR: str | None = None
+    VLLM_INKLING2_SM70_DECODE_ATTN: str | None = None
+    VLLM_INKLING2_SM70_DENSE_GEMV: str | None = None
+    VLLM_INKLING2_SM70_DENSE_MOE_PREFILL: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_ADAPTIVE: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_ADAPT_DECAY: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_ADAPT_HYST: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_ADAPT_MIN: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_ADAPT_PRIOR_N: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_CHECK: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_FAST: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_FLAGS_FILE: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_FUSED_MARKOV: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_GRAPH_TOKENS: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_GRAPH_WIDTHS: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_GREEDY_TARGET: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_LAYERS: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_LOCAL_VERIFY: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_LOOKUP: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_LOOKUP_LOG: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_LOOKUP_NMAX: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_LOOKUP_NMIN: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_LOOKUP_NUSE: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_LOOKUP_SEARCH: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_PROBE: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_PROFILE: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_PROFILE_STEPS: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_STEP_MS: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_TRACE_FILE: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_WIDTHS: str | None = None
+    VLLM_INKLING2_SM70_DSPARK_WIDTHS_FILE: str | None = None
+    VLLM_INKLING2_SM70_EXT_DIR: str | None = None
+    VLLM_INKLING2_SM70_EXT_VERBOSE: str | None = None
+    VLLM_INKLING2_SM70_FUSED_AR_MIX: str | None = None
+    VLLM_INKLING2_SM70_FUSED_BLEND: str | None = None
+    VLLM_INKLING2_SM70_FUSED_ROUTER: str | None = None
+    VLLM_INKLING2_SM70_GEMV_V2: str | None = None
+    VLLM_INKLING2_SM70_LOCAL_ARGMAX: str | None = None
+    VLLM_INKLING2_SM70_MAX_IMAGE_TOKENS: str | None = None
+    VLLM_INKLING2_SM70_MOE: str | None = None
+    VLLM_INKLING2_SM70_MOE_FAST: str | None = None
+    VLLM_INKLING2_SM70_MOE_FAST_GROUPED_MIN: str | None = None
+    VLLM_INKLING2_SM70_MOE_FAST_MAX_TOKENS: str | None = None
+    VLLM_INKLING2_SM70_MOE_FUSED: str | None = None
+    VLLM_INKLING2_SM70_MOE_FUSED_CHUNK13: str | None = None
+    VLLM_INKLING2_SM70_MOE_FUSED_CHUNK2: str | None = None
+    VLLM_INKLING2_SM70_MOE_FUSED_DEBUG: str | None = None
+    VLLM_INKLING2_SM70_MOE_FUSED_DENSE: str | None = None
+    VLLM_INKLING2_SM70_MOE_FUSED_PF: str | None = None
+    VLLM_INKLING2_SM70_MOE_PREFILL: str | None = None
+    VLLM_INKLING2_SM70_MOE_PREFILL_LB: str | None = None
+    VLLM_INKLING2_SM70_MOE_PREFILL_MIN_TOKENS: str | None = None
+    VLLM_INKLING2_SM70_MOE_PREFILL_NCH13: str | None = None
+    VLLM_INKLING2_SM70_MOE_PREFILL_NCH2: str | None = None
+    VLLM_INKLING2_SM70_MOE_PREFILL_SUB_TOKENS: str | None = None
+    VLLM_INKLING2_SM70_MXFP8_FUSE: str | None = None
+    VLLM_INKLING2_SM70_MXFP8_WSUM_ORDER: str | None = None
+    VLLM_INKLING2_SM70_PREFILL_ATTN: str | None = None
+    VLLM_INKLING2_SM70_PREFILL_ATTN_VARIANT: str | None = None
+    VLLM_INKLING2_SM70_PREFILL_NCCL_AR_BYTES: str | None = None
+    VLLM_INKLING2_SM70_ROUTER_HMMA: str | None = None
+    VLLM_INKLING2_SM70_SCONVMETA: str | None = None
+    VLLM_INKLING2_SM70_VISION: str | None = None
+    VLLM_INKLING2_TORCH_EXT: str | None = None
     VLLM_PYNCCL_ALLGATHER: str = "1"
     VLLM_V41_NATIVE: str = "0"
     VLLM_V41_ATTN_RING_POST: str = "0"
@@ -7610,6 +7689,985 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: os.getenv("VLLM_SM70_MXFP4_GROUPED_ANY"),
         description=("SM70 kernel policy switch (developer)."),
         category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_ROUTER_BUILD": env_var(
+        lambda: os.getenv("VLLM_INKLING2_ROUTER_BUILD"),
+        description=(
+            "Directory of a prebuilt Inkling 2 router extension; overrides its JIT "
+            "build directory."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_ATTN2_2CTA": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_ATTN2_2CTA", "1"),
+        description=(
+            "Run two CTAs per SM in the second-generation decode attention for "
+            "query lengths up to 3. Set 0 for one CTA per SM."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_ATTN2_GLOBAL1": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_ATTN2_GLOBAL1", "0"),
+        description=(
+            "Use the second-generation decode attention for single-token decode on "
+            "global layers too. Default 0 keeps the first generation there, which "
+            "wins at long context."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_ATTN2_PREFETCH": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_ATTN2_PREFETCH", "0"),
+        description=(
+            "Look up block-table entries and prefetch K/V tiles ahead of use in the "
+            "second-generation decode attention. Default off."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_ATTN2_WARPS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_ATTN2_WARPS", "16"),
+        description=(
+            "Warps per CTA of the second-generation decode attention: 8 (256 "
+            "threads) or 16 (512 threads, up to 16 query rows in one round)."
+        ),
+        category="tuning",
+        declared_default="'16'",
+        effective_default="'16'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_ATTN_V2": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_ATTN_V2", "auto"),
+        description=(
+            "Selects the second-generation decode attention: auto (sliding-window "
+            "layers always, global layers for 2 to 8 token verify steps), 1 (every "
+            "layer and length), local (sliding-window layers only) or 0 (first "
+            "generation only)."
+        ),
+        category="tuning",
+        declared_default="'auto'",
+        effective_default="'auto'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_BLEND_MODE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_BLEND_MODE", "1"),
+        description=("Variant of the fused decode-size stream blend kernel."),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_BLEND_NT": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_BLEND_NT", "128"),
+        description=("Threads per CTA of the fused decode-size stream blend kernel."),
+        category="tuning",
+        declared_default="'128'",
+        effective_default="'128'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_BLEND_ONE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_BLEND_ONE", "1"),
+        description=(
+            "Run the decode-size stream blend as one launch with barrier counters. "
+            "Set 0 for the two-launch blend."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_BLEND_ONE_MAX_CTAS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_BLEND_ONE_MAX_CTAS", "560"),
+        description=(
+            "Maximum CTAs of the one-launch stream blend; it must not exceed what "
+            "is co-resident on the GPU."
+        ),
+        category="tuning",
+        declared_default="'560'",
+        effective_default="'560'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_BLEND_ONE_POLICY": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_BLEND_ONE_POLICY", "all"),
+        description=(
+            "Where the one-launch stream blend is used: all (every token count) or "
+            "auto (the single-stream MLP blend at any count, the attention blend up "
+            "to 2 tokens)."
+        ),
+        category="tuning",
+        declared_default="'all'",
+        effective_default="'all'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_BLEND_PREFETCH": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_BLEND_PREFETCH", "1"),
+        description=(
+            "Prefetch the weights of both phases of the one-launch blend to L2 at "
+            "its start (same results). Set 0 to disable."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_BLOCKTABLE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_BLOCKTABLE", "1"),
+        description=(
+            "Commit only the changed block-table entries to the GPU each step "
+            "instead of the whole table. Set 0 to copy everything."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_CONV_MIX_REHEARSE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_CONV_MIX_REHEARSE", "0"),
+        description=(
+            "Run the fused conv + mix prefill kernel twice and compare, for kernel "
+            "debugging."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_CONV_MIX_V2": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_CONV_MIX_V2", "1"),
+        description=(
+            "Use the fused prefill conv + mix kernel. Set 0 to run the short "
+            "convolution and the mix as separate operations."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_CONV_MIX_V2_VERIFY_AR": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_CONV_MIX_V2_VERIFY_AR", "1"),
+        description=(
+            "Fuse the all-reduce into the conv + mix kernel for speculative "
+            "verification batches. Set 0 to keep it separate."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DECODE_ATTN": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DECODE_ATTN", "1"),
+        description=(
+            "Use the Inkling 2 decode attention kernels. Set 0 to fall back to the "
+            "generic relative-bias attention for decode."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DENSE_GEMV": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DENSE_GEMV", "1"),
+        description=(
+            "Use the small-batch dense GEMV kernels for decode projections. Set 0 "
+            "to use cuBLAS everywhere."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DENSE_MOE_PREFILL": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DENSE_MOE_PREFILL", "1"),
+        description=(
+            "Run MXFP8 expert layers on large batches with GPU-side routing and "
+            "grouped tensor-core GEMMs. Set 0 for per-expert cuBLAS."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_ADAPTIVE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_ADAPTIVE", "1"),
+        description=(
+            "Let DSpark choose the number of draft tokens from measured acceptance "
+            "and step times. Set 0 for the fixed width table."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_ADAPT_DECAY": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_ADAPT_DECAY", "0.95"),
+        description=(
+            "Decay of the running acceptance statistics used by the adaptive DSpark "
+            "width."
+        ),
+        category="tuning",
+        declared_default="'0.95'",
+        effective_default="'0.95'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_ADAPT_HYST": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_ADAPT_HYST", "0.08"),
+        description=(
+            "Relative gain a new DSpark width must promise over the current one "
+            "before the width changes."
+        ),
+        category="tuning",
+        declared_default="'0.08'",
+        effective_default="'0.08'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_ADAPT_MIN": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_ADAPT_MIN", "1"),
+        description=(
+            "Smallest DSpark width the adaptive policy may choose; 0 allows "
+            "speculation to switch itself off."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_ADAPT_PRIOR_N": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_ADAPT_PRIOR_N", "5.0"),
+        description=(
+            "Weight, in steps, of the prior acceptance estimate in the adaptive "
+            "DSpark width policy."
+        ),
+        category="tuning",
+        declared_default="'5.0'",
+        effective_default="'5.0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_CHECK": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_CHECK", "0"),
+        description=(
+            "After every DSpark proposal compare the draft tokens of all TP ranks "
+            "(synchronizes)."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_FAST": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_FAST"),
+        description=(
+            "Use the graph-captured DSpark decode path. Unset resolves to 1 when "
+            "the spin-loop extension is enabled, 0 otherwise."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=(
+            "None; resolves to '1' when VLLM_USE_SPINLOOP_EXT is on, else '0'"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_FLAGS_FILE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_FLAGS_FILE"),
+        description=(
+            "Path of a file such as 'fast=0 greedy=1 local=0' read when it changes, "
+            "to switch the DSpark host paths at run time (benchmark aid)."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_FUSED_MARKOV": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_FUSED_MARKOV", "1"),
+        description=(
+            "Use the fused Markov head kernel of the DSpark drafter. Set 0 for the "
+            "unfused operations."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_GRAPH_TOKENS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_GRAPH_TOKENS", "16"),
+        description=(
+            "Largest number of query tokens per request (1 + width) for which "
+            "DSpark decode CUDA graphs are captured."
+        ),
+        category="tuning",
+        declared_default="'16'",
+        effective_default="'16'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_GRAPH_WIDTHS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_GRAPH_WIDTHS", "all"),
+        description=(
+            "Capture DSpark graphs for every width (all) or only the width the "
+            "table gives for each batch size and the widest."
+        ),
+        category="tuning",
+        declared_default="'all'",
+        effective_default="'all'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_GREEDY_TARGET": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_GREEDY_TARGET", "1"),
+        description=(
+            "Take the target tokens of an all-greedy batch from a shard-local "
+            "argmax, with no vocabulary all-gather. Set 0 for the general sampler."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_LAYERS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_LAYERS", "1"),
+        description=(
+            "Use the fast DSpark draft layers (one key block per attention program, "
+            "fused SiLU * up). Set 0 for the old layers."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_LOCAL_VERIFY": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_LOCAL_VERIFY", "1"),
+        description=(
+            "Verify sampling batches with shard-local rejection sampling instead of "
+            "gathered vocabularies. Set 0 to gather."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_LOOKUP": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_LOOKUP", "0"),
+        description=(
+            "Draft the continuation of a span repeated earlier in the request "
+            "instead of the drafter's sample; the verifier decides. Default off."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_LOOKUP_LOG": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_LOOKUP_LOG", "0"),
+        description=("Log prompt-lookup draft hits."),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_LOOKUP_NMAX": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_LOOKUP_NMAX", "12"),
+        description=("Longest suffix (tokens) the prompt lookup tries to match."),
+        category="tuning",
+        declared_default="'12'",
+        effective_default="'12'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_LOOKUP_NMIN": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_LOOKUP_NMIN", "4"),
+        description=("Shortest suffix (tokens) the prompt lookup accepts as a match."),
+        category="tuning",
+        declared_default="'4'",
+        effective_default="'4'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_LOOKUP_NUSE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_LOOKUP_NUSE", "8"),
+        description=("Length (tokens) of the repeated span the prompt lookup drafts."),
+        category="tuning",
+        declared_default="'8'",
+        effective_default="'8'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_LOOKUP_SEARCH": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_LOOKUP_SEARCH", "65536"),
+        description=("How many recent tokens the prompt lookup searches back."),
+        category="tuning",
+        declared_default="'65536'",
+        effective_default="'65536'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_PROBE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_PROBE", "24"),
+        description=("Probe interval, in steps, of the adaptive DSpark width policy."),
+        category="tuning",
+        declared_default="'24'",
+        effective_default="'24'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_PROFILE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_PROFILE", "0"),
+        description=(
+            "1 = GPU-synchronous timing of each DSpark phase (slows serving), 0 = off."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_PROFILE_STEPS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_PROFILE_STEPS", "0"),
+        description=("1 = log the timings of every DSpark step."),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_STEP_MS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_STEP_MS"),
+        description=(
+            "Comma list of per-width step times (ms) for the adaptive DSpark "
+            "policy; unset uses the built-in table."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None; the built-in table of widths.py",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_TRACE_FILE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_TRACE_FILE"),
+        description=("Path of a file that receives one JSON line per DSpark step."),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_WIDTHS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_WIDTHS"),
+        description=(
+            "Comma list of DSpark widths by batch size for fixed width selection; "
+            "unset uses the built-in table."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None; the built-in table of widths.py",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_DSPARK_WIDTHS_FILE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_DSPARK_WIDTHS_FILE"),
+        description=(
+            "Path of a width table re-read while serving (benchmark aid); overrides "
+            "VLLM_INKLING2_SM70_DSPARK_WIDTHS."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_EXT_DIR": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_EXT_DIR"),
+        description=(
+            "Build directory of the JIT-compiled Inkling 2 SM70 CUDA extensions. "
+            "Unset uses ~/.cache/vllm/inkling2_sm70_ext."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None; resolves to ~/.cache/vllm/inkling2_sm70_ext",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_INKLING2_SM70_EXT_VERBOSE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_EXT_VERBOSE"),
+        description=(
+            "Verbose output, with ptxas statistics, when the Inkling 2 SM70 CUDA "
+            "extensions are built."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_FUSED_AR_MIX": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_FUSED_AR_MIX", "2"),
+        description=(
+            "Fused all-reduce and mix kernels: 0 off, 1 conv + mix kernel after the "
+            "all-reduce, 2 the all-reduce fused in as well."
+        ),
+        category="tuning",
+        declared_default="'2'",
+        effective_default="'2'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_FUSED_BLEND": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_FUSED_BLEND", "1"),
+        description=(
+            "Use the fused decode-size stream blend. Set 0 for the unfused operations."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_FUSED_ROUTER": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_FUSED_ROUTER", "1"),
+        description=(
+            "Use the fused router kernel (scores, bias, top-8, normalisation). Set "
+            "0 for the torch operations."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_GEMV_V2": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_GEMV_V2", "1"),
+        description=(
+            "Use the second-generation dense GEMV (exact batch size, rows share the "
+            "input, reduce-scatter). Set 0 for the first generation."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_LOCAL_ARGMAX": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_LOCAL_ARGMAX", "0"),
+        description=(
+            "Take the greedy token per vocabulary shard on the GPU and reduce, "
+            "instead of gathering logits. Default off."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MAX_IMAGE_TOKENS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MAX_IMAGE_TOKENS", "4096"),
+        description=(
+            "Largest number of image cells one image may use before it is "
+            "downscaled (4096 is about 2560x2560 pixels)."
+        ),
+        category="configuration",
+        declared_default="'4096'",
+        effective_default="'4096'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_INKLING2_SM70_MOE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE", "auto"),
+        description=(
+            "Inkling 2 expert backend: auto (the fast paths) or ref (the packed "
+            "reference path, the checker of the fast paths)."
+        ),
+        category="configuration",
+        declared_default="'auto'",
+        effective_default="'auto'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_FAST": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_FAST", "1"),
+        description=(
+            "Use the shape-generic NVFP4 decode GEMV for small batches. Set 0 for "
+            "the TurboMind routes."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_FAST_GROUPED_MIN": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_FAST_GROUPED_MIN", "4"),
+        description=(
+            "Smallest batch (tokens) at which the NVFP4 decode route groups tokens "
+            "by expert."
+        ),
+        category="tuning",
+        declared_default="'4'",
+        effective_default="'4'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_FAST_MAX_TOKENS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_FAST_MAX_TOKENS", "16"),
+        description=("Largest batch (tokens) served by the NVFP4 decode GEMV route."),
+        category="tuning",
+        declared_default="'16'",
+        effective_default="'16'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_FUSED": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_FUSED", "1"),
+        description=(
+            "Run a decode-size MoE layer as one fused launch. Set 0 for separate "
+            "launches."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_FUSED_CHUNK13": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_FUSED_CHUNK13", "3"),
+        description=(
+            "Work chunk size of the gate/up (W13) phase of the fused MoE launch."
+        ),
+        category="tuning",
+        declared_default="'3'",
+        effective_default="'3'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_FUSED_CHUNK2": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_FUSED_CHUNK2", "3"),
+        description=("Work chunk size of the down (W2) phase of the fused MoE launch."),
+        category="tuning",
+        declared_default="'3'",
+        effective_default="'3'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_FUSED_DEBUG": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_FUSED_DEBUG", "0"),
+        description=(
+            "Build the fused MoE kernel with phase timing (a separate extension)."
+        ),
+        category="debug",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_FUSED_DENSE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_FUSED_DENSE", "0"),
+        description=(
+            "Also use the fused MoE launch on the resident fp16 experts of the "
+            "MXFP8 layers. Default off."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_FUSED_PF": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_FUSED_PF", "1"),
+        description=(
+            "Let each CTA prefetch the next W13 job's weights to L2 while it works. "
+            "Set 0 to disable."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_PREFILL": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_PREFILL", "1"),
+        description=(
+            "Use the grouped NVFP4 prefill route for batches above the decode "
+            "limit. Set 0 for the TurboMind routes."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_PREFILL_LB": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_PREFILL_LB", "3"),
+        description=(
+            "Launch bound (blocks per SM) of the grouped NVFP4 prefill kernel."
+        ),
+        category="tuning",
+        declared_default="'3'",
+        effective_default="'3'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_PREFILL_MIN_TOKENS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_PREFILL_MIN_TOKENS", "17"),
+        description=("Smallest batch (tokens) for the grouped NVFP4 prefill route."),
+        category="tuning",
+        declared_default="'17'",
+        effective_default="'17'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_PREFILL_NCH13": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_PREFILL_NCH13", "4"),
+        description=(
+            "Number of work chunks of the grouped prefill gate/up (W13) GEMM."
+        ),
+        category="tuning",
+        declared_default="'4'",
+        effective_default="'4'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_PREFILL_NCH2": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_PREFILL_NCH2", "4"),
+        description=("Number of work chunks of the grouped prefill down (W2) GEMM."),
+        category="tuning",
+        declared_default="'4'",
+        effective_default="'4'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MOE_PREFILL_SUB_TOKENS": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MOE_PREFILL_SUB_TOKENS", "4096"),
+        description=(
+            "Largest number of tokens the grouped prefill route handles in one "
+            "round; bigger calls are split."
+        ),
+        category="tuning",
+        declared_default="'4096'",
+        effective_default="'4096'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MXFP8_FUSE": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MXFP8_FUSE", "1"),
+        description=(
+            "Run MXFP8 expert layers as route + fused W13/SwiGLU + W2 + weighted "
+            "sum launches. Set 0 for per-expert GEMV."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_MXFP8_WSUM_ORDER": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_MXFP8_WSUM_ORDER", "1"),
+        description=(
+            "Summation order of the MXFP8 weighted expert sum: 1 matches the "
+            "reference order, 0 the other one."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_PREFILL_ATTN": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_PREFILL_ATTN", "1"),
+        description=(
+            "Use the Inkling 2 prefill attention kernel. Set 0 for the generic "
+            "relative-bias kernel."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_PREFILL_ATTN_VARIANT": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_PREFILL_ATTN_VARIANT", "0"),
+        description=("Variant of the Inkling 2 prefill attention kernel."),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_PREFILL_NCCL_AR_BYTES": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_PREFILL_NCCL_AR_BYTES", "0"),
+        description=(
+            "All-reduces of at least this many bytes (prefill chunks) use NCCL "
+            "instead of the custom 2-stage kernel; 0 keeps the custom kernel."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_ROUTER_HMMA": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_ROUTER_HMMA", "0"),
+        description=(
+            "For batches above 16 tokens compute router logits as an fp16 "
+            "tensor-core GEMM with fp32 accumulation. Default off."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_SCONVMETA": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_SCONVMETA", "1"),
+        description=(
+            "Share the short-convolution sequence metadata across the conv-state KV "
+            "groups. Set 0 to build it per group."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_INKLING2_SM70_VISION": env_var(
+        lambda: os.getenv("VLLM_INKLING2_SM70_VISION", "1"),
+        description=("Offer the image modality. Set 0 to run the model as text only."),
+        category="configuration",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_INKLING2_TORCH_EXT": env_var(
+        lambda: os.getenv("VLLM_INKLING2_TORCH_EXT"),
+        description=(
+            "Directory of a prebuilt dense GEMV extension; overrides its JIT build "
+            "directory."
+        ),
+        category="debug",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
@@ -21922,6 +22980,85 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_KV_RETENTION_SOFT_CAP",
         "VLLM_STARTUP_LOG_FILE",
         "VLLM_INPLACE_AR_MIN",
+        "VLLM_INKLING2_ROUTER_BUILD",
+        "VLLM_INKLING2_SM70_ATTN2_2CTA",
+        "VLLM_INKLING2_SM70_ATTN2_GLOBAL1",
+        "VLLM_INKLING2_SM70_ATTN2_PREFETCH",
+        "VLLM_INKLING2_SM70_ATTN2_WARPS",
+        "VLLM_INKLING2_SM70_ATTN_V2",
+        "VLLM_INKLING2_SM70_BLEND_MODE",
+        "VLLM_INKLING2_SM70_BLEND_NT",
+        "VLLM_INKLING2_SM70_BLEND_ONE",
+        "VLLM_INKLING2_SM70_BLEND_ONE_MAX_CTAS",
+        "VLLM_INKLING2_SM70_BLEND_ONE_POLICY",
+        "VLLM_INKLING2_SM70_BLEND_PREFETCH",
+        "VLLM_INKLING2_SM70_BLOCKTABLE",
+        "VLLM_INKLING2_SM70_CONV_MIX_REHEARSE",
+        "VLLM_INKLING2_SM70_CONV_MIX_V2",
+        "VLLM_INKLING2_SM70_CONV_MIX_V2_VERIFY_AR",
+        "VLLM_INKLING2_SM70_DECODE_ATTN",
+        "VLLM_INKLING2_SM70_DENSE_GEMV",
+        "VLLM_INKLING2_SM70_DENSE_MOE_PREFILL",
+        "VLLM_INKLING2_SM70_DSPARK_ADAPTIVE",
+        "VLLM_INKLING2_SM70_DSPARK_ADAPT_DECAY",
+        "VLLM_INKLING2_SM70_DSPARK_ADAPT_HYST",
+        "VLLM_INKLING2_SM70_DSPARK_ADAPT_MIN",
+        "VLLM_INKLING2_SM70_DSPARK_ADAPT_PRIOR_N",
+        "VLLM_INKLING2_SM70_DSPARK_CHECK",
+        "VLLM_INKLING2_SM70_DSPARK_FAST",
+        "VLLM_INKLING2_SM70_DSPARK_FLAGS_FILE",
+        "VLLM_INKLING2_SM70_DSPARK_FUSED_MARKOV",
+        "VLLM_INKLING2_SM70_DSPARK_GRAPH_TOKENS",
+        "VLLM_INKLING2_SM70_DSPARK_GRAPH_WIDTHS",
+        "VLLM_INKLING2_SM70_DSPARK_GREEDY_TARGET",
+        "VLLM_INKLING2_SM70_DSPARK_LAYERS",
+        "VLLM_INKLING2_SM70_DSPARK_LOCAL_VERIFY",
+        "VLLM_INKLING2_SM70_DSPARK_LOOKUP",
+        "VLLM_INKLING2_SM70_DSPARK_LOOKUP_LOG",
+        "VLLM_INKLING2_SM70_DSPARK_LOOKUP_NMAX",
+        "VLLM_INKLING2_SM70_DSPARK_LOOKUP_NMIN",
+        "VLLM_INKLING2_SM70_DSPARK_LOOKUP_NUSE",
+        "VLLM_INKLING2_SM70_DSPARK_LOOKUP_SEARCH",
+        "VLLM_INKLING2_SM70_DSPARK_PROBE",
+        "VLLM_INKLING2_SM70_DSPARK_PROFILE",
+        "VLLM_INKLING2_SM70_DSPARK_PROFILE_STEPS",
+        "VLLM_INKLING2_SM70_DSPARK_STEP_MS",
+        "VLLM_INKLING2_SM70_DSPARK_TRACE_FILE",
+        "VLLM_INKLING2_SM70_DSPARK_WIDTHS",
+        "VLLM_INKLING2_SM70_DSPARK_WIDTHS_FILE",
+        "VLLM_INKLING2_SM70_EXT_DIR",
+        "VLLM_INKLING2_SM70_EXT_VERBOSE",
+        "VLLM_INKLING2_SM70_FUSED_AR_MIX",
+        "VLLM_INKLING2_SM70_FUSED_BLEND",
+        "VLLM_INKLING2_SM70_FUSED_ROUTER",
+        "VLLM_INKLING2_SM70_GEMV_V2",
+        "VLLM_INKLING2_SM70_LOCAL_ARGMAX",
+        "VLLM_INKLING2_SM70_MAX_IMAGE_TOKENS",
+        "VLLM_INKLING2_SM70_MOE",
+        "VLLM_INKLING2_SM70_MOE_FAST",
+        "VLLM_INKLING2_SM70_MOE_FAST_GROUPED_MIN",
+        "VLLM_INKLING2_SM70_MOE_FAST_MAX_TOKENS",
+        "VLLM_INKLING2_SM70_MOE_FUSED",
+        "VLLM_INKLING2_SM70_MOE_FUSED_CHUNK13",
+        "VLLM_INKLING2_SM70_MOE_FUSED_CHUNK2",
+        "VLLM_INKLING2_SM70_MOE_FUSED_DEBUG",
+        "VLLM_INKLING2_SM70_MOE_FUSED_DENSE",
+        "VLLM_INKLING2_SM70_MOE_FUSED_PF",
+        "VLLM_INKLING2_SM70_MOE_PREFILL",
+        "VLLM_INKLING2_SM70_MOE_PREFILL_LB",
+        "VLLM_INKLING2_SM70_MOE_PREFILL_MIN_TOKENS",
+        "VLLM_INKLING2_SM70_MOE_PREFILL_NCH13",
+        "VLLM_INKLING2_SM70_MOE_PREFILL_NCH2",
+        "VLLM_INKLING2_SM70_MOE_PREFILL_SUB_TOKENS",
+        "VLLM_INKLING2_SM70_MXFP8_FUSE",
+        "VLLM_INKLING2_SM70_MXFP8_WSUM_ORDER",
+        "VLLM_INKLING2_SM70_PREFILL_ATTN",
+        "VLLM_INKLING2_SM70_PREFILL_ATTN_VARIANT",
+        "VLLM_INKLING2_SM70_PREFILL_NCCL_AR_BYTES",
+        "VLLM_INKLING2_SM70_ROUTER_HMMA",
+        "VLLM_INKLING2_SM70_SCONVMETA",
+        "VLLM_INKLING2_SM70_VISION",
+        "VLLM_INKLING2_TORCH_EXT",
         "VLLM_PYNCCL_ALLGATHER",
         "VLLM_V41_ATTN_TIMING",
         "VLLM_V41_MARKOV_FUSED",

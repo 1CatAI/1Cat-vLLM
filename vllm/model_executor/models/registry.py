@@ -426,6 +426,14 @@ _MULTIMODAL_MODELS = {
     "Glm4vForConditionalGeneration": ("glm4_1v", "Glm4vForConditionalGeneration"),
     "Glm4vMoeForConditionalGeneration": ("glm4_1v", "Glm4vMoeForConditionalGeneration"),
     "GlmOcrForConditionalGeneration": ("glm_ocr", "GlmOcrForConditionalGeneration"),
+    "Inkling2ForConditionalGeneration": (
+        "vllm.models.inkling2",
+        "Inkling2ForConditionalGeneration",
+    ),
+    "Inkling2LoopForConditionalGeneration": (
+        "vllm.models.inkling2",
+        "Inkling2LoopForConditionalGeneration",
+    ),
     "Glm5NextForConditionalGeneration": (
         "vllm.models.glm5next",
         "Glm5NextForConditionalGeneration",
@@ -622,6 +630,10 @@ _SPECULATIVE_DECODING_MODELS = {
     "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
     "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
+    "Inkling2DSparkModel": (
+        "vllm.models.inkling2.sm70.dspark",
+        "Inkling2DSparkModel",
+    ),
     "DFlash2DraftModel": ("qwen3_dflash2", "DFlash2Qwen3ForCausalLM"),
     "DSparkDraftModel": (
         "vllm.models.deepseek_v4",

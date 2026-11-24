@@ -102,6 +102,10 @@ _TOOL_PARSERS_TO_REGISTER = {
         "lfm2_tool_parser",
         "Lfm2ToolParser",
     ),
+    "inkling": (
+        "inkling_tool_parser",
+        "InklingToolParser",
+    ),
     "kimi_k2": (
         "kimi_k2_tool_parser",
         "KimiK2ToolParser",
