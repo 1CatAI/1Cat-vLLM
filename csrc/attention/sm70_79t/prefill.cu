@@ -1365,7 +1365,11 @@ struct ExpRowSumTransformAImpl {
       int row = int(blockIdx.x) * PVThreadblockShape::kM + local_row;
       if (row < active_rows()) {
         #if defined(PREFIX_PV_FUSED_PREFIX_SUM)
+          #if defined(PREFIX_SM70_V3_SPLITK2_PV)
+        atomicAdd(&active_row_sum_out()[active_row_sum_index(row)], sum);
+          #else
         active_row_sum_out()[active_row_sum_index(row)] += sum;
+          #endif
         #else
         active_row_sum_out()[active_row_sum_index(row)] = sum;
         #endif
@@ -1409,7 +1413,11 @@ struct ExpRowSumTransformAImpl {
       int row = int(blockIdx.x) * PVThreadblockShape::kM + local_row;
       if (row < active_rows()) {
         #if defined(PREFIX_PV_FUSED_PREFIX_SUM)
+          #if defined(PREFIX_SM70_V3_SPLITK2_PV)
+        atomicAdd(&active_row_sum_out()[active_row_sum_index(row)], sum);
+          #else
         active_row_sum_out()[active_row_sum_index(row)] += sum;
+          #endif
         #else
         active_row_sum_out()[active_row_sum_index(row)] = sum;
         #endif
@@ -1454,7 +1462,11 @@ struct ExpRowSumTransformAImpl {
       int row = int(blockIdx.x) * PVThreadblockShape::kM + local_row;
       if (row < active_rows()) {
         #if defined(PREFIX_PV_FUSED_PREFIX_SUM)
+          #if defined(PREFIX_SM70_V3_SPLITK2_PV)
+        atomicAdd(&active_row_sum_out()[active_row_sum_index(row)], sum);
+          #else
         active_row_sum_out()[active_row_sum_index(row)] += sum;
+          #endif
         #else
         active_row_sum_out()[active_row_sum_index(row)] = sum;
         #endif
@@ -1574,7 +1586,11 @@ struct ExpRowSumTransformAImpl {
       int row = blockIdx.x * PVThreadblockShape::kM + local_row;
       if (row < active_rows()) {
         #if defined(PREFIX_PV_FUSED_PREFIX_SUM)
+          #if defined(PREFIX_SM70_V3_SPLITK2_PV)
+        atomicAdd(&active_row_sum_out()[active_row_sum_index(row)], sum);
+          #else
         active_row_sum_out()[active_row_sum_index(row)] += sum;
+          #endif
         #else
         active_row_sum_out()[active_row_sum_index(row)] = sum;
         #endif
@@ -1967,6 +1983,8 @@ struct CublasQKLauncher {
     check(cublasSetStream(handle, stream), "set cuBLAS QK stream");
   #if defined(PREFIX_QK_CUBLAS_FP32_ACCUM)
     cublasGemmAlgo_t qk_algorithm = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+  #elif defined(PREFIX_SM70_V3_PRESCALE_16F)
+    cublasGemmAlgo_t qk_algorithm = CUBLAS_GEMM_ALGO7_TENSOR_OP;
   #else
     cublasGemmAlgo_t qk_algorithm = CUBLAS_GEMM_ALGO9_TENSOR_OP;
   #endif
@@ -1997,7 +2015,8 @@ struct CublasQKLauncher {
   #else
     #if defined(PREFIX_QK_LOG2_SCORES)
     __half alpha = __float2half(0.0625f * 1.4426950408889634f);
-    #elif defined(PREFIX_QK_DEFER_SCALE_TO_PV)
+    #elif defined(PREFIX_QK_DEFER_SCALE_TO_PV) || \
+        defined(PREFIX_SM70_V3_PRESCALE_16F)
     __half alpha = __float2half(1.0f);
     #else
     __half alpha = __float2half(0.0625f);
@@ -2149,6 +2168,24 @@ struct PrefixFloatPVLauncher {
   }
     #endif
 };
+  #endif
+
+  #if defined(PREFIX_SM70_V3_SPLITK2_PV)
+    #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
+using Sk2Kernel = PrefixFloatPVKernel;
+using Sk2Launcher = PrefixFloatPVLauncher;
+    #else
+using Sk2Kernel = PVKernel;
+using Sk2Launcher = PVLauncher;
+    #endif
+__global__ void pv_splitk2_kernel(typename Sk2Kernel::Params p0,
+                                  typename Sk2Kernel::Params p1) {
+  extern __shared__ int shared_storage_base[];
+  auto* shared_storage =
+      reinterpret_cast<typename Sk2Kernel::SharedStorage*>(shared_storage_base);
+  Sk2Kernel operation;
+  operation(blockIdx.z == 0 ? p0 : p1, *shared_storage);
+}
   #endif
 
   #if defined(PREFIX_BATCHED_TRI_FUSE_CAUSAL_MASK) || \
@@ -3000,8 +3037,13 @@ __global__ void transpose_half_32x32(__half const* input, __half* output,
   for (int offset = 0; offset < 32; offset += 8) {
     int row = input_row + offset;
     if (row < rows && input_column < columns) {
+  #if defined(PREFIX_SM70_V3_PRESCALE_16F)
+      tile[threadIdx.y + offset][threadIdx.x] = __hmul(
+          input[int64_t(row) * columns + input_column], __float2half(0.25f));
+  #else
       tile[threadIdx.y + offset][threadIdx.x] =
           input[int64_t(row) * columns + input_column];
+  #endif
     }
   }
   __syncthreads();
@@ -5864,6 +5906,8 @@ namespace FLASH_NAMESPACE {
 extern "C" int64_t onecat_sm70_q8192_accumulation_bits() {
   #elif PREFIX_TORCH_QUERY_TOKENS == 4096
 extern "C" int64_t onecat_sm70_q4096_accumulation_bits() {
+  #elif PREFIX_TORCH_QUERY_TOKENS == 2048
+extern "C" int64_t onecat_sm70_q2048_accumulation_bits() {
   #else
 extern "C" int64_t onecat_sm70_q8000_accumulation_bits() {
   #endif
@@ -5912,7 +5956,9 @@ Sm70GqaScoreWorkspacePtr get_sm70_gqa_score_workspace(const at::Tensor& q,
             ? onecat_sm70_prefill::CacheSlot::Q8000Score
             : (PREFIX_TORCH_QUERY_TOKENS == 4096
                    ? onecat_sm70_prefill::CacheSlot::Q4096Score
-                   : onecat_sm70_prefill::CacheSlot::Q8192Score);
+                   : (PREFIX_TORCH_QUERY_TOKENS == 2048
+                          ? onecat_sm70_prefill::CacheSlot::Q2048Score
+                          : onecat_sm70_prefill::CacheSlot::Q8192Score));
     return owner->workspace<Sm70GqaScoreWorkspace>(slot, q.get_device(), [&] {
       return std::make_shared<Sm70GqaScoreWorkspace>(q, rows, block_n);
     });
@@ -5934,7 +5980,9 @@ Sm70GqaScoreWorkspacePtr find_sm70_gqa_score_workspace(int device) {
             ? onecat_sm70_prefill::CacheSlot::Q8000Score
             : (PREFIX_TORCH_QUERY_TOKENS == 4096
                    ? onecat_sm70_prefill::CacheSlot::Q4096Score
-                   : onecat_sm70_prefill::CacheSlot::Q8192Score);
+                   : (PREFIX_TORCH_QUERY_TOKENS == 2048
+                          ? onecat_sm70_prefill::CacheSlot::Q2048Score
+                          : onecat_sm70_prefill::CacheSlot::Q8192Score));
     return owner->find<Sm70GqaScoreWorkspace>(slot, device);
   }
   std::lock_guard<std::mutex> lock(sm70_gqa_score_cache_mutex());
@@ -6086,6 +6134,9 @@ struct Sm70GqaHalf2Workspace {
   at::Tensor key_transposed;
   at::Tensor scores;
   at::Tensor prefix_numerator;
+    #if defined(PREFIX_SM70_V3_SPLITK2_PV)
+  at::Tensor prefix_numerator_splitk2;
+    #endif
   at::Tensor prefix_sum;
   at::Tensor tail_scores;
   at::Tensor tail_numerator;
@@ -6141,6 +6192,15 @@ struct Sm70GqaHalf2Workspace {
     #else
                                    q.options())),
     #endif
+    #if defined(PREFIX_SM70_V3_SPLITK2_PV)
+        prefix_numerator_splitk2(
+            at::empty({kRows, kHeadDim},
+      #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
+                      q.options().dtype(at::ScalarType::Float))),
+      #else
+                      q.options())),
+      #endif
+    #endif
         prefix_sum(
             at::empty({kRows}, q.options().dtype(at::ScalarType::Float))),
         tail_scores(),
@@ -6166,10 +6226,13 @@ struct Sm70GqaHalf2Workspace {
     static_assert(
         (kQuery == 8000 && kTailTileTokens == 320 && kTailTiles == 25) ||
         (kQuery == 8192 && kTailTileTokens == 256 && kTailTiles == 32) ||
-        (kQuery == 4096 && kTailTileTokens == 256 && kTailTiles == 16));
+        (kQuery == 4096 && kTailTileTokens == 256 && kTailTiles == 16) ||
+        (kQuery == 2048 && kTailTileTokens == 128 && kTailTiles == 16));
     static_assert(kFinePVGroupTiles == 4);
     static_assert(kFinePVTasks ==
-                  (kQuery == 8000 ? 91 : (kQuery == 4096 ? 40 : 144)));
+                  (kQuery == 8000
+                       ? 91
+                       : ((kQuery == 4096 || kQuery == 2048) ? 40 : 144)));
     static_assert(kBlockN >= 8192 && kBlockN <= 16 * 8192 &&
                   kBlockN % 8192 == 0);
     static_assert(kTailScoreElements <= size_t(kBlockN) * kRows);
@@ -6193,6 +6256,15 @@ struct Sm70GqaHalf2Workspace {
           cutlass::Kernel<TailPVKernel>,
           cudaFuncAttributeMaxDynamicSharedMemorySize, kTailPVSmemBytes));
     }
+    #if defined(PREFIX_SM70_V3_SPLITK2_PV)
+    constexpr int kSk2SmemBytes =
+        int(sizeof(typename Sk2Kernel::SharedStorage));
+    if (kSk2SmemBytes >= 48 * 1024) {
+      C10_CUDA_CHECK(cudaFuncSetAttribute(
+          pv_splitk2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          kSk2SmemBytes));
+    }
+    #endif
 
     size_t free_bytes = 0;
     size_t total_bytes = 0;
@@ -6219,9 +6291,18 @@ struct Sm70GqaHalf2Workspace {
     block_max = at::empty({kRows}, fp32);
     prefix_max = at::empty({kRows}, fp32);
     prefix_accumulator = at::empty({kRows, kHeadDim}, fp32);
+      #if defined(PREFIX_SM70_V3_VEC_STABLE)
+    const int64_t max_partial_tiles =
+        std::max<int64_t>(16, (shared_scores->block_n + 1023) / 1024);
+    max_partials = at::empty({max_partial_tiles, kRows}, fp32);
+    // Tail scans need two planes (complete and sampled maxima) per 512-col
+    // tile.
+    static_assert(2 * ((kQuery + 511) / 512) <= 16);
+      #else
     max_partials = at::empty({16, kRows}, fp32);
     // Tail scans need two planes (complete and sampled maxima).
     static_assert(2 * ((kQuery + 8191) / 8192) <= 16);
+      #endif
     tail_max_partials = at::empty({16, kRows}, fp32);
     prefix_outliers = at::empty(
         {(kRows + PVThreadblockShape::kM - 1) / PVThreadblockShape::kM},
@@ -6254,7 +6335,9 @@ Sm70GqaHalf2WorkspacePtr get_sm70_gqa_half2_workspace(const at::Tensor& q) {
             ? onecat_sm70_prefill::CacheSlot::Q8000Half2
             : (PREFIX_TORCH_QUERY_TOKENS == 4096
                    ? onecat_sm70_prefill::CacheSlot::Q4096Half2
-                   : onecat_sm70_prefill::CacheSlot::Q8192Half2);
+                   : (PREFIX_TORCH_QUERY_TOKENS == 2048
+                          ? onecat_sm70_prefill::CacheSlot::Q2048Half2
+                          : onecat_sm70_prefill::CacheSlot::Q8192Half2));
     return owner->workspace<Sm70GqaHalf2Workspace>(slot, q.get_device(), [&] {
       return std::make_shared<Sm70GqaHalf2Workspace>(q);
     });
@@ -6532,7 +6615,11 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     float beta = 0.0f;
     constexpr cublasComputeType_t kTorchTailQKComputeType = CUBLAS_COMPUTE_32F;
     #else
+      #if defined(PREFIX_SM70_V3_PRESCALE_16F)
+    __half alpha = __float2half(1.0f);
+      #else
     __half alpha = __float2half(0.0625f);
+      #endif
     __half beta = __float2half(0.0f);
     constexpr cublasComputeType_t kTorchTailQKComputeType = CUBLAS_COMPUTE_16F;
     #endif
@@ -6559,7 +6646,13 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
         reinterpret_cast<__half*>(tail_scores), Workspace::kTailTileRows,
         Workspace::kTailTileTokens, 0);
     #if defined(PREFIX_TORCH_STABLE_ROWS)
+      #if defined(PREFIX_SM70_V3_VEC_STABLE)
+    int tail_tiles = (Workspace::kQuery + 511) / 512;
+    dim3 max_grid((Workspace::kRows + 1023) / 1024, tail_tiles);
+      #else
+    int tail_tiles = 1;
     dim3 max_grid((Workspace::kRows + 255) / 256, 1);
+      #endif
     stable_row_max_partials<true><<<max_grid, 128, 0, tail_stream>>>(
         reinterpret_cast<__half const*>(tail_scores),
         workspace->tail_max_partials.data_ptr<float>(), Workspace::kRows,
@@ -6567,7 +6660,7 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     stable_finish_max<true>
         <<<(Workspace::kRows + 255) / 256, 256, 0, tail_stream>>>(
             workspace->tail_max_partials.data_ptr<float>(), tail_max,
-            Workspace::kRows, 1);
+            Workspace::kRows, tail_tiles);
     #endif
     if (direct_tail_debug) {
       set_pv_task_base_kernel<<<1, 1, 0, tail_stream>>>(0);
@@ -6612,8 +6705,13 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     }
     #if defined(PREFIX_TORCH_STABLE_ROWS)
     int width = std::min(block_n, prefix - block * block_n);
+      #if defined(PREFIX_SM70_V3_VEC_STABLE)
+    int tiles = (width + 1023) / 1024;
+    dim3 max_grid((Workspace::kRows + 1023) / 1024, tiles);
+      #else
     int tiles = (width + 8191) / 8192;
     dim3 max_grid((Workspace::kRows + 255) / 256, tiles);
+      #endif
     stable_row_max_partials<false><<<max_grid, 128, 0, prefix_stream>>>(
         reinterpret_cast<__half const*>(scores),
         workspace->max_partials.data_ptr<float>(), Workspace::kRows, width);
@@ -6622,8 +6720,56 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
             workspace->max_partials.data_ptr<float>(), block_max,
             Workspace::kRows, tiles);
     #endif
+    #if defined(PREFIX_SM70_V3_SPLITK2_PV) && \
+        defined(PREFIX_TORCH_STABLE_ROWS) &&  \
+        defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
+    float* prefix_num2 = workspace->prefix_numerator_splitk2.data_ptr<float>();
+    if (width >= 4096 && (width % 64 == 0)) {
+      int half_w = (width / 2 / 32) * 32;
+      int rem_w = width - half_w;
+      int begin_k = block * block_n;
+      Sk2Launcher h0(scores, value + size_t(begin_k) * Workspace::kHeadDim,
+                     prefix_numerator, Workspace::kRows, half_w, false);
+      Sk2Launcher h1(scores + size_t(half_w) * Workspace::kRows,
+                     value + size_t(begin_k + half_w) * Workspace::kHeadDim,
+                     prefix_num2, Workspace::kRows, rem_w, false);
+      dim3 g2(h0.grid.x, h0.grid.y, 2);
+      pv_splitk2_kernel<<<g2, h0.block, h0.smem_bytes, prefix_stream>>>(
+          h0.params, h1.params);
+      // No host readback or graph branch: these kernels exit immediately for
+      // tiles whose complete PV traversal proved that no exponent was clipped.
+      stable_row_max_partials<false, true><<<max_grid, 128, 0, prefix_stream>>>(
+          reinterpret_cast<__half const*>(scores),
+          workspace->max_partials.data_ptr<float>(), Workspace::kRows, width);
+      stable_finish_max<false, true>
+          <<<(Workspace::kRows + 255) / 256, 256, 0, prefix_stream>>>(
+              workspace->max_partials.data_ptr<float>(), block_max,
+              Workspace::kRows, tiles);
+      prefix_pv[block]->repair(prefix_stream);
+      stable_merge_prefix_2way<<<(Workspace::kRows + 3) / 4, 256, 0,
+                                 prefix_stream>>>(
+          reinterpret_cast<StablePrefixPartial const*>(prefix_numerator),
+          reinterpret_cast<StablePrefixPartial const*>(prefix_num2), block_sum,
+          block_max, prefix_accumulator, prefix_sum, prefix_max, block == 0);
+    } else {
+      prefix_pv[block]->launch(prefix_stream);
+      stable_row_max_partials<false, true><<<max_grid, 128, 0, prefix_stream>>>(
+          reinterpret_cast<__half const*>(scores),
+          workspace->max_partials.data_ptr<float>(), Workspace::kRows, width);
+      stable_finish_max<false, true>
+          <<<(Workspace::kRows + 255) / 256, 256, 0, prefix_stream>>>(
+              workspace->max_partials.data_ptr<float>(), block_max,
+              Workspace::kRows, tiles);
+      prefix_pv[block]->repair(prefix_stream);
+      stable_merge_prefix<<<(Workspace::kRows + 3) / 4, 256, 0,
+                            prefix_stream>>>(
+          reinterpret_cast<StablePrefixPartial const*>(prefix_numerator),
+          block_sum, block_max, prefix_accumulator, prefix_sum, prefix_max,
+          block == 0);
+    }
+    #else
     prefix_pv[block]->launch(prefix_stream);
-    #if defined(PREFIX_TORCH_STABLE_ROWS)
+      #if defined(PREFIX_TORCH_STABLE_ROWS)
     // No host readback or graph branch: these kernels exit immediately for
     // tiles whose complete PV traversal proved that no exponent was clipped.
     stable_row_max_partials<false, true><<<max_grid, 128, 0, prefix_stream>>>(
@@ -6638,6 +6784,7 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
         reinterpret_cast<StablePrefixPartial const*>(prefix_numerator),
         block_sum, block_max, prefix_accumulator, prefix_sum, prefix_max,
         block == 0);
+      #endif
     #endif
     if (block == 0 && !exact_tail_debug && concurrent_tail_scores) {
       C10_CUDA_CHECK(

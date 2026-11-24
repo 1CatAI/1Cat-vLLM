@@ -9,6 +9,11 @@ import torch
 
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings, call_native
+from vllm._sm70_27b_prefill_ops import (
+    drain_prefill_prefetcher,
+    fast_fp8_prefill_out,
+    has_sm70_27b_prefill_ops,
+)
 from vllm.config import get_current_vllm_config
 from vllm.config.kernel import Sm70Fp8Config
 from vllm.logger import init_logger
@@ -1443,6 +1448,18 @@ def dispatch_channel_rows(
                 gated_silu,
             )
         return
+    if (
+        rows >= 256
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and out.is_contiguous()
+        and codes.numel() <= workspace.numel()
+        and not torch.cuda.is_current_stream_capturing()
+        and has_sm70_27b_prefill_ops()
+    ):
+        fast_fp8_prefill_out(out, workspace, x, codes, scales, gated_silu)
+        return
+    drain_prefill_prefetcher(x.device)
     call_native(
         sm70_ops.fp8_qpn8_dispatch_sm70_out,
         native_policy,

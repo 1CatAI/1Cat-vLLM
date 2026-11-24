@@ -93,6 +93,11 @@ at::Tensor sm70_d256_gqa_architecture_q4096_fwd(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     at::Tensor& out, double softmax_scale, bool causal);
 }
+namespace onecat_79t_q2048 {
+at::Tensor sm70_d256_gqa_architecture_q2048_fwd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, double softmax_scale, bool causal);
+}
 
 namespace onecat_sm70_prefill {
 namespace {
@@ -141,7 +146,8 @@ PrefillOwner::PrefillOwner(std::vector<int64_t> values)
 }
 std::vector<int64_t> PrefillOwner::observations() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
-  return {observations_[0], observations_[1], observations_[2]};
+  return {observations_[0], observations_[1], observations_[2],
+          observations_[3]};
 }
 at::Tensor PrefillOwner::run(int kind, at::Tensor q, at::Tensor k, at::Tensor v,
                              at::Tensor out, double scale, bool causal) {
@@ -149,13 +155,16 @@ at::Tensor PrefillOwner::run(int kind, at::Tensor q, at::Tensor k, at::Tensor v,
   TORCH_CHECK(!closed_, "SM70 prefill runtime has been closed");
   OwnerScope scope(this);
   auto result =
-      kind == 2
-          ? onecat_79t_q4096::sm70_d256_gqa_architecture_q4096_fwd(
+      kind == 3
+          ? onecat_79t_q2048::sm70_d256_gqa_architecture_q2048_fwd(
                 q, k, v, out, scale, causal)
-          : (kind == 1 ? onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_fwd(
+          : (kind == 2 ? onecat_79t_q4096::sm70_d256_gqa_architecture_q4096_fwd(
                              q, k, v, out, scale, causal)
-                       : flash::sm70_d256_gqa_architecture_fwd(q, k, v, out,
-                                                               scale, causal));
+                       : (kind == 1 ? onecat_79t_q8192::
+                                          sm70_d256_gqa_architecture_q8192_fwd(
+                                              q, k, v, out, scale, causal)
+                                    : flash::sm70_d256_gqa_architecture_fwd(
+                                          q, k, v, out, scale, causal)));
   ++observations_[kind];
   return result;
 }
@@ -170,6 +179,10 @@ at::Tensor PrefillOwner::q8192(at::Tensor q, at::Tensor k, at::Tensor v,
 at::Tensor PrefillOwner::q4096(at::Tensor q, at::Tensor k, at::Tensor v,
                                at::Tensor out, double scale, bool causal) {
   return run(2, q, k, v, out, scale, causal);
+}
+at::Tensor PrefillOwner::q2048(at::Tensor q, at::Tensor k, at::Tensor v,
+                               at::Tensor out, double scale, bool causal) {
+  return run(3, q, k, v, out, scale, causal);
 }
 void PrefillOwner::close() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -201,6 +214,7 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
       .def("q8000", &onecat_sm70_prefill::PrefillOwner::q8000)
       .def("q8192", &onecat_sm70_prefill::PrefillOwner::q8192)
       .def("q4096", &onecat_sm70_prefill::PrefillOwner::q4096)
+      .def("q2048", &onecat_sm70_prefill::PrefillOwner::q2048)
       .def("values", &onecat_sm70_prefill::PrefillOwner::values)
       .def("observations", &onecat_sm70_prefill::PrefillOwner::observations)
       .def("close", &onecat_sm70_prefill::PrefillOwner::close);
@@ -216,6 +230,9 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
   ops.def(
       "sm70_d256_gqa_architecture_q4096_fwd(Tensor q, Tensor k, Tensor v, "
       "Tensor(a!) out, float softmax_scale, bool causal) -> Tensor(a!)");
+  ops.def(
+      "sm70_d256_gqa_architecture_q2048_fwd(Tensor q, Tensor k, Tensor v, "
+      "Tensor(a!) out, float softmax_scale, bool causal) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, ops) {
@@ -223,4 +240,6 @@ TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, ops) {
            &onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_fwd);
   ops.impl("sm70_d256_gqa_architecture_q4096_fwd",
            &onecat_79t_q4096::sm70_d256_gqa_architecture_q4096_fwd);
+  ops.impl("sm70_d256_gqa_architecture_q2048_fwd",
+           &onecat_79t_q2048::sm70_d256_gqa_architecture_q2048_fwd);
 }

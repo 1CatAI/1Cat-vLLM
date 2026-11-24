@@ -193,7 +193,7 @@ def flashqla_sm70_chunk_gated_delta_rule(
             os.getenv("FN_DISABLE_CUSTOM_GDN", "0") != "1"
             and has_sm70_flashnext_prefill_ops()
             and current_platform.is_device_capability(70)
-            and chunk_offsets is None
+            and (chunk_offsets is None or cu_arg.numel() >= 2)
             and q_arg.shape[0] == 1
             and q_arg.shape[1] >= 256
             and q_arg.shape[2:] == (4, 128)
@@ -214,13 +214,28 @@ def flashqla_sm70_chunk_gated_delta_rule(
                 else chunk_indices.to(cu_arg.dtype).contiguous()
             )
             t_len = int(q_arg.shape[1])
-            a_bar_buf = torch.empty(
-                (1, t_len, 12, 64), dtype=torch.float16, device=q_arg.device
-            )
-            p_buf = torch.empty(
-                (1, t_len, 12, 64), dtype=torch.float16, device=q_arg.device
-            )
-            g_cs_buf = torch.empty_like(g_arg)
+            ws_cache = getattr(flashqla_sm70_chunk_gated_delta_rule, "_fn_ws", None)
+            if ws_cache is None:
+                ws_cache = {}
+                flashqla_sm70_chunk_gated_delta_rule._fn_ws = ws_cache  # type: ignore[attr-defined]
+            dev_idx = q_arg.device.index or 0
+            ent = ws_cache.get(dev_idx)
+            if ent is None or ent[0] < t_len:
+                cap = max(t_len, 4096)
+                ent = (
+                    cap,
+                    torch.empty(
+                        (1, cap, 12, 64), dtype=torch.float16, device=q_arg.device
+                    ),
+                    torch.empty(
+                        (1, cap, 12, 64), dtype=torch.float16, device=q_arg.device
+                    ),
+                    torch.empty((1, cap, 12), dtype=torch.float32, device=q_arg.device),
+                )
+                ws_cache[dev_idx] = ent
+            a_bar_buf = ent[1][:, :t_len]
+            p_buf = ent[2][:, :t_len]
+            g_cs_buf = ent[3][:, :t_len]
             out = torch.empty_like(v_arg) if output is None else output
             need_store = bool(output_final_state or inplace_final_state)
             final_state = (

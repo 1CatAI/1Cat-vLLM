@@ -45,6 +45,8 @@ _sm70_d256_gqa_architecture_q8192_op = None
 _sm70_d256_gqa_architecture_q8192_op_checked = False
 _sm70_d256_gqa_architecture_q4096_op = None
 _sm70_d256_gqa_architecture_q4096_op_checked = False
+_sm70_d256_gqa_architecture_q2048_op = None
+_sm70_d256_gqa_architecture_q2048_op_checked = False
 _fp8_e5m2_paged_kv_to_fp16 = None
 _fp8_e5m2_paged_kv_to_fp16_checked = False
 _flash_attn_turboquant_decode_paged = None
@@ -359,6 +361,31 @@ def get_sm70_d256_gqa_architecture_q4096_op():
     except (AttributeError, ImportError, RuntimeError):
         _sm70_d256_gqa_architecture_q4096_op = None
     return bind_prefill_operation(_sm70_d256_gqa_architecture_q4096_op, 4096)
+
+
+def get_sm70_d256_gqa_architecture_q2048_op():
+    """Load the native Q2048 specialization when the extension provides it."""
+    global _sm70_d256_gqa_architecture_q2048_op
+    global _sm70_d256_gqa_architecture_q2048_op_checked
+    if _sm70_d256_gqa_architecture_q2048_op_checked:
+        return bind_prefill_operation(_sm70_d256_gqa_architecture_q2048_op, 2048)
+
+    _sm70_d256_gqa_architecture_q2048_op_checked = True
+    op_name = "sm70_d256_gqa_architecture_q2048_fwd"
+    try:
+        if not hasattr(torch.ops._vllm_fa2_C, op_name):
+            get_sm70_splitd_d256_ops()
+        if not _sm70_gqa_has_fp32_accumulation():
+            _sm70_d256_gqa_architecture_q2048_op = None
+            return None
+        _sm70_d256_gqa_architecture_q2048_op = getattr(
+            torch.ops._vllm_fa2_C,
+            op_name,
+            None,
+        )
+    except (AttributeError, ImportError, RuntimeError):
+        _sm70_d256_gqa_architecture_q2048_op = None
+    return bind_prefill_operation(_sm70_d256_gqa_architecture_q2048_op, 2048)
 
 
 def get_sm70_splitd_d256_splitkv_op():

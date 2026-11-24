@@ -607,3 +607,33 @@ PARAMETER_BOUNDARIES["VLLM_SM70_MXFP4_GROUPED_ANY"] = (
 COMPATIBILITY_CONSUMERS["vllm/model_executor/layers/quantization/mxfp4_sm70_moe.py"] = {
     ""
 }
+PARAMETER_BOUNDARIES.update(
+    {
+        "VLLM_SM70_27B_FAST_PREFILL": (
+            "process_library_loading",
+            (
+                "Eager extension load guard in _sm70_27b_prefill_ops; disables "
+                "custom SM70 27B dense prefill kernels before op registration."
+            ),
+        ),
+        "VLLM_SM70_27B_PREFETCH_DEQUANT": (
+            "standalone_compatibility",
+            (
+                "Side-stream NVFP4/FP8 weight dequantization overlap toggle in "
+                "_sm70_27b_prefill_ops; no numerics change."
+            ),
+        ),
+        "VLLM_SM70_27B_DISABLE_P2P_NORM": (
+            "standalone_compatibility",
+            (
+                "Debug/rollback switch in Sm7027BPeerRuntime.try_create to force "
+                "standard communicator fallback even on NVLink mesh hosts."
+            ),
+        ),
+    }
+)
+COMPATIBILITY_CONSUMERS["vllm/_sm70_27b_prefill_ops.py"] = {
+    "_init_sm70_27b_prefill_ops",
+    "_prefetch_dequant_enabled",
+    "Sm7027BPeerRuntime.try_create",
+}

@@ -51,9 +51,24 @@ set_source_files_properties("${SM70_79T_DIR}/prefill_q8192.cu"
   TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
   COMPILE_DEFINITIONS "${_79t_defs}"
   COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70;-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda")
+set(_79t_v3_base_defs ${_79t_defs})
+list(REMOVE_ITEM _79t_v3_base_defs PREFIX_QK_CUBLAS_FP32_ACCUM)
+set(_79t_v3_q4096_defs
+  ${_79t_v3_base_defs}
+  PREFIX_SM70_V3_VEC_STABLE
+  PREFIX_SM70_V3_SPLITK2_PV
+  PREFIX_SM70_V3_PRESCALE_16F)
+set(_79t_v3_q2048_defs ${_79t_v3_q4096_defs})
+list(REMOVE_ITEM _79t_v3_q2048_defs PV_TB_M=128 PV_WARP_M=64)
+list(APPEND _79t_v3_q2048_defs PV_TB_M=64 PV_WARP_M=32)
+
 set_source_files_properties("${SM70_79T_DIR}/prefill_q4096.cu"
   TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
-  COMPILE_DEFINITIONS "${_79t_defs}"
+  COMPILE_DEFINITIONS "${_79t_v3_q4096_defs}"
+  COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70;-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda")
+set_source_files_properties("${SM70_79T_DIR}/prefill_q2048.cu"
+  TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
+  COMPILE_DEFINITIONS "${_79t_v3_q2048_defs}"
   COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70;-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda")
 set_source_files_properties("${SM70_79T_DIR}/legacy_tail_adapter.cu"
   TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
@@ -67,6 +82,7 @@ target_sources(_vllm_fa2_C PRIVATE
   "${SM70_79T_DIR}/prefill.cu"
   "${SM70_79T_DIR}/prefill_q8192.cu"
   "${SM70_79T_DIR}/prefill_q4096.cu"
+  "${SM70_79T_DIR}/prefill_q2048.cu"
   "${SM70_79T_DIR}/legacy_tail_adapter.cu"
   "${SM70_79T_DIR}/register.cpp")
 target_link_libraries(_vllm_fa2_C PRIVATE CUDA::cublas)

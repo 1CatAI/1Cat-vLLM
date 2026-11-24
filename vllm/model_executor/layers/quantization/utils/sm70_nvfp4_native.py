@@ -6,6 +6,12 @@ import torch
 
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import register_policy_op
+from vllm._sm70_27b_prefill_ops import (
+    clear_sm70_27b_prefill_workspaces,
+    drain_prefill_prefetcher,
+    fast_nvfp4_prefill_out,
+    has_sm70_27b_prefill_ops,
+)
 from vllm.model_executor.kernels.linear.qpn.nvfp4_dequant import (
     _e4m3_value,
 )
@@ -18,6 +24,7 @@ _code_workspaces: dict[tuple[int, int], torch.Tensor] = {}
 
 
 def clear_sm70_nvfp4_native_workspaces() -> None:
+    clear_sm70_27b_prefill_workspaces()
     _dense_workspaces.clear()
     _retained_dense_workspaces.clear()
     _scale_workspaces.clear()
@@ -178,6 +185,7 @@ def _dispatch(
     # Keep M dispatch opaque: compiled token ranges include both decode and
     # prefill. Native QPN2 codes and E4M3 scales are the only resident layout.
     if x.shape[0] <= _native_decode_rows():
+        drain_prefill_prefetcher(x.device)
         op = (
             sm70_ops.nvfp4_qpn2_gated_sm70_out
             if gated_silu
@@ -203,6 +211,19 @@ def _dispatch(
     device = codes.device.index
     assert device is not None
     if codes.is_contiguous() and scales.is_contiguous():
+        if (
+            x.shape[0] >= 256
+            and x.dtype == torch.float16
+            and x.is_contiguous()
+            and out.is_contiguous()
+            and not torch.cuda.is_current_stream_capturing()
+            and has_sm70_27b_prefill_ops()
+        ):
+            fast_nvfp4_prefill_out(
+                out, workspace, x, codes, scales, float(global_scale), gated_silu
+            )
+            return
+        drain_prefill_prefetcher(x.device)
         call_native(
             sm70_ops.nvfp4_qpn4_prefill_sm70_out,
             native_policy,

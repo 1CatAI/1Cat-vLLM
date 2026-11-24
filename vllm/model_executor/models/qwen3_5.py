@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterable
 import torch
 from torch import nn
 
+from vllm._sm70_27b_prefill_ops import has_sm70_27b_prefill_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -572,7 +573,15 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         if self.gdn_policy.projection.mixed_qkv_contiguous:
             mixed_qkv = mixed_qkv.contiguous()
         z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
-        z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)
+        if (
+            self.head_v_dim == 128
+            and z.ndim == 2
+            and z.dtype == torch.float16
+            and has_sm70_27b_prefill_ops()
+        ):
+            z = z.view(z.size(0), -1, 128)
+        else:
+            z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)
         b = b.contiguous()
         a = a.contiguous()
 
