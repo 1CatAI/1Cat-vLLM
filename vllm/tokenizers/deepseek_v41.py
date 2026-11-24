@@ -14,6 +14,10 @@ from .hf import HfTokenizer, get_cached_tokenizer
 from .protocol import TokenizerLike
 
 _IMAGE = "<｜deepseek_image｜>"
+# Neutralized form for literal occurrences in user/assistant/system text:
+# encodes to ordinary text tokens (never image_token_id 129264) and cannot
+# collide with placeholders inserted by vLLM for real image content blocks.
+_IMAGE_ESCAPED = "<|deepseek_image|>"
 
 
 def _vision() -> bool:
@@ -22,13 +26,29 @@ def _vision() -> bool:
     return envs.VLLM_V41_VISION == "1"
 
 
+def _escape_image_placeholder(text: str) -> str:
+    if _IMAGE in text:
+        return text.replace(_IMAGE, _IMAGE_ESCAPED)
+    return text
+
+
 def _text_only(value, images=False):
-    """Text and tool results; image blocks too when `images` (VLLM_V41_VISION).
-    Placeholder tokens typed into text are always refused."""
+    """Validate content blocks and neutralize literal V4.1 image special tokens.
+
+    Allows text and tool results (plus image blocks when ``images`` is true,
+    i.e. ``VLLM_V41_VISION=1``). Ordinary ``<image>`` strings are not special
+    tokens in V4.1 and pass through unchanged; literal ``<｜deepseek_image｜>``
+    strings in text are escaped to ``<|deepseek_image|>`` (copy-on-write) so
+    they neither trigger 400 errors on transcript/compaction prompts nor emit
+    ``image_token_id`` or collide with real multimodal placeholders.
+    """
     if isinstance(value, list):
-        for block in value:
+        new_list = None
+        for idx, block in enumerate(value):
             kind = block.get("type")
             if images and kind in ("image", "image_url"):
+                if new_list is not None:
+                    new_list.append(block)
                 continue
             if kind not in ("text", "tool_result"):
                 raise ValueError(
@@ -36,9 +56,78 @@ def _text_only(value, images=False):
                     + (" and images" if images else "")
                     + " only"
                 )
-            _text_only(block.get("content", block.get("text")), images)
-    elif isinstance(value, str) and (_IMAGE in value or "<image>" in value):
-        raise ValueError("V4.1 does not admit image placeholders in text")
+            key = "content" if "content" in block else "text"
+            raw = block.get(key)
+            cleaned = _text_only(raw, images)
+            if cleaned is not raw:
+                if new_list is None:
+                    new_list = list(value[:idx])
+                updated = dict(block)
+                updated[key] = cleaned
+                new_list.append(updated)
+            elif new_list is not None:
+                new_list.append(block)
+        return new_list if new_list is not None else value
+    if isinstance(value, str):
+        return _escape_image_placeholder(value)
+    return value
+
+
+def _sanitize_tool_calls(tool_calls):
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    new_calls = None
+    for idx, call in enumerate(tool_calls):
+        updated = call
+        if isinstance(call, dict):
+            fn = call.get("function")
+            if isinstance(fn, dict):
+                args = fn.get("arguments")
+                if isinstance(args, str) and _IMAGE in args:
+                    updated = dict(
+                        call,
+                        function=dict(fn, arguments=_escape_image_placeholder(args)),
+                    )
+        if updated is not call:
+            if new_calls is None:
+                new_calls = list(tool_calls[:idx])
+            new_calls.append(updated)
+        elif new_calls is not None:
+            new_calls.append(call)
+    return new_calls if new_calls is not None else tool_calls
+
+
+def _sanitize_message(message, images=False):
+    """Validate and copy-on-write neutralize literal image special tokens."""
+    content = message.get("content")
+    new_content = _text_only(content, images)
+    content_blocks = message.get("content_blocks")
+    new_blocks = _text_only(content_blocks, images)
+    reasoning = message.get("reasoning_content")
+    new_reasoning = (
+        _escape_image_placeholder(reasoning)
+        if isinstance(reasoning, str)
+        else reasoning
+    )
+    tool_calls = message.get("tool_calls")
+    new_tool_calls = _sanitize_tool_calls(tool_calls)
+    if (
+        new_content is content
+        and new_blocks is content_blocks
+        and new_reasoning is reasoning
+        and new_tool_calls is tool_calls
+    ):
+        return message
+    updated = dict(message)
+    if new_content is not content:
+        updated["content"] = new_content
+    if new_blocks is not content_blocks:
+        updated["content_blocks"] = new_blocks
+    if new_reasoning is not reasoning:
+        updated["reasoning_content"] = new_reasoning
+    if new_tool_calls is not tool_calls:
+        updated["tool_calls"] = new_tool_calls
+    return updated
 
 
 def _image_blocks(text):
@@ -181,12 +270,25 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                     content = content[:-2]
                     message = dict(message, content=content)
                 if _vision() and isinstance(content, str) and _IMAGE in content:
-                    # Placeholders inserted by vLLM for the request's images.
+                    # Placeholders inserted by vLLM for the request's images
+                    # (any literal placeholders in user text were neutralized
+                    # beforehand by DeepseekV41Renderer).
+                    reasoning = message.get("reasoning_content")
+                    new_reasoning = (
+                        _escape_image_placeholder(reasoning)
+                        if isinstance(reasoning, str)
+                        else reasoning
+                    )
+                    tool_calls = message.get("tool_calls")
+                    new_tool_calls = _sanitize_tool_calls(tool_calls)
                     message = dict(message, content=_image_blocks(content))
+                    if new_reasoning is not reasoning:
+                        message["reasoning_content"] = new_reasoning
+                    if new_tool_calls is not tool_calls:
+                        message["tool_calls"] = new_tool_calls
                     conversation.append(message)
                     continue
-                _text_only(content)
-                _text_only(message.get("content_blocks"))
+                message = _sanitize_message(message, images=False)
                 conversation.append(message)
             thinking = kwargs.get("thinking", False) or kwargs.get(
                 "enable_thinking", False
