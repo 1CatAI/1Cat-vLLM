@@ -861,6 +861,27 @@ class KernelConfig:
             )
         return True
 
+    mla_kv_b_skinny: bool = False
+    """Run the two kv_b products of MLA decode (``q_nope @ W_UK_T`` and
+    ``attn_out @ W_UV``, one FP16 matrix per head) as a Triton tensor-core kernel
+    for two to eight rows, instead of ``torch.bmm``. FP32 accumulation like the
+    cuBLAS kernels, but another summation order, so outputs are not bit-identical.
+    Needs ``triton_sm7x_tensor_cores``."""
+
+    def use_mla_kv_b_skinny(self, device_index: int | None = None) -> bool:
+        """Whether an MLA layer on a device takes the skinny kv_b kernel.
+
+        Like the route it builds on, it applies to SM70-family devices only.
+        """
+        if not self.mla_kv_b_skinny:
+            return False
+        if not self.triton_sm7x_tensor_cores:
+            raise ValueError(
+                "kernel_config.mla_kv_b_skinny needs "
+                "kernel_config.triton_sm7x_tensor_cores"
+            )
+        return self.use_triton_sm7x_tensor_cores(device_index)
+
     sm70_packed_topk_gather: bool = True
     """Gather SM70 TP2/TP4 compact candidates in one lossless message."""
 
@@ -1507,6 +1528,8 @@ class KernelConfig:
             "host_reduce",
             # Micro-batch interleaving around the same compiled graph.
             "tp_prefill_overlap_min_tokens",
+            # Runs inside the opaque attention op, outside the compiled graph.
+            "mla_kv_b_skinny",
         }
         if not self.qsa_host_kv_prefill_stage_tokens or not (
             self.qsa_host_kv or self.qsa_host_kv_active
