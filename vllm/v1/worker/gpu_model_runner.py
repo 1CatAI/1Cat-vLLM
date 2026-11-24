@@ -10848,15 +10848,11 @@ class GPUModelRunner(
             spec_cad, token_indices, num_rejected = drafter.prepare_inputs_padded(
                 static_cad, spec, d["valid"]
             )
-            # Ensure DFlash's per-group metadata map uses static_cad's graph-owned
-            # tensors instead of transient per-step views when replaying.
-            saved_by_gid = getattr(
-                drafter, "_dflash_common_attn_metadata_by_gid", None
+            from vllm.models.deepseek_v41.propose_graph import (
+                bind_static_attn_metadata,
             )
-            if saved_by_gid is not None and len(saved_by_gid) == 1:
-                gid = next(iter(saved_by_gid))
-                drafter._dflash_common_attn_metadata_by_gid = {gid: spec_cad}
-            try:
+
+            with bind_static_attn_metadata(drafter, spec_cad):
                 total = spec_cad.num_actual_tokens
                 hidden = torch.cat(
                     [d[f"aux{i}"][:total] for i in range(len(aux_hidden_states))],
@@ -10874,9 +10870,6 @@ class GPUModelRunner(
                     num_rejected_tokens_gpu=num_rejected,
                     slot_mappings=slot_mappings,
                 )
-            finally:
-                if saved_by_gid is not None and len(saved_by_gid) == 1:
-                    drafter._dflash_common_attn_metadata_by_gid = saved_by_gid
 
         if cad.max_query_len > self.num_spec_tokens + 1:
             # A prefill chunk in the step: its shape is new nearly every time
