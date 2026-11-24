@@ -23,6 +23,7 @@ _ARCHITECTURES = {
     "qwen35moe": ("qwen3_5_moe_text", "Qwen3_5MoeForCausalLM"),
     "dflash": ("qwen3", "DFlash2DraftModel"),
     "qwen4exp": ("qwen4_exp_text", "Qwen4ExpForCausalLM"),
+    "inkling2": ("inkling2_loop", "Inkling2LoopForConditionalGeneration"),
 }
 
 
@@ -306,6 +307,12 @@ def gguf_config_dict(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 def gguf_config_from_metadata(metadata: dict[str, Any]) -> PretrainedConfig:
+    if metadata.get("general.architecture") == "inkling2":
+        # Looped layers and per-visit metadata: mapped onto the official
+        # Inkling2 config by the model package.
+        from vllm.models.inkling2.gguf_config import inkling2_config_from_gguf
+
+        return inkling2_config_from_gguf(metadata)
     config_dict = gguf_config_dict(metadata)
     model_type = config_dict.pop("model_type")
     if model_type == "qwen3_5_text":
