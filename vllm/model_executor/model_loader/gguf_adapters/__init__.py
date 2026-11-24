@@ -31,4 +31,8 @@ def get_gguf_adapter(config, tp_size=1):
         from .qwen35 import Qwen35Adapter
 
         return Qwen35Adapter(config.get_text_config(), tp_size=tp_size)
+    if getattr(config, "gguf_architecture", None) == "inkling2":
+        from .inkling2 import Inkling2Adapter
+
+        return Inkling2Adapter(text, tp_size=tp_size)
     return None

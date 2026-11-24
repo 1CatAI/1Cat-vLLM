@@ -34,6 +34,23 @@ _QWEN35_PATTERN = (
 )
 
 
+# OpenAI o200k (GPT-4o) segmentation; llama.cpp maps tokenizer.ggml.pre
+# "inkling2" to LLAMA_VOCAB_PRE_TYPE_GPT4O (original tokenizer.json regex).
+_O200K_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+    r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+
+def _pre_pattern(pre: str) -> str:
+    if pre == "inkling2":
+        return _O200K_PATTERN
+    return _QWEN35_PATTERN if pre == "qwen35" else _QWEN2_PATTERN
+
+
 class _QwenGGUFTokenizer(PreTrainedTokenizerFast):
     """Reuse HF's per-piece BPE IDs for repeating long ASCII ``encode`` calls.
 
@@ -122,7 +139,7 @@ class _QwenGGUFTokenizer(PreTrainedTokenizerFast):
 def tokenizer_from_gguf_metadata(metadata, **kwargs):
     model = metadata.get("tokenizer.ggml.model")
     pre = metadata.get("tokenizer.ggml.pre")
-    if model != "gpt2" or pre not in ("qwen2", "qwen35"):
+    if model != "gpt2" or pre not in ("qwen2", "qwen35", "inkling2"):
         raise ValueError(
             f"No native GGUF tokenizer for model={model!r}, pre={pre!r}. "
             "Provide --tokenizer with a tokenizer repository or local directory."
@@ -136,7 +153,7 @@ def tokenizer_from_gguf_metadata(metadata, **kwargs):
     backend.pre_tokenizer = pre_tokenizers.Sequence(
         [
             pre_tokenizers.Split(
-                Regex(_QWEN35_PATTERN if pre == "qwen35" else _QWEN2_PATTERN),
+                Regex(_pre_pattern(pre)),
                 behavior="isolated",
             ),
             pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
@@ -199,7 +216,7 @@ def tokenizer_from_gguf_metadata(metadata, **kwargs):
             else regex.compile(r"(?!x)x")
         )
         tokenizer._qwen_piece_pattern = regex.compile(
-            _QWEN35_PATTERN if pre == "qwen35" else _QWEN2_PATTERN
+            _pre_pattern(pre)
         )
     return tokenizer
 
