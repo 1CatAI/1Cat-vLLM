@@ -13,7 +13,14 @@ from vllm.models.deepseek_v41.vision import (
     num_image_tokens,
     plan_image_grid,
 )
-from vllm.tokenizers.deepseek_v41 import _image_blocks, _text_only
+from vllm.renderers.deepseek_v41 import DeepseekV41Renderer
+from vllm.tokenizers.deepseek_v41 import (
+    _IMAGE,
+    _IMAGE_ESCAPED,
+    _image_blocks,
+    _sanitize_message,
+    _text_only,
+)
 
 CONFIG = {
     "num_hidden_layers": 32,
@@ -90,9 +97,67 @@ def test_chat_placeholders_become_image_blocks():
     ]
 
 
-def test_typed_placeholders_are_refused():
-    with pytest.raises(ValueError):
-        _text_only("look <｜deepseek_image｜>", images=True)
+def test_typed_placeholders_are_sanitized(monkeypatch):
+    # Literal <image> is ordinary ASCII text in V4.1 and passes verbatim.
+    assert _text_only("compact <image> tag </image>", images=False) == (
+        "compact <image> tag </image>"
+    )
+    assert _text_only("compact <image> tag", images=True) == "compact <image> tag"
+
+    # Literal <｜deepseek_image｜> in text is neutralized so it never collides
+    # with real multimodal placeholders or emits image_token_id (129264).
+    assert _text_only(f"look {_IMAGE} here", images=True) == (
+        f"look {_IMAGE_ESCAPED} here"
+    )
+    assert _text_only(f"look {_IMAGE} here", images=False) == (
+        f"look {_IMAGE_ESCAPED} here"
+    )
+
+    # Unsupported block types and image blocks with vision disabled still fail.
     with pytest.raises(ValueError):
         _text_only([{"type": "image_url", "image_url": {"url": "x"}}])
-    _text_only([{"type": "image_url", "image_url": {"url": "x"}}], images=True)
+    with pytest.raises(ValueError):
+        _text_only([{"type": "audio", "url": "x"}], images=True)
+
+    # Real image blocks pass when vision is enabled; mixed text+image blocks
+    # sanitize only the literal text without mutating caller inputs.
+    orig_msg = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": f"saw <image> and {_IMAGE}"},
+            {"type": "image_url", "image_url": {"url": "x"}},
+            {
+                "type": "tool_result",
+                "content": [{"type": "text", "text": f"tool {_IMAGE}"}],
+            },
+        ],
+        "reasoning_content": f"think {_IMAGE}",
+        "tool_calls": [
+            {
+                "type": "function",
+                "function": {"name": "f", "arguments": f'{{"x":"{_IMAGE}"}}'},
+            }
+        ],
+    }
+    cleaned = _sanitize_message(orig_msg, images=True)
+    assert cleaned is not orig_msg
+    assert orig_msg["content"][0]["text"] == f"saw <image> and {_IMAGE}"
+    assert cleaned["content"][0]["text"] == f"saw <image> and {_IMAGE_ESCAPED}"
+    assert cleaned["content"][1] == {"type": "image_url", "image_url": {"url": "x"}}
+    assert cleaned["content"][2]["content"][0]["text"] == f"tool {_IMAGE_ESCAPED}"
+    assert cleaned["reasoning_content"] == f"think {_IMAGE_ESCAPED}"
+    assert (
+        cleaned["tool_calls"][0]["function"]["arguments"]
+        == f'{{"x":"{_IMAGE_ESCAPED}"}}'
+    )
+
+    # Renderer validates and sanitizes before parse_chat_messages.
+    monkeypatch.setattr("vllm.renderers.deepseek_v41._vision", lambda: True)
+    msgs = [
+        {"role": "system", "content": f"sys <image> {_IMAGE}"},
+        {"role": "user", "content": "plain text"},
+    ]
+    out = DeepseekV41Renderer._validate_messages(msgs)
+    assert out[0]["content"] == f"sys <image> {_IMAGE_ESCAPED}"
+    assert out[1] is msgs[1]
+    assert msgs[0]["content"] == f"sys <image> {_IMAGE}"
