@@ -164,6 +164,55 @@ FP32 GGUF reference forward (`tools/inkling2/gguf_reference.py` in the standalon
 - **Repo checks:** `pre-commit`, layering, env registration, config inventory,
   architecture reference, route snapshots.
 
+## Implementation status (this branch)
+
+The GGUF route loads both Unsloth files into #1598's
+`Inkling2LoopForConditionalGeneration` at TP=1. Dense layers are dequantized
+to FP16; keeping Q8_0 is a decode-speed follow-up.
+
+| piece | where | check |
+| --- | --- | --- |
+| GGML NVFP4 → official layout | `vllm/models/inkling2/gguf_weights.py` | dequantizes bit-identically (random data and real expert banks) |
+| config from GGUF metadata | `vllm/models/inkling2/gguf_config.py` | equals the official `config.json` field by field |
+| tensor adapter | `model_loader/gguf_adapters/inkling2.py` | covers every official text tensor. The UD-Q8_K_XL GGUF reproduces the official tensors exactly on sampled layers: dense weights, norms, queries, NVFP4 experts byte for byte, BF16 experts equal to the dequantized MXFP8 banks. UD-Q4_K_XL dense weights are within Q8_0 error. |
+| registration, o200k tokenizer | `gguf_config.py`, `gguf_adapters/__init__.py`, `tokenizers/gguf.py` | the native GGUF tokenizer equals the official `tokenizer.json` on mixed-script samples |
+| model | `nvidia/model.py`, `nvidia/moe.py`, `nvidia/ops/moe_sm70.py`, `config/model.py` | the GGUF quant config is accepted; dense (`"fp16"`) experts on SM70; float casts for GGUF only; a GGUF tokenizer is allowed with `--language-model-only` |
+
+Layout details found while matching the official tensors:
+- **Gate and up rows:** GGUF stores `ffn_gate_up_exps` as all gate rows then all up rows;
+  the official `w13` interleaves them (gate₀, up₀, gate₁, …).
+- **Short-conv taps:** full layers' GGUF K/V conv taps run newest-first; the official
+  `static_w` is `[taps, C]` oldest-first.
+- **Residual queries:** they map one-to-one: `blk.N.attn_res_query` →
+  `attn_queries.{N-1}` (`[3, 2304]` on full layers), and `blk.N.ffn_res_query` →
+  `mlp_queries.{N}`.
+
+End-to-end parity through the model (`tools/inkling2/gguf_parity.py`):
+- **Setup:** 6 prompts (English, code, translation, arithmetic, Japanese, a list), greedy,
+  24 tokens, top-5 log-probs, one V100, eager.
+
+| | greedy tokens equal to official | max top-5 log-prob difference (aligned steps) |
+| --- | --- | --- |
+| UD-Q8_K_XL | 6 / 6 prompts, 24 / 24 tokens each | 0.0000 |
+| UD-Q4_K_XL | 5 / 6 prompts (one diverges after 16 tokens) | 0.16–1.19 on tail candidates; top token within ~0.05 |
+
+Serving a GGUF:
+
+```bash
+vllm serve Inkling-2-Mini-UD-Q4_K_XL.gguf --tokenizer Inkling-2-Mini-UD-Q4_K_XL.gguf \
+  --served-model-name inkling-2-mini --dtype float16 --kv-cache-dtype float16 \
+  --language-model-only --max-model-len 32768 --max-num-seqs 4 \
+  --max-num-batched-tokens 2048 --enable-prefix-caching
+# with #1599: --reasoning-parser inkling2 --enable-auto-tool-choice --tool-call-parser inkling2
+```
+
+Still to do for this PR:
+- serving through the API with the #1599 parsers;
+- the speed and coding runs for both GGUFs;
+- the TP=2 check;
+- the repo checks (`pre-commit`, layering, env registration, config inventory,
+  architecture reference, route snapshots).
+
 ## Decode profile: where the time goes
 
 Per-kernel GPU time per decode step, from `torch.profiler`:
