@@ -17,7 +17,9 @@ wrong draft costs acceptance, never output tokens.
 
 import logging
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from typing import Any
 
 import torch
 
@@ -25,6 +27,21 @@ import vllm.envs as envs
 from vllm.distributed import graph_capture
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def bind_static_attn_metadata(drafter: Any, spec_cad: Any) -> Iterator[None]:
+    """Bind a drafter's per-group metadata map to graph-owned static metadata."""
+    saved_by_gid = getattr(drafter, "_dflash_common_attn_metadata_by_gid", None)
+    if saved_by_gid is not None and len(saved_by_gid) == 1:
+        gid = next(iter(saved_by_gid))
+        drafter._dflash_common_attn_metadata_by_gid = {gid: spec_cad}
+    try:
+        yield
+    finally:
+        if saved_by_gid is not None and len(saved_by_gid) == 1:
+            drafter._dflash_common_attn_metadata_by_gid = saved_by_gid
+
 
 _WARMUP = 1
 # relaxed: the round's host-side helpers may allocate pinned memory or query
@@ -62,12 +79,17 @@ class V41ProposeGraph:
 
     def _capture(self, key, entry, fn, inputs) -> bool:
         static = {name: t.clone() for name, t in inputs.items()}
+        device = next(iter(static.values())).device
+        # Drain pending work on the default stream (including non-blocking
+        # H2D copies and TP P2P markov kernels) before switching to the
+        # capture stream, matching V41QueryGraph / V41GreedyDraftGraph.
+        torch.accelerator.synchronize(device)
         graph = torch.cuda.CUDAGraph()
         try:
             # vLLM's graph_capture: TP custom all-reduce inside the round
             # (sharded draft head) needs its capture-registered buffers.
             with (
-                graph_capture(device=next(iter(static.values())).device) as context,
+                graph_capture(device=device) as context,
                 torch.cuda.graph(
                     graph,
                     pool=self.pool,

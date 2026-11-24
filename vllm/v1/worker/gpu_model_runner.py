@@ -7645,8 +7645,25 @@ class GPUModelRunner(
         # The buffer can be replaced (grown), so its address is part of the key.
         state = (buffer.data_ptr(), keys)
         if keys and state != getattr(self, "_coupled_keys_state", None):
-            staged = torch.tensor(keys, dtype=torch.int64).pin_memory()
-            buffer[:num_reqs].copy_(staged, non_blocking=True)
+            ring = getattr(self, "_coupled_keys_ring", None)
+            if ring is None or ring[0][0].numel() < self.max_num_reqs:
+                ring = [
+                    (
+                        torch.zeros(
+                            self.max_num_reqs, dtype=torch.int64, pin_memory=True
+                        ),
+                        torch.cuda.Event(),
+                    )
+                    for _ in range(8)
+                ]
+                self._coupled_keys_ring = ring
+                self._coupled_keys_turn = 0
+            staged, uploaded = ring[self._coupled_keys_turn]
+            self._coupled_keys_turn = (self._coupled_keys_turn + 1) % len(ring)
+            uploaded.synchronize()
+            staged[:num_reqs].copy_(torch.tensor(keys, dtype=torch.int64))
+            buffer[:num_reqs].copy_(staged[:num_reqs], non_blocking=True)
+            uploaded.record()
             self._coupled_keys_state = state
 
     def _set_coupled_rows(
@@ -10831,23 +10848,28 @@ class GPUModelRunner(
             spec_cad, token_indices, num_rejected = drafter.prepare_inputs_padded(
                 static_cad, spec, d["valid"]
             )
-            total = spec_cad.num_actual_tokens
-            hidden = torch.cat(
-                [d[f"aux{i}"][:total] for i in range(len(aux_hidden_states))],
-                dim=-1,
+            from vllm.models.deepseek_v41.propose_graph import (
+                bind_static_attn_metadata,
             )
-            return drafter.propose(
-                target_token_ids=self.input_ids.gpu[:total],
-                target_positions=self._get_positions(total),
-                target_hidden_states=hidden,
-                next_token_ids=d["next"],
-                token_indices_to_sample=token_indices,
-                sampling_metadata=sm_use,
-                common_attn_metadata=spec_cad,
-                mm_embed_inputs=None,
-                num_rejected_tokens_gpu=num_rejected,
-                slot_mappings=slot_mappings,
-            )
+
+            with bind_static_attn_metadata(drafter, spec_cad):
+                total = spec_cad.num_actual_tokens
+                hidden = torch.cat(
+                    [d[f"aux{i}"][:total] for i in range(len(aux_hidden_states))],
+                    dim=-1,
+                )
+                return drafter.propose(
+                    target_token_ids=self.input_ids.gpu[:total],
+                    target_positions=self._get_positions(total),
+                    target_hidden_states=hidden,
+                    next_token_ids=d["next"],
+                    token_indices_to_sample=token_indices,
+                    sampling_metadata=sm_use,
+                    common_attn_metadata=spec_cad,
+                    mm_embed_inputs=None,
+                    num_rejected_tokens_gpu=num_rejected,
+                    slot_mappings=slot_mappings,
+                )
 
         if cad.max_query_len > self.num_spec_tokens + 1:
             # A prefill chunk in the step: its shape is new nearly every time
