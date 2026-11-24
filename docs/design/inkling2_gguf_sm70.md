@@ -206,12 +206,29 @@ vllm serve Inkling-2-Mini-UD-Q4_K_XL.gguf --tokenizer Inkling-2-Mini-UD-Q4_K_XL.
 # with #1599: --reasoning-parser inkling2 --enable-auto-tool-choice --tool-call-parser inkling2
 ```
 
-Still to do for this PR:
-- serving through the API with the #1599 parsers;
-- the speed and coding runs for both GGUFs;
-- the TP=2 check;
-- the repo checks (`pre-commit`, layering, env registration, config inventory,
-  architecture reference, route snapshots).
+Serving through the API (#1599 parsers merged locally, one V100 unless noted):
+
+| | official (#1598) | GGUF Q8 | GGUF Q4 | GGUF Q4, TP=2 |
+| --- | --- | --- | --- | --- |
+| model memory per GPU | 22.6 GiB | 22.6 GiB | 22.6 GiB | 11.4 GiB |
+| KV capacity (tokens) | 25,239 | 25,239 | 25,239 | 562,555 |
+| decode tok/s (short / 4k / 16k) | 45.3 / 42.5 / 39.3 | 44.2 / 41.4 / 38.4 | 45.0 / 42.2 / 39.1 | 47.2 / 44.8 / 42.9 |
+| prefill tok/s (16k) | 773 | 753–760 | 765–773 | 1289–1314 |
+| 4 concurrent, total tok/s | 112 | 109 | 112 | — |
+| sanity (12 cases, exact text / JSON / tool calls) | 12/12 | 12/12 | 12/12 | — |
+| next turn of a 41k-token conversation | — | — | — | 40.0 s → 0.43 s |
+
+What this shows:
+- **Speed matches #1598**, as expected for a loading change.
+- **Prefix caching now works for GGUF files.**
+- **On one card, the GGUFs take the official checkpoint's memory**, because dense Q8_0 is
+  dequantized. Keeping it quantized is a follow-up.
+
+Static checks on the changed files:
+- **Pass:** ruff, typos, layering, architecture reference, config inventory, env
+  registration, SPDX headers, forbidden imports, `torch.cuda` calls.
+- **mypy:** no new errors over #1598.
+- **SM70 route snapshots:** `moe` and `nvfp4` show no changes against #1598.
 
 ## Decode profile: where the time goes
 
