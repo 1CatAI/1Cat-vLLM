@@ -774,7 +774,7 @@ class ModelConfig:
         # (not needed when only the language model runs).
         if (
             is_gguf(self.tokenizer)
-            and self.is_multimodal_model
+            and self.multimodal_config is not None
             and not self.multimodal_config.language_model_only
         ):
             raise ValueError(

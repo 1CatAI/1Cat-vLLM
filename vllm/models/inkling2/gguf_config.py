@@ -60,7 +60,7 @@ def inkling2_config_from_gguf(metadata: dict[str, Any]) -> Inkling2LoopMMConfig:
     pattern = [bool(x) for x in get("attention.sliding_window_pattern")]
     if len(pattern) != visits:
         raise ValueError("sliding_window_pattern must list every layer visit")
-    local = {}
+    local: dict[int, bool] = {}
     for visit, layer in enumerate(order):
         if local.setdefault(layer, pattern[visit]) != pattern[visit]:
             raise ValueError(f"layer {layer} changes window type between visits")
