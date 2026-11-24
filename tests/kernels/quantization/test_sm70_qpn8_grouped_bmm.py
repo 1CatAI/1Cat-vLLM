@@ -23,6 +23,7 @@ from vllm.config.sm70_native import capture_linear_native_config
 from vllm.model_executor.kernels.linear.qpn.fp8_block import (
     QPN8Fp8BlockScaledMMLinearKernel,
 )
+from vllm.utils.torch_utils import set_high_precision_cuda_matmul_defaults
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -34,6 +35,33 @@ BLOCK = 128
 # DeepSeek-V4-Flash wo_a (one stage, no TP): 8 groups of 1024 rows over K = 4096.
 PRODUCTION = (8, 1024, 4096)
 SMALL = (2, 256, 512)
+
+
+@pytest.fixture(autouse=True)
+def worker_matmul_policy():
+    """The numerical policy a worker sets before loading (gpu_worker.py): no
+    reduced-precision FP16 reductions. Without it cuBLAS reduces split-K partial
+    sums in FP16 and the large-M products drift from the FP32 oracle. The flags
+    are restored afterwards; the split-K half is read-only and is written back
+    together with its reduction flag as a tuple."""
+    matmul = torch.backends.cuda.matmul
+    saved: dict[str, object] = {}
+    for name in (
+        "allow_fp16_reduced_precision_reduction",
+        "allow_bf16_reduced_precision_reduction",
+    ):
+        split_k_name = f"{name}_split_k"
+        saved[name] = (
+            (getattr(matmul, name), getattr(matmul, split_k_name))
+            if hasattr(matmul, split_k_name)
+            else getattr(matmul, name)
+        )
+    if hasattr(matmul, "allow_fp16_accumulation"):
+        saved["allow_fp16_accumulation"] = matmul.allow_fp16_accumulation
+    set_high_precision_cuda_matmul_defaults()
+    yield
+    for name, value in saved.items():
+        setattr(matmul, name, value)
 
 
 def _weights(groups, n_group, k, seed=0):
@@ -168,6 +196,37 @@ def test_layer_matches_fp32_reference_on_every_m_branch(shape, rows):
 
     assert out.shape == (rows, groups, n_group) and out.dtype == torch.float16
     _assert_close(out, _reference(x, dense))
+
+
+@pytest.mark.parametrize("rows", [129, 256, 600, 1024])
+@torch.no_grad()
+def test_dense_bmm_rows_equal_the_former_einsum_on_the_dequantized_weight(rows):
+    """Above the grouped-launch range the result is the old route's result.
+
+    The old route multiplied the FP16-dequantized weight with torch.einsum; the
+    new one dequantizes into the shared workspace and runs one
+    batched product. The decoded weights are identical, so with the worker's
+    matmul policy (fixture) the outputs should agree bit for
+    bit. If cuBLAS picks a different kernel for the transposed operand layout and
+    this fails by a few ulp, compare against the FP32 oracle instead (the layer
+    test above) and record the difference.
+
+    Old code: the layer holds an FP16 weight and no packed codes.
+    """
+    import vllm._C  # noqa: F401
+
+    groups, n_group, k = PRODUCTION
+    weight, scales, dense = _weights(groups, n_group, k)
+    layer = _layer(weight, scales, groups)
+    kernel = _kernel()
+    kernel.process_weights_after_loading(layer)
+    x = torch.randn(rows, groups, k, device="cuda", dtype=torch.float16)
+
+    out = kernel.apply_weights(layer, x)
+
+    old_weight = (dense.half()).contiguous()  # exact: FP8 * power of two in FP16
+    expected = torch.einsum("...gk,grk->...gr", x, old_weight)
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
 
 
 @torch.no_grad()

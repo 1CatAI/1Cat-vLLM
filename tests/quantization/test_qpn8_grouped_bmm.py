@@ -82,8 +82,8 @@ def test_decode_rows_are_one_launch_over_all_groups(monkeypatch, rows) -> None:
     )
 
 
-@pytest.mark.parametrize("rows", [9, 64, 512])
-def test_prefill_rows_run_each_group_on_its_own_slices(monkeypatch, rows) -> None:
+@pytest.mark.parametrize("rows", [9, 64, fp8_block._GROUPED_DENSE_MIN_M])
+def test_mid_rows_run_each_group_on_its_own_slices(monkeypatch, rows) -> None:
     calls = _record_native(monkeypatch)
     codes, scales = _stacked_pack()
     x = torch.randn(rows, GROUPS * K).half()
@@ -103,6 +103,45 @@ def test_prefill_rows_run_each_group_on_its_own_slices(monkeypatch, rows) -> Non
         out.view(rows, GROUPS, N_GROUP),
         out.view(rows, GROUPS, N_GROUP)[..., :1].expand(-1, -1, N_GROUP),
     )
+
+
+@pytest.mark.parametrize("rows", [fp8_block._GROUPED_DENSE_MIN_M + 1, 600, 1024])
+def test_large_rows_dequantize_the_whole_weight_into_the_shared_workspace(
+    monkeypatch, rows
+) -> None:
+    calls = _record_native(monkeypatch)
+    codes, scales = _stacked_pack()
+    workspace = torch.empty(GROUPS * K * N_GROUP, dtype=torch.float16)
+    requested: list[int] = []
+    prefill: list[tuple] = []
+
+    def dense(device, elements):
+        requested.append(elements)
+        return workspace
+
+    def fake_prefill(out, ptr, x, codes_arg, scales_arg, gated):
+        prefill.append((ptr, tuple(codes_arg.shape), tuple(scales_arg.shape), gated))
+
+    monkeypatch.setattr(fp8_block, "_block_qpn8_prefill_dense", dense)
+    monkeypatch.setattr(fp8_block.sm70_ops, "fp8_qpn8_prefill_sm70_out", fake_prefill)
+    x = torch.randn(rows, GROUPS * K).half()
+    out = x.new_empty(rows, GROUPS * N_GROUP)
+
+    fp8_block._qpn8_native_grouped_linear_write(
+        out, x, codes, scales, 16, 2, False, sm75_mma=True
+    )
+
+    # One op over the grouped packs, on a workspace of the whole weight.
+    assert calls == []
+    assert requested == [GROUPS * K * N_GROUP]
+    assert prefill == [
+        (
+            workspace.data_ptr(),
+            (GROUPS, K, N_GROUP),
+            (GROUPS, K // 128, N_GROUP // 32),
+            False,
+        )
+    ]
 
 
 def test_empty_batch_launches_nothing(monkeypatch) -> None:

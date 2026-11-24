@@ -1551,6 +1551,11 @@ void fp8_qpn8_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// Grouped mode (DeepSeek-V4 wo_a): codes [G, K, N], group_scales
+// [G, K / 128, N / 32], input [M, G * K], out [M, G * N], and the workspace
+// holds the whole dequantized weight, G * K * N elements laid out [G, K, N].
+// One batched product then computes out[:, g] = input[:, g] @ W_g like the
+// dense-weight bmm it replaces. Not combined with gated_silu.
 void fp8_qpn8_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
                                torch::Tensor input, torch::Tensor codes,
                                torch::Tensor group_scales, bool gated_silu) {
@@ -1564,13 +1569,33 @@ void fp8_qpn8_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   TORCH_CHECK(input.is_contiguous() && out.is_contiguous(),
               "fp8_qpn8_prefill_sm70_out: tensors must be contiguous");
 
+  const bool grouped = codes.dim() == 3;
+  TORCH_CHECK(!grouped || !gated_silu,
+              "fp8_qpn8_prefill_sm70_out: grouped mode has no gated SiLU");
+  const int64_t batch = grouped ? codes.size(0) : 1;
   const int64_t m = input.size(0);
-  const int64_t k = input.size(1);
-  const int64_t n = codes.size(1);
-  TORCH_CHECK(codes.dim() == 2 && codes.size(0) == k,
+  const int64_t k = codes.size(grouped ? 1 : 0);
+  const int64_t n = codes.size(grouped ? 2 : 1);
+  TORCH_CHECK(codes.dim() == (grouped ? 3 : 2) && input.size(1) == batch * k,
               "fp8_qpn8_prefill_sm70_out: code shape mismatch");
-  TORCH_CHECK(out.size(0) == m && out.size(1) == (gated_silu ? n / 2 : n),
-              "fp8_qpn8_prefill_sm70_out: output shape mismatch");
+  TORCH_CHECK(
+      out.size(0) == m && out.size(1) == (gated_silu ? n / 2 : batch * n),
+      "fp8_qpn8_prefill_sm70_out: output shape mismatch");
+
+  if (grouped) {
+    auto dense_weight =
+        torch::from_blob(reinterpret_cast<void*>(dense_weight_ptr),
+                         {batch, k, n}, input.options());
+    for (int64_t group = 0; group < batch; ++group) {
+      auto group_weight = dense_weight.select(0, group);
+      fp8_qpn8_dequantize_sm70_out(group_weight, codes.select(0, group),
+                                   group_scales.select(0, group));
+    }
+    auto out_by_group = out.view({m, batch, n}).transpose(0, 1);
+    at::bmm_out(out_by_group, input.view({m, batch, k}).transpose(0, 1),
+                dense_weight);
+    return;
+  }
 
   auto dense_weight = torch::from_blob(
       reinterpret_cast<void*>(dense_weight_ptr), {k, n}, input.options());

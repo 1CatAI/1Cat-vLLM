@@ -62,6 +62,15 @@ _block_qpn8_prefill_workspaces: dict[tuple[int, int], torch.Tensor] = {}
 # 0.78-1.02x on the other three, and 0.16-0.60x at M=16..64); above this bound
 # the dense reconstruction + cuBLAS is faster (1.15-1.75x at M>=1024).
 _SM75_MMA_MAX_M = 512
+# Grouped BMM (DeepSeek-V4 wo_a): above this many rows per group the whole
+# weight is dequantized into the shared prefill workspace and multiplied as one
+# batch (the dequantization, ~100 MB of traffic per call, is amortized); up to
+# it each group runs the dense linears' M ladder on its own pack. On a Quadro
+# RTX 8000 (benchmarks/kernels/benchmark_dsv4_wo_a_grouped.py, wo_a 8 x
+# [1024, 4096]) the per-group path took 342.1 / 353.5 us at M = 96 / 128
+# against 360.2 / 364.5 us for the batched product on the dequantized weight
+# (arm qpn8_dense_bmm), so the bound keeps M = 128 on the per-group path.
+_GROUPED_DENSE_MIN_M = 128
 logger = init_logger(__name__)
 
 
@@ -383,9 +392,11 @@ def _qpn8_native_grouped_linear_write(
     x is [M, G * K], codes [G, K, N_g], group_scales [G, K / 128, N_g / 32] and
     out [M, G * N_g]. Decode rows (M <= 8) are one launch over all groups, so
     the groups' weights stream together at the bandwidth of a single large
-    linear. Larger M runs each group through the ordinary M ladder of the dense
-    linears (Turing tensor-core GEMM, then dense FP16 prefill on a per-group
-    scratch); the M decision stays inside this opaque op like in
+    linear. Up to ``_GROUPED_DENSE_MIN_M`` rows each group runs the M ladder of
+    the dense linears on its own pack (Turing tensor-core GEMM). Above that the
+    whole weight is dequantized into the shared prefill workspace and one
+    batched product runs (its reduction is FP32 under the worker's matmul
+    policy). The M decision stays inside this opaque op like in
     ``_qpn8_native_linear_write``.
     """
     groups, k_dim, n_group = codes.shape
@@ -404,6 +415,19 @@ def _qpn8_native_grouped_linear_write(
             accumulator_chains,
             True,
             prefetch_codes,
+        )
+        return
+    if rows > _GROUPED_DENSE_MIN_M:
+        dense = _block_qpn8_prefill_dense(x.device, groups * k_dim * n_group)
+        call_native(
+            sm70_ops.fp8_qpn8_prefill_sm70_out,
+            native_policy,
+            out,
+            dense.data_ptr(),
+            x,
+            codes,
+            group_scales,
+            False,
         )
         return
     x_by_group = x.view(rows, groups, k_dim)
@@ -875,9 +899,7 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
                 and not torch.cuda.is_current_stream_capturing()
                 and _graphs_capture_dense_prefill(_QPN8_MAX_M)
             ):
-                _ensure_block_qpn8_prefill_workspace(
-                    codes.device, k_dim * n_dim // max(groups, 1)
-                )
+                _ensure_block_qpn8_prefill_workspace(codes.device, k_dim * n_dim)
             logger.info_once(
                 "Block FP8 QPN8 native GEMM supports M=1..128; larger M uses the "
                 "FP16 prefill, which needs no second copy of the weights (a "

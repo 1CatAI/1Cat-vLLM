@@ -9,6 +9,9 @@ wo_a is a grouped matmul, 8 groups of [1024, 4096] block-FP8 rows. Arms:
                      load (2 bytes per weight), torch.einsum per call (cuBLAS)
   qpn8_grouped       the grouped QPN8 route (FP8 pack, one launch for M <= 8);
                      runs on Volta and Turing
+  qpn8_dense_bmm     the large-M route of the grouped QPN8 layer forced for every
+                     M: the whole weight dequantized into the shared workspace
+                     on each call, then one batched product (FP32 reduction)
   turbomind_grouped  the Volta production route (TurboMind one-launch grouped
                      GEMM on FP8); Volta only
 
@@ -90,20 +93,54 @@ def _fp16_einsum_arm(weight, scales, groups):
     return apply, dense.numel() * dense.element_size()
 
 
-def _qpn8_arm(weight, scales, groups):
+def _qpn8_kernel():
     from vllm.config.kernel import Sm70Fp8Config
     from vllm.model_executor.kernels.linear.qpn.fp8_block import (
         QPN8Fp8BlockScaledMMLinearKernel,
     )
 
-    layer = _layer(weight, scales, groups)
     kernel = object.__new__(QPN8Fp8BlockScaledMMLinearKernel)
     kernel.policy = Sm70Fp8Config()
     kernel.policy.resolve()
     kernel.native_ops = _native_ops()
+    return kernel
+
+
+def _qpn8_arm(weight, scales, groups):
+    layer = _layer(weight, scales, groups)
+    kernel = _qpn8_kernel()
     kernel.process_weights_after_loading(layer)
     codes = layer._sm70_block_fp8_qpn8_packed_codes
     return (lambda x: kernel.apply_weights(layer, x)), codes.numel()
+
+
+def _qpn8_dense_bmm_arm(weight, scales, groups):
+    """Dequantize-per-call plus one bmm, at every M (finds the M crossover)."""
+    from vllm import _sm70_ops as sm70_ops
+    from vllm.model_executor.kernels.linear.qpn import fp8_block
+
+    layer = _layer(weight, scales, groups)
+    kernel = _qpn8_kernel()
+    kernel.process_weights_after_loading(layer)
+    codes = layer._sm70_block_fp8_qpn8_packed_codes
+    scales_packed = layer._sm70_block_fp8_qpn8_packed_scales
+    n_group = codes.shape[2]
+
+    def apply(x: torch.Tensor) -> torch.Tensor:
+        rows = x.shape[0]
+        out = x.new_empty(rows, groups * n_group)
+        dense = fp8_block._ensure_block_qpn8_prefill_workspace(x.device, codes.numel())
+        sm70_ops.fp8_qpn8_prefill_sm70_out(
+            out,
+            dense.data_ptr(),
+            x.reshape(rows, -1),
+            codes,
+            scales_packed,
+            False,
+        )
+        return out.view(rows, groups, n_group)
+
+    return apply, codes.numel()
 
 
 def _turbomind_arm(weight, scales, groups):
@@ -161,7 +198,7 @@ def main() -> None:
         "--m",
         type=int,
         nargs="+",
-        default=[1, 2, 3, 4, 5, 6, 7, 8, 16, 64, 512, 1024],
+        default=[1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 96, 128, 192, 256, 512, 1024],
         help="tokens per group (rows of the GEMM)",
     )
     parser.add_argument("--calls", type=int, default=20, help="calls per graph")
@@ -172,11 +209,18 @@ def main() -> None:
     torch.accelerator.set_device_index(args.device)
     import vllm._C  # noqa: F401
 
+    from vllm.utils.torch_utils import set_high_precision_cuda_matmul_defaults
+
+    # The numerical policy a worker sets before loading: no reduced-precision
+    # FP16 reductions, so the cuBLAS arms measure what production runs.
+    set_high_precision_cuda_matmul_defaults()
+
     name = torch.cuda.get_device_name()
     capability = torch.cuda.get_device_capability()
     arms = {
         "fp16_einsum": _fp16_einsum_arm,
         "qpn8_grouped": _qpn8_arm,
+        "qpn8_dense_bmm": _qpn8_dense_bmm_arm,
     }
     if capability == (7, 0):
         arms["turbomind_grouped"] = _turbomind_arm
