@@ -117,6 +117,14 @@ class Inkling2Adapter:
     def build_name_map(self, tensors) -> dict[str, str]:
         result = {}
         n_layers = self.config.num_hidden_layers
+        # Layers whose expert banks are not NVFP4 (the official MXFP8 layers:
+        # BF16 in UD-Q8_K_XL, Q8_0 in UD-Q4_K_XL) load as dense FP16 banks.
+        # Read by the model when it builds its experts.
+        self.config.gguf_dense_expert_layers = sorted(
+            int(raw.split(".")[1])
+            for raw, t in tensors.items()
+            if raw.endswith(".ffn_gate_up_exps.weight") and t.tensor_type != Q.NVFP4
+        )
         for raw in tensors:
             if raw in _GLOBALS:
                 result[raw] = _GLOBALS[raw]

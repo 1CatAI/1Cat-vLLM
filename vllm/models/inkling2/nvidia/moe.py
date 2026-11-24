@@ -33,7 +33,9 @@ from .ops.moe_sm70 import Inkling2Sm70Experts
 from .ops.moe_sm90 import select_experts
 from .ops.seq_parallel import SeqParallel
 
-QuantFormat = Literal["nvfp4", "mxfp8"]
+# "fp16": dense banks (GGUF BF16 / Q8_0 experts), held as on SM70 after
+# MXFP8 dequantization; SM70 only.
+QuantFormat = Literal["nvfp4", "mxfp8", "fp16"]
 
 
 class ExpertsLoRA(Protocol):
@@ -93,6 +95,11 @@ class Inkling2Experts(nn.Module):
 
     def __init__(self, config, quant_format: QuantFormat) -> None:
         super().__init__()
+        if quant_format == "fp16":
+            raise NotImplementedError(
+                "Inkling2 dense (GGUF BF16 / Q8_0) expert banks are supported "
+                "on SM70 only"
+            )
         self.ep_rank = get_tensor_model_parallel_rank()
         self.ep_size = get_tensor_model_parallel_world_size()
         assert config.n_routed_experts % self.ep_size == 0
