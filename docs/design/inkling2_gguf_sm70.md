@@ -164,11 +164,51 @@ FP32 GGUF reference forward (`tools/inkling2/gguf_reference.py` in the standalon
 - **Repo checks:** `pre-commit`, layering, env registration, config inventory,
   architecture reference, route snapshots.
 
+## Decode profile: where the time goes
+
+Per-kernel GPU time per decode step, from `torch.profiler`:
+- Eager mode, one sequence, 16 steps, one V100.
+- #1598 ran the official checkpoint at TP=1 (`max_num_seqs=4`, because `1` trips a warm-up
+  assertion).
+- The standalone port ran the GGUF Q8, which holds the same weights.
+
+| | #1598 | standalone GGUF Q8 | standalone GGUF Q4 |
+| --- | --- | --- | --- |
+| total GPU time per step | 23.5 ms | 14.4 ms | 12.0 ms |
+| kernels per step | 1,597 | 1,085 | 1,177 |
+
+By component (ms per step; groupings from kernel names):
+
+| component | #1598 kernels | #1598 | standalone kernels | standalone Q8 | gap |
+| --- | --- | --- | --- | --- | --- |
+| routed experts and routing | TurboMind NVFP4 GEMM, FP16 MoE GEMV (layers 20–23), radix sort, select, permute / unpermute | ~8.2 | `_w13_situ`, `_w2` (dp4a NVFP4 GEMV, fused SiTU), `_router`, `_router_logits` | ~4.7 | ~3.5 |
+| loop controllers | `_k_group_kernel` (K-grouped linear), `_blend_rms_norm` | ~3.2 | `_ctrl_down`, `_ctrl_apply` | ~0.8 | ~2.4 |
+| attention and short convs | `_rel_attention`, `_attn_prologue`, `_rel_decode_combine`, `_sconv` | ~3.6 | `_inkling2_attn`, `_inkling2_attn_g3`, `_prep`, `_sconv` | ~1.4 | ~2.2 |
+| residual mixing and norms | `_attn_res_row`, `_pair_rms_norm` | ~1.2 | `_mix`, `_merge`, `_rows_norm` | ~1.4 | ~0 |
+| dense projections and LM head | cuBLAS GEMV, CUTLASS | ~5.6 | cuBLAS GEMV, CUTLASS | ~5.3 | ~0 |
+
+What this means:
+- **Three components account for nearly all of the 9 ms gap**: routed experts, loop
+  controllers, and attention with short convs.
+- **Dense projections cost the same**; the Q4 GGUF saves a further ~0.9 ms there with Q8_0
+  GEMV.
+- **Kernel count matters less.** CUDA graphs remove most launch overhead in serving, so
+  these GPU-time gaps are the ones to close.
+
 ## Follow-ups (separate stacked PRs)
 
-1. **Single-card decode speed.** Profile #1598 per op at TP=1 against the standalone port.
-   Bring over only the kernels that win (candidates: dp4a NVFP4 expert GEMV, fused mix /
-   loop controller / prep / router kernels, split-KV decode attention for full and
-   sliding-window visits).
-2. **KV memory on one card.** Confirm the cause of the per-token overhead. If it is
-   allocator-level, discuss with maintainers before changing shared code.
+1. **Single-card decode speed**, in the order of the profile:
+   - routed-expert decode: dp4a NVFP4 GEMV with fused SiTU, and a routing path without
+     sort / permute for small batches;
+   - loop controllers: fused down and apply;
+   - decode attention and short convs: fused prep with the K/V convs, and grouped-query
+     split-KV attention.
+
+   Each kernel only replaces #1598's decode path where measured faster at TP=1 and TP=2,
+   behind #1598's existing dispatch.
+2. **KV memory on one card.**
+   - 1Cat's `SlidingWindowSpec.max_memory_usage_bytes` is already window-bounded.
+   - By that sizing, #1598 at 64k context should need ~2.6 GiB, but startup asked for
+     5.79 GiB.
+   - The cause is not yet identified. Next: log the per-group admission sizes from
+     `get_kv_cache_configs`, and compare with prefix caching on and off.
