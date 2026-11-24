@@ -28,8 +28,11 @@ _LAYERS = (0, 5, 11, 20, 23)  # sliding, full, looped full, BF16/Q8_0 experts, l
 
 def _adapter(path):
     reader = gguf.GGUFReader(path)
-    meta = {k: f.contents() for k, f in reader.fields.items()
-            if k.startswith(("inkling2.", "general.architecture"))}
+    meta = {
+        k: f.contents()
+        for k, f in reader.fields.items()
+        if k.startswith(("inkling2.", "general.architecture"))
+    }
     config = inkling2_config_from_gguf(meta).text_config
     tensors = {t.name: t for t in reader.tensors}
     adapter = Inkling2Adapter(config)
@@ -66,7 +69,8 @@ needs_q4 = pytest.mark.skipif(
 def test_names_cover_the_official_text_model():
     adapter, tensors, name_map = _adapter(_Q8)
     with _official() as f:
-        official = {k for k in f.keys() if not k.startswith("model.visual.")}
+        names = f.keys()  # safetensors handle, not a dict
+        official = {k for k in names if not k.startswith("model.visual.")}
     # expert global scales ("*_exps.scale") are emitted with their bank
     yielded = {n for n in name_map.values() if "_exps." not in n}
     expert_extras = {
@@ -102,23 +106,28 @@ def test_q8_matches_official_values():
             assert w.shape == ref.shape, (name, w.shape, ref.shape)
             if name.endswith("_amax"):
                 denom = f.get_tensor(name.replace("_amax", "_outer_scale_denominator"))
-                torch.testing.assert_close(w.float(), ref.float() / denom.float(),
-                                           rtol=1e-6, atol=0)
+                torch.testing.assert_close(
+                    w.float(), ref.float() / denom.float(), rtol=1e-6, atol=0
+                )
             elif name.endswith("_outer_scale_denominator"):
                 continue  # checked together with amax
             elif ref.dtype in (torch.uint8, torch.float8_e4m3fn):
                 assert w.dtype == ref.dtype, name
                 assert torch.equal(w.view(torch.uint8), ref.view(torch.uint8)), name
             else:
-                torch.testing.assert_close(w.float(), ref.float(), rtol=0, atol=0,
-                                           msg=name)
+                torch.testing.assert_close(
+                    w.float(), ref.float(), rtol=0, atol=0, msg=name
+                )
 
 
 @needs_q4
 def test_q4_dense_within_q8_0_error():
     adapter, tensors, name_map = _adapter(_Q4)
-    sub = {r: n for r, n in name_map.items()
-           if _selected(n) and n.endswith(("wq_du.weight", "wo_ud.weight"))}
+    sub = {
+        r: n
+        for r, n in name_map.items()
+        if _selected(n) and n.endswith(("wq_du.weight", "wo_ud.weight"))
+    }
     with _official() as f:
         for name, w in adapter.weights(tensors, sub, torch.float16):
             ref = f.get_tensor(name).float()

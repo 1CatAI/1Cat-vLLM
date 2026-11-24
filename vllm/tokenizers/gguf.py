@@ -215,9 +215,7 @@ def tokenizer_from_gguf_metadata(metadata, **kwargs):
             if added
             else regex.compile(r"(?!x)x")
         )
-        tokenizer._qwen_piece_pattern = regex.compile(
-            _pre_pattern(pre)
-        )
+        tokenizer._qwen_piece_pattern = regex.compile(_pre_pattern(pre))
     return tokenizer
 
 

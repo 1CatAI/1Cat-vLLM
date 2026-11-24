@@ -28,9 +28,15 @@ def run(model: str, out: str) -> None:
     from vllm import LLM, SamplingParams
 
     kw = dict(
-        model=model, dtype="float16", kv_cache_dtype="float16", max_model_len=4096,
-        max_num_seqs=4, max_num_batched_tokens=2048, gpu_memory_utilization=0.90,
-        enforce_eager=True, enable_prefix_caching=False,
+        model=model,
+        dtype="float16",
+        kv_cache_dtype="float16",
+        max_model_len=4096,
+        max_num_seqs=4,
+        max_num_batched_tokens=2048,
+        gpu_memory_utilization=0.90,
+        enforce_eager=True,
+        enable_prefix_caching=False,
         language_model_only=True,  # the GGUFs carry no vision tower
     )
     if model.endswith(".gguf"):
@@ -40,13 +46,17 @@ def run(model: str, out: str) -> None:
     res = []
     for o in llm.generate(PROMPTS, sp):
         c = o.outputs[0]
-        res.append({
-            "prompt": o.prompt,
-            "prompt_ids": list(o.prompt_token_ids),
-            "ids": list(c.token_ids),
-            "text": c.text,
-            "logprobs": [{str(k): v.logprob for k, v in s.items()} for s in c.logprobs],
-        })
+        res.append(
+            {
+                "prompt": o.prompt,
+                "prompt_ids": list(o.prompt_token_ids),
+                "ids": list(c.token_ids),
+                "text": c.text,
+                "logprobs": [
+                    {str(k): v.logprob for k, v in s.items()} for s in c.logprobs
+                ],
+            }
+        )
     with open(out, "w") as f:
         json.dump(res, f, ensure_ascii=False, indent=1)
     print("wrote", out)
