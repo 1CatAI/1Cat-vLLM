@@ -197,11 +197,15 @@ class Inkling2DecoderLayer(nn.Module):
             config.hidden_size, eps, num_inputs=self.num_attn_inputs
         )
         self.mlp_norm = Inkling2RMSNorm(config.hidden_size, eps)
-        expert_format: QuantFormat = (
-            "mxfp8"
-            if quant_config is not None and quant_config.is_mxfp8_layer(layer_id)
-            else "nvfp4"
-        )
+        expert_format: QuantFormat
+        if layer_id in getattr(config, "gguf_dense_expert_layers", ()):
+            expert_format = "fp16"
+        elif isinstance(
+            quant_config, Inkling2QuantConfig
+        ) and quant_config.is_mxfp8_layer(layer_id):
+            expert_format = "mxfp8"
+        else:
+            expert_format = "nvfp4"
         self.mlp = Inkling2MoE(config, expert_format, config.layer_visit_ids(layer_id))
         self.attn_sconv, self.mlp_sconv = (
             Inkling2ShortConv(
@@ -543,7 +547,15 @@ class Inkling2ForConditionalGeneration(
         super().__init__()
         config: Inkling2MMConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        assert quant_config is None or isinstance(quant_config, Inkling2QuantConfig)
+        # GGUF checkpoints (llama.cpp / Unsloth) reach the model as official
+        # tensors through the Inkling2 GGUF adapter; their dense layers run
+        # unquantized like the official checkpoint's.
+        self.gguf = getattr(quant_config, "get_name", lambda: None)() == "gguf"
+        assert (
+            quant_config is None
+            or self.gguf
+            or isinstance(quant_config, Inkling2QuantConfig)
+        )
         assert vllm_config.parallel_config.pipeline_parallel_size == 1
         if vllm_config.model_config.enable_prompt_embeds:
             # The reference applies embed_norm to raw input embeddings, which
@@ -783,6 +795,15 @@ class Inkling2ForConditionalGeneration(
                     continue
                 raise ValueError(f"Unexpected checkpoint tensor: {name}")
             param = params[name]
+            if (
+                self.gguf
+                and param.dtype != weight.dtype
+                and param.is_floating_point()
+                and weight.is_floating_point()
+                and weight.element_size() > 1
+            ):
+                # F32 / BF16 / dequantized Q8_0 GGUF tensors
+                weight = weight.to(param.dtype)
             if param.dtype != weight.dtype:
                 if ".mlp.experts." in name and weight.dtype == torch.bfloat16:
                     raise ValueError(

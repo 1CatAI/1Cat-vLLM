@@ -771,7 +771,12 @@ class ModelConfig:
                 )
 
         # Multimodal GGUF models must use original repo for mm processing
-        if is_gguf(self.tokenizer) and self.is_multimodal_model:
+        # (not needed when only the language model runs).
+        if (
+            is_gguf(self.tokenizer)
+            and self.is_multimodal_model
+            and not self.multimodal_config.language_model_only
+        ):
             raise ValueError(
                 "Loading a multimodal GGUF model needs to use original "
                 "tokenizer. Please specify the unquantized hf model's "

@@ -209,6 +209,7 @@ class Inkling2Sm70Experts(nn.Module):
         self.gate_cap = float(config.mlp_gate_softcap)
         self.up_cap = float(config.mlp_up_softcap)
         self.nvfp4 = quant_format == "nvfp4"
+        self.dense = quant_format == "fp16"
         self.hidden_size = int(config.hidden_size)
         self.intermediate_size = int(config.intermediate_size)
 
@@ -220,6 +221,14 @@ class Inkling2Sm70Experts(nn.Module):
             (self.hidden_size, self.intermediate_size),
         )
         for name, (n, k) in zip(("w13", "w2"), self.shapes):
+            if self.dense:
+                self._register(
+                    f"{name}_weight",
+                    (n, k),
+                    torch.float16,
+                    loader=self._load_expert_shard,
+                )
+                continue
             self._register(
                 f"{name}_weight",
                 (n, k // pack),
@@ -462,6 +471,11 @@ class Inkling2Sm70Experts(nn.Module):
                 delattr(self, f"{name}_weight_scale")
                 delattr(self, f"{name}_weight_amax")
                 delattr(self, f"{name}_weight_outer_scale_denominator")
+        elif self.dense:
+            for name in ("w13", "w2"):
+                fp16_w = getattr(self, f"{name}_weight").data.contiguous()
+                self.register_buffer(f"{name}_fp16", fp16_w, persistent=False)
+                delattr(self, f"{name}_weight")
         else:
             for name in ("w13", "w2"):
                 raw_w = getattr(self, f"{name}_weight").data
