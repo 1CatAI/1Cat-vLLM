@@ -119,11 +119,78 @@ __global__ void stable_restore_recovered(float const* recovered,
   }
 }
 
-// Each lane reads a pair of adjacent query rows. K tiles stay independent,
-// preserving coalesced loads from the transposed cuBLAS score workspace.
+// Each lane reads a pair of adjacent query rows (or 8 rows via 16B uint4 under
+// PREFIX_SM70_V3_VEC_STABLE). K tiles stay independent, preserving coalesced
+// loads from the transposed cuBLAS score workspace.
 template <bool Tail, bool Repair = false>
 __global__ void stable_row_max_partials(__half const* scores, float* partials,
                                         int rows, int width) {
+#if defined(PREFIX_SM70_V3_VEC_STABLE)
+  int row = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (row >= rows) return;
+  if constexpr (Repair) {
+    if (!g_79t_prefix_outliers[row / PVThreadblockShape::kM]) return;
+  }
+  int stride = rows;
+  int local_row = row;
+  int64_t base = 0;
+  if constexpr (Tail) {
+    constexpr int tile_tokens = PREFIX_BATCHED_TAIL_TILE_TOKENS;
+    constexpr int tile_rows = tile_tokens * 6;
+    int tile = row / tile_rows;
+    local_row = row % tile_rows;
+    stride = tile_rows;
+    width = (tile + 1) * tile_tokens;
+    base = int64_t(tile_rows) * tile_tokens * tile * (tile + 1) / 2;
+  }
+  constexpr int kTileW = Tail ? 512 : 1024;
+  int start_c = int(blockIdx.y) * kTileW;
+  int64_t offset = int64_t(blockIdx.y) * rows + row;
+  if (start_c >= width) {
+  #pragma unroll
+    for (int j = 0; j < 8; ++j) partials[offset + j] = -CUDART_INF_F;
+    if constexpr (Tail) {
+      int64_t soff = int64_t(gridDim.y + blockIdx.y) * rows + row;
+  #pragma unroll
+      for (int j = 0; j < 8; ++j) partials[soff + j] = -CUDART_INF_F;
+    }
+    return;
+  }
+  float mx[8];
+  float sm[8];
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    mx[j] = -CUDART_INF_F;
+    sm[j] = -CUDART_INF_F;
+  }
+  int end = min(width, start_c + kTileW);
+  constexpr int kStride = (Tail || Repair) ? 1 : 8;
+  __half const* ptr = scores + base + local_row;
+  #pragma unroll 4
+  for (int col = start_c; col < end; col += kStride) {
+    uint4 v = *reinterpret_cast<uint4 const*>(ptr + int64_t(col) * stride);
+    __half2 const* vh = reinterpret_cast<__half2 const*>(&v);
+  #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      float2 b = __half22float2(vh[j]);
+      mx[2 * j] = fmaxf(mx[2 * j], b.x);
+      mx[2 * j + 1] = fmaxf(mx[2 * j + 1], b.y);
+      if constexpr (Tail) {
+        if ((col & 7) == 0) {
+          sm[2 * j] = fmaxf(sm[2 * j], b.x);
+          sm[2 * j + 1] = fmaxf(sm[2 * j + 1], b.y);
+        }
+      }
+    }
+  }
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) partials[offset + j] = mx[j];
+  if constexpr (Tail) {
+    int64_t sample_offset = int64_t(gridDim.y + blockIdx.y) * rows + row;
+  #pragma unroll
+    for (int j = 0; j < 8; ++j) partials[sample_offset + j] = sm[j];
+  }
+#else
   int row = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
   if (row >= rows) return;
   if constexpr (Repair) {
@@ -148,7 +215,7 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
   // Prefix PV detects missed peaks while reading all scores; flagged tiles are
   // rescanned completely and recomputed before their output can be merged.
   constexpr int kStride = (Tail || Repair) ? 1 : 8;
-#pragma unroll 4
+  #pragma unroll 4
   for (int col = int(blockIdx.y) * 8192; col < end; col += kStride) {
     float2 value = __half22float2(*reinterpret_cast<__half2 const*>(
         scores + base + int64_t(col) * stride + local_row));
@@ -169,6 +236,7 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
     partials[sample_offset] = sampled.x;
     partials[sample_offset + 1] = sampled.y;
   }
+#endif
 }
 
 template <bool Tail, bool Repair = false>
@@ -234,14 +302,79 @@ __global__ void stable_merge_prefix(StablePrefixPartial const* partial,
   }
   __syncthreads();
   if (!valid) return;
-#pragma unroll
+#if defined(PREFIX_SM70_V3_VEC_STABLE) && \
+    defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
+  float s0 = scales[group][0];
+  float s1 = scales[group][1];
+  int64_t idx4 = int64_t(row) * 64 + lane;
+  float4 p = reinterpret_cast<float4 const*>(partial)[idx4];
+  float4* acc_p = reinterpret_cast<float4*>(accumulator) + idx4;
+  if (first) {
+    *acc_p = make_float4(p.x * s1, p.y * s1, p.z * s1, p.w * s1);
+  } else {
+    float4 a = *acc_p;
+    *acc_p = make_float4(a.x * s0 + p.x * s1, a.y * s0 + p.y * s1,
+                         a.z * s0 + p.z * s1, a.w * s0 + p.w * s1);
+  }
+#else
+  #pragma unroll
   for (int d = lane; d < 256; d += kThreadsPerRow) {
     int64_t index = int64_t(row) * 256 + d;
     accumulator[index] =
         (first ? 0.0f : accumulator[index] * scales[group][0]) +
         stable_partial_to_float(partial[index]) * scales[group][1];
   }
+#endif
 }
+
+#if defined(PREFIX_SM70_V3_SPLITK2_PV) && \
+    defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
+__global__ void stable_merge_prefix_2way(float const* partial0,
+                                         float const* partial1,
+                                         float* block_sum,
+                                         float const* block_max,
+                                         float* accumulator, float* sum,
+                                         float* maximum, bool first) {
+  constexpr int kRowsPerBlock = 4;
+  constexpr int kThreadsPerRow = 64;
+  int group = threadIdx.x / kThreadsPerRow;
+  int lane = threadIdx.x % kThreadsPerRow;
+  int row = blockIdx.x * kRowsPerBlock + group;
+  bool valid = row < g_rows;
+  __shared__ float scales[kRowsPerBlock][2];
+  if (lane == 0 && valid) {
+    float old_max = first ? -CUDART_INF_F : maximum[row];
+    float next = fmaxf(old_max, block_max[row]);
+    scales[group][0] = first ? 0.0f : expf(old_max - next);
+    scales[group][1] = expf(block_max[row] - next);
+    sum[row] = (first ? 0.0f : sum[row] * scales[group][0]) +
+               block_sum[row] * scales[group][1];
+    maximum[row] = next;
+    block_sum[row] = 0.0f;
+  }
+  __syncthreads();
+  if (!valid) return;
+  float s0 = scales[group][0];
+  float s1 = scales[group][1];
+  int64_t idx4 = int64_t(row) * 64 + lane;
+  float4 p0 = reinterpret_cast<float4 const*>(partial0)[idx4];
+  float4 p1 = reinterpret_cast<float4 const*>(partial1)[idx4];
+  // If outlier repair ran on this M-tile, repair_prefix_pv_kernel already
+  // recomputed the complete prefix block into partial0.
+  bool repaired = g_79t_prefix_outliers[row / PVThreadblockShape::kM] != 0;
+  float4 p = repaired ? p0
+                      : make_float4(p0.x + p1.x, p0.y + p1.y, p0.z + p1.z,
+                                    p0.w + p1.w);
+  float4* acc_p = reinterpret_cast<float4*>(accumulator) + idx4;
+  if (first) {
+    *acc_p = make_float4(p.x * s1, p.y * s1, p.z * s1, p.w * s1);
+  } else {
+    float4 a = *acc_p;
+    *acc_p = make_float4(a.x * s0 + p.x * s1, a.y * s0 + p.y * s1,
+                         a.z * s0 + p.z * s1, a.w * s0 + p.w * s1);
+  }
+}
+#endif
 
 __global__ void stable_merge_final(float const* prefix, float const* prefix_sum,
                                    float const* prefix_max, __half const* tail,

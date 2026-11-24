@@ -30,7 +30,9 @@ enum class CacheSlot {
   Q8192Score,
   Q4096Half2,
   Q4096Score,
-  Q4096Scores
+  Q4096Scores,
+  Q2048Half2,
+  Q2048Score
 };
 
 class PrefillOwner : public torch::CustomClassHolder {
@@ -48,6 +50,8 @@ class PrefillOwner : public torch::CustomClassHolder {
   at::Tensor q8192(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
                    double scale, bool causal);
   at::Tensor q4096(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
+                   double scale, bool causal);
+  at::Tensor q2048(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
                    double scale, bool causal);
 
   template <typename T, typename Factory>
@@ -71,13 +75,13 @@ class PrefillOwner : public torch::CustomClassHolder {
   }
 
  private:
-  // kind: 0 = Q8000, 1 = Q8192, 2 = Q4096.
+  // kind: 0 = Q8000, 1 = Q8192, 2 = Q4096, 3 = Q2048.
   at::Tensor run(int kind, at::Tensor q, at::Tensor k, at::Tensor v,
                  at::Tensor out, double scale, bool causal);
   const std::vector<int64_t> values_;
   std::recursive_mutex mutex_;
   bool closed_ = false;
-  std::array<int64_t, 3> observations_{};
+  std::array<int64_t, 4> observations_{};
   std::map<int, std::map<CacheSlot, std::shared_ptr<void>>> caches_;
 };
 

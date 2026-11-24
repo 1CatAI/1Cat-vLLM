@@ -1466,9 +1466,163 @@ LEGACY_ALIASES = {
 }
 
 
+def _run_sm70_27b_v3_padded(
+    op: Callable[..., torch.Tensor],
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    q_target: int,
+) -> torch.Tensor:
+    q_len = int(query.shape[1])
+    kv_len = int(key.shape[1])
+    kv_pad = (32 - (kv_len % 32)) % 32
+    if q_len == q_target and kv_pad == 0:
+        return _run_sm70_gqa_groups(op, query, key, value, out, softmax_scale, True)
+    lead_pad = q_target - q_len - kv_pad
+    assert lead_pad >= 0
+    padded_q, padded_out = _get_sm70_79t_q8192_padding_workspace(query, q_target)
+    if lead_pad > 0:
+        padded_q[:, :lead_pad].zero_()
+    padded_q[:, lead_pad : lead_pad + q_len].copy_(query)
+    if kv_pad > 0:
+        padded_q[:, lead_pad + q_len :].zero_()
+        key = torch.nn.functional.pad(key, (0, 0, 0, 0, 0, kv_pad))
+        value = torch.nn.functional.pad(value, (0, 0, 0, 0, 0, kv_pad))
+    _run_sm70_gqa_groups(op, padded_q, key, value, padded_out, softmax_scale, True)
+    out.copy_(padded_out[:, lead_pad : lead_pad + q_len])
+    return out
+
+
+def _try_sm70_27b_v3_architecture(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    splitd_out: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    dense_op: Callable[..., torch.Tensor],
+) -> torch.Tensor | None:
+    """Route extended 1024..4096 tail chunks and odd-KV shapes through native
+    Q4096 / Q2048 79T specializations without disturbing existing Q4000..Q4096
+    32-aligned dispatch and route telemetry."""
+    if (
+        _config.options().value("prefill_d256_gqa_v37")
+        or not _config.options().value("prefill_d256_gqa_arch_128k_experimental")
+        or _routing.is_cuda_graph_capturing(query)
+        or query.ndim != 4
+        or key.ndim != 4
+        or query.shape[0] <= 0
+        or query.shape[1] != max_seqlen_q
+        or key.shape[0] != query.shape[0]
+        or key.shape[1] != max_seqlen_k
+        or query.shape[3] != 256
+        or key.shape[3] != 256
+        or key.shape[2] <= 0
+        or query.shape[2] != 6 * key.shape[2]
+        or value.shape != key.shape
+        or query.dtype != torch.float16
+        or key.dtype != torch.float16
+        or value.dtype != torch.float16
+        or not (query.is_contiguous() and key.is_contiguous() and value.is_contiguous())
+        or abs(softmax_scale - 0.0625) > 1.0e-8
+        or max_seqlen_k < 8192
+        or max_seqlen_k > 262144
+        or max_seqlen_q < 1024
+        or max_seqlen_q > 4096
+        or max_seqlen_q > max_seqlen_k
+    ):
+        return None
+    kv_pad = (32 - (max_seqlen_k % 32)) % 32
+    if max_seqlen_k + kv_pad > 262144:
+        return None
+    # Standard Q4000..Q4096 with 32-aligned KV is handled by the normal
+    # Q4096 path right below so route telemetry stays identical.
+    if max_seqlen_q >= _config.SM70_79T_Q4096_MIN_QUERY_LEN and kv_pad == 0:
+        return None
+
+    q4096_op = _ops.get_sm70_d256_gqa_architecture_q4096_op()
+    q2048_op = _ops.get_sm70_d256_gqa_architecture_q2048_op()
+
+    try:
+        # Case 1: Large tail Q in [2944..4096] (or odd-KV Q in [4000..4096-kv_pad])
+        if (
+            q4096_op is not None
+            and max_seqlen_q >= 2944
+            and max_seqlen_q + kv_pad <= 4096
+        ):
+            return _run_sm70_27b_v3_padded(
+                q4096_op, query, key, value, splitd_out, softmax_scale, 4096
+            )
+
+        # Case 2: Medium tail Q in [1024..2048 - kv_pad] -> native Q2048
+        if q2048_op is not None and max_seqlen_q + kv_pad <= 2048:
+            return _run_sm70_27b_v3_padded(
+                q2048_op, query, key, value, splitd_out, softmax_scale, 2048
+            )
+
+        # Case 3: Upper-medium tail Q in [2049..2943] (or odd-KV Q near 2048/4096)
+        # Bottom core_q=(2048-kv_pad) via native Q2048 + top fringe via splitkv/dense.
+        if q2048_op is not None:
+            core_q = 2048 - kv_pad
+            fringe_q = max_seqlen_q - core_q
+            fringe_kv = max_seqlen_k - core_q  # Guaranteed multiple of 32.
+            if fringe_q > 0 and fringe_kv >= fringe_q and (fringe_kv % 32) == 0:
+                _run_sm70_27b_v3_padded(
+                    q2048_op,
+                    query[:, fringe_q:].contiguous(),
+                    key,
+                    value,
+                    splitd_out[:, fringe_q:],
+                    softmax_scale,
+                    2048,
+                )
+                padded_fringe = ((fringe_q + 63) // 64) * 64
+                if padded_fringe == fringe_q:
+                    fq = query[:, :fringe_q].contiguous()
+                    fout = splitd_out[:, :fringe_q]
+                    fpref = 0
+                else:
+                    fq = torch.zeros(
+                        (query.shape[0], padded_fringe, *query.shape[2:]),
+                        dtype=query.dtype,
+                        device=query.device,
+                    )
+                    fpref = padded_fringe - fringe_q
+                    fq[:, fpref:].copy_(query[:, :fringe_q])
+                    fout = torch.empty_like(fq)
+                fk = key[:, :fringe_kv].contiguous()
+                fv = value[:, :fringe_kv].contiguous()
+                res = _try_prefill_dense_splitkv(
+                    fq, fk, fv, fout, padded_fringe, fringe_kv, softmax_scale
+                )
+                if res is None:
+                    dense_op(fq, fk, fv, fout, softmax_scale, True)
+                if fpref:
+                    splitd_out[:, :fringe_q].copy_(fout[:, fpref:])
+                return splitd_out
+    except torch.OutOfMemoryError:
+        return None
+    return None
+
+
 def _try_dense_architecture(
     query, key, value, splitd_out, max_seqlen_q, max_seqlen_k, softmax_scale, dense_op
 ):
+    v3_result = _try_sm70_27b_v3_architecture(
+        query,
+        key,
+        value,
+        splitd_out,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        dense_op,
+    )
+    if v3_result is not None:
+        return v3_result
     splitd_result = None
     architecture_op = (
         _ops.get_sm70_d256_gqa_architecture_op()

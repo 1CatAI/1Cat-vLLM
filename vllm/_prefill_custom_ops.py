@@ -147,6 +147,14 @@ def maybe_gdn_rmsnorm_gated(
     num_tokens: int,
     layer_name: str,
 ) -> torch.Tensor | None:
+    from vllm._custom_ops import maybe_fast_gdn_rmsnorm_gated
+
+    dump_requested = _gdn_projection_dump_requested(layer_name)
+    fast_out = maybe_fast_gdn_rmsnorm_gated(
+        attn, core_attn_out, z, num_tokens, layer_name, dump_requested
+    )
+    if fast_out is not None:
+        return fast_out
     if not (
         num_tokens >= 256
         and not torch.compiler.is_compiling()
@@ -167,7 +175,7 @@ def maybe_gdn_rmsnorm_gated(
         and attn.norm.group_size is None
         and attn.norm.norm_before_gate
         and attn.norm.activation in ("silu", "swish")
-        and not _gdn_projection_dump_requested(layer_name)
+        and not dump_requested
     ):
         return None
     profile_start = attn._gdn_profiler.start()

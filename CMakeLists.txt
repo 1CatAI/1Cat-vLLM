@@ -886,6 +886,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     ARCHITECTURES "70"
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
+  define_extension_target(
+    _sm70_27b_prefill_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/sm70_turbomind/ops/sm70_27b_prefill.cu"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so" CUDA::cublas CUDA::cublasLt
+    WITH_SOABI)
   # Host-side expert-cache lane (C++ with the CUDA runtime); prebuilt so
   # installed wheels do not need the source tree or a JIT toolchain.
   define_extension_target(

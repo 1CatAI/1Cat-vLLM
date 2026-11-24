@@ -1228,6 +1228,9 @@ if TYPE_CHECKING:
     VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS: str | None = None
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS: str | None = None
     VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS: str | None = None
+    VLLM_SM70_27B_FAST_PREFILL: bool = True
+    VLLM_SM70_27B_PREFETCH_DEQUANT: bool = True
+    VLLM_SM70_27B_DISABLE_P2P_NORM: bool = False
 
 
 def get_default_cache_root():
@@ -21803,6 +21806,62 @@ environment_variables: dict[str, Callable[[], Any]] = {
             (
                 "Native reader: csrc/custom_all_reduce.cuh:277; its local operator "
                 "checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_27B_FAST_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_27B_FAST_PREFILL", "1"))),
+        description=(
+            "Enable SM70 27B dense prefill custom kernels (KN-cached FP32-accum "
+            "cuBLASLt GEMM, 16B SiLU+Mul, strided-z D=128 GDN RMSNormGated, and "
+            "NVLink P2P push RS+GemmaRMSNorm+AG)."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(
+            (
+                "Active on SM70 (V100) GPUs for dense prefill batches with M >= 256 "
+                "when the _sm70_27b_prefill_C extension is built; decode and CUDA "
+                "Graph capture paths stay on their existing kernels."
+            ),
+        ),
+        acceleration_paths=("SM70 dense prefill",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_27B_PREFETCH_DEQUANT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_27B_PREFETCH_DEQUANT", "1"))),
+        description=(
+            "Overlap next-layer NVFP4/FP8 weight dequantization on a side CUDA "
+            "stream during SM70 dense prefill."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(
+            (
+                "Active when VLLM_SM70_27B_FAST_PREFILL=1 and M >= 256 outside "
+                "CUDA Graph capture."
+            ),
+        ),
+        acceleration_paths=("SM70 dense prefill",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_27B_DISABLE_P2P_NORM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_27B_DISABLE_P2P_NORM", "0"))),
+        description=(
+            "Disable the SM70 TP2/TP4 NVLink P2P push RS+GemmaRMSNorm+AG kernel "
+            "and force the standard communicator fallback."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(
+            (
+                "Automatically bypassed on non-NVLink/PCIe topologies when native "
+                "peer atomics are unavailable on any TP rank."
             ),
         ),
         acceleration_paths=("SM70 collectives",),

@@ -4428,3 +4428,64 @@ def maybe_register_tp2_push_buffer(
         "through 640 KiB and 1..64-row fused Gemma RMSNorm."
     )
     return ptrs
+
+
+def try_create_peer_gemma_norm_runtime(
+    cpu_group,
+    device: torch.device | None,
+    rank: int,
+    world_size: int,
+    ca_comm,
+    *,
+    max_rows: int = 4096,
+):
+    if device is None or not current_platform.is_device_capability(
+        70, device_id=device.index
+    ):
+        return None
+    from vllm._sm70_27b_prefill_ops import Sm7027BPeerRuntime
+
+    return Sm7027BPeerRuntime.try_create(
+        cpu_group, device, rank, world_size, ca_comm, max_rows=max_rows
+    )
+
+
+def maybe_fast_gdn_rmsnorm_gated(
+    attn,
+    core_attn_out: torch.Tensor,
+    z: torch.Tensor,
+    num_tokens: int,
+    layer_name: str,
+    dump_requested: bool,
+) -> torch.Tensor | None:
+    from vllm._sm70_27b_prefill_ops import has_sm70_27b_prefill_ops
+
+    if not (
+        has_sm70_27b_prefill_ops()
+        and hasattr(torch.ops.vllm, "sm70_27b_gdn_rmsnorm_gated")
+        and hasattr(torch.ops.vllm, "sm70_qwen_gdn_rmsnorm_gated_configured")
+        and getattr(attn, "enable_sm70_gdn_rmsnorm_onepass", False)
+        and not getattr(attn, "enable_sm70_dflash2_fused_gdn_norm", False)
+        and core_attn_out.ndim == 3
+        and core_attn_out.shape[2] == 128
+        and core_attn_out.dtype == torch.float16
+        and z.ndim == 3
+        and z.shape == core_attn_out.shape
+        and z.dtype == torch.float16
+        and attn.norm.weight.shape == (128,)
+        and attn.norm.weight.dtype in (torch.float16, torch.float32)
+        and attn.norm.weight.is_contiguous()
+        and attn.norm.group_size is None
+        and attn.norm.norm_before_gate
+        and attn.norm.activation in ("silu", "swish")
+        and not dump_requested
+    ):
+        return None
+    return torch.ops.vllm.sm70_27b_gdn_rmsnorm_gated(
+        core_attn_out,
+        z,
+        attn.norm.weight,
+        float(attn.norm.eps),
+        attn.norm.activation,
+        bool(attn.gdn_policy.projection.rmsnorm_onepass),
+    )
