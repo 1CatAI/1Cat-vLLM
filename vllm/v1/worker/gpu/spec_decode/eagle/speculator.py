@@ -613,9 +613,11 @@ class EagleSpeculator(TargetSamplingHooks):
         pos = self.input_buffers.positions[last_token_indices]
         idx_mapping = self.idx_mapping[:num_reqs]
 
+        # Profile the full draft so its first compilation sees multiple rows.
         if (
             cudagraph_runtime_mode == CUDAGraphMode.NONE
             and (mm_inputs is None or not mm_inputs[0])
+            and attn_metadata is not None
             and num_tokens > 64
             and 0 < num_reqs <= 64
             and not torch.cuda.is_current_stream_capturing()

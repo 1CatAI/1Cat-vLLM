@@ -134,6 +134,39 @@ def test_mtp_moe_warmup_executes_each_captured_concurrency(
     ]
 
 
+@pytest.mark.parametrize("profiling", [True, False])
+def test_mtp_prefill_profiles_the_full_draft(
+    monkeypatch: pytest.MonkeyPatch, profiling: bool
+) -> None:
+    speculator = eagle_speculator.EagleSpeculator.__new__(
+        eagle_speculator.EagleSpeculator
+    )
+    rows = 128
+    speculator.last_token_indices = torch.tensor([rows - 1])
+    speculator.idx_mapping = torch.zeros(1, dtype=torch.int32)
+    speculator.input_buffers = SimpleNamespace(positions=torch.arange(rows))
+    speculator.hidden_states = torch.zeros(rows, 4)
+    speculator.draft_tokens = torch.zeros((1, 1), dtype=torch.int64)
+    speculator.current_draft_step = torch.zeros((), dtype=torch.int32)
+    speculator.draft_logits = None
+    speculator.draft_step_listener = None
+    speculator.run_model = mock.Mock(
+        return_value=(torch.ones(rows, 4), torch.ones(rows, 4))
+    )
+    speculator.run_last_rows_prefill = mock.Mock(
+        return_value=(torch.ones(1, 4), torch.ones(1, 4))
+    )
+    speculator._sample_draft = mock.Mock(return_value=torch.tensor([7]))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    metadata = None if profiling else {"draft": object()}
+    speculator.prefill(1, rows, metadata, None, None)
+
+    assert speculator.run_model.call_count == int(profiling)
+    assert speculator.run_last_rows_prefill.call_count == int(not profiling)
+    assert speculator.draft_tokens.item() == 7
+
+
 def test_qwen4_exp_mtp_v2_unpacks_logits_and_feedback_hidden_states(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
