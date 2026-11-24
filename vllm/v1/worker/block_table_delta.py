@@ -30,7 +30,7 @@ _CAP_TRIPLETS = 1 << 17
 _RING = 4
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["n"])
 def _scatter_block_table_kernel(
     table_ptrs,  # int64[num_groups]: base address of each group's int32 table
     packed,  # int32[3 * n]: (group, flat index, value) triplets

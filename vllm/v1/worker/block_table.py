@@ -591,7 +591,7 @@ class MultiGroupBlockTable:
         return self.block_tables[idx]
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_tokens"])
 def _compute_slot_mapping_kernel(
     num_tokens,
     max_num_tokens,
@@ -649,7 +649,7 @@ def _compute_slot_mapping_kernel(
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_tokens"])
 def _compute_slot_mapping_no_pad_kernel(
     num_tokens,
     query_start_loc_ptr,  # [num_reqs + 1], int32
@@ -694,7 +694,7 @@ def _compute_slot_mapping_no_pad_kernel(
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_tokens"])
 def _compute_slot_mapping_single_req_no_pad_kernel(
     num_tokens,
     positions_ptr,  # [num_tokens], int64

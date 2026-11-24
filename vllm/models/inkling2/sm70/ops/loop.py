@@ -18,7 +18,7 @@ from vllm.triton_utils import tl, tldevice, triton
 from .norm import rsqrt
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["T"])
 def _pair_rms_norm_kernel(
     Dest,
     Message,
@@ -65,7 +65,7 @@ def pair_rms_norm(dest: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["T"])
 def _blend_rms_norm_kernel(
     Dest,
     Message,

@@ -85,7 +85,7 @@ def gate_sink(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["n"])
 def _log_scaling_tau_kernel(
     Pos,
     Out,

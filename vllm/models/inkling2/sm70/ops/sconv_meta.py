@@ -35,7 +35,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["T"])
 def _fused_sconv_kernel(
     x_ptr,  # [T, H*WS] head-major current-token inputs (also residual)
     cache_ptr,  # [num_blocks, H, N, D] paged (page-strided view)
@@ -223,7 +223,7 @@ def fused_sconv(
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_actual_tokens", "num_padded_tokens"])
 def _seq_metadata_kernel(
     qsl_ptr,  # [num_reqs + 1] int32 cumulative query start rows
     seq_idx_ptr,  # [T] int32 out: token -> owning request
