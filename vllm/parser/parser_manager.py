@@ -301,6 +301,20 @@ class ParserManager:
         if reasoning_parser_cls is None and tool_parser_cls is None:
             return None
 
+        if (
+            reasoning_parser_cls is not None
+            and tool_parser_cls is not None
+            and getattr(reasoning_parser_cls, "parses_content_delimiters", False)
+            and not getattr(tool_parser_cls, "supports_content_delimiters", False)
+        ):
+            raise ValueError(
+                f"Reasoning parser {reasoning_parser_cls.__name__} preserves "
+                "content delimiter tokens and cannot be combined with tool "
+                f"parser {tool_parser_cls.__name__}. Use a compatible tool "
+                "parser (such as '--tool-call-parser inkling2') or disable "
+                "tool call parsing."
+            )
+
         # Set the class-level attributes on the imported _WrappedParser
         _WrappedParser.reasoning_parser_cls = reasoning_parser_cls
         _WrappedParser.tool_parser_cls = tool_parser_cls
