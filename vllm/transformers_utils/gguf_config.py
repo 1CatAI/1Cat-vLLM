@@ -23,6 +23,8 @@ _ARCHITECTURES = {
     "qwen35moe": ("qwen3_5_moe_text", "Qwen3_5MoeForCausalLM"),
     "dflash": ("qwen3", "DFlash2DraftModel"),
     "qwen4exp": ("qwen4_exp_text", "Qwen4ExpForCausalLM"),
+    # Built by vllm.models.inkling2.gguf_config (see gguf_config_from_metadata);
+    # listed here so native GGUF config loading accepts the architecture.
     "inkling2": ("inkling2_loop", "Inkling2LoopForConditionalGeneration"),
 }
 
@@ -51,6 +53,11 @@ def gguf_config_dict(metadata: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"No native GGUF config adapter for architecture {arch!r}. "
             "Provide --hf-config-path with an explicit model config."
+        )
+    if arch == "inkling2":
+        raise ValueError(
+            "Inkling2 GGUF configs are built by gguf_config_from_metadata, not "
+            "the generic GGUF config dictionary"
         )
     model_type, implementation = _ARCHITECTURES[arch]
 

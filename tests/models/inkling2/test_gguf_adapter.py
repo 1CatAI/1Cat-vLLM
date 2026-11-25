@@ -80,7 +80,10 @@ def test_names_cover_the_official_text_model():
         for s in ("_scale", "_amax", "_outer_scale_denominator")
     }
     produced = yielded | expert_extras
-    # every official text tensor is produced; extras only for non-NVFP4 banks
+    # every official text tensor name is mapped; names the official checkpoint
+    # lacks may only belong to expert banks (the dense banks of layers 20-23
+    # have no NVFP4 scales). Real yields are checked in
+    # test_q8_matches_official_values.
     assert official - produced == set()
     extra = produced - official
     assert all(".mlp.experts.w" in n for n in extra), sorted(extra)[:5]
@@ -90,9 +93,11 @@ def test_names_cover_the_official_text_model():
 def test_q8_matches_official_values():
     adapter, tensors, name_map = _adapter(_Q8)
     sub = {r: n for r, n in name_map.items() if _selected(n)}
+    yielded = set()
     with _official() as f:
         keys = set(f.keys())
         for name, w in adapter.weights(tensors, sub, torch.float16):
+            yielded.add(name)
             assert name in keys or ".mlp.experts.w" in name, name
             if name.endswith(("w13_weight", "w2_weight")) and w.is_floating_point():
                 # BF16 banks of the layers the official checkpoint holds as MXFP8
@@ -118,6 +123,12 @@ def test_q8_matches_official_values():
                 torch.testing.assert_close(
                     w.float(), ref.float(), rtol=0, atol=0, msg=name
                 )
+
+    # NVFP4 banks must come with their block scales and global scale
+    for name in sub.values():
+        if name.endswith(("w13_weight", "w2_weight")) and name + "_amax" in keys:
+            for suffix in ("_scale", "_amax", "_outer_scale_denominator"):
+                assert name + suffix in yielded, name + suffix
 
 
 @needs_q4
