@@ -1148,6 +1148,13 @@ class VllmConfig:
                 "activations and recurrent states retain their precision."
             )
 
+        # SM70: env-gated QSA host-KV history. Must run before
+        # resolve_attention_history below, which gates on
+        # kernel_config.qsa_host_kv.
+        if envs.VLLM_SM70_QSA_HOST_KV:
+            self.kernel_config.qsa_host_kv = True
+            self.kernel_config.qsa_host_kv_device_reference = False
+
         self.try_verify_and_update_config()
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.

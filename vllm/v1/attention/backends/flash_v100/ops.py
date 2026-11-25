@@ -163,6 +163,7 @@ def get_flash_ops():
 
 def get_flash_grouped_verify_op():
     """Load the optional exact SM70 grouped verifier."""
+    prepare_attention_runtime()
     global _flash_attn_grouped_verify_paged
     global _flash_attn_grouped_verify_max_query_tokens
     global _flash_attn_grouped_verify_request_major_abi_version
@@ -438,6 +439,7 @@ _flash_attn_forward_lse_checked = False
 
 def get_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
     """Lazy-load the private LSE-capable forward entry of the FA-V100 wheel."""
+    prepare_attention_runtime()
     global _flash_attn_forward_lse, _flash_attn_forward_lse_checked
     if not _flash_attn_forward_lse_checked:
         _flash_attn_forward_lse_checked = True

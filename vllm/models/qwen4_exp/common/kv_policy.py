@@ -89,10 +89,30 @@ def resolve_qsa_host_kv(cfg) -> bool:
 
     policy = cfg.kernel_config
     model = cfg.model_config
+    hf = getattr(model, "hf_text_config", None) if model is not None else None
+
+    # GLM5next exposes the QSA selector metadata as index_n_heads /
+    # index_kpool / index_topk with qk_nope_head_dim (head_dim unset); the
+    # qwen4_exp names are indexer_n_heads / indexer_compress_ratio /
+    # indexer_budget / head_dim. Normalize before gating.
+    idx_heads = getattr(hf, "indexer_n_heads", None)
+    compress = getattr(hf, "indexer_compress_ratio", None)
+    budget = getattr(hf, "indexer_budget", None)
+    hdim = getattr(hf, "head_dim", None)
+    if hf is not None:
+        if idx_heads is None:
+            idx_heads = getattr(hf, "index_n_heads", None)
+        if compress is None:
+            compress = getattr(hf, "index_kpool", None)
+        if budget is None:
+            budget = getattr(hf, "index_topk", None)
+        if not hdim:
+            hdim = getattr(hf, "qk_nope_head_dim", None)
+
     reason = None
     if not policy.qsa_host_kv:
         reason = "disabled by KernelConfig"
-    elif model is None or not getattr(model.hf_text_config, "indexer_n_heads", None):
+    elif model is None or not idx_heads:
         reason = "no QSA selector metadata"
     elif not current_platform.is_cuda() or not current_platform.is_device_capability(
         70
@@ -100,13 +120,15 @@ def resolve_qsa_host_kv(cfg) -> bool:
         reason = "requires SM70 CUDA"
     elif model.dtype != torch.float16:
         reason = "host staging requires FP16 activations"
-    elif getattr(model.hf_text_config, "head_dim", None) != 256:
+    elif hdim != 256:
         reason = "host staging requires D256"
-    elif getattr(model.hf_text_config, "indexer_compress_ratio", None) != 4 or (
-        getattr(model.hf_text_config, "indexer_budget", 0) % 4
-    ):
+    elif compress != 4 or (budget or 0) % 4:
         reason = "host staging requires complete four-token selector pages"
-    elif model.get_num_kv_heads(cfg.parallel_config) != 1:
+    elif model.get_num_kv_heads(cfg.parallel_config) != 1 and not getattr(
+        hf, "kv_lora_rank", None
+    ):
+        # MLA latent KV is one shared head per layer per rank, so the raw
+        # num_key_value_heads/TP gate does not apply.
         reason = "host writer requires one TP-local KV head"
     elif cfg.parallel_config.decode_context_parallel_size not in (1, 2) or (
         cfg.parallel_config.prefill_context_parallel_size != 1
