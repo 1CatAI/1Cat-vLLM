@@ -68,7 +68,12 @@ class ImageMediaIO(MediaIO[Image.Image]):
             image = normalize_image(image)
             image.load()
             image = self._convert_image_mode(image)
-        except (OSError, Image.UnidentifiedImageError) as e:
+        except (
+            OSError,
+            Image.UnidentifiedImageError,
+            SyntaxError,
+            Image.DecompressionBombError,
+        ) as e:
             raise ValueError(f"Failed to load image: {e}") from e
         return MediaWithBytes(image, data)
 
