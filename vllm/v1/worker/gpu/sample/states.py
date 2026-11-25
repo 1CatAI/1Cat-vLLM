@@ -30,11 +30,14 @@ class SamplingStates:
         self.min_p = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
         self.seeds = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
 
-        # Initialize top_k and top_p manually because 0 is an invalid value for them.
+        # Initialize top_k and top_p across every rotating UVA pool slot
+        # because 0 is an invalid value for them.
         self.top_k.np.fill(self.vocab_size)
-        self.top_k.copy_to_uva()
+        for _ in range(self.top_k.pool.max_concurrency):
+            self.top_k.copy_to_uva()
         self.top_p.np.fill(1.0)
-        self.top_p.copy_to_uva()
+        for _ in range(self.top_p.pool.max_concurrency):
+            self.top_p.copy_to_uva()
 
         self.num_logprobs = np.empty(self.max_num_reqs, dtype=np.int32)
         # -1 means no logprobs are requested.

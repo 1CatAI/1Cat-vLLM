@@ -1017,9 +1017,7 @@ def _topk_topp_kernel(
                         tl.abs(logits_blk - duplicate_logit) < 1e-9
                     ) & mask_n
                     duplicate_count = tl.cumsum(duplicate_mask) + num_kept
-                    duplicate_keep_mask = (
-                        duplicate_count <= num_duplicate_logit
-                    ) & duplicate_mask
+                    duplicate_keep_mask = (duplicate_count <= num_keep) & duplicate_mask
                     duplicate_remove_mask = duplicate_mask & ~duplicate_keep_mask
                     num_kept += tl.sum(duplicate_keep_mask)
                     keep_mask = keep_mask & (~duplicate_remove_mask)
