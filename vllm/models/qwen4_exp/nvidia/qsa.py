@@ -1727,6 +1727,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
 
             workspace = prefill_history_workspace(state)
+        if workspace is None and getattr(self, "_host_kv_write_deferred", False):
+            state.write(*self._host_kv_new)
+            self._host_kv_write_deferred = False
+
         if workspace is not None:
             # Prefill: one DMA of the whole history per layer, then device
             # reads, instead of re-reading host history for every query row.
@@ -1993,6 +1997,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     self.host_kv_is_draft,
                 )
                 return
+            if staged is None and getattr(self, "_host_kv_write_deferred", False):
+                # No single stage called write_staged for the new rows. Persist
+                # them before any window reads this step's physical pages.
+                assert new_kv is not None
+                state.write(*new_kv)
+                self._host_kv_write_deferred = False
+                state.clear_gpu_page_cache()
             if plan is None and query.shape[0] > 0:
                 # Longer than the stage buffer: stage it window by window and
                 # merge the windows' softmax states instead of falling back to
