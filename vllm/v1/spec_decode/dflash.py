@@ -59,7 +59,22 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
+        cache_updates: dict[str, Any] = {}
+        # Target-model skip-layer indices/patterns do not apply to draft layers.
+        if getattr(base.cache_config, "kv_cache_dtype_skip_layers", None):
+            cache_updates["kv_cache_dtype_skip_layers"] = []
         if (
+            getattr(base.model_config.hf_config, "sm70_force_fp16_draft_kv", False)
+            and base.cache_config.cache_dtype != "auto"
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+        ):
+            logger.info_once(
+                "Using FP16 draft KV cache for SM70 DSpark while the target uses %s.",
+                base.cache_config.cache_dtype,
+            )
+            cache_updates["cache_dtype"] = "auto"
+        elif (
             self.speculative_config.kv_cache_dtype is None
             and is_quantized_kv_cache(str(base.cache_config.cache_dtype))
             and current_platform.is_cuda()
@@ -70,9 +85,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 "target uses %s.",
                 base.cache_config.cache_dtype,
             )
+            cache_updates["cache_dtype"] = "auto"
+        if cache_updates:
             base = replace(
                 base,
-                cache_config=replace(base.cache_config, cache_dtype="auto"),
+                cache_config=replace(base.cache_config, **cache_updates),
             )
         return replace(
             base,
@@ -100,7 +117,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
             runner=runner,
         )
         self.use_ddtree = vllm_config.speculative_config.use_dflash_ddtree()
-        self.sample_from_anchor = vllm_config.speculative_config.use_dspark()
+        self.sample_from_anchor = vllm_config.speculative_config.use_dspark() and bool(
+            getattr(self.draft_model_config.hf_config, "sample_from_anchor", True)
+        )
         self.num_query_per_req = (
             self.num_speculative_tokens
             if self.sample_from_anchor

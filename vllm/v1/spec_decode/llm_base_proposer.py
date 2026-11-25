@@ -1097,7 +1097,28 @@ class SpecDecodeBaseProposer:
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states
             )
-            assert target_hidden_states.shape[-1] == self.hidden_size
+            if getattr(self.model, "expects_raw_aux_hidden_states", False):
+                n_aux = len(
+                    getattr(
+                        self.draft_model_config.hf_config,
+                        "dspark_target_layer_ids",
+                        (),
+                    )
+                )
+                assert n_aux >= 1, (
+                    "expects_raw_aux_hidden_states requires non-empty "
+                    "dspark_target_layer_ids"
+                )
+                assert target_hidden_states.shape[-1] == n_aux * self.hidden_size, (
+                    f"Expected raw aux hidden width {n_aux * self.hidden_size}, "
+                    f"got {target_hidden_states.shape[-1]}"
+                )
+                assert target_hidden_states.dtype == self.dtype, (
+                    f"Expected raw aux hidden dtype {self.dtype}, "
+                    f"got {target_hidden_states.dtype}"
+                )
+            else:
+                assert target_hidden_states.shape[-1] == self.hidden_size
         if profile_events is not None:
             self._step_profiler.add_cpu_ms(
                 profile_cpu_ms, "setup_combine_cpu", setup_stage_start
@@ -2150,7 +2171,7 @@ class SpecDecodeBaseProposer:
                 self.model.config.image_token_index = (
                     target_model.config.media_placeholder_token_id
                 )
-            else:
+            elif hasattr(target_model.config, "image_token_index"):
                 self.model.config.image_token_index = (
                     target_model.config.image_token_index
                 )
@@ -2168,6 +2189,7 @@ class SpecDecodeBaseProposer:
             self.parallel_drafting
             and self.pass_hidden_states_to_model
             and self.parallel_drafting_hidden_state_tensor is not None
+            and hasattr(self.model, "mask_hidden")
         ):
             flat_mask = self.model.mask_hidden.view(-1)
             if self.eagle3_use_aux_hidden_state:

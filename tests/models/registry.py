@@ -963,6 +963,14 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         "tencent/HunyuanOCR",
         hf_overrides={"num_experts": 0},
     ),
+    "Inkling2ForConditionalGeneration": _HfExamplesInfo(
+        "thinkingmachines/Inkling-2-Mini",
+        is_available_online=False,
+    ),
+    "Inkling2LoopForConditionalGeneration": _HfExamplesInfo(
+        "thinkingmachines/Inkling-2-Mini",
+        is_available_online=False,
+    ),
     "Idefics3ForConditionalGeneration": _HfExamplesInfo(
         "HuggingFaceM4/Idefics3-8B-Llama3",
         extras={"tiny": "HuggingFaceTB/SmolVLM-256M-Instruct"},
@@ -1443,6 +1451,11 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         "deepseek-ai/DeepSeek-V4-Flash",
         speculative_model="deepseek-ai/DeepSeek-V4-Flash",
         trust_remote_code=True,
+        is_available_online=False,
+    ),
+    "Inkling2DSparkModel": _HfExamplesInfo(
+        "thinkingmachines/Inkling-2-Mini",
+        speculative_model="thinkingmachines/Inkling-2-Mini",
         is_available_online=False,
     ),
     # [Eagle]

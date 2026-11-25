@@ -443,6 +443,14 @@ _MULTIMODAL_MODELS = {
         "hunyuan_vision",
         "HunYuanVLForConditionalGeneration",
     ),
+    "Inkling2ForConditionalGeneration": (
+        "vllm.models.inkling2",
+        "Inkling2ForConditionalGeneration",
+    ),
+    "Inkling2LoopForConditionalGeneration": (
+        "vllm.models.inkling2",
+        "Inkling2LoopForConditionalGeneration",
+    ),
     "InternVLChatModel": ("internvl", "InternVLChatModel"),
     "InternS1ForConditionalGeneration": (
         "interns1",
@@ -630,6 +638,10 @@ _SPECULATIVE_DECODING_MODELS = {
     "DSparkDeepseekV41ForCausalLM": (
         "vllm.models.deepseek_v41.dspark",
         "DSparkDeepseekV41ForCausalLM",
+    ),
+    "Inkling2DSparkModel": (
+        "vllm.models.inkling2",
+        "Inkling2DSparkModel",
     ),
     "PEagleDraftModel": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
     "PeagleLlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
