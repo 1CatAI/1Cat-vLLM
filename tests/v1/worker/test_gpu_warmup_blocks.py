@@ -13,7 +13,9 @@ from vllm.config.vllm import VllmConfig
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.warmup import (
@@ -82,12 +84,13 @@ def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
     warmup_kernels(runner, executions.append, samples.append)
 
     tokens = [output.total_num_scheduled_tokens for output in executions]
-    # Full batch, then the 33-token kernel profile and a full prefill chunk
-    # (capped so the decode step fits max_model_len), one request each.
-    assert tokens[:9] == [24, 20, 0, 33, 5, 0, 59, 5, 0]
+    # Full batch, then the 16-token prefill (added under speculation when the
+    # default prompt is shorter), the 33-token kernel profile and a full prefill
+    # chunk (capped so the decode step fits max_model_len), one request each.
+    assert tokens[:12] == [24, 20, 0, 16, 5, 0, 33, 5, 0, 59, 5, 0]
     # Every smaller request count: a pure decode step, then a decode step
     # that also admits a 6-token prefill.
-    assert tokens[9:] == [
+    assert tokens[12:] == [
         *(18, 15, 0, 18, 21, 0),
         *(12, 10, 0, 12, 16, 0),
         *(6, 5, 0, 6, 11, 0),
@@ -100,16 +103,18 @@ def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
     finished = set().union(*(output.finished_req_ids for output in executions))
     assert started == finished
     assert connector_states == [True, False]
-    assert len(samples) == 6 + 6 * 2
-    # Only the short prompts ask for prompt logprobs: on the kernel profile and
-    # the full chunk they would build logits for every prompt token.
+    # The extra 16-token prefill cycle adds two samples.
+    assert len(samples) == 6 + 2 + 6 * 2
+    # Only the default batch asks for prompt logprobs: the kernel profiles, the
+    # full chunk and the smaller request counts would build logits for every
+    # prompt token and keep that memory reserved.
     prompt_logprobs = [
         {r.sampling_params.prompt_logprobs for r in output.scheduled_new_reqs}
         for output in executions
         if output.scheduled_new_reqs
     ]
-    assert prompt_logprobs[:3] == [{1}, {None}, {None}]
-    assert all(entry == {1} for entry in prompt_logprobs[3:])
+    assert prompt_logprobs[0] == {1}
+    assert all(entry == {None} for entry in prompt_logprobs[1:])
 
 
 def _speculative_config(method: str) -> SpeculativeConfig:
@@ -179,6 +184,17 @@ def _circular_spec() -> CircularBufferSpec:
     )
 
 
+def _kpool_tail_spec(ring: int) -> KpoolTailSpec:
+    return KpoolTailSpec(
+        block_size=ring,
+        num_kv_heads=1,
+        head_size=8,
+        head_size_v=0,
+        dtype=torch.float16,
+        sliding_window=ring,
+    )
+
+
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
@@ -187,6 +203,13 @@ def _circular_spec() -> CircularBufferSpec:
         (
             UniformTypeKVCacheSpecs(
                 block_size=4, kv_cache_specs={"compressor_state": _circular_spec()}
+            ),
+            1,
+        ),
+        (_kpool_tail_spec(8), 1),
+        (
+            UniformTypeKVCacheSpecs(
+                block_size=8, kv_cache_specs={"tail": _kpool_tail_spec(8)}
             ),
             1,
         ),
@@ -260,3 +283,100 @@ def test_warmup_keeps_state_groups_inside_a_bounded_state_pool(
                 assert all(1 <= i < state_blocks for i in ids), ids
             else:
                 assert all(state_blocks <= i < 400 for i in ids), ids
+
+
+def _glm53_warmup_runner(num_spec: int, num_blocks: int) -> SimpleNamespace:
+    # GLM-5.3-Flash PP stage layout: attention, kpool tail (ring of
+    # kpool * next_pow2(cdiv(kpool + k, kpool)) slots, kpool 4), six align-mode
+    # Mamba groups and the DFlash auxiliary sliding window.
+    ring = 8 if num_spec <= 4 else 16
+    big = 8960
+    mamba = MambaSpec(
+        block_size=big,
+        shapes=((1,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=num_spec,
+    )
+    specs = [
+        UniformTypeKVCacheSpecs(
+            block_size=big,
+            kv_cache_specs={
+                "attn": FullAttentionSpec(
+                    block_size=big, num_kv_heads=1, head_size=8, dtype=torch.float16
+                )
+            },
+        ),
+        UniformTypeKVCacheSpecs(
+            block_size=ring, kv_cache_specs={"tail": _kpool_tail_spec(ring)}
+        ),
+        *([mamba] * 6),
+        SlidingWindowSpec(
+            block_size=1120,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float16,
+            sliding_window=1120,
+        ),
+    ]
+    return SimpleNamespace(
+        num_speculative_steps=num_spec,
+        scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1024),
+        max_model_len=524288,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec) for spec in specs],
+            num_blocks=num_blocks,
+        ),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=num_spec + 1),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        is_pooling_model=False,
+        is_last_pp_rank=True,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
+    )
+
+
+# Pool sizes of GLM-5.3-Flash PP boots, from the boot journals.
+@pytest.mark.parametrize(
+    ("num_spec", "num_blocks"), [(3, 130), (4, 130), (5, 130), (7, 126)]
+)
+def test_warmup_keeps_kpool_tail_layouts_inside_the_pool(
+    monkeypatch: pytest.MonkeyPatch, num_spec: int, num_blocks: int
+) -> None:
+    # 22.11.2026: at num_speculative_tokens 4 the full-chunk warmup reserved
+    # 129 tail blocks and handed out IDs up to 162; PP3 then hit an illegal
+    # memory access.
+    executions: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    warmup_kernels(
+        _glm53_warmup_runner(num_spec, num_blocks), executions.append, lambda *_: None
+    )
+
+    ids = [
+        i
+        for output in executions
+        for req in output.scheduled_new_reqs
+        for group in req.block_ids
+        for i in group
+    ]
+    ids += [
+        i
+        for output in executions
+        for groups in output.scheduled_cached_reqs.new_block_ids
+        if groups is not None
+        for group in groups
+        for i in group
+    ]
+    assert ids
+    assert max(ids) < num_blocks
+
+
+def test_warmup_refuses_block_ids_past_the_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    with pytest.raises(AssertionError, match="the KV pool has 20 blocks"):
+        warmup_kernels(_glm53_warmup_runner(4, 20), lambda _: None, lambda *_: None)
