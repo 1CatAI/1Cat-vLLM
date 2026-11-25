@@ -150,6 +150,9 @@ class AnthropicMessagesRequest(BaseModel):
     top_p: float | None = None
 
     # vLLM-specific fields that are not in Anthropic spec
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    repetition_penalty: float | None = Field(default=None, gt=0.0)
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",

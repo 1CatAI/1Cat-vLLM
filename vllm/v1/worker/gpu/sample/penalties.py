@@ -24,9 +24,11 @@ class PenaltiesState:
         self.presence_penalty = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
         self.use_penalty = np.zeros(max_num_reqs, dtype=bool)
 
-        # Initialize repetition penalty manually because 0 is an invalid value for it.
+        # Initialize repetition penalty across every rotating UVA pool slot
+        # because 0 is an invalid value for it (1.0 / 0.0 -> inf).
         self.repetition_penalty.np.fill(1.0)
-        self.repetition_penalty.copy_to_uva()
+        for _ in range(self.repetition_penalty.pool.max_concurrency):
+            self.repetition_penalty.copy_to_uva()
 
         # Statistics for penalties.
         self.prompt_bin_mask = torch.zeros(

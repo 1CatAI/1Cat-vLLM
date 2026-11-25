@@ -119,11 +119,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             for messages in request.messages
         ]
 
+        chat_template_kwargs = self._effective_chat_template_kwargs(single_requests[0])
         reasoning_parser: ReasoningParser | None = None
         if self.reasoning_parser_cls:
-            chat_template_kwargs = self._effective_chat_template_kwargs(
-                single_requests[0]
-            )
             reasoning_parser = self.reasoning_parser_cls(
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
@@ -146,6 +144,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
         max_model_len = self.model_config.max_model_len
 
+        effective_sampling_params = self._effective_sampling_params(
+            single_requests[0], chat_template_kwargs
+        )
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         for i, engine_prompt in enumerate(engine_prompts):
             sub_request_id = f"{request_id}_{i}"
@@ -155,12 +156,12 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 if request.max_completion_tokens is not None
                 else request.max_tokens,
                 self._extract_prompt_len(engine_prompt),
-                self.default_sampling_params,
+                effective_sampling_params,
                 self.override_max_tokens,
             )
             single_request = single_requests[i]
             sampling_params = single_request.to_sampling_params(
-                max_tokens, self.default_sampling_params
+                max_tokens, effective_sampling_params
             )
             self._log_inputs(
                 sub_request_id,

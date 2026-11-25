@@ -56,6 +56,34 @@ def _proposal_nucleus_logits(
 
 
 @triton.jit
+def _refresh_dflash_penalties_kernel(
+    src_rep_ptr,
+    src_freq_ptr,
+    src_pres_ptr,
+    dst_rep_ptr,
+    dst_freq_ptr,
+    dst_pres_ptr,
+    n,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(
+        dst_rep_ptr + offs, tl.load(src_rep_ptr + offs, mask=mask, other=1.0), mask=mask
+    )
+    tl.store(
+        dst_freq_ptr + offs,
+        tl.load(src_freq_ptr + offs, mask=mask, other=0.0),
+        mask=mask,
+    )
+    tl.store(
+        dst_pres_ptr + offs,
+        tl.load(src_pres_ptr + offs, mask=mask, other=0.0),
+        mask=mask,
+    )
+
+
+@triton.jit
 def _apply_candidate_penalties(
     scores,
     candidates,
@@ -77,7 +105,7 @@ def _apply_candidate_penalties(
     rep_penalty = tl.load(repetition_penalty_ptr + req_state)
     freq_penalty = tl.load(frequency_penalty_ptr + req_state)
     pres_penalty = tl.load(presence_penalty_ptr + req_state)
-    use_rep_penalty = rep_penalty != 1.0
+    use_rep_penalty = (rep_penalty != 1.0) & (rep_penalty > 0.0)
     if use_rep_penalty or freq_penalty != 0.0 or pres_penalty != 0.0:
         in_vocab = mask & (candidates >= 0) & (candidates < vocab_size)
         safe_tokens = tl.where(in_vocab, candidates, 0)
@@ -677,6 +705,19 @@ class DFlash2Speculator(DFlashSpeculator):
         )
         self._req_states = None
         self._penalties_state: Any | None = None
+        # Graph-stable penalty mirrors: PenaltiesState stores parameters in
+        # rotating UVA pools whose .gpu address changes on every
+        # apply_staged_writes(). Captured FULL draft CUDA graphs must bind
+        # these fixed-address device tensors and refresh them per step.
+        self._repetition_penalty = torch.ones(
+            self.max_num_reqs, dtype=torch.float32, device=device
+        )
+        self._frequency_penalty = torch.zeros(
+            self.max_num_reqs, dtype=torch.float32, device=device
+        )
+        self._presence_penalty = torch.zeros(
+            self.max_num_reqs, dtype=torch.float32, device=device
+        )
         self._lookup_current_req_key: tuple[int, ...] = ()
         self._lookup_current_eligible = False
         self._lookup_last_emitted: torch.Tensor | None = None
@@ -767,6 +808,42 @@ class DFlash2Speculator(DFlashSpeculator):
     def set_penalties_state(self, penalties_state) -> None:
         """Expose target sampling penalties so probabilistic proposals stay aligned."""
         self._penalties_state = penalties_state
+        self._refresh_penalties()
+
+    def _refresh_penalties(self) -> None:
+        """Copy live rotating UVA penalty pools into graph-stable device buffers."""
+        penalties = self._penalties_state
+        if self.draft_logits is None or penalties is None:
+            return
+        n = min(
+            int(self._repetition_penalty.numel()),
+            int(penalties.repetition_penalty.gpu.numel()),
+        )
+        if n <= 0:
+            return
+        if self.device.type == "cuda" and penalties.repetition_penalty.gpu.is_cuda:
+            block = triton.next_power_of_2(min(max(n, 32), 1024))
+            _refresh_dflash_penalties_kernel[(triton.cdiv(n, block),)](
+                penalties.repetition_penalty.gpu,
+                penalties.frequency_penalty.gpu,
+                penalties.presence_penalty.gpu,
+                self._repetition_penalty,
+                self._frequency_penalty,
+                self._presence_penalty,
+                n,
+                BLOCK=block,
+                num_warps=1 if block <= 128 else 4,
+            )
+        else:
+            self._repetition_penalty[:n].copy_(
+                penalties.repetition_penalty.gpu[:n], non_blocking=True
+            )
+            self._frequency_penalty[:n].copy_(
+                penalties.frequency_penalty.gpu[:n], non_blocking=True
+            )
+            self._presence_penalty[:n].copy_(
+                penalties.presence_penalty.gpu[:n], non_blocking=True
+            )
 
     def _reset_lookup_controller(self, req_key: tuple[int, ...]) -> None:
         self._lookup_controller_req_key = req_key
@@ -803,8 +880,9 @@ class DFlash2Speculator(DFlashSpeculator):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
     ) -> None:
-        """Refresh lookup eligibility and controller inputs before replay."""
+        """Refresh penalty mirrors, lookup eligibility and controller inputs."""
         del num_rejected
+        self._refresh_penalties()
         if not self._lookup_enabled:
             return
 
@@ -1131,9 +1209,9 @@ class DFlash2Speculator(DFlashSpeculator):
         penalties = self._penalties_state
         if self.draft_logits is not None and penalties is not None:
             has_penalties = True
-            rep_ptr = penalties.repetition_penalty.gpu
-            freq_ptr = penalties.frequency_penalty.gpu
-            pres_ptr = penalties.presence_penalty.gpu
+            rep_ptr = self._repetition_penalty
+            freq_ptr = self._frequency_penalty
+            pres_ptr = self._presence_penalty
             prompt_mask_ptr = penalties.prompt_bin_mask
             prompt_mask_stride = penalties.prompt_bin_mask.stride(0)
             out_counts_ptr = penalties.output_bin_counts
