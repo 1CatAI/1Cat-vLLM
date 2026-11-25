@@ -954,13 +954,11 @@ class _Qwen4ExpMTPPrefillSequenceModel(nn.Module):
     },
 )
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
-    # Qwen4Exp repacks the small BF16/shared/MTP tensors separately from the
-    # target experts and PLE tables. Loading the standalone drafter from that
-    # compact shard set avoids scanning the full target checkpoint a second
-    # time. The remaining patterns preserve compatibility with conventional
-    # Hugging Face checkpoint layouts.
+    # A BF16-named shard may contain only KV scales, with the MTP body in
+    # ordinary shards. Select the full checkpoint, including compact BF16
+    # layouts; skip_checkpoint_weight filters target tensors before reading
+    # them in the standard mapped/direct safetensors iterator.
     allow_patterns_overrides = [
-        "model-bf16-*.safetensors",
         "*.safetensors",
         "*.bin",
         "*.pt",
