@@ -46,6 +46,10 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "HCXVisionConfig": "vllm.transformers_utils.configs.hyperclovax",
     "HYV3Config": "vllm.transformers_utils.configs.hy_v3",
     "HyperCLOVAXConfig": "vllm.transformers_utils.configs.hyperclovax",
+    "Inkling2MMConfig": "vllm.models.inkling2.configs",
+    "Inkling2LoopMMConfig": "vllm.models.inkling2.configs",
+    "Inkling2ModelConfig": "vllm.models.inkling2.configs",
+    "Inkling2LoopTextConfig": "vllm.models.inkling2.configs",
     "IsaacConfig": "vllm.transformers_utils.configs.isaac",
     # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
     # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
@@ -125,6 +129,10 @@ __all__ = [
     "HCXVisionConfig",
     "HYV3Config",
     "HyperCLOVAXConfig",
+    "Inkling2MMConfig",
+    "Inkling2LoopMMConfig",
+    "Inkling2ModelConfig",
+    "Inkling2LoopTextConfig",
     "IsaacConfig",
     "RWConfig",
     "LagunaConfig",
