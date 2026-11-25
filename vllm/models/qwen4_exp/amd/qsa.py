@@ -394,7 +394,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         attn_output = torch.empty_like(query)
         encoded_layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
-            torch.ops.vllm.qwen4_exp_qsa_with_output(
+            torch.ops.vllm.qwen4_exp_qsa_with_output_amd(
                 hidden_states,
                 positions,
                 query,
@@ -457,8 +457,9 @@ def qwen4_exp_qsa_with_output_fake(
     del hidden_states, positions, query, key, value, output, layer_name
 
 
+# Keep registrations distinct when both platform modules share a process.
 direct_register_custom_op(
-    op_name="qwen4_exp_qsa_with_output",
+    op_name="qwen4_exp_qsa_with_output_amd",
     op_func=qwen4_exp_qsa_with_output,
     mutates_args=["output"],
     fake_impl=qwen4_exp_qsa_with_output_fake,
