@@ -17,11 +17,13 @@ to keep mapped are memory-mapped, so a stage reads only what it uses, and their
 pages are released from the page cache once the loader has consumed them.
 """
 
+import contextlib
 import ctypes
 import json
 import mmap
 import os
 import struct
+import uuid
 from collections.abc import Callable, Collection, Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,6 +148,11 @@ class RunSharing:
     is_leader: bool
 
 
+_SHM_DIR = "/dev/shm"
+# Below 1 MiB, Gloo broadcast is faster than creating/unlinking a /dev/shm file.
+_SHM_MIN_BYTES = 1 << 20
+
+
 def _run_buffer(start: int, end: int) -> tuple[mmap.mmap, int]:
     """An aligned buffer for [start, end) and the file offset it starts at."""
     begin = start - start % _ALIGN
@@ -157,21 +164,78 @@ def _run_buffer(start: int, end: int) -> tuple[mmap.mmap, int]:
     return buffer, begin
 
 
-def _read_run(fd: int, start: int, end: int) -> tuple[mmap.mmap, int]:
+def _shm_run_buffer(start: int, end: int) -> tuple[mmap.mmap, int, str]:
+    """An aligned /dev/shm buffer for [start, end), its aligned file offset,
+    and its path so same-host peers can map it zero-copy."""
+    begin = start - start % _ALIGN
+    stop = -(-end // _ALIGN) * _ALIGN
+    length = stop - begin
+    shm_path = f"{_SHM_DIR}/vllm_dio_{os.getpid()}_{uuid.uuid4().hex}"
+    shm_fd = os.open(shm_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    try:
+        os.ftruncate(shm_fd, length)
+        buffer = mmap.mmap(
+            shm_fd,
+            length,
+            flags=mmap.MAP_SHARED,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+    except BaseException:
+        os.close(shm_fd)
+        with contextlib.suppress(OSError):
+            os.unlink(shm_path)
+        raise
+    os.close(shm_fd)
+    return buffer, begin, shm_path
+
+
+def _open_shm_run_buffer(shm_path: str, start: int, end: int) -> tuple[mmap.mmap, int]:
+    """Map a leader's /dev/shm run buffer read-only/CoW (zero-copy)."""
+    begin = start - start % _ALIGN
+    stop = -(-end // _ALIGN) * _ALIGN
+    length = stop - begin
+    shm_fd = os.open(shm_path, os.O_RDONLY)
+    try:
+        buffer = mmap.mmap(
+            shm_fd,
+            length,
+            flags=mmap.MAP_PRIVATE,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+    finally:
+        os.close(shm_fd)
+    return buffer, begin
+
+
+def _read_into(fd: int, buffer: mmap.mmap, begin: int, end: int) -> None:
+    """Read [begin, end) with O_DIRECT into *buffer*."""
+    view = memoryview(buffer)
+    try:
+        done = 0
+        while begin + done < end:
+            count = os.preadv(fd, [view[done:]], begin + done)
+            if count == 0:
+                raise EOFError(
+                    f"safetensors shard ended at offset {begin + done}, "
+                    f"expected data up to {end}"
+                )
+            done += count
+    finally:
+        view.release()
+
+
+def _read_run(
+    fd: int,
+    start: int,
+    end: int,
+    buffer: mmap.mmap | None = None,
+    begin: int | None = None,
+) -> tuple[mmap.mmap, int]:
     """Read [start, end) with O_DIRECT; return the buffer and the aligned
     file offset it starts at."""
-    buffer, begin = _run_buffer(start, end)
-    view = memoryview(buffer)
-    done = 0
-    while begin + done < end:
-        count = os.preadv(fd, [view[done:]], begin + done)
-        if count == 0:
-            raise EOFError(
-                f"safetensors shard ended at offset {begin + done}, "
-                f"expected data up to {end}"
-            )
-        done += count
-    view.release()
+    if buffer is None or begin is None:
+        buffer, begin = _run_buffer(start, end)
+    _read_into(fd, buffer, begin, end)
     return buffer, begin
 
 
@@ -364,6 +428,7 @@ def direct_io_weights(
                 _check_same_runs(path, runs, sharing, leader_ok=open_error is None)
             except RuntimeError as error:
                 raise error from open_error
+        use_shm = sharing is not None and os.path.isdir(_SHM_DIR)
         for index, last, run_start, run_end in runs:
             if run_start == run_end:
                 # Only empty tensors: nothing to read, and a zero-size
@@ -372,26 +437,89 @@ def direct_io_weights(
                     yield name, torch.empty(info["shape"], dtype=_DTYPES[info["dtype"]])
                 continue
             run_error: Exception | None = None
+            shm_path: str | None = None
+            buffer: mmap.mmap | None = None
+            buffer_start = 0
+            try_shm = use_shm and (run_end - run_start) >= _SHM_MIN_BYTES
             try:
                 if reads:
-                    buffer, buffer_start = _read_run(fd, run_start, run_end)
-                else:
+                    if try_shm:
+                        try:
+                            buffer, buffer_start, shm_path = _shm_run_buffer(
+                                run_start, run_end
+                            )
+                        except OSError:
+                            # /dev/shm full or unavailable; fall back to
+                            # anonymous buffer + dist.broadcast via shm_msg=[None].
+                            buffer, buffer_start = _read_run(fd, run_start, run_end)
+                        else:
+                            buffer, buffer_start = _read_run(
+                                fd, run_start, run_end, buffer, buffer_start
+                            )
+                    else:
+                        buffer, buffer_start = _read_run(fd, run_start, run_end)
+                elif not try_shm:
                     buffer, buffer_start = _run_buffer(run_start, run_end)
             except (OSError, EOFError) as error:
+                if shm_path is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(shm_path)
+                    shm_path = None
                 if sharing is None:
                     raise
                 run_error = error
             if sharing is not None:
                 if not _group_ready(run_error is None, sharing):
+                    if shm_path is not None:
+                        with contextlib.suppress(OSError):
+                            os.unlink(shm_path)
                     raise RuntimeError(
                         f"Direct I/O run sharing: a rank of the group could not "
                         f"read or buffer {path}"
                     ) from run_error
-                dist.broadcast(
-                    torch.frombuffer(buffer, dtype=torch.uint8),
-                    src=sharing.leader,
-                    group=sharing.group,
-                )
+                need_broadcast = True
+                if try_shm:
+                    shm_msg: list[object] = [shm_path]
+                    dist.broadcast_object_list(
+                        shm_msg, src=sharing.leader, group=sharing.group
+                    )
+                    shared_path = shm_msg[0]
+                    if isinstance(shared_path, str):
+                        peer_ok = True
+                        if not reads:
+                            try:
+                                buffer, buffer_start = _open_shm_run_buffer(
+                                    shared_path, run_start, run_end
+                                )
+                            except OSError:
+                                peer_ok = False
+                        all_mapped = _group_ready(peer_ok, sharing)
+                        if reads and shm_path is not None:
+                            # Every peer that succeeded already holds an mmap;
+                            # unlink now so pages are freed automatically even
+                            # on crash once mappings close.
+                            with contextlib.suppress(OSError):
+                                os.unlink(shm_path)
+                        if all_mapped:
+                            need_broadcast = False
+                        else:
+                            use_shm = False
+                            if not reads:
+                                if buffer is not None:
+                                    buffer.close()
+                                buffer, buffer_start = _run_buffer(run_start, run_end)
+                    else:
+                        use_shm = False
+                        if not reads:
+                            buffer, buffer_start = _run_buffer(run_start, run_end)
+                if need_broadcast:
+                    assert buffer is not None
+                    dist.broadcast(
+                        torch.frombuffer(buffer, dtype=torch.uint8),
+                        src=sharing.leader,
+                        group=sharing.group,
+                    )
+            assert buffer is not None
             for begin, end, name, info in tensors[index:last]:
                 dtype = _DTYPES[info["dtype"]]
                 shape = info["shape"]

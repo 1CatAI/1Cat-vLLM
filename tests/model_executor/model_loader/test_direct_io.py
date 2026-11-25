@@ -214,6 +214,16 @@ def _sharing_rank(rank, init_file, path, out_dir, mode):
             raise EOFError("truncated shard")
 
         direct_io._read_run = eof
+    elif mode == "shm":
+        direct_io._SHM_MIN_BYTES = 0
+    elif mode == "shm_fallback":
+        direct_io._SHM_MIN_BYTES = 0
+        if rank == 1:
+
+            def no_shm(*args):
+                raise FileNotFoundError("other node")
+
+            direct_io._open_shm_run_buffer = no_shm
     sharing = direct_io.RunSharing(dist.group.WORLD, 0, rank == 0)
     keep = (
         (lambda name: "mtp" in name)
@@ -246,8 +256,9 @@ def _run_sharing(tmp_path, mode):
     return path, [torch.load(tmp_path / f"rank{rank}.pt") for rank in (0, 1)]
 
 
-def test_run_sharing_reads_once_per_group(tmp_path):
-    path, results = _run_sharing(tmp_path, "all")
+@pytest.mark.parametrize("mode", ["all", "shm", "shm_fallback"])
+def test_run_sharing_reads_once_per_group(tmp_path, mode):
+    path, results = _run_sharing(tmp_path, mode)
     for result in results:
         _assert_same(result, _reference(path))
 
