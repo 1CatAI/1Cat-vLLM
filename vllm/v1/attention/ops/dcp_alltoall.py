@@ -130,6 +130,30 @@ def _dcp_a2a_send_recv_buffers(
     )
 
 
+def prealloc_dcp_a2a_workspace(
+    max_rows: int,
+    world_size: int,
+    h_per_rank: int,
+    head_dim: int,
+    output_dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """Reserve the largest packed send/recv pair before A2A can be in flight.
+
+    This avoids replacing the workspace and clearing the allocator cache as
+    batch sizes grow during warmup or serving (issue #1575).
+    """
+    if not is_workspace_manager_initialized() or max_rows <= 0:
+        return
+    shape = (
+        world_size,
+        max_rows,
+        h_per_rank,
+        head_dim + _dcp_a2a_lse_pack_dim(output_dtype),
+    )
+    _dcp_a2a_send_recv_buffers(shape, device, output_dtype)
+
+
 @triton.jit
 def _dcp_a2a_pack_send_kernel(
     out_ptr,

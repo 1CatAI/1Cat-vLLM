@@ -338,6 +338,37 @@ class TestLSEWeightedCombine:
         assert _dcp_a2a_lse_pack_dim(torch.float32) == 1
 
 
+def test_preallocated_fp32_workspace_covers_max_batch():
+    from vllm.v1.attention.ops.dcp_alltoall import (
+        _dcp_a2a_send_recv_buffers,
+        prealloc_dcp_a2a_workspace,
+    )
+    from vllm.v1.worker.workspace import (
+        init_workspace_manager,
+        lock_workspace,
+        reset_workspace_manager,
+    )
+
+    device = torch.device("cpu")
+    max_rows, world_size, heads, head_dim = 4096, 2, 6, 256
+    init_workspace_manager(device)
+    try:
+        prealloc_dcp_a2a_workspace(
+            max_rows, world_size, heads, head_dim, torch.float32, device
+        )
+        lock_workspace()
+        first_send, _ = _dcp_a2a_send_recv_buffers(
+            (world_size, 24, heads, head_dim + 1), device, torch.float32
+        )
+        send, recv = _dcp_a2a_send_recv_buffers(
+            (world_size, max_rows, heads, head_dim + 1), device, torch.float32
+        )
+        assert send.data_ptr() == first_send.data_ptr()
+        assert recv.data_ptr() == send.data_ptr() + send.nbytes
+    finally:
+        reset_workspace_manager()
+
+
 class TestPackedA2AKernels:
     @pytest.mark.skipif(
         torch.accelerator.device_count() < 1, reason="CUDA is required."

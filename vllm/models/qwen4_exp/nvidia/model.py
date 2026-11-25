@@ -890,6 +890,21 @@ class Qwen4ExpModel(nn.Module):
                 self.dcp_local_indices_buffer = dcp_local_indices_buffer
                 self.dcp_partial_output_buffer = dcp_partial_output_buffer
                 self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
+                if vllm_config.parallel_config.dcp_comm_backend == "a2a":
+                    from vllm.v1.attention.ops.dcp_alltoall import (
+                        prealloc_dcp_a2a_workspace,
+                    )
+
+                    # The QSA A2A fallback exchanges FP32 partial results.
+                    # Reserve its largest batch before collectives can be in flight.
+                    prealloc_dcp_a2a_workspace(
+                        max_tokens,
+                        2,
+                        gathered_heads // 2,
+                        int(config.head_dim),
+                        torch.float32,
+                        dcp_partial_output_buffer.device,
+                    )
         embedding_quant = (
             vllm_config.quant_config
             if vllm_config.model_config.quantization == "gguf"
