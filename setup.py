@@ -1373,6 +1373,11 @@ if _is_cuda():
         ext_modules.append(
             CMakeExtension(name="vllm._sm70_sparse_attention_C", py_limited_api=False)
         )
+        # Qwen3.8-Flash-Next prefill kernels (CMake target of the same name);
+        # vllm/_sm70_flashnext_prefill_ops.py falls back silently without it.
+        ext_modules.append(
+            CMakeExtension(name="vllm._sm70_flashnext_prefill_C", py_limited_api=False)
+        )
     build_sm70_fa2 = (
         _cuda_arch_contains(7, 0) or _cuda_arch_contains(7, 2)
     ) and not _cuda_arch_at_least(8, 0)
