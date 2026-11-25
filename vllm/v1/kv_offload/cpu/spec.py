@@ -114,6 +114,15 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
         world_size = vllm_config.parallel_config.world_size
+        tensor_page_sizes = []
+        if kv_cache_config.num_blocks:
+            for tensor in kv_cache_config.kv_cache_tensors:
+                page_bytes = tensor.get_physical_page_size_bytes(
+                    kv_cache_config.num_blocks
+                )
+                tensor_page_sizes.append(
+                    (tensor, page_bytes + tensor.qsa_scale_page_size_bytes)
+                )
         if self.partition_by_group:
             mamba_groups: set[int] = set()
             mamba_spec: MambaSpec | None = None
@@ -123,8 +132,8 @@ class CPUOffloadingSpec(OffloadingSpec):
                 # by its largest layer spec. Physical tensor sizes/shared_by are
                 # preserved and give identical budgets on scheduler and workers.
                 page_size = sum(
-                    tensor.size // kv_cache_config.num_blocks
-                    for tensor in kv_cache_config.kv_cache_tensors
+                    page_bytes
+                    for tensor, page_bytes in tensor_page_sizes
                     if not layer_names.isdisjoint(tensor.shared_by)
                 )
                 self.cpu_group_page_sizes[i] = page_size * self.block_size_factor
@@ -193,13 +202,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                 self.state_slots_reference_tokens,
             )
         else:
-            total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
             self.cpu_page_size_per_worker = (
-                total_gpu_kv_bytes
-                // kv_cache_config.num_blocks
+                sum(page_bytes for _, page_bytes in tensor_page_sizes)
                 * self.block_size_factor
-                if kv_cache_config.num_blocks > 0
-                else 0
             )
             kv_bytes_per_offloaded_block = self.cpu_page_size_per_worker * world_size
             self.num_blocks = (

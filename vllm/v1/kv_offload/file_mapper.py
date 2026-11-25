@@ -88,6 +88,12 @@ class FileMapper:
             }
             for group in kv_cache_config.kv_cache_groups
         ]
+        persistent_layout = getattr(offloading_spec, "persistent_layout", None)
+        if getattr(offloading_spec, "use_lookahead_block_hashes", False):
+            persistent_layout = {
+                **(persistent_layout or {}),
+                "prefix_hash_scheme": "1cat-lookahead-v1",
+            }
         return cls(
             root_dir=root_dir,
             model_name=vllm_config.model_config.model,
@@ -101,7 +107,7 @@ class FileMapper:
             dtype=dtype,
             kv_cache_groups=kv_cache_groups,
             parallel_agnostic=parallel_agnostic,
-            persistent_layout=getattr(offloading_spec, "persistent_layout", None),
+            persistent_layout=persistent_layout,
         )
 
     def get_file_name(self, key: OffloadKey) -> str:

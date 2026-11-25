@@ -3,7 +3,7 @@
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -37,6 +37,9 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
 
 logger = init_logger(__name__)
 
@@ -121,6 +124,7 @@ class SchedulerOffloadConfig(NamedTuple):
     num_kv_cache_groups: int
     # See OffloadingSpec.demote_superseded_states.
     demote_superseded_states: bool = True
+    use_lookahead_block_hashes: bool = False
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -314,8 +318,18 @@ class RequestOffloadState:
     def advance_stored_idx(self, num_offloadable_tokens: int) -> None:
         for group_config in self.config.kv_group_configs:
             group_state = self.group_states[group_config.group_idx]
-            num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
-            group_state.next_stored_block_idx = num_blocks
+            group_state.next_stored_block_idx = self.num_storable_blocks(
+                group_config, num_offloadable_tokens
+            )
+
+    def num_storable_blocks(
+        self, group: GroupOffloadConfig, num_offloadable_tokens: int
+    ) -> int:
+        # Lookahead hashes can trail behind computed KV by one full page.
+        return min(
+            num_offloadable_tokens // group.offloaded_block_size,
+            len(self.group_states[group.group_idx].offload_keys),
+        )
 
     def update_num_hit_blocks(self, num_cached_tokens: int) -> None:
         for group_config in self.config.kv_group_configs:
@@ -336,7 +350,10 @@ class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
     def __init__(self, spec: OffloadingSpec):
-        self.config = SchedulerOffloadConfig.from_spec(spec)
+        self.config = SchedulerOffloadConfig.from_spec(spec)._replace(
+            use_lookahead_block_hashes=spec.use_lookahead_block_hashes
+        )
+        self.gpu_block_pool: BlockPool | None = None
         self._group_config_by_idx = {
             group.group_idx: group for group in self.config.kv_group_configs
         }
@@ -362,13 +379,13 @@ class OffloadingConnectorScheduler:
         self._sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
         self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
         self._mamba_align_size: int | None = resolve_mamba_align_size(spec)
-        # With EAGLE/MTP (same condition as Scheduler.use_eagle), restored Mamba
-        # states must sit one page before the full-attention reach; see _lookup.
+        # Apply the same trailing-page rule as the local prefix scheduler.
         speculative_config = spec.vllm_config.speculative_config
         self._eagle_state_shift: int | None = (
             self._mamba_align_size
             if speculative_config is not None
             and speculative_config.use_eagle_kv_cache()
+            and not self.config.use_lookahead_block_hashes
             else None
         )
 
@@ -528,12 +545,7 @@ class OffloadingConnectorScheduler:
                 offloaded_block_size = group_config.offloaded_block_size
                 offload_keys = group_state.offload_keys
 
-                assert (
-                    len(offload_keys)
-                    >= req_status.req.num_tokens // offloaded_block_size
-                )
-
-                # Constrain to block-aligned boundary for this group
+                # Only pages with an available hash can participate in a hit.
                 max_hit_size_tokens = min(
                     max_hit_size_tokens, len(offload_keys) * offloaded_block_size
                 )
@@ -695,6 +707,15 @@ class OffloadingConnectorScheduler:
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
 
+        # After async preemption the worker can finish the store before the
+        # scheduler has consumed its completion. Defer re-admission until then.
+        if req_status.transfer_jobs:
+            return None, False
+
+        if self.config.use_lookahead_block_hashes and request.resumable:
+            # Streaming input can replace the sampled token in the tail hash.
+            for group_state in req_status.group_states:
+                group_state.offload_keys.clear()
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
 
@@ -889,7 +910,9 @@ class OffloadingConnectorScheduler:
                 group_state = req_status.group_states[group_config.group_idx]
                 if group_config.requires_exact_boundary_source:
                     continue
-                num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+                num_blocks = req_status.num_storable_blocks(
+                    group_config, num_offloadable_tokens
+                )
                 start_block_idx = group_state.next_stored_block_idx
                 if num_blocks <= start_block_idx:
                     continue
@@ -961,7 +984,9 @@ class OffloadingConnectorScheduler:
                 is_sliding_window = (
                     group_config.sliding_window_size_in_blocks is not None
                 )
-                num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+                num_blocks = req_status.num_storable_blocks(
+                    group_config, num_offloadable_tokens
+                )
                 start_block_idx = group_state.next_stored_block_idx
                 block_ids = group_state.block_ids
                 num_group_blocks = 0
@@ -1133,6 +1158,13 @@ class OffloadingConnectorScheduler:
                 if offload_block_idx >= len(group_state.offload_keys):
                     continue
                 offload_key = group_state.offload_keys[offload_block_idx]
+                if self.config.use_lookahead_block_hashes:
+                    # The GPU key may concatenate several hashes. The offload
+                    # key uses its last hash, which still covers the prefix.
+                    assert self.gpu_block_pool is not None
+                    source_key = self.gpu_block_pool.blocks[block_id].block_hash
+                    if source_key is None or not source_key.endswith(offload_key):
+                        continue
                 store_output = self.manager.prepare_store(
                     [offload_key], req_status.req_context
                 )

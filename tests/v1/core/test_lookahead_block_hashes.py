@@ -14,7 +14,7 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import VllmConfig
+from vllm.config import KVTransferConfig, VllmConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.distributed.kv_events import BlockStored
 from vllm.sampling_params import SamplingParams
@@ -386,10 +386,50 @@ def _speculative_config(
         pytest.param(
             {"disable_lookahead_block_hashes": True}, False, id="disabled-by-config"
         ),
-        pytest.param({"kv_connector": True}, False, id="kv-connector"),
+        pytest.param({"kv_connector": "ExampleConnector"}, False, id="other-connector"),
+        pytest.param({"kv_connector": "OffloadingConnector"}, True, id="native-cpu"),
+        pytest.param(
+            {
+                "kv_connector": "OffloadingConnector",
+                "extra_config": {
+                    "spec_name": "TieringOffloadingSpec",
+                    "secondary_tiers": [{"type": "fs"}],
+                },
+            },
+            True,
+            id="native-fs",
+        ),
+        pytest.param(
+            {
+                "kv_connector": "OffloadingConnector",
+                "extra_config": {
+                    "spec_name": "TieringOffloadingSpec",
+                    "secondary_tiers": [{"type": "example"}],
+                },
+            },
+            False,
+            id="unsupported-tier",
+        ),
+        pytest.param(
+            {
+                "kv_connector": "OffloadingConnector",
+                "extra_config": {"spec_name": "CustomOffloadingSpec"},
+            },
+            False,
+            id="custom-spec",
+        ),
+        pytest.param(
+            {
+                "kv_connector": "OffloadingConnector",
+                "disable_lookahead_block_hashes": True,
+            },
+            False,
+            id="native-cpu-opt-out",
+        ),
     ],
 )
 def test_lookahead_block_hashing_enabled(overrides: dict[str, Any], expected: bool):
+    connector = overrides.get("kv_connector")
     vllm_config = cast(
         VllmConfig,
         SimpleNamespace(
@@ -401,7 +441,15 @@ def test_lookahead_block_hashing_enabled(overrides: dict[str, Any], expected: bo
                 overrides.get("disable_lookahead_block_hashes", False),
                 overrides.get("num_mtp_layers", 1),
             ),
-            kv_transfer_config=object() if overrides.get("kv_connector") else None,
+            kv_transfer_config=(
+                KVTransferConfig(
+                    kv_connector=connector,
+                    kv_role="kv_both",
+                    kv_connector_extra_config=overrides.get("extra_config", {}),
+                )
+                if connector is not None
+                else None
+            ),
         ),
     )
 

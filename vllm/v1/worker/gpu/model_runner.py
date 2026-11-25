@@ -693,7 +693,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Clear cache blocks before their first use after allocation."""
         if hasattr(self, "_kv_block_zeroer"):
-            self._kv_block_zeroer.zero_block_ids(block_ids)
+            self._kv_block_zeroer.zero_block_ids(
+                block_ids,
+                invalidate_host_hot=(
+                    self.vllm_config.kernel_config.qsa_host_kv_active
+                    and self.vllm_config.kv_transfer_config is not None
+                ),
+            )
 
     def _warmup_sm70_aux_kernels(self) -> None:
         """Compatibility hook preserving the independent convolution warmup."""

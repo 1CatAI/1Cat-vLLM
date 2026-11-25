@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -43,6 +43,9 @@ from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
+
 
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransfers):
     """Native CPU KV offload connector.
@@ -52,6 +55,20 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
     memory through RDMA, GDS, or CUDA IPC, so it is safe under CUDA VMM
     remapping.
     """
+
+    @classmethod
+    def supports_lookahead_block_hashes(cls, extra_config: dict[str, Any]) -> bool:
+        spec_name = extra_config.get("spec_name", "CPUOffloadingSpec")
+        if spec_name == "CPUOffloadingSpec":
+            return True
+        tiers = extra_config.get("secondary_tiers", [])
+        return (
+            spec_name == "TieringOffloadingSpec"
+            and isinstance(tiers, list)
+            and all(
+                isinstance(tier, dict) and tier.get("type") == "fs" for tier in tiers
+            )
+        )
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
@@ -79,6 +96,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
             self.connector_worker.shutdown()
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.gpu_block_pool = gpu_block_pool
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None

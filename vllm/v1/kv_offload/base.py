@@ -14,7 +14,10 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import (
+    is_lookahead_block_hashing_enabled,
+    resolve_kv_cache_block_sizes,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -420,6 +423,9 @@ class OffloadingSpec(ABC):
         # Request.block_hashes (resolved via resolve_kv_cache_block_sizes).
         _, self.hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
+        )
+        self.use_lookahead_block_hashes = is_lookahead_block_hashing_enabled(
+            vllm_config
         )
 
         # Keep the full worker layout, but scratch rings have no offload keys

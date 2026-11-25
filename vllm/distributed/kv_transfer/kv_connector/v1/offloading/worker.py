@@ -57,12 +57,19 @@ class OffloadingConnectorWorker:
     def register_kv_caches(
         self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
     ):
-        num_blocks = self.spec.kv_cache_config.num_blocks
+        cache_config = self.spec.kv_cache_config
+        num_blocks = cache_config.num_blocks
+        host_layers: set[str] = set()
+        physical_blocks: dict[str, int] = {}
         # Packed attention layers split each physical block of one tensor,
         # interleaved kernel block by kernel block, so they transfer as one
         # whole physical page registered once, by the first member.
         packed: dict[str, tuple[int, int]] = {}
-        for kv_cache_tensor in self.spec.kv_cache_config.kv_cache_tensors:
+        for kv_cache_tensor in cache_config.kv_cache_tensors:
+            if kv_cache_tensor.host_backed:
+                host_layers.update(kv_cache_tensor.shared_by)
+            elif (blocks := kv_cache_tensor.physical_num_blocks) is not None:
+                physical_blocks.update(dict.fromkeys(kv_cache_tensor.shared_by, blocks))
             members = getattr(kv_cache_tensor, "packed_members", None) or []
             for index, layer_name in enumerate(members):
                 packed[layer_name] = (index, len(members))
@@ -73,7 +80,7 @@ class OffloadingConnectorWorker:
         unpadded_page_size_bytes: dict[str, int] = {}
         # layer_name -> size of page in bytes
         page_size_bytes: dict[str, int] = {}
-        for kv_cache_group in self.spec.kv_cache_config.kv_cache_groups:
+        for kv_cache_group in cache_config.kv_cache_groups:
             group_layer_names = kv_cache_group.layer_names
             group_kv_cache_spec = kv_cache_group.kv_cache_spec
             if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -81,9 +88,17 @@ class OffloadingConnectorWorker:
             else:
                 per_layer_specs = {}
             for layer_name in group_layer_names:
+                if layer_name in host_layers:
+                    continue
                 layer_kv_cache_spec = per_layer_specs.get(
                     layer_name, group_kv_cache_spec
                 )
+                if (
+                    cache_config.device_state_blocks
+                    and not layer_kv_cache_spec.prefix_cacheable
+                ):
+                    continue
+                layer_num_blocks = physical_blocks.get(layer_name, num_blocks)
                 if isinstance(layer_kv_cache_spec, AttentionSpec):
                     layer_kv_cache = kv_caches[layer_name]
                     assert isinstance(layer_kv_cache, torch.Tensor)
@@ -100,7 +115,7 @@ class OffloadingConnectorWorker:
                             device=layer_kv_cache.device,
                         )
                         .set_(storage)
-                        .view(num_blocks, page),
+                        .view(layer_num_blocks, page),
                     )
                     page_size_bytes[layer_name] = page
                     unpadded_page_size_bytes[layer_name] = (
@@ -125,7 +140,7 @@ class OffloadingConnectorWorker:
                             device=first_state_tensor.device,
                         )
                         .set_(first_state_tensor.untyped_storage())
-                        .view((num_blocks, layer_kv_cache_spec.page_size_bytes))
+                        .view(layer_num_blocks, layer_kv_cache_spec.page_size_bytes)
                     )
                     tensors_per_block[layer_name] = (tensor,)
 
@@ -139,7 +154,34 @@ class OffloadingConnectorWorker:
 
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
-        for kv_cache_tensor in self.spec.kv_cache_config.kv_cache_tensors:
+        for kv_cache_tensor in cache_config.kv_cache_tensors:
+            if kv_cache_tensor.host_backed:
+                (layer_name,) = kv_cache_tensor.shared_by
+                compilation = self.spec.vllm_config.compilation_config
+                layer = compilation.static_forward_context[layer_name]
+                host_kv = getattr(layer, "host_kv", None)
+                if host_kv is None or host_kv.device_reference:
+                    raise ValueError(
+                        "CPU offloading requires a mapped QSA history owner"
+                    )
+                page_bytes = kv_cache_tensor.get_physical_page_size_bytes(num_blocks)
+                segments = [(host_kv.history, page_bytes)]
+                scale_bytes = kv_cache_tensor.qsa_scale_page_size_bytes
+                if bool(scale_bytes) != host_kv.fp8:
+                    raise ValueError(
+                        "QSA history codec and offload scale layout differ"
+                    )
+                if scale_bytes:
+                    segments.append((host_kv.scales, scale_bytes))
+                for tensor, page_bytes in segments:
+                    # Preserve the bank offset in the shared pinned allocation.
+                    # The byte view contains all kernel pages of one pool block.
+                    view = tensor.view(torch.int8).view(num_blocks, page_bytes)
+                    block_data_refs[layer_name].append(
+                        CanonicalKVCacheRef(len(block_tensors), page_bytes)
+                    )
+                    block_tensors.append(CanonicalKVCacheTensor(view, page_bytes))
+                continue
             # Filter to layers that were actually processed above.
             # _get_kv_cache_config_deepseek_v4 emits KVCacheTensor entries for
             # every (tuple_idx, page_size) slot; slots where no group has a
@@ -184,7 +226,7 @@ class OffloadingConnectorWorker:
                     )
 
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
-        for kv_cache_group in self.spec.kv_cache_config.kv_cache_groups:
+        for kv_cache_group in cache_config.kv_cache_groups:
             group_refs: list[CanonicalKVCacheRef] = []
             for layer_name in kv_cache_group.layer_names:
                 group_refs += block_data_refs[layer_name]

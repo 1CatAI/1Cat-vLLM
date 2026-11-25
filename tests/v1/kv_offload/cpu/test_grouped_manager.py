@@ -9,6 +9,7 @@ import torch
 
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheTensor,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -238,13 +239,13 @@ def _flash_next_spec(
         groups[g].layer_names = [f"m{g}_{i}" for i in range(12)]
     groups[5].layer_names = ["ple"]
     tensors = [
-        SimpleNamespace(
+        KVCacheTensor(
             size=104 * 802816,
             shared_by=[f"fa{i}", f"m2_{i}", f"m3_{i}", f"m4_{i}"]
             + (["ple"] if i == 0 else []),
         )
         for i in range(12)
-    ] + [SimpleNamespace(size=104 * 50176, shared_by=[f"index{i}"]) for i in range(12)]
+    ] + [KVCacheTensor(size=104 * 50176, shared_by=[f"index{i}"]) for i in range(12)]
     if layout == "scheduler":
         groups[0].kv_cache_spec = fa
     if layout == "mixed":

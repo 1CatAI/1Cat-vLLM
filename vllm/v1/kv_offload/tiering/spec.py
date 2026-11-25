@@ -77,6 +77,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             raise ValueError("secondary_tiers must be a list of tier configurations")
 
         self.persistent_layout: dict | None = None
+        host_backed = any(t.host_backed for t in kv_cache_config.kv_cache_tensors)
+        if host_backed and not self.partition_by_group:
+            raise ValueError("Host-KV tiering requires group-partitioned offload")
         if self.partition_by_group:
             parallel = vllm_config.parallel_config
             # Decode context parallelism needs nothing extra: every rank
@@ -96,19 +99,31 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 raise ValueError(
                     "Grouped tiering requires an explicit attention backend"
                 )
+            tensors = []
+            for tensor in kv_cache_config.kv_cache_tensors:
+                layout = {
+                    "page_size": tensor.get_physical_page_size_bytes(
+                        kv_cache_config.num_blocks
+                    ),
+                    "shared_by": list(tensor.shared_by),
+                }
+                if host_backed:
+                    layout.update(
+                        host_backed=tensor.host_backed,
+                        scale_page_size=tensor.qsa_scale_page_size_bytes,
+                    )
+                tensors.append(layout)
             self.persistent_layout = {
-                "version": "grouped-worker-interleaved-v1",
+                "version": (
+                    "grouped-qsa-host-kv-v1"
+                    if host_backed
+                    else "grouped-worker-interleaved-v1"
+                ),
                 "config_hash": vllm_config.compute_hash(),
                 "attention_backend": str(backend),
                 "model_revision": vllm_config.model_config.revision,
                 "group_pages": self.cpu_group_page_sizes,
-                "tensors": [
-                    {
-                        "page_size": tensor.size // kv_cache_config.num_blocks,
-                        "shared_by": list(tensor.shared_by),
-                    }
-                    for tensor in kv_cache_config.kv_cache_tensors
-                ],
+                "tensors": tensors,
             }
 
         # Scheduler-side mmap (rank=None); kept for cleanup
