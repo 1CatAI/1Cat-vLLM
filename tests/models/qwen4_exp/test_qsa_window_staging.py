@@ -3,11 +3,13 @@
 """History staged in windows must reproduce the single-pass prefill readers."""
 
 import importlib
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
-from vllm.models.qwen4_exp.nvidia.ops.host_kv import merge_windows
+from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV, merge_windows
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -153,3 +155,71 @@ def test_windowed_history_matches_single_pass(fp8, windows):
     torch.accelerator.synchronize()
     # One FP16 rounding of the output (the merge reorders the softmax sum).
     torch.testing.assert_close(out, reference, rtol=0, atol=2e-3)
+
+
+@pytest.mark.parametrize("count", [4, 5, 32])
+def test_outstanding_stage_plans_keep_their_own_tables(count):
+    state = object.__new__(HostQSAKV)
+    state.history = torch.empty(0, device="cuda")
+    state.blocks = count
+    plans = []
+    for i in range(count):
+        table = np.full((1, count), -1, dtype=np.int32)
+        table[0, i] = 0
+        pages = np.array([count - 1 - i], dtype=np.int32)
+        plans.append(state._make_stage_plan(table, pages, [count]))
+    for i, (_, _, table, pages, *_) in enumerate(plans):
+        expected = [-1] * count
+        expected[i] = 0
+        assert table.cpu().tolist() == [expected]
+        assert pages.cpu().tolist() == [count - 1 - i]
+
+
+@pytest.mark.parametrize("has_workspace", [False, True])
+def test_deferred_kv_is_visible_to_first_reader(monkeypatch, has_workspace):
+    from vllm.models.qwen4_exp.nvidia import qsa
+    from vllm.models.qwen4_exp.nvidia.ops import device_kv_attention, host_kv_attention
+
+    stored = torch.tensor([-55])
+    fresh = torch.tensor([73])
+    state = SimpleNamespace(
+        history=stored,
+        blocks=2,
+        page_size=1,
+        width=1,
+        resolve_rows=1,
+        device_history_hot=True,
+        device_history_workspace=(),
+        stage_plan=lambda *args, **kwargs: None,
+        stage_window_plans=lambda *args, **kwargs: [object(), object()],
+        sync_stage_inputs=lambda *args: (None, [2]),
+        write=lambda key, value, slots: stored.copy_(key),
+        clear_gpu_page_cache=lambda: None,
+    )
+    observed = []
+
+    def read(*args, **kwargs):
+        observed.append(stored.item())
+
+    owner = SimpleNamespace(
+        host_kv=state,
+        host_kv_prefill_stage_tokens=1,
+        host_kv_decode_rows=1,
+        host_kv_is_draft=False,
+        _host_kv_new=(fresh, fresh, torch.zeros(1, dtype=torch.long)),
+        _host_kv_write_deferred=True,
+        _windowed_rows=read,
+    )
+    monkeypatch.setattr(
+        device_kv_attention,
+        "prefill_history_workspace",
+        lambda state: () if has_workspace else None,
+    )
+    monkeypatch.setattr(host_kv_attention, "host_qsa_attention", read)
+    q = torch.empty((2, 6, 256))
+    row = torch.zeros(2, dtype=torch.int32)
+    qsa.Qwen4ExpQSAAttention._host_kv_forward_local(
+        owner, q, row[:, None], row[None, :], row, row, row[:1], q, None
+    )
+    assert observed and all(value == 73 for value in observed)
+    assert not owner._host_kv_write_deferred

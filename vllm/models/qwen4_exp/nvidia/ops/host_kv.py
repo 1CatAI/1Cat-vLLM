@@ -20,10 +20,6 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 _WORKSPACES: dict[tuple, tuple[torch.Tensor, ...]] = {}
 # Prefill history stages, shared by all QSA layers of a device.
 _STAGES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
-_STAGE_PLAN_RINGS: dict[
-    tuple, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
-] = {}
-_STAGE_PLAN_RING_IDX: dict[tuple, int] = {}
 
 
 @triton.jit
@@ -1283,37 +1279,20 @@ class HostQSAKV:
         starts = np.concatenate(([0], breaks))
         counts = np.diff(np.concatenate((starts, [sources.size])))
         runs = [[int(sources[a]), int(a), int(n)] for a, n in zip(starts, counts)]
+        # A logical plan can outlive four other plans in the same prefill step.
+        # Own its device tables; the pinned allocator tracks the async copies.
         device = self.history.device
-        ring_key = (
-            device.index,
-            max(64, staged.shape[0]),
-            max(self.blocks, staged.shape[1], k),
+        staged_device = (
+            torch.from_numpy(staged).pin_memory().to(device, non_blocking=True)
         )
-        if ring_key not in _STAGE_PLAN_RINGS:
-            _, max_r, max_c = ring_key
-            _STAGE_PLAN_RINGS[ring_key] = [
-                (
-                    torch.empty((max_r, max_c), dtype=torch.int32, pin_memory=True),
-                    torch.empty((max_r, max_c), dtype=torch.int32, device=device),
-                    torch.empty((max_c,), dtype=torch.int32, pin_memory=True),
-                    torch.empty((max_c,), dtype=torch.int32, device=device),
-                )
-                for _ in range(4)
-            ]
-            _STAGE_PLAN_RING_IDX[ring_key] = 0
-        slot_idx = _STAGE_PLAN_RING_IDX[ring_key]
-        _STAGE_PLAN_RING_IDX[ring_key] = (slot_idx + 1) & 3
-        st_cpu, st_gpu, pg_cpu, pg_gpu = _STAGE_PLAN_RINGS[ring_key][slot_idx]
-        r_n, c_n = staged.shape
-        st_cpu[:r_n, :c_n].numpy()[:] = staged
-        st_gpu[:r_n, :c_n].copy_(st_cpu[:r_n, :c_n], non_blocking=True)
-        pg_cpu[:k].numpy()[:] = sources
-        pg_gpu[:k].copy_(pg_cpu[:k], non_blocking=True)
+        pages_device = (
+            torch.from_numpy(sources).pin_memory().to(device, non_blocking=True)
+        )
         return (
             runs,
             k,
-            st_gpu[:r_n, :c_n],
-            pg_gpu[:k],
+            staged_device,
+            pages_device,
             lengths_host,
             prefix_k,
             upto_k,
