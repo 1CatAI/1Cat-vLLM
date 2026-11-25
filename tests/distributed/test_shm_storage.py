@@ -7,6 +7,7 @@ import time
 import traceback
 import unittest
 from multiprocessing import Lock
+from unittest.mock import patch
 
 import torch
 
@@ -148,6 +149,197 @@ class TestShmObjectStorageReferenceCounting(unittest.TestCase):
         self.readers[0].touch("image", address=address, monotonic_id=monotonic_id)
 
         self.assertEqual(bytes(self.writer.ring_buffer.shared_memory.buf), before)
+
+    def test_release_balances_a_put_that_is_never_fetched(self):
+        """The request that wrote the item was rejected before any reader
+        saw it; another request's reference on it is fetched normally."""
+        unread = self.writer.put("image", _dummy_item({"pixels": 64}))
+        read = self.writer.get_cached("image")
+        generation = self.writer.generation
+
+        for reader in self.readers:
+            reader.get(*read)
+        self.assertFalse(self._is_evictable("image"))
+
+        self.assertTrue(self.writer.release("image", unread[1], generation))
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_release_balances_a_get_cached_reference(self):
+        address, monotonic_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        for reader in self.readers:
+            reader.get(address, monotonic_id)
+        self.writer.touch("image")
+        self.assertEqual(self.writer.get_cached("image"), (address, monotonic_id))
+        self.writer.release_touches()
+        self.assertFalse(self._is_evictable("image"))
+
+        self.assertTrue(
+            self.writer.release("image", monotonic_id, self.writer.generation)
+        )
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_release_keeps_the_item_for_another_unfetched_reference(self):
+        """Two concurrent requests reference the same item; only one of them
+        is rejected, the other still has to be fetched by every reader."""
+        first = self.writer.put("image", _dummy_item({"pixels": 64}))
+        second = self.writer.get_cached("image")
+
+        self.assertTrue(self.writer.release("image", first[1], self.writer.generation))
+        self.assertFalse(self._is_evictable("image"))
+        for reader in self.readers[:-1]:
+            reader.get(*second)
+        self.assertFalse(self._is_evictable("image"))
+        self.readers[-1].get(*second)
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_release_of_each_reference_of_an_item_twice_in_one_request(self):
+        first = self.writer.put("image", _dummy_item({"pixels": 64}))
+        second = self.writer.get_cached("image")
+        generation = self.writer.generation
+
+        self.assertTrue(self.writer.release("image", first[1], generation))
+        self.assertFalse(self._is_evictable("image"))
+        self.assertTrue(self.writer.release("image", second[1], generation))
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_release_never_goes_below_zero(self):
+        _, monotonic_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        generation = self.writer.generation
+
+        self.assertTrue(self.writer.release("image", monotonic_id, generation))
+        self.assertFalse(self.writer.release("image", monotonic_id, generation))
+        self.assertEqual(self.writer.writer_flag[monotonic_id], 0)
+
+    def test_release_after_the_item_was_freed_and_written_again_is_ignored(self):
+        """The slot of a freed item is reused, possibly by the same key: a
+        stale reference must not take a count from the new object."""
+        _, old_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        generation = self.writer.generation
+        for reader in self.readers:
+            reader.get(*self.writer.key_index["image"])
+        self.assertTrue(self._is_evictable("image"))
+
+        self.writer.put("other", _dummy_item({"pixels": 64}))
+        _, new_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.assertNotEqual(new_id, old_id)
+
+        self.assertFalse(self.writer.release("image", old_id, generation))
+        self.assertFalse(self.writer.release("missing", old_id, generation))
+        self.assertEqual(self.writer.writer_flag[new_id], 1)
+
+    def test_release_after_clear_is_ignored(self):
+        """clear() restarts monotonic ids, so the same key written again gets
+        the same address and id as the reference handed out before it."""
+        old = self.writer.put("image", _dummy_item({"pixels": 64}))
+        old_generation = self.writer.generation
+
+        self.writer.clear()
+        new = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.assertEqual(new, old)
+        self.assertNotEqual(self.writer.generation, old_generation)
+
+        self.assertFalse(self.writer.release("image", old[1], old_generation))
+        self.assertEqual(self.writer.writer_flag[new[1]], 1)
+        self.assertTrue(self.writer.release("image", new[1], self.writer.generation))
+
+    def test_added_reference_keeps_the_item_for_the_second_request(self):
+        """Every reader fetches an item once per request that sends it, so a
+        second request sending the same reference needs a count of its own."""
+        reference = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.assertTrue(
+            self.writer.add_reference("image", reference[1], self.writer.generation)
+        )
+        # The touches of a later batch must not take it back.
+        self.writer.release_touches()
+
+        for reader in self.readers:
+            reader.get(*reference)
+        self.assertFalse(self._is_evictable("image"))
+        for reader in self.readers:
+            reader.get(*reference)
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_added_reference_is_given_back_like_any_other(self):
+        _, monotonic_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        generation = self.writer.generation
+        self.assertTrue(self.writer.add_reference("image", monotonic_id, generation))
+        self.assertEqual(self.writer.writer_flag[monotonic_id], 2)
+
+        self.assertTrue(self.writer.release("image", monotonic_id, generation))
+        self.assertTrue(self.writer.release("image", monotonic_id, generation))
+        self.assertTrue(self._is_evictable("image"))
+
+    def test_no_reference_is_added_to_a_freed_or_cleared_item(self):
+        """The address may name another object by then."""
+        _, old_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        generation = self.writer.generation
+        for reader in self.readers:
+            reader.get(*self.writer.key_index["image"])
+        self.assertTrue(self._is_evictable("image"))
+        self.assertFalse(self.writer.add_reference("image", old_id, generation))
+
+        self.writer.put("other", _dummy_item({"pixels": 64}))
+        _, new_id = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.assertFalse(self.writer.add_reference("image", old_id, generation))
+        self.assertEqual(self.writer.writer_flag[new_id], 1)
+
+        self.writer.clear()
+        cleared = self.writer.put("image", _dummy_item({"pixels": 64}))
+        self.assertEqual(cleared[1], 0)
+        self.assertFalse(self.writer.add_reference("image", cleared[1], generation))
+        self.assertEqual(self.writer.writer_flag[cleared[1]], 1)
+
+
+class TestShmObjectStorageReaderCopy(unittest.TestCase):
+    """A reader decodes into its own copy, since the slot is reused once
+    every reader has fetched it. The copy must be pageable: torch keeps
+    pinned host blocks, rounded up to a power of two, until the process
+    exits."""
+
+    def test_reader_copy_is_pageable_and_private(self):
+        pixels = torch.arange(1024, dtype=torch.int32)
+        item = MultiModalKwargsItem(
+            {
+                "pixel_values": MultiModalFieldElem(
+                    data=pixels, field=MultiModalSharedField(batch_size=1)
+                )
+            }
+        )
+        # 4 KiB is above the zero-copy threshold, so the tensor travels as an
+        # aux buffer: the decode branch that used to pin.
+        self.assertGreater(len(MsgpackSerde().serialize(item)[0]), 1)
+
+        writer = SingleWriterShmObjectStorage(
+            max_object_size=1024 * 10,
+            n_readers=1,
+            ring_buffer=SingleWriterShmRingBuffer(
+                data_buffer_size=1024 * 100, create=True
+            ),
+            serde_class=MsgpackSerde,
+        )
+        self.addCleanup(writer.close)
+        handle = writer.handle()
+        handle.reader_lock = Lock()
+
+        # Make pinning available, so the reader would pin if it chose to.
+        with (
+            patch("vllm.v1.serial_utils.is_pin_memory_available", return_value=True),
+            patch.object(
+                torch.Tensor,
+                "pin_memory",
+                side_effect=AssertionError("shm reader pinned its copy"),
+            ),
+        ):
+            reader = SingleWriterShmObjectStorage.create_from_handle(handle)
+            self.addCleanup(reader.close)
+            decoded = reader.get(*writer.put("image", item))
+
+        copy = decoded["pixel_values"].data
+        self.assertFalse(copy.is_pinned())
+        # The writer may reuse the slot as soon as every reader has read it.
+        shm_buf = writer.ring_buffer.shared_memory.buf
+        shm_buf[:] = bytes(len(shm_buf))
+        self.assertTrue(torch.equal(copy, pixels))
 
 
 class TestSingleWriterShmObjectStorage(unittest.TestCase):

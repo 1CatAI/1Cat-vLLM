@@ -239,6 +239,31 @@ def test_numpy_array_serialization():
     )
 
 
+@pytest.mark.parametrize("pin_tensors", [True, False])
+def test_tensor_copy_pinning(monkeypatch: pytest.MonkeyPatch, pin_tensors: bool):
+    """With share_mem=False a large tensor is copied out of the buffer.
+    The copy is pinned by default when pinning is available, and pageable
+    with pin_tensors=False."""
+    monkeypatch.setattr("vllm.v1.serial_utils.is_pin_memory_available", lambda: True)
+    pinned: list[torch.Tensor] = []
+
+    def fake_pin_memory(self: torch.Tensor) -> torch.Tensor:
+        pinned.append(self)
+        return self.clone()
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", fake_pin_memory)
+    decoder = MsgpackDecoder(torch.Tensor, share_mem=False, pin_tensors=pin_tensors)
+
+    tensor = torch.rand(16, 16)
+    encoded = MsgpackEncoder().encode(tensor)
+    assert len(encoded) == 2  # sent as an aux buffer, the branch that pins
+    decoded = decoder.decode(encoded)
+
+    assert torch.equal(decoded, tensor)
+    assert decoded.data_ptr() != tensor.data_ptr()
+    assert len(pinned) == int(pin_tensors)
+
+
 class CustomClass:
     def __init__(self, value):
         self.value = value
@@ -423,3 +448,21 @@ def test_multiple_senders_single_receiver_ipc():
         assert torch.allclose(decoded.prompt_embeds, original_tensor), (
             f"Value mismatch for sender {sender_idx} msg {msg_idx}"
         )
+
+
+def test_engine_core_outputs_finished_mm_requests():
+    """The field is optional and last: the other fields keep their positions
+    in the array-like encoding, and outputs without it decode as before."""
+    from vllm.v1.engine import EngineCoreOutputs
+
+    encoder = MsgpackEncoder()
+    decoder = MsgpackDecoder(EngineCoreOutputs)
+
+    outputs = EngineCoreOutputs(finished_mm_requests={"a": False, "b": True})
+    decoded = decoder.decode(encoder.encode(outputs))
+    assert decoded.finished_mm_requests == {"a": False, "b": True}
+
+    plain = EngineCoreOutputs(finished_requests={"a"}, timestamp=1.0)
+    decoded = decoder.decode(encoder.encode(plain))
+    assert decoded.finished_mm_requests is None
+    assert decoded.finished_requests == {"a"}

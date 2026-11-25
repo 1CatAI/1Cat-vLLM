@@ -4,6 +4,7 @@
 import asyncio
 from abc import ABC
 from collections.abc import AsyncGenerator, Mapping
+from contextlib import aclosing
 
 import numpy as np
 
@@ -11,6 +12,7 @@ from vllm import CompletionOutput, RequestOutput
 from vllm.engine.protocol import EngineClient
 from vllm.inputs import EngineInput
 from vllm.lora.request import LoRARequest
+from vllm.multimodal.cache import take_cache_references
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
@@ -32,6 +34,32 @@ class BeamSearchOnlineMixin(ABC):
         params: BeamSearchParams,
         lora_request: LoRARequest | None = None,
         trace_headers: Mapping[str, str] | None = None,
+    ) -> AsyncGenerator[RequestOutput, None]:
+        # Every step sends the rendered multimodal items again, in requests of
+        # its own. Hold the processor-cache references that rendering counted
+        # (shm cache) for the whole search, so that the items stay cached
+        # between steps; each of those requests counts one more of its own
+        # (AsyncLLM.add_request).
+        held = take_cache_references(self.renderer.get_mm_items(prompt))
+        try:
+            async with aclosing(
+                self._beam_search(
+                    prompt, request_id, params, lora_request, trace_headers
+                )
+            ) as outputs:
+                async for output in outputs:
+                    yield output
+        finally:
+            if held:
+                self.renderer.release_mm_cache_references_async(held)
+
+    async def _beam_search(
+        self,
+        prompt: EngineInput,
+        request_id: str,
+        params: BeamSearchParams,
+        lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None,
     ) -> AsyncGenerator[RequestOutput, None]:
         beam_width = params.beam_width
         max_tokens = params.max_tokens

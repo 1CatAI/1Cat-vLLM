@@ -371,8 +371,20 @@ class MsgpackSerde(ObjectSerde):
         from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
         self.encoder = MsgpackEncoder()
-        self.tensor_decoder = MsgpackDecoder(torch.Tensor, share_mem=False)
-        self.mm_decoder = MsgpackDecoder(MultiModalKwargsItem, share_mem=False)
+        # The copy out of the ring is needed (the slot is reused once every
+        # reader has fetched it), but pinning it is not needed for
+        # correctness: Model Runner V2 batches encoder inputs with
+        # pin_memory=False; V1 concatenates a multi-item batch into a new
+        # pinned tensor and copies a single item from pageable memory.
+        # torch's caching host allocator rounds pinned blocks up to a power of
+        # two and keeps them until the process exits, so pinning every copy
+        # grew each reader's host memory for the life of the server.
+        self.tensor_decoder = MsgpackDecoder(
+            torch.Tensor, share_mem=False, pin_tensors=False
+        )
+        self.mm_decoder = MsgpackDecoder(
+            MultiModalKwargsItem, share_mem=False, pin_tensors=False
+        )
         self._mm_kwargs_item_cls = MultiModalKwargsItem
 
     def serialize(self, value: Any) -> tuple[bytes | list[bytes], int, bytes, int]:
@@ -513,6 +525,10 @@ class SingleWriterShmObjectStorage:
             # monotonic_id -> count. Scoped to one batch, which relies on the
             # single writer thread this storage is designed for.
             self._touched: dict[int, int] = {}
+            # Bumped by clear(), which restarts monotonic ids at 0: a
+            # reference handed out before a clear can carry the same key and
+            # id as an object written after it, so release() checks this.
+            self.generation = 0
         else:
             if reader_lock is None:
                 raise ValueError("Lock must be provided for readers.")
@@ -527,6 +543,7 @@ class SingleWriterShmObjectStorage:
             self.id_index.clear()
             self.writer_flag.clear()
             self._touched.clear()
+            self.generation += 1
             logger.debug("Object storage cleared and reinitialized.")
 
     def copy_to_buffer(
@@ -604,6 +621,60 @@ class SingleWriterShmObjectStorage:
         for monotonic_id, count in self._touched.items():
             self.writer_flag[monotonic_id] -= count
         self._touched.clear()
+
+    def release(self, key: str, monotonic_id: int, generation: int) -> bool:
+        """Give back one writer reference that no reader will ever fetch.
+
+        put() and get_cached() count a reference for every request that will
+        hand the item to the readers. When that request never reaches them
+        (rejected or aborted first), the count stays above what the readers
+        can match, the item is never freed, and since the ring frees in FIFO
+        order nothing written after it is freed either.
+
+        The reference is identified by the `generation`, key and monotonic id
+        it was handed out with. If the item has been freed since (its slot
+        may hold another object now, possibly for the same key) or the
+        storage was cleared, the reference is gone and nothing is changed.
+
+        Returns:
+            Whether a reference was released.
+        """
+        assert self.is_writer, "Only the writer can release references."
+        if generation != self.generation:
+            return False
+        entry = self.key_index.get(key)
+        if entry is None or entry[1] != monotonic_id:
+            return False
+        count = self.writer_flag[monotonic_id]
+        if count <= 0:
+            return False
+        self.writer_flag[monotonic_id] = count - 1
+        return True
+
+    def add_reference(self, key: str, monotonic_id: int, generation: int) -> bool:
+        """Count one more writer reference to an item that is still stored.
+
+        Every request that hands an item to the readers needs a reference of
+        its own, since each reader fetches the item once per request. A
+        request that sends the address of an earlier request (an n > 1 child,
+        a beam search step) takes one here, while the earlier reference still
+        keeps the item from being freed.
+
+        The item is identified like in `release()`. If it has been freed or
+        the storage was cleared since, nothing is counted: the address may
+        name another object by now.
+
+        Returns:
+            Whether a reference was counted.
+        """
+        assert self.is_writer, "Only the writer can add references."
+        if generation != self.generation:
+            return False
+        entry = self.key_index.get(key)
+        if entry is None or entry[1] != monotonic_id:
+            return False
+        self.increment_writer_flag(monotonic_id)
+        return True
 
     def put(self, key: str, value: Any) -> tuple[int, int]:
         """

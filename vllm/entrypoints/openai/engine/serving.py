@@ -433,11 +433,18 @@ class OpenAIServing(BeamSearchOnlineMixin):
         is rejected before reaching the engine would otherwise leave entries
         the engine never held. The next request that uses the same image then
         sends `data=None` and hits `MultiModalCacheMissError` in the engine.
-        Rolling back here means the first retry sends the data."""
+        Rolling back here means the first retry sends the data.
+
+        With the shm cache, rendering also counts a reference on each item
+        that only the workers' reads balance; one never read keeps the item,
+        and every item written after it, in the cache for good. The rollback
+        gives back the references the engine client has not taken; it takes
+        them itself when the request reaches it, which may happen inside this
+        window (non-streaming) or after it (streaming)."""
         # Rendering updates the sender cache before length checks, sampling
         # parameter conversion and parser adjustments. Roll it back before a
         # frontend rejection is returned, so the first retry sends the data.
-        with self.renderer.track_mm_cache_items() as mm_hashes:
+        with self.renderer.track_mm_cache_items() as rendered:
             rejected = True
             try:
                 result = await self._with_kv_transfer_rejection_cleanup_impl(
@@ -446,8 +453,11 @@ class OpenAIServing(BeamSearchOnlineMixin):
                 rejected = isinstance(result, ErrorResponse)
                 return result
             finally:
-                if rejected and mm_hashes:
-                    await self.renderer.invalidate_mm_cache_items_async(mm_hashes)
+                # Not gated on what was recorded so far: after a client
+                # disconnect the render can still be running, and the
+                # rollback queued behind it sees what it adds.
+                if rejected and rendered.submitted:
+                    await self.renderer.rollback_mm_cache_items_async(rendered)
 
     async def _with_kv_transfer_rejection_cleanup_impl(
         self,

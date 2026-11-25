@@ -916,6 +916,18 @@ class SyncMPClient(MPClient):
         self.call_utility("save_sharded_state", path, pattern, max_size)
 
 
+def _is_for_output_queue(outputs: EngineCoreOutputs) -> bool:
+    """Whether AsyncMPClient passes `outputs` on to the engine client.
+
+    finished_mm_requests can come alone (requests aborted before they were
+    scheduled): AsyncLLM needs it to give back their processor-cache
+    references.
+    """
+    return bool(
+        outputs.outputs or outputs.scheduler_stats or outputs.finished_mm_requests
+    )
+
+
 class AsyncMPClient(MPClient):
     """Asyncio-compatible client for multi-proc EngineCore."""
 
@@ -1008,7 +1020,7 @@ class AsyncMPClient(MPClient):
                             return
                         await output_handler(_self, outputs)
 
-                    if outputs.outputs or outputs.scheduler_stats:
+                    if _is_for_output_queue(outputs):
                         outputs_queue.put_nowait(outputs)
             except Exception as e:
                 outputs_queue.put_nowait(e)

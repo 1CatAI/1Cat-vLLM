@@ -7,7 +7,7 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -25,6 +25,8 @@ from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.multimodal.cache import ShmCacheReference, take_cache_references
+from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.outputs import (
     STREAM_FINISHED,
     STREAM_KEEPALIVE,
@@ -71,6 +73,93 @@ class InputStreamError(Exception):
     def __init__(self, cause: Exception):
         self.cause = cause
         super().__init__(str(cause))
+
+
+def _references_owned_by_others(
+    sent: list[ShmCacheReference], owned: list[ShmCacheReference]
+) -> list[ShmCacheReference]:
+    """The references in `sent`, one per occurrence, that are not among
+    `owned`: another request took them, so this one needs its own."""
+    unclaimed = list(owned)
+    others: list[ShmCacheReference] = []
+    for reference in sent:
+        for idx, own in enumerate(unclaimed):
+            if own is reference:
+                del unclaimed[idx]
+                break
+        else:
+            others.append(reference)
+    return others
+
+
+class _MMCacheReferences:
+    """The shm processor-cache references of one engine request, held until
+    EngineCore reports it finished."""
+
+    def __init__(self, references: list[ShmCacheReference]) -> None:
+        self.references = references
+
+
+class MMCacheReferenceLedger:
+    """Processor-cache references (shm cache) of the requests sent to the
+    engine, by request id.
+
+    Every engine request, also each n > 1 child, holds references of its own,
+    and the workers' reads of the request balance them. EngineCore reports
+    every finished request that carries any, with whether the workers received
+    it (EngineCoreOutputs.finished_mm_requests); if they did not, nothing else
+    will balance its references, so they have to be given back. Giving back a
+    reference the workers read lets the item be freed while another request
+    still has to fetch it, so the default is to keep it.
+    """
+
+    def __init__(self) -> None:
+        self._by_request: dict[str, _MMCacheReferences] = {}
+
+    def __bool__(self) -> bool:
+        return bool(self._by_request)
+
+    def hold(
+        self, references: list[ShmCacheReference], request_id: str
+    ) -> _MMCacheReferences | None:
+        """Register the references before `request_id` is sent, so a report
+        cannot arrive before them. Returns the holder, or None if nothing was
+        registered."""
+        if not references:
+            return None
+        if request_id in self._by_request:
+            # Only possible with VLLM_DISABLE_REQUEST_ID_RANDOMIZATION and a
+            # reused id. EngineCore reports by id, so a report for the earlier
+            # request would give back these references although the workers
+            # may read them. Leave them unmanaged instead: at worst they keep
+            # their items in the cache.
+            logger.warning(
+                "Request id %s is already in use; its multimodal cache "
+                "references will not be given back if it is aborted early.",
+                request_id,
+            )
+            return None
+        held = _MMCacheReferences(references)
+        self._by_request[request_id] = held
+        return held
+
+    def finish(
+        self,
+        request_id: str,
+        sent_to_workers: bool,
+        holder: _MMCacheReferences | None = None,
+    ) -> list[ShmCacheReference]:
+        """Record that `request_id` finished (or was never sent, with
+        `sent_to_workers=False`), and return the references to give back.
+
+        EngineCore's reports pass no `holder`. A failure in this process
+        passes the holder its own `hold()` returned, so that it cannot finish
+        another request registered under the same id."""
+        held = self._by_request.get(request_id)
+        if held is None or (holder is not None and held is not holder):
+            return []
+        del self._by_request[request_id]
+        return [] if sent_to_workers else held.references
 
 
 class AsyncLLM(EngineClient):
@@ -177,6 +266,9 @@ class AsyncLLM(EngineClient):
         # because the frontend's sender cache said the engine had them. If such
         # a request fails, those entries may have drifted and are dropped.
         self._mm_shadow_hits: dict[str, list[str]] = {}
+        # Processor-cache references (shm cache) of the requests sent to the
+        # engine, until it reports whether the workers received them.
+        self._mm_cache_references = MMCacheReferenceLedger()
 
         self.output_handler: asyncio.Task | None = None
         try:
@@ -308,105 +400,201 @@ class AsyncLLM(EngineClient):
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
-        if self.errored:
-            raise EngineDeadError()
+        # From here on this request is responsible for the processor-cache
+        # references its prompt carries (shm cache): the serving layer's
+        # rollback leaves them alone, so they are given back here if the
+        # request fails before it is sent to the engine.
+        mm_refs = take_cache_references(self._get_mm_items(prompt))
+        try:
+            if self.errored:
+                raise EngineDeadError()
 
-        is_pooling = isinstance(params, PoolingParams)
+            is_pooling = isinstance(params, PoolingParams)
 
-        if (
-            self.vllm_config.cache_config.kv_sharing_fast_prefill
-            and not is_pooling
-            and params.prompt_logprobs
-        ):
-            raise ValueError(
-                "--kv-sharing-fast-prefill produces incorrect logprobs for "
-                "prompt tokens, please disable it when the requests need "
-                "prompt logprobs"
-            )
-
-        if isinstance(prompt, AsyncGenerator):
-            if reasoning_ended is not None or reasoning_parser_kwargs is not None:
-                raise NotImplementedError
-
-            # Streaming input case.
-            return await self._add_streaming_input_request(
-                request_id,
-                prompt,
-                params,
-                arrival_time,
-                lora_request,
-                tokenization_kwargs,
-                trace_headers,
-                priority,
-                data_parallel_rank,
-            )
-
-        # Convert Input --> Request.
-        if isinstance(prompt, EngineCoreRequest):
-            logger.warning_once(
-                "Passing EngineCoreRequest to AsyncLLM.generate() and .add_requests() "
-                "is deprecated and will be removed in v0.18. You should instead pass "
-                "the outputs of Renderer.render_cmpl() or Renderer.render_chat()."
-            )
-
-            request = prompt
-            if request_id != request.request_id:
-                logger.warning_once(
-                    "AsyncLLM.add_request() was passed a request_id parameter that "
-                    "does not match the EngineCoreRequest.request_id attribute. The "
-                    "latter will be used, and the former will be ignored."
+            if (
+                self.vllm_config.cache_config.kv_sharing_fast_prefill
+                and not is_pooling
+                and params.prompt_logprobs
+            ):
+                raise ValueError(
+                    "--kv-sharing-fast-prefill produces incorrect logprobs for "
+                    "prompt tokens, please disable it when the requests need "
+                    "prompt logprobs"
                 )
-        else:
-            request = self.input_processor.process_inputs(
-                request_id,
-                prompt,
-                params,
-                supported_tasks=await self.get_supported_tasks(),
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank,
+
+            if isinstance(prompt, AsyncGenerator):
+                if reasoning_ended is not None or reasoning_parser_kwargs is not None:
+                    raise NotImplementedError
+
+                # Streaming input case.
+                return await self._add_streaming_input_request(
+                    request_id,
+                    prompt,
+                    params,
+                    arrival_time,
+                    lora_request,
+                    tokenization_kwargs,
+                    trace_headers,
+                    priority,
+                    data_parallel_rank,
+                )
+
+            # Convert Input --> Request.
+            if isinstance(prompt, EngineCoreRequest):
+                logger.warning_once(
+                    "Passing EngineCoreRequest to AsyncLLM.generate() and "
+                    ".add_requests() is deprecated and will be removed in v0.18. "
+                    "You should instead pass the outputs of Renderer.render_cmpl() "
+                    "or Renderer.render_chat()."
+                )
+
+                request = prompt
+                if request_id != request.request_id:
+                    logger.warning_once(
+                        "AsyncLLM.add_request() was passed a request_id parameter "
+                        "that does not match the EngineCoreRequest.request_id "
+                        "attribute. The latter will be used, and the former will "
+                        "be ignored."
+                    )
+            else:
+                request = self.input_processor.process_inputs(
+                    request_id,
+                    prompt,
+                    params,
+                    supported_tasks=await self.get_supported_tasks(),
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                    tokenization_kwargs=tokenization_kwargs,
+                    trace_headers=trace_headers,
+                    priority=priority,
+                    data_parallel_rank=data_parallel_rank,
+                )
+                prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+
+            if reasoning_ended is not None:
+                request.reasoning_ended = reasoning_ended
+            if reasoning_parser_kwargs is not None:
+                request.reasoning_parser_kwargs = reasoning_parser_kwargs
+
+            self.input_processor.assign_request_id(request)
+
+            # We start the output_handler on the first call to add_request() so
+            # we can call __init__ before the event loop, which enables us
+            # to handle startup failure gracefully in the OpenAI server.
+            self._run_output_handler()
+
+            # Create a new output collector for the request.
+            queue = RequestOutputCollector(params.output_kind, request.request_id)
+
+            # Use cloned params that may have been updated in process_inputs()
+            params = request.params
+            # Items rendered inside process_inputs (raw prompts).
+            mm_refs += take_cache_references(
+                feature.data for feature in request.mm_features or ()
             )
-            prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
-        if reasoning_ended is not None:
-            request.reasoning_ended = reasoning_ended
-        if reasoning_parser_kwargs is not None:
-            request.reasoning_parser_kwargs = reasoning_parser_kwargs
+            # The workers fetch an item once for every engine request that
+            # sends it, so each request needs a reference of its own to each
+            # item. This one owns the references it took. It counts one more
+            # for every reference someone else took (beam search sends the
+            # rendered items again every step), and every n > 1 child after
+            # the first counts a full set.
+            num_requests = 1 if is_pooling or params.n == 1 else params.n
+            sent = [
+                feature.data
+                for feature in request.mm_features or ()
+                if isinstance(feature.data, ShmCacheReference)
+            ]
+            not_owned = _references_owned_by_others(sent, mm_refs)
+            added: list[ShmCacheReference] = []
+            to_add = not_owned + sent * (num_requests - 1)
+            if to_add:
+                try:
+                    if not await self.renderer.add_mm_cache_references_async(
+                        to_add, added
+                    ):
+                        raise RuntimeError(
+                            f"Request {request.request_id} sends multimodal "
+                            "items that are no longer in the shm processor "
+                            "cache (it was reset, or the earlier request "
+                            "that sent them has finished)."
+                        )
+                except BaseException:
+                    # Runs behind the add, so it gives back all it counted.
+                    self.renderer.release_mm_cache_references_async(added)
+                    raise
+        except BaseException:
+            self._release_mm_cache_references(mm_refs)
+            raise
+        # The references of each engine request, in the order of `children`.
+        first = len(not_owned)
+        request_refs = [mm_refs + added[:first]] + [
+            added[first + i * len(sent) : first + (i + 1) * len(sent)]
+            for i in range(num_requests - 1)
+        ]
 
-        self.input_processor.assign_request_id(request)
-
-        # We start the output_handler on the first call to add_request() so
-        # we can call __init__ before the event loop, which enables us
-        # to handle startup failure gracefully in the OpenAI server.
-        self._run_output_handler()
-
-        # Create a new output collector for the request.
-        queue = RequestOutputCollector(params.output_kind, request.request_id)
-
-        # Use cloned params that may have been updated in process_inputs()
-        params = request.params
-
-        if is_pooling or params.n == 1:
-            await self._add_request(request, prompt_text, None, 0, queue)
+        if num_requests == 1:
+            holder = self._mm_cache_references.hold(request_refs[0], request.request_id)
+            await self._add_request(request, prompt_text, None, 0, queue, holder)
             return queue
 
         parent_params = params
         assert isinstance(parent_params, SamplingParams)
 
         # Fan out child requests (for n>1).
-        parent_request = ParentRequest(request)
-        for idx in range(parent_params.n):
-            request_id, child_params = parent_request.get_child_info(idx)
-            child_request = request if idx == parent_params.n - 1 else copy(request)
-            child_request.request_id = request_id
-            child_request.sampling_params = child_params
-            await self._add_request(
-                child_request, prompt_text, parent_request, idx, queue
-            )
+        try:
+            parent_request = ParentRequest(request)
+            children: list[EngineCoreRequest] = []
+            for idx in range(parent_params.n):
+                request_id, child_params = parent_request.get_child_info(idx)
+                child_request = request if idx == parent_params.n - 1 else copy(request)
+                child_request.request_id = request_id
+                child_request.sampling_params = child_params
+                children.append(child_request)
+        except BaseException:
+            self._release_mm_cache_references(mm_refs + added)
+            raise
+        # Each child holds its own references, given back if it alone never
+        # reaches the workers.
+        holders = [
+            self._mm_cache_references.hold(refs, child.request_id)
+            for refs, child in zip(request_refs, children)
+        ]
+        for idx, child_request in enumerate(children):
+            try:
+                await self._add_request(
+                    child_request, prompt_text, parent_request, idx, queue, holders[idx]
+                )
+            except BaseException:
+                for unsent, holder in zip(children[idx + 1 :], holders[idx + 1 :]):
+                    self._finish_mm_cache_references(unsent.request_id, holder)
+                raise
         return queue
+
+    def _finish_mm_cache_references(
+        self, request_id: str, holder: _MMCacheReferences | None
+    ) -> None:
+        """`request_id` failed in this process before it was sent. Only the
+        references this call registered (`holder`) are affected."""
+        if holder is not None:
+            self._release_mm_cache_references(
+                self._mm_cache_references.finish(request_id, False, holder)
+            )
+
+    def _get_mm_items(self, prompt: object) -> list[MultiModalKwargsItem | None]:
+        if isinstance(prompt, EngineCoreRequest):
+            return [feature.data for feature in prompt.mm_features or ()]
+        if isinstance(prompt, dict) and "type" in prompt:
+            return self.renderer.get_mm_items(cast(EngineInput, prompt))
+        # A raw prompt is rendered inside process_inputs, or a stream.
+        return []
+
+    def _release_mm_cache_references(self, references: list[ShmCacheReference]) -> None:
+        """Give back processor-cache references of a request that will never
+        reach the workers. Runs on the renderer thread ahead of any later
+        render; nothing waits for it."""
+        if references:
+            self.renderer.release_mm_cache_references_async(references)
 
     async def _add_request(
         self,
@@ -415,9 +603,14 @@ class AsyncLLM(EngineClient):
         parent_req: ParentRequest | None,
         index: int,
         queue: RequestOutputCollector,
+        mm_cache_references: _MMCacheReferences | None = None,
     ):
         # Add the request to OutputProcessor (this process).
-        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        try:
+            self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        except Exception:
+            self._finish_mm_cache_references(request.request_id, mm_cache_references)
+            raise
 
         # Remember items sent without data (sender-cache hits), so they can be
         # dropped from the sender cache if the engine fails the request.
@@ -433,8 +626,14 @@ class AsyncLLM(EngineClient):
         # Add the EngineCoreRequest to EngineCore (separate process).
         try:
             await self.engine_core.add_request_async(request)
-        except BaseException:
+        except BaseException as e:
             self._mm_shadow_hits.pop(request.request_id, None)
+            # Not sent. A send cancelled while it is awaited may already be on
+            # its way, though; EngineCore then reports the request as usual.
+            if isinstance(e, Exception):
+                self._finish_mm_cache_references(
+                    request.request_id, mm_cache_references
+                )
             raise
 
         if self.log_requests:
@@ -691,6 +890,7 @@ class AsyncLLM(EngineClient):
         renderer = self.renderer
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
         mm_shadow_hits = self._mm_shadow_hits
+        mm_cache_references = self._mm_cache_references
 
         async def output_handler():
             try:
@@ -716,6 +916,18 @@ class AsyncLLM(EngineClient):
                                 drifted.extend(hits)
                         if drifted:
                             renderer.invalidate_mm_cache_items_async(drifted)
+
+                    # 1c) Shm processor cache: give back the references of
+                    # requests that finished without ever reaching the workers
+                    # (aborted while waiting, failed before scheduling), whose
+                    # reads would have balanced them. Runs on the renderer
+                    # thread ahead of later renders.
+                    if outputs.finished_mm_requests and mm_cache_references:
+                        released: list[ShmCacheReference] = []
+                        for req_id, sent in outputs.finished_mm_requests.items():
+                            released += mm_cache_references.finish(req_id, sent)
+                        if released:
+                            renderer.release_mm_cache_references_async(released)
 
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None
@@ -774,6 +986,8 @@ class AsyncLLM(EngineClient):
         all_request_ids = self.output_processor.abort_requests(request_ids, internal)
         for req_id in all_request_ids:
             self._mm_shadow_hits.pop(req_id, None)
+        # _mm_cache_references stays: only EngineCore knows whether the
+        # workers received an aborted request, and it reports that.
         await self.engine_core.abort_requests_async(all_request_ids)
 
         if self.log_requests:
