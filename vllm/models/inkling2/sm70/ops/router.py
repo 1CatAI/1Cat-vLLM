@@ -161,7 +161,7 @@ void router_select(torch::Tensor logits, torch::Tensor bias, torch::Tensor w_out
 ENABLED = os.environ.get("VLLM_INKLING2_SM70_FUSED_ROUTER", "1") == "1"
 # M > 16: logits as an fp16 tensor-core GEMM with fp32 accumulate/output on an fp16 copy of the
 # (bf16-origin) gate weight, instead of x.float() + an fp32 SGEMM.
-ROUTER_HMMA = os.environ.get("VLLM_INKLING2_SM70_ROUTER_HMMA", "0") == "1"
+ROUTER_HMMA = os.environ.get("VLLM_INKLING2_SM70_ROUTER_HMMA", "1") == "1"
 MAX_FUSED_M = 16
 _E, _H, _TOPK = 128, 2304, 8
 

@@ -43,6 +43,7 @@ _CUDA_SRC = r"""
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <stdint.h>
 
 #define HD 128
@@ -302,8 +303,12 @@ __global__ void __launch_bounds__(NW * 32, (NW == 8) ? 2 : 1) attn2_kernel(const
     }
 
     if (p.stop == 2) return;
+    const int interior_hi = (p.window == 0 && rows >= 12 && pos0 > p.E) ? ((pos0 - p.E) & ~31) : 0;
+    const int u_wmma_start = interior_hi > 0 ? ((tile0 + ntiles) - (interior_hi >> 5)) : ntiles;
+    const int u_scalar_limit = min(ulimit, u_wmma_start);
+    int u = split;
 #pragma unroll 1
-    for (int u = split; u < ulimit; u += ustep) {
+    for (; u < u_scalar_limit; u += ustep) {
       const int base = (tile0 + ntiles - 1 - u) << 5;
       // ---- new keys of the tile: K/V short conv, K clip, V norm, cache writes.
       //      Work item i = (new key, K | V) runs on warp 7 - (i & 7) (the q/r clip of the
@@ -440,10 +445,10 @@ __global__ void __launch_bounds__(NW * 32, (NW == 8) ? 2 : 1) attn2_kernel(const
       __syncthreads();
       if (p.stop == 3) return;
       if (p.pf) {
-        if (u + ustep < ulimit) issue_pg(u + ustep, pg1);
+        if (u + ustep < u_scalar_limit) issue_pg(u + ustep, pg1);
         prefetch_pg(u + 3 * ustep, pg3);
         pg1 = pg2; pg2 = pg3; pg3 = page_of(u + 4 * ustep);
-      } else if (u + ustep < ulimit) issue(u + ustep);  // next tile in flight during this tile's rows
+      } else if (u + ustep < u_scalar_limit) issue(u + ustep);  // next tile in flight during this tile's rows
       if (p.stop == 9) { __syncthreads(); continue; }  // tuning aid: tile loads + staging only
       // ---- rows of this warp: QK (lane = key), bias, softmax, P.V (lane = 4 dims) ----
 #pragma unroll 1
@@ -520,6 +525,192 @@ __global__ void __launch_bounds__(NW * 32, (NW == 8) ? 2 : 1) attn2_kernel(const
         mv.z = fmaf(mv.z, alpha, c2);
         mv.w = fmaf(mv.w, alpha, c3);
         *mp = mv;
+      }
+      __syncthreads();
+    }
+
+
+    // ---- WMMA tensor-core interior loop for global layers (dist >= E, no bias/mask/conv) ----
+    if (u < ulimit) {
+      using namespace nvcuda;
+      constexpr int W_BM = 32;
+      constexpr int W_LDK = HD + 8;  // 136 halves
+      constexpr int W_LDS = TK + 4;  // 36 floats
+      constexpr int W_LDP = TK + 8;  // 40 halves
+      // Reuse K_s + V_s (32,768 bytes) for all WMMA staging -> zero extra shared memory!
+      __half* w_sQ = reinterpret_cast<__half*>(K_s);  // 32 * 136 * 2 = 8,704 B (temp before key loop)
+      // 1) Convert q_s [rows, 128] (fp32) -> w_sQ [32, 136] (fp16)
+      for (int idx = tid; idx < W_BM * (HD / 4); idx += NW * 32) {
+        const int r = idx >> 5;
+        const int c4 = idx & 31;
+        __half2 h0 = __floats2half2_rn(0.f, 0.f), h1 = h0;
+        if (r < rows) {
+          const float4 qv = *reinterpret_cast<const float4*>(q_s + r * HD + c4 * 4);
+          h0 = __floats2half2_rn(qv.x, qv.y);
+          h1 = __floats2half2_rn(qv.z, qv.w);
+        }
+        __half2* dst2 = reinterpret_cast<__half2*>(w_sQ + r * W_LDK + c4 * 4);
+        dst2[0] = h0;
+        dst2[1] = h1;
+      }
+      __syncthreads();
+
+      // Load Q fragments into registers for warps 0..3 (wm = w>>1, wn = w&1)
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> q_frag[8];
+      if (w < 4) {
+        const int q_wm = w >> 1;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          wmma::load_matrix_sync(q_frag[k], w_sQ + q_wm * 16 * W_LDK + k * 16, W_LDK);
+        }
+      }
+      __syncthreads();
+
+      // 2) Copy existing macc [rows, 128] -> sO_tmp [32, 128] (in K_s, 16 KB) and load into o_frag[0..1] for w < 8
+      float* sO_tmp = K_s;
+      for (int idx = tid; idx < W_BM * (HD / 4); idx += NW * 32) {
+        const int r = idx >> 5;
+        const int c4 = idx & 31;
+        float4 mv = (r < rows) ? *reinterpret_cast<const float4*>(macc + r * HD + c4 * 4)
+                               : make_float4(0.f, 0.f, 0.f, 0.f);
+        *reinterpret_cast<float4*>(sO_tmp + r * HD + c4 * 4) = mv;
+      }
+      __syncthreads();
+
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_frag[2];
+      if (w < 8) {
+        const int o_wm = w >> 2;
+        const int o_wd = w & 3;
+        wmma::load_matrix_sync(o_frag[0], sO_tmp + o_wm * 16 * HD + (o_wd * 32 + 0), HD, wmma::mem_row_major);
+        wmma::load_matrix_sync(o_frag[1], sO_tmp + o_wm * 16 * HD + (o_wd * 32 + 16), HD, wmma::mem_row_major);
+      }
+      __syncthreads();
+
+      // Layout inside K_s + V_s (32,768 B total):
+      // sK_h: 8,704 B | sV_h: 8,704 B | sS_w: 4,608 B | sP_h: 2,560 B | sAlpha: 128 B => 24,704 B <= 32,768 B!
+      __half* sK_h = reinterpret_cast<__half*>(K_s);
+      __half* sV_h = sK_h + TK * W_LDK;
+      float* sS_w = reinterpret_cast<float*>(sV_h + TK * W_LDK);
+      __half* sP_h = reinterpret_cast<__half*>(sS_w + W_BM * W_LDS);
+      float* sAlpha = reinterpret_cast<float*>(sP_h + W_BM * W_LDP);
+
+      const int* bt_row = p.block_table + (int64_t)req * p.stride_bt;
+      // Software-pipelined K/V loads: issue tile u+ustep into registers while WMMA runs on tile u!
+      constexpr int NLD_KV = (TK * (HD / 8)) / (NW * 32);  // 1 for NW=16, 2 for NW=8
+      uint4 pf_k[NLD_KV], pf_v[NLD_KV];
+      auto load_kv_regs = [&](int uu) {
+        const int base = (tile0 + ntiles - 1 - uu) << 5;
+#pragma unroll
+        for (int it = 0; it < NLD_KV; ++it) {
+          const int idx = tid + it * (NW * 32);
+          const int kl = idx >> 4;
+          const int c8 = idx & 15;
+          const int key = base + kl;
+          const int page = bt_row[key >> p.page_shift];
+          const __half* kp = p.kv + (int64_t)page * p.stride_blk + (int64_t)(key & page_mask) * p.stride_slot + (int64_t)kvh * p.stride_h;
+          pf_k[it] = __ldg(reinterpret_cast<const uint4*>(kp + c8 * 8));
+          pf_v[it] = __ldg(reinterpret_cast<const uint4*>(kp + HD + c8 * 8));
+        }
+      };
+      load_kv_regs(u);
+#pragma unroll 1
+      for (; u < ulimit; u += ustep) {
+        // Store prefetched K/V into shared memory
+#pragma unroll
+        for (int it = 0; it < NLD_KV; ++it) {
+          const int idx = tid + it * (NW * 32);
+          const int kl = idx >> 4;
+          const int c8 = idx & 15;
+          *reinterpret_cast<uint4*>(sK_h + kl * W_LDK + c8 * 8) = pf_k[it];
+          *reinterpret_cast<uint4*>(sV_h + kl * W_LDK + c8 * 8) = pf_v[it];
+        }
+        __syncthreads();
+        // Overlap next tile HBM loads with this tile WMMA + softmax!
+        if (u + ustep < ulimit) load_kv_regs(u + ustep);
+
+        // QK^T: warps 0..3 cover [32, 32] (4 tiles of 16x16)
+        if (w < 4) {
+          const int q_wm = w >> 1;
+          const int q_wn = w & 1;
+          wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
+          wmma::fill_fragment(s_frag, 0.f);
+#pragma unroll
+          for (int k = 0; k < 8; ++k) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> k_frag;
+            wmma::load_matrix_sync(k_frag, sK_h + q_wn * 16 * W_LDK + k * 16, W_LDK);
+            wmma::mma_sync(s_frag, q_frag[k], k_frag, s_frag);
+          }
+          wmma::store_matrix_sync(sS_w + q_wm * 16 * W_LDS + q_wn * 16, s_frag, W_LDS, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // Online softmax: warps 0..7 handle 4 rows each (32 cols = 1 col/lane)
+        if (w < 8) {
+#pragma unroll
+          for (int dr = 0; dr < 4; ++dr) {
+            const int r = w * 4 + dr;
+            if (r < rows) {
+              const float sc = sS_w[r * W_LDS + lane] * p.scale_log2;
+              const float mo = m_s[r];
+              const float mn = fmaxf(mo, warp_max(sc));
+              const float ms = (mn == -INFINITY) ? 0.f : mn;
+              const float alpha = (mo == -INFINITY) ? 0.f : ex2f(mo - ms);
+              const float pr = ex2f(sc - ms);
+              float lt = pr;
+#pragma unroll
+              for (int o = 16; o > 0; o >>= 1) lt += shx(lt, o);
+              sP_h[r * W_LDP + lane] = __float2half_rn(pr);
+              if (lane == 0) {
+                m_s[r] = mn;
+                l_s[r] = l_s[r] * alpha + lt;
+                sAlpha[r] = alpha;
+              }
+            } else {
+              sP_h[r * W_LDP + lane] = __float2half_rn(0.f);
+              if (lane == 0) sAlpha[r] = 1.f;
+            }
+          }
+        }
+        __syncthreads();
+
+        // Rescale o_frag & P @ V: warps 0..7 (o_wm = w>>2, o_wd = w&3 -> 32 dims/warp)
+        if (w < 8) {
+          const int o_wm = w >> 2;
+          const int o_wd = w & 3;
+          const int base_r = o_wm * 16;
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const int r = base_r + (lane & 1) + 2 * ((e >> 1) & 1) + 4 * ((lane >> 4) & 1) + 8 * ((lane >> 2) & 1);
+            const float a = sAlpha[r];
+            o_frag[0].x[e] *= a;
+            o_frag[1].x[e] *= a;
+          }
+#pragma unroll
+          for (int k = 0; k < 2; ++k) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> p_frag;
+            wmma::load_matrix_sync(p_frag, sP_h + o_wm * 16 * W_LDP + k * 16, W_LDP);
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> v0_frag, v1_frag;
+            wmma::load_matrix_sync(v0_frag, sV_h + k * 16 * W_LDK + (o_wd * 32 + 0), W_LDK);
+            wmma::load_matrix_sync(v1_frag, sV_h + k * 16 * W_LDK + (o_wd * 32 + 16), W_LDK);
+            wmma::mma_sync(o_frag[0], p_frag, v0_frag, o_frag[0]);
+            wmma::mma_sync(o_frag[1], p_frag, v1_frag, o_frag[1]);
+          }
+        }
+        __syncthreads();
+      }
+
+      // Write final o_frag back to sO_tmp (K_s) and copy [rows, 128] -> macc
+      if (w < 8) {
+        const int o_wm = w >> 2;
+        const int o_wd = w & 3;
+        wmma::store_matrix_sync(sO_tmp + o_wm * 16 * HD + (o_wd * 32 + 0), o_frag[0], HD, wmma::mem_row_major);
+        wmma::store_matrix_sync(sO_tmp + o_wm * 16 * HD + (o_wd * 32 + 16), o_frag[1], HD, wmma::mem_row_major);
+      }
+      __syncthreads();
+      for (int idx = tid; idx < rows * (HD / 4); idx += NW * 32) {
+        const int r = idx >> 5;
+        const int c4 = idx & 31;
+        *reinterpret_cast<float4*>(macc + r * HD + c4 * 4) = *reinterpret_cast<const float4*>(sO_tmp + r * HD + c4 * 4);
       }
       __syncthreads();
     }
@@ -804,7 +995,7 @@ _STOP = int(
 # VLLM_INKLING2_SM70_ATTN2_WARPS: 8 = first build (256 threads), 16 = 512 threads: up to 16 rows (5 tokens) in one round
 _NW = int(os.environ.get("VLLM_INKLING2_SM70_ATTN2_WARPS", "16"))
 # VLLM_INKLING2_SM70_ATTN2_PREFETCH=1: block-table lookups 3 tiles ahead + L2 prefetch of K/V two tiles ahead
-_PREFETCH = int(os.environ.get("VLLM_INKLING2_SM70_ATTN2_PREFETCH", "0") == "1")
+_PREFETCH = int(os.environ.get("VLLM_INKLING2_SM70_ATTN2_PREFETCH", "1") == "1")
 assert _NW in (8, 16)
 
 _EXT = None

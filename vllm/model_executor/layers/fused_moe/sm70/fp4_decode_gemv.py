@@ -29,9 +29,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-MAX_TOKENS = min(
-    16, int(os.environ.get("VLLM_INKLING2_SM70_MOE_FAST_MAX_TOKENS", "16"))
-)
+MAX_TOKENS = min(16, int(os.environ.get("VLLM_INKLING2_SM70_MOE_FAST_MAX_TOKENS", "8")))
 _PERSISTENT_TOKENS = 18  # NvFp4MoEWorkspace persistent buffers
 
 _CPP = r"""

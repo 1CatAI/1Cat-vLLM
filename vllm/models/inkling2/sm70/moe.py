@@ -46,7 +46,7 @@ QuantFormat = Literal["nvfp4", "mxfp8"]
 
 _BACKEND = os.environ.get("VLLM_INKLING2_SM70_MOE", "auto")
 # Batches up to this many tokens run the dense experts as GEMVs.
-_DENSE_GEMV_MAX_TOKENS = 64
+_DENSE_GEMV_MAX_TOKENS = 8
 # Order of the 8-slot weighted sum of `forward_decode` (0 sequential, 1 four interleaved partials):
 # whichever is bitwise torch's `sum(1)`, found by test_mxfp8.py.
 _WSUM_ORDER = int(os.environ.get("VLLM_INKLING2_SM70_MXFP8_WSUM_ORDER", "1"))
