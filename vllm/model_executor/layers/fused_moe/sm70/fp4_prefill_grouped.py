@@ -34,12 +34,12 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-MIN_TOKENS = int(os.environ.get("VLLM_INKLING2_SM70_MOE_PREFILL_MIN_TOKENS", "17"))
+MIN_TOKENS = int(os.environ.get("VLLM_INKLING2_SM70_MOE_PREFILL_MIN_TOKENS", "9"))
 # Largest token count per kernel round; bigger calls are split (bounds the
 # [slots, hidden] routed buffer: 4096 tokens x 8 x 2304 x 2 B = 150 MB).
 SUB_TOKENS = int(os.environ.get("VLLM_INKLING2_SM70_MOE_PREFILL_SUB_TOKENS", "4096"))
-_NCH13 = int(os.environ.get("VLLM_INKLING2_SM70_MOE_PREFILL_NCH13", "4"))
-_NCH2 = int(os.environ.get("VLLM_INKLING2_SM70_MOE_PREFILL_NCH2", "4"))
+_NCH13 = int(os.environ.get("VLLM_INKLING2_SM70_MOE_PREFILL_NCH13", "1"))
+_NCH2 = int(os.environ.get("VLLM_INKLING2_SM70_MOE_PREFILL_NCH2", "1"))
 
 _CPP = r"""
 #include <torch/extension.h>
@@ -817,7 +817,8 @@ class Fp4PrefillGrouped:
         top_k, hidden = self.top_k, self.hidden
         out = torch.empty(tokens, hidden, dtype=torch.float16, device=x.device)
         sub = min(tokens, SUB_TOKENS)
-        ws = _workspace(x.device, sub, top_k, hidden, self.inter, self.experts, _NCH13)
+        nch = _NCH13 if tokens <= 128 else 4
+        ws = _workspace(x.device, sub, top_k, hidden, self.inter, self.experts, nch)
         ids = topk_ids.view(-1)
         wts = topk_weights.view(-1)
         for t0 in range(0, tokens, sub):
@@ -838,7 +839,7 @@ class Fp4PrefillGrouped:
                 top_k,
                 self.gate_cap,
                 self.up_cap,
-                _NCH13,
-                _NCH2,
+                nch,
+                nch,
             )
         return out

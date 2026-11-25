@@ -259,22 +259,47 @@ def block_attention(
     lse_part = torch.empty(
         (num_splits, num_tokens, num_heads), dtype=torch.float32, device=q.device
     )
-    rel_attention(
-        q,
-        key_cache,
-        value_cache,
-        o_part,
-        lse_part,
-        None,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        max_query_len=block,
-        softmax_scale=softmax_scale,
-        window=window,
-        num_splits=num_splits,
-        mode=MODE_PARTIAL,
+    from . import dspark_block_attn as _dba
+
+    # key_cache and value_cache are slices [..., :D] and [..., D:] of kv_cache.
+    use_wmma = (
+        key_cache.dtype == torch.float16
+        and value_cache.dtype == torch.float16
+        and key_cache.stride() == value_cache.stride()
+        and value_cache.data_ptr() - key_cache.data_ptr() == head_dim * 2
+        and _dba.supported(q, key_cache, block)
     )
+    if use_wmma:
+        _dba.run_partial(
+            q,
+            key_cache,
+            o_part,
+            lse_part,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            block=block,
+            softmax_scale=softmax_scale,
+            window=window,
+            num_splits=num_splits,
+        )
+    else:
+        rel_attention(
+            q,
+            key_cache,
+            value_cache,
+            o_part,
+            lse_part,
+            None,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_query_len=block,
+            softmax_scale=softmax_scale,
+            window=window,
+            num_splits=num_splits,
+            mode=MODE_PARTIAL,
+        )
     block_d = 64
     _block_combine_kernel[(num_tokens, num_heads, head_dim // block_d)](
         o_part,

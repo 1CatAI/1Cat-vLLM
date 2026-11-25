@@ -37,7 +37,7 @@ from vllm.triton_utils import triton
 
 from .attn_res import _attn_res_row_kernel
 
-MAX_TOKENS = 16
+MAX_TOKENS = 32
 RANK = 64
 
 _CUDA_SRC = r"""
@@ -299,6 +299,146 @@ __global__ void __launch_bounds__(256) norm_finish_kernel(
   }
 }
 
+
+// Tiled variant for 16 < T <= 128: loads wg/wf ONCE into registers and processes
+// T in 16-token tiles. MODE == 1 uses the 2-phase grid barrier per tile (no xs traffic);
+// MODE == 2 writes xs/partial across all tiles and finishes with norm_finish_kernel.
+template <int NT, typename WT, int MODE>
+__global__ void __launch_bounds__(NT) gf_blend_tiled_kernel(
+    const float* __restrict__ dest, long dest_stride_s,
+    const float* __restrict__ msg,
+    const __half* __restrict__ hidden,
+    const __half* __restrict__ wgf, long wgf_stride_s,
+    const WT* __restrict__ nw, long nw_stride_s,
+    __half* __restrict__ out,
+    float* __restrict__ xs,
+    float* __restrict__ partial,
+    unsigned* __restrict__ counters,
+    int T, int D, float eps) {
+  constexpr int TT = 16;
+  __shared__ float hs[TT][R_];
+  __shared__ float red[NT / 32][TT];
+  __shared__ float rs1[TT];
+  const int s = blockIdx.y, cb = blockIdx.x, CB = gridDim.x;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int j = cb * NT + tid;
+
+  float wg[R_], wf[R_];
+  {
+    const uint4* g8 = reinterpret_cast<const uint4*>(wgf + s * wgf_stride_s + (long)j * R_);
+    const uint4* f8 = reinterpret_cast<const uint4*>(wgf + s * wgf_stride_s + (long)(D + j) * R_);
+#pragma unroll
+    for (int i = 0; i < R_ / 8; i++) {
+      uint4 g = __ldg(g8 + i), f = __ldg(f8 + i);
+      float2 v;
+      v = h2f2(g.x); wg[8 * i + 0] = v.x; wg[8 * i + 1] = v.y;
+      v = h2f2(g.y); wg[8 * i + 2] = v.x; wg[8 * i + 3] = v.y;
+      v = h2f2(g.z); wg[8 * i + 4] = v.x; wg[8 * i + 5] = v.y;
+      v = h2f2(g.w); wg[8 * i + 6] = v.x; wg[8 * i + 7] = v.y;
+      v = h2f2(f.x); wf[8 * i + 0] = v.x; wf[8 * i + 1] = v.y;
+      v = h2f2(f.y); wf[8 * i + 2] = v.x; wf[8 * i + 3] = v.y;
+      v = h2f2(f.z); wf[8 * i + 4] = v.x; wf[8 * i + 5] = v.y;
+      v = h2f2(f.w); wf[8 * i + 6] = v.x; wf[8 * i + 7] = v.y;
+    }
+  }
+  const WT* w = nw + s * nw_stride_s;
+  const float wj = ldf(w + j);
+
+  for (int t0 = 0; t0 < T; t0 += TT) {
+    const int t_len = (T - t0) < TT ? (T - t0) : TT;
+    for (int e = tid; e < t_len * R_; e += NT)
+      hs[e / R_][e % R_] = __half2float(hidden[((long)s * T + t0) * R_ + e]);
+    __syncthreads();
+
+    float xv[TT];
+#pragma unroll
+    for (int t = 0; t < TT; t++) {
+      float x = 0.f;
+      if (t < t_len) {
+        float g0 = 0.f, g1 = 0.f, g2 = 0.f, g3 = 0.f, f0 = 0.f, f1 = 0.f, f2 = 0.f, f3 = 0.f;
+        const float4* h4 = reinterpret_cast<const float4*>(hs[t]);
+#pragma unroll
+        for (int i = 0; i < R_ / 4; i++) {
+          float4 h = h4[i];
+          g0 = fmaf(wg[4 * i + 0], h.x, g0); g1 = fmaf(wg[4 * i + 1], h.y, g1);
+          g2 = fmaf(wg[4 * i + 2], h.z, g2); g3 = fmaf(wg[4 * i + 3], h.w, g3);
+          f0 = fmaf(wf[4 * i + 0], h.x, f0); f1 = fmaf(wf[4 * i + 1], h.y, f1);
+          f2 = fmaf(wf[4 * i + 2], h.z, f2); f3 = fmaf(wf[4 * i + 3], h.w, f3);
+        }
+        float gain = tanhf((g0 + g1) + (g2 + g3));
+        float forget = tanhf((f0 + f1) + (f2 + f3));
+        const int tg = t0 + t;
+        float d = dest[s * dest_stride_s + (long)tg * D + j];
+        float m = msg[((long)s * T + tg) * D + j];
+        x = __fadd_rn(__fmul_rn(__fsub_rn(1.f, forget), d), __fmul_rn(gain, m));
+        if (MODE != 1) xs[((long)s * T + tg) * D + j] = x;
+      }
+      xv[t] = x;
+    }
+#pragma unroll
+    for (int t = 0; t < TT; t++) {
+      float v = warp_sum(__fmul_rn(xv[t], xv[t]));
+      if (lane == 0) red[warp][t] = v;
+    }
+    __syncthreads();
+    if (tid < t_len) {
+      float v = 0.f;
+#pragma unroll
+      for (int ww = 0; ww < NT / 32; ww++) v += red[ww][tid < TT ? tid : 0];
+      partial[((long)s * T + (t0 + tid)) * CB + cb] = v;
+    }
+    if (MODE == 1) {
+      __threadfence();
+      __syncthreads();
+      if (tid == 0) {
+        unsigned old = atomicInc(counters + s, 2 * CB - 1);
+        const bool ph1 = old >= (unsigned)CB;
+        volatile unsigned* c = counters + s;
+        while (true) {
+          unsigned v = *c;
+          if (ph1 ? (v < (unsigned)CB) : (v >= (unsigned)CB)) break;
+        }
+        __threadfence();
+      }
+      __syncthreads();
+      for (int t = warp; t < t_len; t += NT / 32) {
+        float p = 0.f;
+        for (int c = lane; c < CB; c += 32) p += __ldcg(partial + ((long)s * T + (t0 + t)) * CB + c);
+        p = warp_sum(p);
+        if (lane == 0) rs1[t] = rsqrt_approx(__fadd_rn(__fdiv_rn(p, (float)D), eps));
+      }
+      __syncthreads();
+#pragma unroll
+      for (int t = 0; t < TT; t++)
+        if (t < t_len) out[((long)s * T + (t0 + t)) * D + j] = __float2half_rn(__fmul_rn(__fmul_rn(xv[t], rs1[t]), wj));
+    }
+    __syncthreads();
+  }
+}
+
+template <int NT, typename WT, int MODE>
+static void launch_b_tiled(const at::Tensor& dest, const at::Tensor& msg, const at::Tensor& hidden,
+                           const at::Tensor& wgf, const at::Tensor& nw, const at::Tensor& out,
+                           const at::Tensor& xs, const at::Tensor& partial, const at::Tensor& counters,
+                           int64_t S, int64_t T, int64_t D, double eps) {
+  dim3 grid(D / NT, S);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  constexpr int EFF_MODE = (MODE == 1) ? 1 : 2;
+  gf_blend_tiled_kernel<NT, WT, EFF_MODE><<<grid, NT, 0, stream>>>(
+      dest.data_ptr<float>(), dest.stride(0), msg.data_ptr<float>(),
+      reinterpret_cast<const __half*>(hidden.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(wgf.data_ptr<at::Half>()), wgf.stride(0),
+      reinterpret_cast<const WT*>(nw.data_ptr()), nw.stride(0),
+      reinterpret_cast<__half*>(out.data_ptr<at::Half>()), xs.data_ptr<float>(),
+      partial.data_ptr<float>(), reinterpret_cast<unsigned*>(counters.data_ptr<int>()),
+      (int)T, (int)D, (float)eps);
+  if (EFF_MODE == 2) {
+    norm_finish_kernel<WT><<<dim3(T, S), 256, 0, stream>>>(
+        xs.data_ptr<float>(), partial.data_ptr<float>(), reinterpret_cast<const WT*>(nw.data_ptr()), nw.stride(0),
+        reinterpret_cast<__half*>(out.data_ptr<at::Half>()), (int)T, (int)D, (int)(D / NT), (float)eps);
+  }
+}
+
 template <int NT, int TT, typename WT, int MODE>
 static void launch_b(const at::Tensor& dest, const at::Tensor& msg, const at::Tensor& hidden,
                      const at::Tensor& wgf, const at::Tensor& nw, const at::Tensor& out,
@@ -329,6 +469,10 @@ static void dispatch_tt(int64_t T, const at::Tensor& dest, const at::Tensor& msg
 #define CASE(TT_) if (T <= TT_) { launch_b<NT, TT_, WT, MODE>(dest, msg, hidden, wgf, nw, out, xs, partial, counters, S, T, D, eps); return; }
   CASE(1) CASE(2) CASE(4) CASE(8) CASE(16)
 #undef CASE
+  if (T <= 128) {
+    launch_b_tiled<NT, WT, MODE>(dest, msg, hidden, wgf, nw, out, xs, partial, counters, S, T, D, eps);
+    return;
+  }
   TORCH_CHECK(false, "T too large");
 }
 
@@ -337,13 +481,15 @@ void blend(const at::Tensor& dest, const at::Tensor& msg, const at::Tensor& wd, 
            const at::Tensor& partial, const at::Tensor& counters, int64_t nt, int64_t nb, int64_t mode, double eps) {
   const int64_t S = msg.size(0), T = msg.size(1), D = msg.size(2);
   auto stream = at::cuda::getCurrentCUDAStream();
-  TORCH_CHECK(D == 2304 && nb == 16, "pair_down needs D=2304, nb=16");
-  dim3 ga(nb, T, S);
-  size_t smem = 2 * D * sizeof(__half);
-  pair_down_kernel<<<ga, 128, smem, stream>>>(
-      dest.data_ptr<float>(), dest.stride(0), msg.data_ptr<float>(),
-      reinterpret_cast<const __half*>(wd.data_ptr<at::Half>()), wd.stride(0),
-      reinterpret_cast<__half*>(hidden.data_ptr<at::Half>()), (int)T, (int)D, 1e-6f);
+  TORCH_CHECK(D == 2304 && (nb == 16 || nb == 0), "pair_down needs D=2304, nb=16 or 0");
+  if (nb > 0) {
+    dim3 ga(nb, T, S);
+    size_t smem = 2 * D * sizeof(__half);
+    pair_down_kernel<<<ga, 128, smem, stream>>>(
+        dest.data_ptr<float>(), dest.stride(0), msg.data_ptr<float>(),
+        reinterpret_cast<const __half*>(wd.data_ptr<at::Half>()), wd.stride(0),
+        reinterpret_cast<__half*>(hidden.data_ptr<at::Half>()), (int)T, (int)D, 1e-6f);
+  }
   const bool wf32 = nw.scalar_type() == at::kFloat;
 #define GO(NT_, WT_, M_) dispatch_tt<NT_, WT_, M_>(T, dest, msg, hidden, wgf, nw, out, xs, partial, counters, S, D, eps)
 #define GOM(NT_, WT_) if (mode == 0) GO(NT_, WT_, 0); else if (mode == 1) GO(NT_, WT_, 1); else GO(NT_, WT_, 2)
@@ -444,9 +590,21 @@ def blend(
     assert norm_weight.shape == (s, d) and norm_weight.stride(1) == 1
     assert norm_weight.dtype in (torch.float32, torch.float16)
     dev = message.device
-    hidden = torch.empty((s, t, RANK), dtype=torch.float16, device=dev)
+    nb = _NB
+    if t >= 96:
+        from .loop import pair_rms_norm
+
+        pair = pair_rms_norm(dest, message)
+        hidden = torch.bmm(pair, controller_down.transpose(1, 2))
+        nb = 0
+    else:
+        hidden = torch.empty((s, t, RANK), dtype=torch.float16, device=dev)
     out = torch.empty((s, t, d), dtype=torch.float16, device=dev)
-    xs = torch.empty((s, t, d), dtype=torch.float32, device=dev)
+    xs = (
+        torch.empty(1, dtype=torch.float32, device=dev)
+        if (mode == 1 and t > 16)
+        else torch.empty((s, t, d), dtype=torch.float32, device=dev)
+    )
     partial = torch.empty((s, t, d // nt), dtype=torch.float32, device=dev)
     ext.blend(
         dest,
@@ -460,7 +618,7 @@ def blend(
         partial,
         counters,
         nt,
-        _NB,
+        nb,
         mode,
         norm_eps,
     )
