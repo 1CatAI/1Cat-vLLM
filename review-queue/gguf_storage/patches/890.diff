@@ -1,0 +1,729 @@
+diff --git a/csrc/ops.h b/csrc/ops.h
+index 5934c0d8e1..015da71e52 100644
+--- a/csrc/ops.h
++++ b/csrc/ops.h
+@@ -198,6 +198,10 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
+                        bool gated_silu,
+                        bool preserve_default_partition = false);
+ 
++void fp8_gemm_sm70_fp32_head_out(torch::Tensor out, torch::Tensor input,
++                                 torch::Tensor weight, torch::Tensor scales,
++                                 int64_t k_ld, int64_t q_ld);
++
+ void sm70_dflash2_fp16_m8_out(torch::Tensor output, torch::Tensor input,
+                               torch::Tensor packed, int64_t tile,
+                               int64_t warps);
+diff --git a/csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/arch/config_sm70_s884.h b/csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/arch/config_sm70_s884.h
+index cda489043d..962e8da548 100644
+--- a/csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/arch/config_sm70_s884.h
++++ b/csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/arch/config_sm70_s884.h
+@@ -178,7 +178,7 @@ using Config_NVF4 = Sm70_s884<Operand_A<half>,             // A
+                               half,                        // Tc
+                               raster_order, group_axis>;
+ 
+-template <Order raster_order, int group_axis = -1>
++template <Order raster_order, int group_axis = -1, class Output = half>
+ using Config_E4M3 = Sm70_s884<Operand_A<half>,             // A
+                               Transform_Default,           // tarnsform A
+                               VoidOperand,                 // U
+@@ -186,7 +186,7 @@ using Config_E4M3 = Sm70_s884<Operand_A<half>,             // A
+                               Transform_HMMA_SIMT_B,       // transform B,
+                               Operand_V_Pack<uint16_t>,    // V
+                               kRowMajor,                   // order_C
+-                              half,                        // Tc
++                              Output,                      // Tc
+                               raster_order, group_axis>;
+ 
+ // Dense batch FP4/FP8 share the activation supply and warp tiling policy.
+diff --git a/csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_8.cu b/csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_8.cu
+index 3f37b4cffe..352502fda8 100644
+--- a/csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_8.cu
++++ b/csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_8.cu
+@@ -124,6 +124,12 @@ void Registry::sm70_884_8() {
+         Add<C::Type<  8, 256,  64, 1, 4, 1, D, S, 2, true, 1, 128>>();
+         Add<C::Type<  8, 256,  32, 1, 4, 1, D, S, 2, true, 1, 128>>();
+ 
++        // Preserve FP32 verifier logits at single-request and TP4 C4 widths.
++        using F32 = Config_E4M3<kColMajor, 0, float>;
++        Add<F32::Type<8, 128, 64, 1, 4, 1, D, S, 2, true, 1, 128>>();
++        Add<F32::Type<8, 256, 64, 1, 4, 1, D, S, 2, true, 1, 128>>();
++        Add<F32::Type<32, 256, 32, 1, 4, 1, D, S, 2, true, 1, 128>>();
++
+         using CP = Config_E4M3_Prescaled<kColMajor, 0>;
+         using Q38PrescaledFull = CP::Type<64, 256, 16, 1, 4, 1, D, S, 2, true, 1, 128, 64, 128, 1, true>;
+         Add(std::make_unique<Qwen38PrescaledFullTileKernelImpl<typename Q38PrescaledFull::Kernel>>());
+diff --git a/csrc/sm70_turbomind/ops/awq_sm70_gemm.cu b/csrc/sm70_turbomind/ops/awq_sm70_gemm.cu
+index 13b1a8c4db..f8714de97a 100644
+--- a/csrc/sm70_turbomind/ops/awq_sm70_gemm.cu
++++ b/csrc/sm70_turbomind/ops/awq_sm70_gemm.cu
+@@ -4950,8 +4950,15 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
+               "fp8_gemm_sm70: weight must be uint8.");
+   TORCH_CHECK(tm_scales.scalar_type() == torch::kFloat16,
+               "fp8_gemm_sm70: scales must be float16.");
+-  TORCH_CHECK(out.scalar_type() == torch::kFloat16,
+-              "fp8_gemm_sm70: output must be float16.");
++  const bool fp32_head = out.scalar_type() == torch::kFloat32;
++  TORCH_CHECK(
++      out.scalar_type() == torch::kFloat16 || fp32_head,
++      "fp8_gemm_sm70: output must be float16 or supported FP32 logits.");
++  TORCH_CHECK(
++      !fp32_head || (in_feats.size(0) > 0 && in_feats.size(0) <= 32 &&
++                     in_feats.size(1) == 5120 && tm_weight.size(1) == 62080 &&
++                     !gated_silu && !exact_8k_prefill_prescaled),
++      "fp8_gemm_sm70: unsupported FP32 LM-head shape.");
+   TORCH_CHECK(group_size == 128,
+               "fp8_gemm_sm70: only group_size=128 is supported.");
+ 
+@@ -5058,8 +5065,11 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
+   desc_V.ld = static_cast<int>(q_ld);
+ 
+   turbomind::gemm::MatrixLayout desc_D{
+-      turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
+-      static_cast<int>(n), static_cast<int>(out.stride(0)),
++      fp32_head ? turbomind::kFloat32 : turbomind::kHalf,
++      turbomind::gemm::kRowMajor,
++      static_cast<int>(m),
++      static_cast<int>(n),
++      static_cast<int>(out.stride(0)),
+   };
+ 
+   turbomind::gemm::Operation op{};
+@@ -11952,3 +11962,11 @@ void fp8_moe_single_token_router_sm70_out(
+   #endif  // defined(VLLM_ENABLE_SM70_TURBOMIND_EXPERIMENTAL_MOE)
+ 
+ #endif  // defined(ENABLE_SM70_TURBOMIND)
++
++void fp8_gemm_sm70_fp32_head_out(torch::Tensor out, torch::Tensor input,
++                                 torch::Tensor weight, torch::Tensor scales,
++                                 int64_t k_ld, int64_t q_ld) {
++  TORCH_CHECK(out.scalar_type() == torch::kFloat32,
++              "FP32 LM-head output is required.");
++  fp8_gemm_sm70_out(out, input, weight, scales, 128, k_ld, q_ld, false, false);
++}
+diff --git a/csrc/sm70_turbomind/ops/compact_half_topk_sm70.cu b/csrc/sm70_turbomind/ops/compact_half_topk_sm70.cu
+index 79498cae8e..b04d7aecc8 100644
+--- a/csrc/sm70_turbomind/ops/compact_half_topk_sm70.cu
++++ b/csrc/sm70_turbomind/ops/compact_half_topk_sm70.cu
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: Apache-2.0
+ // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-// Lossless FP16-source compact target selection; no precision conversion.
++// Lossless FP16/FP32-source compact target selection; no precision conversion.
+ #include <torch/all.h>
+ #include <torch/library.h>
+ #include <ATen/cuda/CUDAContext.h>
+@@ -8,59 +8,155 @@
+ #include <c10/cuda/CUDAException.h>
+ #include <cuda_fp16.h>
+ #include <climits>
++#include <type_traits>
+ #include <cub/block/block_radix_sort.cuh>
+ 
+-template <int Items, bool Merge>
+-__global__ void select_compact_half_keys(const half* x, uint32_t* partial,
+-                                         float* values, int64_t* ids, int n,
+-                                         int stride, int k, int width) {
++template <typename Input, typename Key, int Items, bool Merge,
++          bool Intermediate = false>
++__global__ void select_compact_keys(const Input* x, Key* partial, float* values,
++                                    int64_t* ids, int n, int stride, int k,
++                                    int width, Key* extra) {
+   constexpr int Threads = 256, Tile = Threads * Items;
+-  using Sort = cub::BlockRadixSort<uint32_t, Threads, Items>;
++  using Sort = cub::BlockRadixSort<Key, Threads, Items>;
+   __shared__ typename Sort::TempStorage storage;
+   const int row = blockIdx.x;
+-  uint32_t keys[Items];
++  Key keys[Items];
+ #pragma unroll
+   for (int i = 0; i < Items; ++i) {
+     const int col = threadIdx.x * Items + i;
+     if constexpr (Merge) {
+-      keys[i] = col < width ? partial[row * width + col] : 0;
++      const int index = col + (Intermediate ? blockIdx.y * Tile : 0);
++      keys[i] = index < width ? partial[row * width + index] : 0;
+     } else {
+       const int index = blockIdx.y * Tile + col;
+-      uint16_t bits = index < n ? __half_as_ushort(x[row * stride + index]) : 0;
+-      if ((bits & 0x7fff) == 0) bits = 0;
+-      if ((bits & 0x7fff) > 0x7c00) bits = 0x7fff;
+-      const uint16_t order = (bits & 0x8000) ? uint16_t(~bits) : bits ^ 0x8000;
+-      keys[i] = index < n ? (uint32_t(order) << 16) | (0xffff - index) : 0;
++      Key order;
++      if constexpr (std::is_same_v<Input, half>) {
++        uint16_t bits =
++            index < n ? __half_as_ushort(x[row * stride + index]) : 0;
++        if ((bits & 0x7fff) == 0) bits = 0;
++        if ((bits & 0x7fff) > 0x7c00) bits = 0x7fff;
++        order = (bits & 0x8000) ? uint16_t(~bits) : bits ^ 0x8000;
++      } else {
++        uint32_t bits =
++            index < n ? __float_as_uint(x[row * stride + index]) : 0;
++        if ((bits & 0x7fffffff) == 0) bits = 0;
++        if ((bits & 0x7fffffff) > 0x7f800000) bits = 0x7fffffff;
++        order = (bits & 0x80000000) ? ~bits : bits ^ 0x80000000;
++      }
++      keys[i] = index < n ? (order << 16) | (0xffff - index) : 0;
+     }
+   }
+-  Sort(storage).SortDescending(keys);
++  Sort(storage).SortDescending(keys, 0, sizeof(Key) == 8 ? 48 : 32);
+ #pragma unroll
+   for (int i = 0; i < Items; ++i) {
+     const int col = threadIdx.x * Items + i;
+     if (col < k) {
+       if constexpr (Merge) {
+-        const int index = 0xffff - (keys[i] & 0xffff);
+-        ids[row * k + col] = index;
+-        values[row * k + col] = __half2float(x[row * stride + index]);
++        if constexpr (Intermediate) {
++          extra[(row * gridDim.y + blockIdx.y) * k + col] = keys[i];
++        } else {
++          const int index = 0xffff - (keys[i] & 0xffff);
++          ids[row * k + col] = index;
++          if constexpr (std::is_same_v<Input, half>)
++            values[row * k + col] = __half2float(x[row * stride + index]);
++          else
++            values[row * k + col] = x[row * stride + index];
++        }
+       } else {
+         partial[row * width + blockIdx.y * k + col] = keys[i];
+       }
+     }
+   }
+ }
++
++// Stable radix ranks preserve ascending vocabulary IDs within a tied leaf.
++// Only the primary float key is sorted here; merges retain the full ID key.
++template <int Items>
++__global__ void select_fp32_leaf(const float* x, uint64_t* partial, int n,
++                                 int stride, int width) {
++  constexpr int Threads = 256, Tile = Threads * Items;
++  using Sort = cub::BlockRadixSort<uint32_t, Threads, Items, uint16_t>;
++  __shared__ typename Sort::TempStorage storage;
++  uint32_t keys[Items];
++  uint16_t indices[Items];
++  const int row = blockIdx.x;
++#pragma unroll
++  for (int i = 0; i < Items; ++i) {
++    const int index = blockIdx.y * Tile + threadIdx.x * Items + i;
++    uint32_t bits = index < n ? __float_as_uint(x[row * stride + index]) : 0;
++    if ((bits & 0x7fffffff) == 0) bits = 0;
++    if ((bits & 0x7fffffff) > 0x7f800000) bits = 0x7fffffff;
++    keys[i] = index < n ? ((bits & 0x80000000) ? ~bits : bits ^ 0x80000000) : 0;
++    indices[i] = index < n ? index : 0xffff;
++  }
++  Sort(storage).SortDescending(keys, indices);
++#pragma unroll
++  for (int i = 0; i < Items; ++i) {
++    const int col = threadIdx.x * Items + i;
++    if (col < 64)
++      partial[row * width + blockIdx.y * 64 + col] =
++          (uint64_t(keys[i]) << 16) | (0xffff - indices[i]);
++  }
++}
++
++template <typename Input, typename Key>
++void launch_compact_topk(const at::Tensor& x, at::Tensor partial,
++                         at::Tensor values, at::Tensor ids, int k, int tiles,
++                         int width, cudaStream_t stream) {
++  const auto* data = reinterpret_cast<const Input*>(x.data_ptr());
++  if constexpr (std::is_same_v<Input, float>) {
++    select_fp32_leaf<4><<<dim3(x.size(0), tiles), 256, 0, stream>>>(
++        data, partial.data_ptr<uint64_t>(), x.size(1), x.stride(0), width);
++  } else {
++    select_compact_keys<Input, Key, 4, false>
++        <<<dim3(x.size(0), tiles), 256, 0, stream>>>(
++            data, partial.data_ptr<Key>(), nullptr, nullptr, x.size(1),
++            x.stride(0), k, width, nullptr);
++  }
++  if constexpr (std::is_same_v<Input, float>) {
++    if (width > 1024) {
++      const int groups = (width + 511) / 512;
++      auto* temp = partial.data_ptr<Key>() + x.size(0) * width;
++      select_compact_keys<Input, Key, 2, true, true>
++          <<<dim3(x.size(0), groups), 256, 0, stream>>>(
++              data, partial.data_ptr<Key>(), nullptr, nullptr, x.size(1),
++              x.stride(0), k, width, temp);
++      select_compact_keys<Input, Key, 2, true><<<x.size(0), 256, 0, stream>>>(
++          data, temp, values.data_ptr<float>(), ids.data_ptr<int64_t>(),
++          x.size(1), x.stride(0), k, groups * k, nullptr);
++      return;
++    }
++  }
++  if (width <= 1024)
++    select_compact_keys<Input, Key, 4, true><<<x.size(0), 256, 0, stream>>>(
++        data, partial.data_ptr<Key>(), values.data_ptr<float>(),
++        ids.data_ptr<int64_t>(), x.size(1), x.stride(0), k, width, nullptr);
++  else
++    select_compact_keys<Input, Key, 16, true><<<x.size(0), 256, 0, stream>>>(
++        data, partial.data_ptr<Key>(), values.data_ptr<float>(),
++        ids.data_ptr<int64_t>(), x.size(1), x.stride(0), k, width, nullptr);
++}
++
+ void sm70_compact_half_topk_out(const at::Tensor& x, at::Tensor partial,
+                                 at::Tensor values, at::Tensor ids, int64_t k) {
+   c10::cuda::CUDAGuard guard(x.device());
+-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
+-              x.stride(1) == 1);
++  TORCH_CHECK(x.is_cuda() &&
++              (x.scalar_type() == at::kHalf || x.scalar_type() == at::kFloat) &&
++              x.dim() == 2 && x.stride(1) == 1);
+   TORCH_CHECK(x.size(1) <= 65535 && x.size(1) >= k && k == 64);
+   int tiles = (x.size(1) + 1023) / 1024, width = tiles * k;
+-  TORCH_CHECK(width <= 4096 && partial.numel() == x.size(0) * width);
++  TORCH_CHECK(width <= 4096 &&
++              partial.numel() ==
++                  x.size(0) *
++                      (width + (x.scalar_type() == at::kFloat && width > 1024
++                                    ? ((width + 511) / 512) * k
++                                    : 0)));
+   TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 32);
+   TORCH_CHECK(partial.is_cuda() && values.is_cuda() && ids.is_cuda());
+   TORCH_CHECK(partial.device() == x.device() && values.device() == x.device() &&
+               ids.device() == x.device());
+-  TORCH_CHECK(partial.scalar_type() == at::kUInt32 &&
++  TORCH_CHECK(partial.scalar_type() ==
++                  (x.scalar_type() == at::kHalf ? at::kUInt32 : at::kUInt64) &&
+               values.scalar_type() == at::kFloat &&
+               ids.scalar_type() == at::kLong);
+   TORCH_CHECK(partial.is_contiguous() && values.is_contiguous() &&
+@@ -71,19 +167,12 @@ void sm70_compact_half_topk_out(const at::Tensor& x, at::Tensor partial,
+   auto* props = at::cuda::getCurrentDeviceProperties();
+   TORCH_CHECK(props->major == 7 && props->minor == 0);
+   auto stream = at::cuda::getCurrentCUDAStream().stream();
+-  auto* data = reinterpret_cast<const half*>(x.data_ptr());
+-  select_compact_half_keys<4, false>
+-      <<<dim3(x.size(0), tiles), 256, 0, stream>>>(
+-          data, partial.data_ptr<uint32_t>(), nullptr, nullptr, x.size(1),
+-          x.stride(0), k, width);
+-  if (width <= 1024)
+-    select_compact_half_keys<4, true><<<x.size(0), 256, 0, stream>>>(
+-        data, partial.data_ptr<uint32_t>(), values.data_ptr<float>(),
+-        ids.data_ptr<int64_t>(), x.size(1), x.stride(0), k, width);
++  if (x.scalar_type() == at::kHalf)
++    launch_compact_topk<half, uint32_t>(x, partial, values, ids, k, tiles,
++                                        width, stream);
+   else
+-    select_compact_half_keys<16, true><<<x.size(0), 256, 0, stream>>>(
+-        data, partial.data_ptr<uint32_t>(), values.data_ptr<float>(),
+-        ids.data_ptr<int64_t>(), x.size(1), x.stride(0), k, width);
++    launch_compact_topk<float, uint64_t>(x, partial, values, ids, k, tiles,
++                                         width, stream);
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ TORCH_LIBRARY_FRAGMENT(_C, m) {
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index d499a08c54..80e768bc68 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -370,6 +370,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "bool gated_silu, bool preserve_default_partition=False) -> ()");
+   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
+ 
++  ops.def(
++      "fp8_gemm_sm70_fp32_head_out(Tensor(a!) out, Tensor input, "
++      "Tensor weight, Tensor scales, int k_ld, int q_ld) -> ()");
++  ops.impl("fp8_gemm_sm70_fp32_head_out", torch::kCUDA,
++           &fp8_gemm_sm70_fp32_head_out);
++
+   ops.def(
+       "sm70_dflash2_fp16_m8_out(Tensor(a!) output, Tensor input, Tensor "
+       "packed, int tile, int warps) -> ()");
+diff --git a/docs/design/sm70_fp8_fp32_logits.md b/docs/design/sm70_fp8_fp32_logits.md
+new file mode 100644
+index 0000000000..65034edbc4
+--- /dev/null
++++ b/docs/design/sm70_fp8_fp32_logits.md
+@@ -0,0 +1,36 @@
++# FP32 logits for the SM70 channel-FP8 head
++
++For the supported DFlash2 channel-FP8 LM head, SM70 TurboMind writes FP32
++logits for verification widths from one through thirty-two. This avoids the final
++FP16 rounding that can make nearby vocabulary scores equal. The checkpoint
++weights remain per-channel FP8.
++
++Dispatch uses the prepared head's capabilities and shape: FP16 activations,
++hidden size 5120, and a 62080-column vocabulary shard. Other shapes retain
++their existing implementation.
++
++Numerical validation uses fixed teacher-forcing prefixes and an independent
++FP64 dense multiplication of the original FP8 codes and BF16 channel scales.
++The gate requires mean KL at most 0.001, p99 at most 0.01, maximum at most
++0.05, top-1 agreement of at least 99%. Maximum logit error is recorded.
++Acceptance and timing use eight fixed-seed 600-token prompts at each input
++length, together with a concurrency smoke.
++
++The model workload uses CUDA 12.8, Torch 2.10, four V100-SXM2-16GB GPUs at
++300 W, TP4, original Qwen3.8-27B NVFP4, DFlash2 draft7, maximum length 262144,
++memory utilization 0.92, FP8 E4M3 target KV storage, and 1024/8192-token inputs.
++
++The SM70 registry includes FP32 epilogues for small and 32-row verifier tiles.
++Explicit FP16 output buffers retain their previous contract. The shared
++DFlash2 candidate head uses that contract to retain its original FP16 logits.
++Batched
++verification uses the same capability guard; widths above 32 retain the
++original head.
++
++The compact top-64 probe sorts original FP32 keys without casting to FP16.
++Its stable first pass sorts 32-bit float keys while carrying vocabulary IDs;
++hierarchical merges retain all 48 significant value/ID bits. Small FP32
++batches use two kernels for short shards and three for full vocabulary
++shards, including batched probes through thirty-two rows. FP16
++inputs continue using their original two-kernel, 32-bit-key probe. The
++existing cutoff/nucleus reference guard remains required.
+diff --git a/tests/kernels/core/test_sm70_compact_half_topk.py b/tests/kernels/core/test_sm70_compact_half_topk.py
+index 0fefb6f34e..d2c68deac2 100644
+--- a/tests/kernels/core/test_sm70_compact_half_topk.py
++++ b/tests/kernels/core/test_sm70_compact_half_topk.py
+@@ -14,10 +14,11 @@
+ 
+ 
+ @pytest.mark.parametrize("rows,width", [(8, 62080), (32, 65535), (8, 1025)])
++@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+ @torch.inference_mode()
+-def test_half_source_values_and_live_graph(rows, width):
++def test_source_values_and_live_graph(rows, width, dtype):
+     torch.manual_seed(1530)
+-    logits = torch.randn(rows, width, dtype=torch.float16, device="cuda")
++    logits = torch.randn(rows, width, dtype=dtype, device="cuda")
+     assert compact_half_topk(logits) is not None
+     graph = torch.cuda.CUDAGraph()
+     with torch.cuda.graph(graph):
+@@ -47,14 +48,26 @@ def test_half_source_values_and_live_graph(rows, width):
+ 
+ 
+ @torch.inference_mode()
+-def test_fp32_source_never_qualifies():
+-    logits = torch.randn(8, 62080, device="cuda", dtype=torch.float32)
++def test_fp64_source_never_qualifies():
++    logits = torch.randn(8, 62080, device="cuda", dtype=torch.float64)
+     assert compact_half_topk(logits) is None
+ 
+ 
++@torch.inference_mode()
++def test_fp32_ranking_retains_values_that_collapse_in_fp16():
++    logits = torch.full((8, 62080), -20.0, device="cuda", dtype=torch.float32)
++    logits[:, :128] = 1.0 + torch.arange(128, device="cuda") * 2**-20
++    assert torch.unique(logits[:, :128].half()).numel() == 1
++    values, ids = compact_half_topk(logits)
++    expected = logits.topk(64, dim=-1)
++    assert torch.equal(ids, expected.indices)
++    assert torch.equal(values.view(torch.int32), expected.values.view(torch.int32))
++
++
+ @pytest.mark.parametrize("rows", [8, 32])
++@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+ @torch.inference_mode()
+-def test_target_probe_preserves_dense_token_mask(rows):
++def test_target_probe_preserves_dense_token_mask(rows, dtype):
+     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+     from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
+     from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
+@@ -62,7 +75,7 @@ def test_target_probe_preserves_dense_token_mask(rows):
+     )
+ 
+     torch.manual_seed(1530)
+-    logits = torch.randn(rows, 248320, dtype=torch.float16, device="cuda") * 1.5
++    logits = torch.randn(rows, 248320, dtype=dtype, device="cuda") * 1.5
+     logits[0].fill_(1)
+     logits[1].fill_(-20)
+     logits[1, :160] = 3
+@@ -77,7 +90,11 @@ def probe(custom):
+         for rank in range(4):
+             shard = logits[:, rank * 62080 : (rank + 1) * 62080]
+             if custom:
+-                values, ids = compact_half_topk(shard)
++                selected = compact_half_topk(shard)
++                if selected is None:
++                    values, ids = shard.float().topk(64, dim=-1)
++                else:
++                    values, ids = selected
+             else:
+                 values, ids = shard.float().topk(64, dim=-1)
+             shard_values.append(values)
+@@ -114,3 +131,13 @@ def probe(custom):
+                     torch.tensor([top_p], device="cuda"),
+                 )
+                 assert torch.equal(actual, expected)
++
++
++@pytest.mark.parametrize("width", [1025, 62080, 65535])
++@torch.inference_mode()
++def test_fp32_ties_use_lowest_vocab_ids(width):
++    logits = torch.ones(8, width, device="cuda", dtype=torch.float32)
++    values, ids = compact_half_topk(logits)
++    expected = torch.arange(64, device="cuda").expand(8, -1)
++    assert torch.equal(ids, expected)
++    assert torch.equal(values, torch.ones_like(values))
+diff --git a/tests/kernels/quantization/test_sm70_fp8_fp32_head.py b/tests/kernels/quantization/test_sm70_fp8_fp32_head.py
+new file mode 100644
+index 0000000000..081c273595
+--- /dev/null
++++ b/tests/kernels/quantization/test_sm70_fp8_fp32_head.py
+@@ -0,0 +1,96 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++
++from vllm import _sm70_ops as ops
++
++
++@torch.inference_mode()
++def test_fp32_head_matches_fp64_dense_and_live_graph_inputs():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("SM70 CUDA device required")
++    torch.manual_seed(20261004)
++    n, k = 62080, 5120
++    weight = (torch.randn(n, k, device="cuda", dtype=torch.float16) * 0.125).to(
++        torch.float8_e4m3fn
++    )
++    scale = torch.ones(n, 1, device="cuda", dtype=torch.float32)
++    packed, packed_scale, meta = ops.fp8_sm70_prepare(weight, scale, 128, False)
++    k_ld, q_ld = int(meta[0]), int(meta[1])
++    from types import SimpleNamespace
++
++    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
++        CompressedTensorsW8A16Fp8,
++    )
++
++    scheme = object.__new__(CompressedTensorsW8A16Fp8)
++    layer = SimpleNamespace(
++        output_size_per_partition=n,
++        sm70_fp8_turbomind=True,
++        sm70_fp8_fp32_head=True,
++        weight=packed,
++        weight_scale_inv=packed_scale,
++        sm70_fp8_k_ld=k_ld,
++        sm70_fp8_q_ld=q_ld,
++    )
++    reference_weight = weight.double() * scale.double()
++    for rows in (1, 8, 32):
++        x = torch.randn(rows, k, device="cuda", dtype=torch.float16)
++        draft_output = torch.empty(rows, n, device="cuda", dtype=torch.float16)
++        draft = scheme.apply_weights(layer, x, output=draft_output)
++        layer.sm70_fp8_fp32_head = False
++        original = scheme.apply_weights(layer, x)
++        layer.sm70_fp8_fp32_head = True
++        assert draft.data_ptr() == draft_output.data_ptr()
++        assert torch.equal(draft.view(torch.int16), original.view(torch.int16))
++        output = torch.empty(rows, n, device="cuda", dtype=torch.float32)
++
++        def apply(values=x, target=output):
++            torch.ops._C.fp8_gemm_sm70_fp32_head_out(
++                target, values, packed, packed_scale, k_ld, q_ld
++            )
++
++        apply()
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            apply()
++        for amplitude in (0.0, 0.125, -0.25, 1.0):
++            x.copy_(torch.randn_like(x) * amplitude)
++            graph.replay()
++            reference = x.double() @ reference_weight.T
++            actual = output.double()
++            torch.testing.assert_close(actual, reference, rtol=1e-5, atol=0.001)
++            lp, lq = reference.log_softmax(-1), actual.log_softmax(-1)
++            kl = (lp.exp() * (lp - lq)).sum(-1)
++            assert kl.max().item() <= 0.001
++            assert torch.equal(reference.argmax(-1), actual.argmax(-1))
++
++
++def test_fp32_head_rejects_unsupported_verification_width():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("SM70 CUDA device required")
++    x = torch.empty(33, 5120, device="cuda", dtype=torch.float16)
++    output = torch.empty(33, 62080, device="cuda", dtype=torch.float32)
++    weight = torch.empty(5120, 62080, device="cuda", dtype=torch.uint8)
++    scale = torch.empty(40, 62080, device="cuda", dtype=torch.float16)
++    with pytest.raises(RuntimeError, match="unsupported FP32 LM-head shape"):
++        torch.ops._C.fp8_gemm_sm70_fp32_head_out(output, x, weight, scale, 0, 0)
++
++
++def test_fp32_head_fake_tensor_registration():
++    from torch._subclasses.fake_tensor import FakeTensorMode
++
++    if not hasattr(torch.ops._C, "fp8_gemm_sm70_fp32_head_out"):
++        pytest.skip("Native FP32 head operator required")
++    with FakeTensorMode():
++        x = torch.empty(8, 5120, device="cuda", dtype=torch.float16)
++        output = torch.empty(8, 62080, device="cuda", dtype=torch.float32)
++        weight = torch.empty(5120, 62080, device="cuda", dtype=torch.uint8)
++        scale = torch.empty(40, 62080, device="cuda", dtype=torch.float16)
++        result = torch.ops._C.fp8_gemm_sm70_fp32_head_out(
++            output, x, weight, scale, 5120, 62080
++        )
++        assert result is None
++        assert output.dtype == torch.float32
+diff --git a/vllm/_sm70_ops.py b/vllm/_sm70_ops.py
+index 7135d52ad4..7161ebcdf8 100644
+--- a/vllm/_sm70_ops.py
++++ b/vllm/_sm70_ops.py
+@@ -811,6 +811,20 @@ def _fp8_gemm_sm70_out_fake(
+         return None
+ 
+ 
++if hasattr(torch.ops._C, "fp8_gemm_sm70_fp32_head_out"):
++
++    @register_fake("_C::fp8_gemm_sm70_fp32_head_out")
++    def _fp8_gemm_sm70_fp32_head_out_fake(
++        out: torch.Tensor,
++        input: torch.Tensor,
++        weight: torch.Tensor,
++        scales: torch.Tensor,
++        k_ld: int,
++        q_ld: int,
++    ) -> None:
++        return None
++
++
+ def fp8_gemm_sm70_prefill_prescaled_out(
+     out: torch.Tensor,
+     input: torch.Tensor,
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py
+index 3c1442babc..ade6055de7 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py
+@@ -9,9 +9,10 @@
+ 
+ from vllm import _sm70_ops as sm70_ops
+ from vllm import envs
+-from vllm.config import get_current_vllm_config
++from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+ from vllm.config.sm70_dflash2 import (
+     capture_sm70_dflash2_config,
++    sm70_dflash2_enabled,
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.kernels.linear import (
+@@ -513,6 +514,16 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+             layer.input_scale = None
+             layer.sm70_fp8_turbomind = True
+             layer.sm70_fp8_channel_scale = True
++            head_config = get_current_vllm_config_or_none()
++            layer.sm70_fp8_fp32_head = (
++                getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "lm_head"
++                and tuple(layer.weight.shape) == (5120, 62080)
++                and (head_config is None or head_config.lora_config is None)
++                and hasattr(torch.ops._C, "fp8_gemm_sm70_fp32_head_out")
++                and sm70_dflash2_enabled("fp32_logits", capture_sm70_dflash2_config())
++            )
++            if layer.sm70_fp8_fp32_head:
++                logger.info_once("SM70 channel-FP8 LM head uses FP32 logits at M1..32.")
+             layer.register_buffer("sm70_fp8_meta", meta, persistent=False)
+             layer.sm70_fp8_k_ld = int(meta[0].item())
+             layer.sm70_fp8_q_ld = int(meta[1].item())
+@@ -565,10 +576,16 @@ def apply_weights(
+             x_2d = x.reshape(-1, x.shape[-1])
+             if x_2d.stride(-1) != 1:
+                 x_2d = x_2d.contiguous()
++            fp32_head = (
++                getattr(layer, "sm70_fp8_fp32_head", False)
++                and bias is None
++                and (output is None or output.dtype == torch.float32)
++                and 1 <= x_2d.shape[0] <= 32
++            )
+             if output is not None:
+                 if (
+                     output.shape != out_shape
+-                    or output.dtype != x.dtype
++                    or output.dtype != (torch.float32 if fp32_head else x.dtype)
+                     or output.device != x.device
+                     or not output.is_contiguous()
+                 ):
+@@ -578,11 +595,20 @@ def apply_weights(
+                 out_2d = torch.empty(
+                     (x_2d.shape[0], layer.output_size_per_partition),
+                     device=x.device,
+-                    dtype=x.dtype,
++                    dtype=torch.float32 if fp32_head else x.dtype,
+                 )
+             if x_2d.shape[0] == 0:
+                 return out_2d.reshape(out_shape)
+-            if getattr(layer, "sm70_fp8_qpn8", False):
++            if fp32_head:
++                torch.ops._C.fp8_gemm_sm70_fp32_head_out(
++                    out_2d,
++                    x_2d,
++                    layer.weight,
++                    layer.weight_scale_inv,
++                    layer.sm70_fp8_k_ld,
++                    layer.sm70_fp8_q_ld,
++                )
++            elif getattr(layer, "sm70_fp8_qpn8", False):
+                 if getattr(layer, "sm70_fp8_batch_tm", False):
+                     torch.ops.vllm.sm70_ct_fp8_qpn8_batch_dispatch(
+                         out_2d,
+diff --git a/vllm/model_executor/layers/sm70_compact_topk.py b/vllm/model_executor/layers/sm70_compact_topk.py
+index 31edb3447f..b1e7c05150 100644
+--- a/vllm/model_executor/layers/sm70_compact_topk.py
++++ b/vllm/model_executor/layers/sm70_compact_topk.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Lossless FP16-source selection for a guarded DFlash2 target probe."""
++"""Lossless FP16/FP32-source selection for a guarded DFlash2 target probe."""
+ 
+ import torch
+ 
+@@ -13,11 +13,11 @@ def compact_half_topk(
+     """Return a sorted top-64 probe; the caller must retain the tie guard.
+ 
+     This does not implement the draft selector's tie contract. Never cast
+-    FP32 logits to FP16 to qualify: ranking uses the original FP16 values.
++    FP32 logits to FP16 to qualify: ranking uses the original source values.
+     """
+     if (
+         not logits.is_cuda
+-        or logits.dtype != torch.float16
++        or logits.dtype not in (torch.float16, torch.float32)
+         or logits.ndim != 2
+         or not 1 <= logits.shape[0] <= 32
+         or not 64 <= logits.shape[1] <= 65535
+@@ -28,9 +28,12 @@ def compact_half_topk(
+     ):
+         return None
+     rows, width = logits.shape
++    scratch_width = ((width + 1023) // 1024) * 64
++    if logits.dtype == torch.float32 and scratch_width > 1024:
++        scratch_width += ((scratch_width + 511) // 512) * 64
+     partial = torch.empty(
+-        (rows, ((width + 1023) // 1024) * 64),
+-        dtype=torch.uint32,
++        (rows, scratch_width),
++        dtype=torch.uint32 if logits.dtype == torch.float16 else torch.uint64,
+         device=logits.device,
+     )
+     values = torch.empty((rows, 64), dtype=torch.float32, device=logits.device)
+diff --git a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+index 58bba991be..69c408b8e1 100644
+--- a/vllm/model_executor/models/qwen3_dflash2.py
++++ b/vllm/model_executor/models/qwen3_dflash2.py
+@@ -547,9 +547,21 @@ def compute_candidates(
+             else None
+         )
+         if local_candidates is None:
+-            logits = self.lm_head.quant_method.apply(
+-                self.lm_head, hidden_states, bias=None
+-            )
++            if getattr(self.lm_head, "sm70_fp8_fp32_head", False):
++                # The shared head's FP32 verifier epilogue must not widen the
++                # draft selector's original logits and radix-sort contract.
++                output = torch.empty(
++                    (*hidden_states.shape[:-1], self.lm_head.output_size_per_partition),
++                    device=hidden_states.device,
++                    dtype=hidden_states.dtype,
++                )
++                logits = self.lm_head.scheme.apply_weights(
++                    self.lm_head, hidden_states, bias=None, output=output
++                )
++            else:
++                logits = self.lm_head.quant_method.apply(
++                    self.lm_head, hidden_states, bias=None
++                )
+             num_pad = self.lm_head.shard_indices.num_org_vocab_padding
+             if num_pad > 0:
+                 logits[..., -num_pad:] = -float("inf")

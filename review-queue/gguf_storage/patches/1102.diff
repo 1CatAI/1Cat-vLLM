@@ -1,0 +1,1920 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f201766df3..fd76537ae0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -418,6 +418,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn2_sm70.cu"
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/skinny_moe_qpn_sm70.cu"
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_fp16_gemv_sm70.cu"
++      "${VLLM_SM70_TURBOMIND_ROOT}/ops/exl3_moe_sm70.cu"
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_cublaslt_sm70.cpp"
+       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
+     list(APPEND VLLM_SM70_TURBOMIND_SRCS
+diff --git a/csrc/ops.h b/csrc/ops.h
+index 80a4b38817..64f2a5936c 100644
+--- a/csrc/ops.h
++++ b/csrc/ops.h
+@@ -439,6 +439,25 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
+ void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
+                               torch::Tensor weight);
+ 
++void exl3_moe_pre_out(torch::Tensor out, std::optional<torch::Tensor> out2,
++                      torch::Tensor x, torch::Tensor topk_ids,
++                      torch::Tensor suh, std::optional<torch::Tensor> suh2);
++
++void exl3_moe_gemv_out(torch::Tensor y, std::optional<torch::Tensor> y2,
++                       torch::Tensor x, std::optional<torch::Tensor> x2,
++                       torch::Tensor trellis,
++                       std::optional<torch::Tensor> trellis2,
++                       torch::Tensor expert_ids,
++                       std::optional<torch::Tensor> group_rows, bool colmajor);
++
++void exl3_moe_mid_out(torch::Tensor out, torch::Tensor yg, torch::Tensor yu,
++                      torch::Tensor topk_ids, torch::Tensor g_svh,
++                      torch::Tensor u_svh, torch::Tensor d_suh);
++
++void exl3_moe_post_out(torch::Tensor out, torch::Tensor yd,
++                       torch::Tensor topk_ids, torch::Tensor topk_weights,
++                       torch::Tensor d_svh);
++
+ void sm70_glm53_moe_permute_q8_out(torch::Tensor input, torch::Tensor topk_ids,
+                                    torch::Tensor permuted_input,
+                                    torch::Tensor sorted_row_idx,
+diff --git a/csrc/sm70_turbomind/ops/exl3_moe_sm70.cu b/csrc/sm70_turbomind/ops/exl3_moe_sm70.cu
+new file mode 100644
+index 0000000000..a07c80dc91
+--- /dev/null
++++ b/csrc/sm70_turbomind/ops/exl3_moe_sm70.cu
+@@ -0,0 +1,675 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// EXL3 (trellis-coded, mcg codebook, K = 2/3/4 bits) routed-expert MoE for
++// SM70. Weights are decoded on the fly from the trellis and multiplied with
++// mma.m8n8k4 (fp32 accumulate); nothing is dequantized to memory.
++//
++// One slot = one (token, routed expert) assignment, s = t * topk + j.
++//   pre  : X'[s] = had128(x[t] * suh[e])                                fp16
++//   [S, k] gemv : Y'[s] = X'[s] @ T[e] fp32 [S, n] mid  : H'[s] =
++//   had128(silu(had128(Yg') * svh_g[e]) *
++//                         (had128(Yu') * svh_u[e]) * suh_d[e])           fp16
++//                         [S, n]
++//   post : out[t] = sum_j w[s] * had128(O'[s]) * svh_d[e]              fp32 [T,
++//   k]
++// W = diag(suh) H T H diag(svh), H = blockwise Sylvester-128 / sqrt(128).
++//
++// Trellis layout (exllamav3): int16 [E, k/16, n/16, 16K]; each 16x16 tile is a
++// tail-biting 256K-bit stream (uint16 pairs half-swapped, i.e. MSB-first when
++// read as little-endian u32), position p's state = the 16 bits ending at bit
++// (p + 1) K. The tile order maps positions to tile elements:
++//   colmajor: p -> (k = p % 16, n = p / 16). A lane reads 8 consecutive k of
++//             one column per run: two runs per tile.
++//   sm80    : exllamav3's default (m16n8k16 B-fragment order). Column c's 16
++//             values are four runs of 4 positions, 8K bits apart; one
++//             m8n8k4 per run, so a lane decodes 4 short runs from 4-6 words.
++// Measured on V100 SXM2 (per-rank GLM-5.3 expert shapes), sm80 vs colmajor:
++// +4-13% at K = 2, +12-20% at K = 3 in decode and none in grouped prefill at
++// K = 3. Both are exact.
++//
++// All launches are shape-static per slot count and read expert ids on the
++// device, so the decode path is CUDA-graph capturable. The grouped variant
++// (prefill) decodes each expert once per <= 8 slots routed to it.
++
++#include <torch/all.h>
++#include <torch/library.h>
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_fp16.h>
++#include <cstdint>
++
++namespace {
++
++constexpr int kWarps = 4;      // gemv: warps per block, each a k-slice
++constexpr int kPrefetch = 8;   // gemv: k-tiles whose window words are in flight per warp
++constexpr int kGlueWarps = 4;  // glue kernels: one warp per 128-chunk
++constexpr int kMaxGridY = 65535;
++// Trellis tensors reach these ops in strip-major order: [.., n/32, k/16, 2 tiles, 16K words]
++// (exl3.exl3_strip_major_), so a warp streams its 32-column strip sequentially along k.
++
++__device__ __forceinline__ void mma884(float (&d)[8], const uint32_t (&a)[2],
++                                       const uint32_t (&b)[2]) {
++  asm volatile(
++      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
++      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
++      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
++      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]),
++        "+f"(d[6]), "+f"(d[7])
++      : "r"(a[0]), "r"(a[1]), "r"(b[0]), "r"(b[1]));
++}
++
++__device__ __forceinline__ half2 mcg2(uint32_t s0, uint32_t s1) {
++  uint32_t x0 = s0 * 0xCBAC1FEDu, x1 = s1 * 0xCBAC1FEDu;
++  asm("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
++  asm("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
++  half2 h0 = *reinterpret_cast<half2*>(&x0);
++  half2 h1 = *reinterpret_cast<half2*>(&x1);
++  return __hadd2(__lows2half2(h0, h1), __highs2half2(h0, h1));
++}
++
++// N consecutive positions from the window starting at bit o of (wa, wb).
++template <int K, int N>
++__device__ __forceinline__ void decode_run(uint32_t wa, uint32_t wb, int o,
++                                           uint32_t (&b)[N / 2]) {
++  uint64_t v = (static_cast<uint64_t>(wa) << 32) | wb;
++  uint32_t st[N];
++#pragma unroll
++  for (int i = 0; i < N; ++i) {
++    st[i] = static_cast<uint32_t>(v >> (48 - o - i * K)) & 0xffffu;
++  }
++#pragma unroll
++  for (int j = 0; j < N / 2; ++j) {
++    half2 r = mcg2(st[2 * j], st[2 * j + 1]);
++    b[j] = *reinterpret_cast<uint32_t*>(&r);
++  }
++}
++
++// Lane-constant window geometry for tile t (0/1 within the strip), column c.
++// colmajor: runs h = 0, 1 at positions 16c + 8h. sm80: run 0 only (the base);
++// runs 1-3 follow at +8K bits each.
++template <int K, bool kColMajor>
++struct Window {
++  static constexpr int kRuns = kColMajor ? 2 : 1;
++  int ja[kRuns], jb[kRuns], o[kRuns];
++  __device__ __forceinline__ Window(int t, int c) {
++    constexpr int kTW = 8 * K, kLB = 256 * K;
++#pragma unroll
++    for (int r = 0; r < kRuns; ++r) {
++      int pos0 = kColMajor ? 16 * c + 8 * r : 32 * (c & 7) + 4 * (c >> 3);
++      int s = (((pos0 + 1) * K - 16) % kLB + kLB) % kLB;
++      ja[r] = t * kTW + (s >> 5);
++      jb[r] = t * kTW + ((s >> 5) + 1) % kTW;
++      o[r] = s & 31;
++    }
++  }
++};
++
++// The words of the two-tile block this lane's windows need, loaded directly
++// (every lane's words sit in the same 128 B line, so DRAM traffic equals one
++// coalesced block read, but each lane can decode as soon as its own loads
++// land instead of waiting for a broadcast and shuffles).
++template <int K, bool kColMajor>
++struct LaneWords {
++  static constexpr int kTW = 8 * K;
++  static constexpr int kCount = kColMajor ? 4 : ((24 * K) >> 5) + 3;
++  uint32_t w[kCount];
++  __device__ __forceinline__ void load(const uint32_t* __restrict__ blk,
++                                       const Window<K, kColMajor>& win) {
++    if constexpr (kColMajor) {
++      w[0] = __ldg(blk + win.ja[0]);
++      w[1] = __ldg(blk + win.jb[0]);
++      w[2] = __ldg(blk + win.ja[1]);
++      w[3] = __ldg(blk + win.jb[1]);
++    } else {
++      const int base = win.ja[0] % kTW, t0 = win.ja[0] - base;
++#pragma unroll
++      for (int m = 0; m < kCount; ++m) w[m] = __ldg(blk + t0 + (base + m) % kTW);
++    }
++  }
++  __device__ __forceinline__ void zero() {
++#pragma unroll
++    for (int m = 0; m < kCount; ++m) w[m] = 0;
++  }
++};
++
++// Strip-major trellis address of k-tile tk for the strip starting at column
++// n0: tile pairs of one strip are contiguous along k.
++__device__ __forceinline__ const uint32_t* strip_block(
++    const uint32_t* __restrict__ tr, int n0, int tk, int ktiles, int kTW) {
++  return tr + (static_cast<int64_t>(n0 >> 5) * ktiles + tk) * (2 * kTW);
++}
++
++// One 16-row k-tile of this lane's column. xr points at the tile's 16
++// activations (row 0 of the m8n8k4 A operand; other rows pass on = false).
++template <int K, bool kColMajor>
++__device__ __forceinline__ void tile_mma(float (&d)[8],
++                                         const LaneWords<K, kColMajor>& lw,
++                                         const Window<K, kColMajor>& win,
++                                         const half* __restrict__ xr, bool on) {
++  if constexpr (kColMajor) {
++    uint32_t bb[2][4];
++    decode_run<K, 8>(lw.w[0], lw.w[1], win.o[0], bb[0]);
++    decode_run<K, 8>(lw.w[2], lw.w[3], win.o[1], bb[1]);
++#pragma unroll
++    for (int h = 0; h < 2; ++h) {
++      uint32_t b0[2] = {bb[h][0], bb[h][1]}, b1[2] = {bb[h][2], bb[h][3]};
++      uint4 xa = on ? *reinterpret_cast<const uint4*>(xr + 8 * h)
++                    : make_uint4(0, 0, 0, 0);
++      uint32_t a0[2] = {xa.x, xa.y}, a1[2] = {xa.z, xa.w};
++      mma884(d, a0, b0);
++      mma884(d, a1, b1);
++    }
++  } else {
++    constexpr int kNW = ((24 * K) >> 5) + 3;
++    uint4 lo =
++        on ? *reinterpret_cast<const uint4*>(xr) : make_uint4(0, 0, 0, 0);
++    uint4 hi =
++        on ? *reinterpret_cast<const uint4*>(xr + 8) : make_uint4(0, 0, 0, 0);
++    const uint32_t xw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
++    const int o0 = win.o[0] & 31;
++    static_assert(LaneWords<K, kColMajor>::kCount == kNW);
++    const uint32_t* w = lw.w;
++#pragma unroll
++    for (int u = 0; u < 4; ++u) {
++      // Run u holds rows (2u, 2u+1, 2u+8, 2u+9): A = activation pairs u, u+4.
++      constexpr int kStep = 8 * K;
++      const int ml = (kStep * u) >> 5, ol = (kStep * u) & 31;
++      const int ou = o0 + ol;
++      const bool carry = ou >= 32;
++      uint32_t b[2];
++      decode_run<K, 4>(carry ? w[ml + 1] : w[ml], carry ? w[ml + 2] : w[ml + 1],
++                       ou & 31, b);
++      uint32_t a[2] = {xw[u], xw[u + 4]};
++      mma884(d, a, b);
++    }
++  }
++}
++
++// grid (n / 32, S or 2S), block kWarps warps. Slot s multiplies expert eid[s].
++// M = 1: row 0 of the m8n8k4 tile carries the activation.
++template <int K, bool kColMajor>
++__global__ void __launch_bounds__(kWarps * 32)
++    exl3_gemv_kernel(const uint32_t* __restrict__ trellis,
++                     const int* __restrict__ eid, const half* __restrict__ x,
++                     float* __restrict__ y, int k, int n, int ktiles_per_warp,
++                     int64_t expert_words, int S,
++                     const uint32_t* __restrict__ trellis2,
++                     const half* __restrict__ x2, float* __restrict__ y2) {
++  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++  int s = blockIdx.y;
++  if (s >= S) {  // second projection of a fused gate + up launch
++    s -= S;
++    trellis = trellis2;
++    x = x2;
++    y = y2;
++  }
++  int n0 = blockIdx.x * 32;
++  int q = (lane >> 2) & 3;
++  int nw = 8 * q + (lane >> 4) * 4 + lane % 4;
++  int t = nw >> 4, c = nw & 15;
++  int row = (lane >> 4) * 4 + lane % 4;
++  int tk0 = warp * ktiles_per_warp;
++  const uint32_t* tr = trellis + static_cast<int64_t>(eid[s]) * expert_words;
++  const half* xr = x + static_cast<int64_t>(s) * k;
++  constexpr int kTW = 8 * K;
++  Window<K, kColMajor> win(t, c);
++
++  float d[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++  const int ktiles = ktiles_per_warp * kWarps;
++  for (int it0 = 0; it0 < ktiles_per_warp; it0 += kPrefetch) {
++    LaneWords<K, kColMajor> lw[kPrefetch];
++#pragma unroll
++    for (int p = 0; p < kPrefetch; ++p) {
++      if (it0 + p < ktiles_per_warp) {
++        lw[p].load(strip_block(tr, n0, tk0 + it0 + p, ktiles, kTW), win);
++      } else {
++        lw[p].zero();
++      }
++    }
++#pragma unroll
++    for (int p = 0; p < kPrefetch; ++p) {
++      if (it0 + p >= ktiles_per_warp) break;
++      int tk = tk0 + it0 + p;
++      tile_mma<K, kColMajor>(d, lw[p], win, xr + tk * 16, row == 0);
++    }
++  }
++
++  // D fragment: lane L, reg i -> row (L&1) + ((i>>1)&1)*2 + (L>=16 ? 4 : 0),
++  // col ((i>>2)&1)*4 + (L&2) + (i&1)
++  __shared__ float red[kWarps][32];
++  if (lane < 16 && !(lane & 1)) {
++    red[warp][8 * q + (lane & 2)] = d[0];
++    red[warp][8 * q + (lane & 2) + 1] = d[1];
++    red[warp][8 * q + 4 + (lane & 2)] = d[4];
++    red[warp][8 * q + 4 + (lane & 2) + 1] = d[5];
++  }
++  __syncthreads();
++  if (threadIdx.x < 32) {
++    float acc = 0.f;
++#pragma unroll
++    for (int w = 0; w < kWarps; ++w) acc += red[w][threadIdx.x];
++    y[static_cast<int64_t>(s) * n + n0 + threadIdx.x] = acc;
++  }
++}
++
++// Grouped variant (prefill): a group is up to 8 slots routed to the same
++// expert; its tiles are decoded once and multiplied against all 8 rows.
++// rows[g * 8 + m] = slot or -1. Launches are sized for the worst case; groups
++// with rows[g * 8] < 0 exit immediately.
++template <int K, bool kColMajor>
++__global__ void __launch_bounds__(kWarps * 32) exl3_gemv_grouped_kernel(
++    const uint32_t* __restrict__ trellis, const int* __restrict__ gexp,
++    const int* __restrict__ rows, const half* __restrict__ x,
++    float* __restrict__ y, int k, int n, int ktiles_per_warp,
++    int64_t expert_words, int G, const uint32_t* __restrict__ trellis2,
++    const half* __restrict__ x2, float* __restrict__ y2) {
++  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++  int g = blockIdx.y;
++  if (g >= G) {
++    g -= G;
++    trellis = trellis2;
++    x = x2;
++    y = y2;
++  }
++  const int* gr = rows + static_cast<int64_t>(g) * 8;
++  if (gr[0] < 0) return;
++  int n0 = blockIdx.x * 32;
++  int q = (lane >> 2) & 3;
++  int nw = 8 * q + (lane >> 4) * 4 + lane % 4;
++  int t = nw >> 4, c = nw & 15;
++  int row = (lane >> 4) * 4 + lane % 4;  // A-operand row held by this lane
++  int slot = gr[row];
++  int tk0 = warp * ktiles_per_warp;
++  const uint32_t* tr = trellis + static_cast<int64_t>(gexp[g]) * expert_words;
++  const half* xr = x + static_cast<int64_t>(slot < 0 ? 0 : slot) * k;
++  constexpr int kTW = 8 * K;
++  Window<K, kColMajor> win(t, c);
++
++  float d[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++  const int ktiles = ktiles_per_warp * kWarps;
++  for (int it0 = 0; it0 < ktiles_per_warp; it0 += kPrefetch) {
++    LaneWords<K, kColMajor> lw[kPrefetch];
++#pragma unroll
++    for (int p = 0; p < kPrefetch; ++p) {
++      if (it0 + p < ktiles_per_warp) {
++        lw[p].load(strip_block(tr, n0, tk0 + it0 + p, ktiles, kTW), win);
++      } else {
++        lw[p].zero();
++      }
++    }
++#pragma unroll
++    for (int p = 0; p < kPrefetch; ++p) {
++      if (it0 + p >= ktiles_per_warp) break;
++      int tk = tk0 + it0 + p;
++      tile_mma<K, kColMajor>(d, lw[p], win, xr + tk * 16, slot >= 0);
++    }
++  }
++
++  __shared__ float red[kWarps][8][32];
++#pragma unroll
++  for (int i = 0; i < 8; ++i) {
++    red[warp][(lane & 1) + ((i >> 1) & 1) * 2 + (lane >= 16 ? 4 : 0)]
++       [8 * q + ((i >> 2) & 1) * 4 + (lane & 2) + (i & 1)] = d[i];
++  }
++  __syncthreads();
++  for (int e = threadIdx.x; e < 256; e += kWarps * 32) {
++    int m = e >> 5, nn = e & 31;
++    int so = gr[m];
++    if (so < 0) continue;
++    float acc = 0.f;
++#pragma unroll
++    for (int w = 0; w < kWarps; ++w) acc += red[w][m][nn];
++    y[static_cast<int64_t>(so) * n + n0 + nn] = acc;
++  }
++}
++
++// 128-point Walsh-Hadamard (Sylvester order) in registers: one warp per
++// 128-chunk, lane l holds elements 4l .. 4l+3.
++__device__ __forceinline__ void fwht128(float (&v)[4]) {
++  int lane = threadIdx.x & 31;
++  float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++  v[0] = a + c;
++  v[1] = b + d;
++  v[2] = a - c;
++  v[3] = b - d;
++#pragma unroll
++  for (int dl = 1; dl < 32; dl <<= 1) {
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      float o = __shfl_xor_sync(0xffffffffu, v[i], dl);
++      v[i] = (lane & dl) ? o - v[i] : v[i] + o;
++    }
++  }
++#pragma unroll
++  for (int i = 0; i < 4; ++i) v[i] *= 0.08838834764831845f;  // 1 / sqrt(128)
++}
++
++__device__ __forceinline__ void load4h(const half* p, float (&v)[4]) {
++  uint2 r = *reinterpret_cast<const uint2*>(p);
++  float2 f0 = __half22float2(*reinterpret_cast<half2*>(&r.x));
++  float2 f1 = __half22float2(*reinterpret_cast<half2*>(&r.y));
++  v[0] = f0.x;
++  v[1] = f0.y;
++  v[2] = f1.x;
++  v[3] = f1.y;
++}
++
++__device__ __forceinline__ void store4h(half* p, const float (&v)[4]) {
++  half2 h0 = __floats2half2_rn(v[0], v[1]), h1 = __floats2half2_rn(v[2], v[3]);
++  uint2 r;
++  r.x = *reinterpret_cast<uint32_t*>(&h0);
++  r.y = *reinterpret_cast<uint32_t*>(&h1);
++  *reinterpret_cast<uint2*>(p) = r;
++}
++
++__device__ __forceinline__ int glue_offset() {
++  return (blockIdx.x * kGlueWarps + (threadIdx.x >> 5)) * 128 +
++         (threadIdx.x & 31) * 4;
++}
++
++__global__ void exl3_pre_kernel(const half* __restrict__ x,
++                                const int* __restrict__ eid,
++                                const half* __restrict__ suh,
++                                half* __restrict__ out, int k, int topk, int S,
++                                const half* __restrict__ suh2,
++                                half* __restrict__ out2) {
++  int s = blockIdx.y;
++  if (s >= S) {
++    s -= S;
++    suh = suh2;
++    out = out2;
++  }
++  int o = glue_offset();
++  float v[4], g[4];
++  load4h(x + static_cast<int64_t>(s / topk) * k + o, v);
++  load4h(suh + static_cast<int64_t>(eid[s]) * k + o, g);
++#pragma unroll
++  for (int i = 0; i < 4; ++i) v[i] *= g[i];
++  fwht128(v);
++  store4h(out + static_cast<int64_t>(s) * k + o, v);
++}
++
++__global__ void exl3_mid_kernel(const float* __restrict__ yg,
++                                const float* __restrict__ yu,
++                                const int* __restrict__ eid,
++                                const half* __restrict__ svh_g,
++                                const half* __restrict__ svh_u,
++                                const half* __restrict__ suh_d,
++                                half* __restrict__ out, int n) {
++  int s = blockIdx.y;
++  int o = glue_offset();
++  int64_t e = static_cast<int64_t>(eid[s]) * n + o;
++  float g[4], u[4], sg[4], su[4], sd[4];
++  float4 a =
++      *reinterpret_cast<const float4*>(yg + static_cast<int64_t>(s) * n + o);
++  float4 b =
++      *reinterpret_cast<const float4*>(yu + static_cast<int64_t>(s) * n + o);
++  g[0] = a.x;
++  g[1] = a.y;
++  g[2] = a.z;
++  g[3] = a.w;
++  u[0] = b.x;
++  u[1] = b.y;
++  u[2] = b.z;
++  u[3] = b.w;
++  fwht128(g);
++  fwht128(u);
++  load4h(svh_g + e, sg);
++  load4h(svh_u + e, su);
++  load4h(suh_d + e, sd);
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++    float gg = g[i] * sg[i];
++    g[i] = gg / (1.f + __expf(-gg)) * (u[i] * su[i]) * sd[i];
++  }
++  fwht128(g);
++  store4h(out + static_cast<int64_t>(s) * n + o, g);
++}
++
++__global__ void exl3_post_kernel(const float* __restrict__ yd,
++                                 const int* __restrict__ eid,
++                                 const float* __restrict__ w,
++                                 const half* __restrict__ svh_d,
++                                 float* __restrict__ out, int n, int topk) {
++  int t = blockIdx.y;
++  int o = glue_offset();
++  float acc[4] = {0.f, 0.f, 0.f, 0.f};
++  for (int j = 0; j < topk; ++j) {
++    int s = t * topk + j;
++    float v[4], sv[4];
++    float4 a =
++        *reinterpret_cast<const float4*>(yd + static_cast<int64_t>(s) * n + o);
++    v[0] = a.x;
++    v[1] = a.y;
++    v[2] = a.z;
++    v[3] = a.w;
++    fwht128(v);
++    load4h(svh_d + static_cast<int64_t>(eid[s]) * n + o, sv);
++    float ww = w[s];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) acc[i] += ww * v[i] * sv[i];
++  }
++  *reinterpret_cast<float4*>(out + static_cast<int64_t>(t) * n + o) =
++      make_float4(acc[0], acc[1], acc[2], acc[3]);
++}
++
++void check_cuda(const torch::Tensor& t, const char* name, at::ScalarType dtype,
++                int dim, const torch::Tensor& ref) {
++  TORCH_CHECK(t.is_cuda() && t.device() == ref.device(), name,
++              " must be on the same CUDA device as the input");
++  TORCH_CHECK(t.scalar_type() == dtype, name, " has the wrong dtype");
++  TORCH_CHECK(t.dim() == dim, name, " must have ", dim, " dimensions");
++  TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++}
++
++// trellis [E, k/16, n/16, 16K] -> (k, n, K)
++std::tuple<int, int, int> trellis_dims(const torch::Tensor& trellis,
++                                       const torch::Tensor& ref) {
++  check_cuda(trellis, "trellis", at::kShort, 4, ref);
++  TORCH_CHECK(trellis.size(3) % 16 == 0, "trellis: last dim must be 16 * K");
++  int K = static_cast<int>(trellis.size(3) / 16);
++  TORCH_CHECK(K == 2 || K == 3 || K == 4, "EXL3 MoE: K must be 2, 3 or 4");
++  int k = static_cast<int>(trellis.size(1) * 16);
++  int n = static_cast<int>(trellis.size(2) * 16);
++  TORCH_CHECK((k / 16) % kWarps == 0 && n % 32 == 0,
++              "EXL3 MoE: k must be a multiple of 64 and n of 32");
++  return {k, n, K};
++}
++
++template <bool kColMajor>
++void launch_gemv(bool grouped, int K, dim3 grid, cudaStream_t stream,
++                 const uint32_t* tr, const int* ids, const int* rows,
++                 const half* x, float* y, int k, int n, int64_t ew, int count,
++                 const uint32_t* tr2, const half* x2, float* y2) {
++  const int kt = k / 16 / kWarps;
++#define EXL3_LAUNCH(KK)                                                        \
++  if (grouped) {                                                               \
++    exl3_gemv_grouped_kernel<KK, kColMajor><<<grid, kWarps * 32, 0, stream>>>( \
++        tr, ids, rows, x, y, k, n, kt, ew, count, tr2, x2, y2);                \
++  } else {                                                                     \
++    exl3_gemv_kernel<KK, kColMajor><<<grid, kWarps * 32, 0, stream>>>(         \
++        tr, ids, x, y, k, n, kt, ew, count, tr2, x2, y2);                      \
++  }
++  if (K == 2) {
++    EXL3_LAUNCH(2)
++  } else if (K == 3) {
++    EXL3_LAUNCH(3)
++  } else {
++    EXL3_LAUNCH(4)
++  }
++#undef EXL3_LAUNCH
++}
++
++}  // namespace
++
++// xg = had128(x[t] * g_suh[e]) per slot; with out2/suh2 also the up input.
++void exl3_moe_pre_out(torch::Tensor out, std::optional<torch::Tensor> out2,
++                      torch::Tensor x, torch::Tensor topk_ids,
++                      torch::Tensor suh, std::optional<torch::Tensor> suh2) {
++  check_cuda(x, "x", at::kHalf, 2, x);
++  check_cuda(topk_ids, "topk_ids", at::kInt, 2, x);
++  check_cuda(out, "out", at::kHalf, 2, x);
++  check_cuda(suh, "suh", at::kHalf, 2, x);
++  TORCH_CHECK(out2.has_value() == suh2.has_value(),
++              "out2 and suh2 go together");
++  const int k = static_cast<int>(x.size(1));
++  const int topk = static_cast<int>(topk_ids.size(1));
++  const int S = static_cast<int>(topk_ids.numel());
++  TORCH_CHECK(topk_ids.size(0) == x.size(0), "topk_ids rows != tokens");
++  TORCH_CHECK(k % (kGlueWarps * 128) == 0,
++              "EXL3 MoE: k must be a multiple of 512");
++  TORCH_CHECK(out.size(0) >= S && out.size(1) == k && suh.size(1) == k,
++              "pre: shape mismatch");
++  const int fused = out2.has_value() ? 2 : 1;
++  if (out2) {
++    check_cuda(*out2, "out2", at::kHalf, 2, x);
++    check_cuda(*suh2, "suh2", at::kHalf, 2, x);
++    TORCH_CHECK(out2->size(0) >= S && out2->size(1) == k && suh2->size(1) == k,
++                "pre: shape mismatch");
++  }
++  if (S == 0) return;
++  TORCH_CHECK(fused * S <= kMaxGridY, "EXL3 MoE: too many slots per launch");
++  const at::cuda::OptionalCUDAGuard guard(x.device());
++  auto stream = at::cuda::getCurrentCUDAStream();
++  exl3_pre_kernel<<<dim3(k / (kGlueWarps * 128), fused * S), kGlueWarps * 32, 0,
++                    stream>>>(
++      reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
++      topk_ids.data_ptr<int>(),
++      reinterpret_cast<const half*>(suh.data_ptr<at::Half>()),
++      reinterpret_cast<half*>(out.data_ptr<at::Half>()), k, topk, S,
++      out2 ? reinterpret_cast<const half*>(suh2->data_ptr<at::Half>())
++           : nullptr,
++      out2 ? reinterpret_cast<half*>(out2->data_ptr<at::Half>()) : nullptr);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// y[s] = x[s] @ T[expert(s)] in the trellis basis. Plain: expert_ids [S] holds
++// each slot's expert. Grouped: expert_ids [G] holds each group's expert and
++// group_rows [G, 8] its slots (-1 = empty). With y2/x2/trellis2, the second
++// projection (up) runs in the same launch.
++void exl3_moe_gemv_out(torch::Tensor y, std::optional<torch::Tensor> y2,
++                       torch::Tensor x, std::optional<torch::Tensor> x2,
++                       torch::Tensor trellis,
++                       std::optional<torch::Tensor> trellis2,
++                       torch::Tensor expert_ids,
++                       std::optional<torch::Tensor> group_rows, bool colmajor) {
++  check_cuda(x, "x", at::kHalf, 2, x);
++  check_cuda(y, "y", at::kFloat, 2, x);
++  check_cuda(expert_ids, "expert_ids", at::kInt, 1, x);
++  auto [k, n, K] = trellis_dims(trellis, x);
++  TORCH_CHECK(x.size(1) == k && y.size(1) == n && y.size(0) >= x.size(0),
++              "gemv: shape mismatch");
++  const bool fused = y2.has_value();
++  TORCH_CHECK(fused == x2.has_value() && fused == trellis2.has_value(),
++              "y2, x2 and trellis2 go together");
++  if (fused) {
++    check_cuda(*y2, "y2", at::kFloat, 2, x);
++    check_cuda(*x2, "x2", at::kHalf, 2, x);
++    auto [k2, n2, K2] = trellis_dims(*trellis2, x);
++    TORCH_CHECK(k2 == k && n2 == n && K2 == K &&
++                    trellis2->size(0) == trellis.size(0) &&
++                    x2->sizes() == x.sizes() && y2->sizes() == y.sizes(),
++                "gemv: the fused projections must have the same shapes");
++  }
++  const bool grouped = group_rows.has_value();
++  int count = static_cast<int>(expert_ids.size(0));
++  if (grouped) {
++    check_cuda(*group_rows, "group_rows", at::kInt, 2, x);
++    TORCH_CHECK(group_rows->size(0) == count && group_rows->size(1) == 8,
++                "group_rows must be [G, 8]");
++  } else {
++    TORCH_CHECK(count <= x.size(0), "expert_ids longer than x");
++  }
++  if (count == 0) return;
++  TORCH_CHECK((fused ? 2 : 1) * count <= kMaxGridY,
++              "EXL3 MoE: too many slots per launch");
++  const int64_t ew = trellis[0].numel() / 2;  // u32 words per expert
++  const at::cuda::OptionalCUDAGuard guard(x.device());
++  auto stream = at::cuda::getCurrentCUDAStream();
++  dim3 grid(n / 32, (fused ? 2 : 1) * count);
++  auto tr = reinterpret_cast<const uint32_t*>(trellis.data_ptr<int16_t>());
++  auto tr2 =
++      fused ? reinterpret_cast<const uint32_t*>(trellis2->data_ptr<int16_t>())
++            : nullptr;
++  auto xp = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
++  auto x2p =
++      fused ? reinterpret_cast<const half*>(x2->data_ptr<at::Half>()) : nullptr;
++  float* y2p = fused ? y2->data_ptr<float>() : nullptr;
++  const int* rows = grouped ? group_rows->data_ptr<int>() : nullptr;
++  if (colmajor) {
++    launch_gemv<true>(grouped, K, grid, stream, tr, expert_ids.data_ptr<int>(),
++                      rows, xp, y.data_ptr<float>(), k, n, ew, count, tr2, x2p,
++                      y2p);
++  } else {
++    launch_gemv<false>(grouped, K, grid, stream, tr, expert_ids.data_ptr<int>(),
++                       rows, xp, y.data_ptr<float>(), k, n, ew, count, tr2, x2p,
++                       y2p);
++  }
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// out[s] = had128(silu(had128(yg) * g_svh) * had128(yu) * u_svh * d_suh)
++void exl3_moe_mid_out(torch::Tensor out, torch::Tensor yg, torch::Tensor yu,
++                      torch::Tensor topk_ids, torch::Tensor g_svh,
++                      torch::Tensor u_svh, torch::Tensor d_suh) {
++  check_cuda(yg, "yg", at::kFloat, 2, yg);
++  check_cuda(yu, "yu", at::kFloat, 2, yg);
++  check_cuda(out, "out", at::kHalf, 2, yg);
++  check_cuda(topk_ids, "topk_ids", at::kInt, 2, yg);
++  check_cuda(g_svh, "g_svh", at::kHalf, 2, yg);
++  check_cuda(u_svh, "u_svh", at::kHalf, 2, yg);
++  check_cuda(d_suh, "d_suh", at::kHalf, 2, yg);
++  const int n = static_cast<int>(yg.size(1));
++  const int S = static_cast<int>(topk_ids.numel());
++  TORCH_CHECK(n % (kGlueWarps * 128) == 0,
++              "EXL3 MoE: n must be a multiple of 512");
++  TORCH_CHECK(yg.size(0) >= S && yu.sizes() == yg.sizes() && out.size(0) >= S &&
++                  out.size(1) == n && g_svh.size(1) == n &&
++                  u_svh.size(1) == n && d_suh.size(1) == n,
++              "mid: shape mismatch");
++  if (S == 0) return;
++  TORCH_CHECK(S <= kMaxGridY, "EXL3 MoE: too many slots per launch");
++  const at::cuda::OptionalCUDAGuard guard(yg.device());
++  auto stream = at::cuda::getCurrentCUDAStream();
++  exl3_mid_kernel<<<dim3(n / (kGlueWarps * 128), S), kGlueWarps * 32, 0,
++                    stream>>>(
++      yg.data_ptr<float>(), yu.data_ptr<float>(), topk_ids.data_ptr<int>(),
++      reinterpret_cast<const half*>(g_svh.data_ptr<at::Half>()),
++      reinterpret_cast<const half*>(u_svh.data_ptr<at::Half>()),
++      reinterpret_cast<const half*>(d_suh.data_ptr<at::Half>()),
++      reinterpret_cast<half*>(out.data_ptr<at::Half>()), n);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// out[t] = sum_j w[t, j] * had128(yd[t * topk + j]) * d_svh[e]   (fp32 [T, k])
++void exl3_moe_post_out(torch::Tensor out, torch::Tensor yd,
++                       torch::Tensor topk_ids, torch::Tensor topk_weights,
++                       torch::Tensor d_svh) {
++  check_cuda(yd, "yd", at::kFloat, 2, yd);
++  check_cuda(out, "out", at::kFloat, 2, yd);
++  check_cuda(topk_ids, "topk_ids", at::kInt, 2, yd);
++  check_cuda(topk_weights, "topk_weights", at::kFloat, 2, yd);
++  check_cuda(d_svh, "d_svh", at::kHalf, 2, yd);
++  const int k = static_cast<int>(yd.size(1));
++  const int T = static_cast<int>(topk_ids.size(0));
++  const int topk = static_cast<int>(topk_ids.size(1));
++  TORCH_CHECK(k % (kGlueWarps * 128) == 0,
++              "EXL3 MoE: k must be a multiple of 512");
++  TORCH_CHECK(topk_weights.sizes() == topk_ids.sizes() &&
++                  yd.size(0) >= T * topk && out.size(0) >= T &&
++                  out.size(1) == k && d_svh.size(1) == k,
++              "post: shape mismatch");
++  if (T == 0) return;
++  TORCH_CHECK(T <= kMaxGridY, "EXL3 MoE: too many tokens per launch");
++  const at::cuda::OptionalCUDAGuard guard(yd.device());
++  auto stream = at::cuda::getCurrentCUDAStream();
++  exl3_post_kernel<<<dim3(k / (kGlueWarps * 128), T), kGlueWarps * 32, 0,
++                     stream>>>(
++      yd.data_ptr<float>(), topk_ids.data_ptr<int>(),
++      topk_weights.data_ptr<float>(),
++      reinterpret_cast<const half*>(d_svh.data_ptr<at::Half>()),
++      out.data_ptr<float>(), k, topk);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index 2639fa46f7..6b792b364d 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -770,6 +770,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "weight) -> ()");
+   ops.impl("sm70_glm53_fp16_gemv_out", torch::kCUDA, &sm70_glm53_fp16_gemv_out);
+ 
++  // EXL3 routed-expert MoE (trellis decode + mma.m8n8k4).
++  ops.def(
++      "exl3_moe_pre_out(Tensor(a!) out, Tensor(b!)? out2, Tensor x, "
++      "Tensor topk_ids, Tensor suh, Tensor? suh2) -> ()");
++  ops.impl("exl3_moe_pre_out", torch::kCUDA, &exl3_moe_pre_out);
++  ops.def(
++      "exl3_moe_gemv_out(Tensor(a!) y, Tensor(b!)? y2, Tensor x, Tensor? x2, "
++      "Tensor trellis, Tensor? trellis2, Tensor expert_ids, "
++      "Tensor? group_rows, bool colmajor) -> ()");
++  ops.impl("exl3_moe_gemv_out", torch::kCUDA, &exl3_moe_gemv_out);
++  ops.def(
++      "exl3_moe_mid_out(Tensor(a!) out, Tensor yg, Tensor yu, "
++      "Tensor topk_ids, Tensor g_svh, Tensor u_svh, Tensor d_suh) -> ()");
++  ops.impl("exl3_moe_mid_out", torch::kCUDA, &exl3_moe_mid_out);
++  ops.def(
++      "exl3_moe_post_out(Tensor(a!) out, Tensor yd, Tensor topk_ids, "
++      "Tensor topk_weights, Tensor d_svh) -> ()");
++  ops.impl("exl3_moe_post_out", torch::kCUDA, &exl3_moe_post_out);
++
+   ops.def(
+       "sm70_glm53_moe_permute_q8_out("
+       "Tensor input, Tensor topk_ids, Tensor(a!) permuted_input, "
+diff --git a/pyproject.toml b/pyproject.toml
+index 2b4c7c3f5e..5615680382 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -156,6 +156,8 @@ inverse_std_variences = "inverse_std_variences"
+ 
+ [tool.typos.default.extend-words]
+ iy = "iy"
++# EXL3 (exllamav3) input sign/scale vector
++suh = "suh"
+ indx = "indx"
+ # intel cpu features
+ tme = "tme"
+diff --git a/tests/kernels/quantization/test_exl3_moe.py b/tests/kernels/quantization/test_exl3_moe.py
+new file mode 100644
+index 0000000000..0008e73dff
+--- /dev/null
++++ b/tests/kernels/quantization/test_exl3_moe.py
+@@ -0,0 +1,325 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""EXL3 routed-expert MoE: the pure-torch reference decoder against exllamav3,
++and the SM70 kernels against that decoder.
++
++Run: pytest tests/kernels/quantization/test_exl3_moe.py -v
++"""
++
++import hashlib
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++from vllm import _custom_ops as ops
++from vllm.model_executor.layers.quantization.exl3 import (
++    MCG_MARKER,
++    Exl3Config,
++    exl3_decode_tiles,
++    exl3_group_slots,
++    exl3_moe_forward,
++    exl3_reconstruct,
++    exl3_strip_major_,
++    tile_perm,
++)
++
++requires_kernels = pytest.mark.skipif(
++    not torch.cuda.is_available() or not ops.exl3_moe_available(),
++    reason="EXL3 MoE kernels are built for compute capability 7.0",
++)
++
++
++def _strip_words(K: int) -> torch.Tensor:
++    """A 16 x 128 strip of trellis words from an integer hash (no RNG, so the
++    golden values below do not depend on the torch version)."""
++    n = 8 * 16 * K
++    v = [((i * 2654435761 + K * 40503) >> 9) & 0xFFFF for i in range(n)]
++    v = [x - 65536 if x >= 32768 else x for x in v]
++    return torch.tensor(v, dtype=torch.int16).view(1, 8, 16 * K)
++
++
++# sha256 of exllamav3's ext.reconstruct(w, trellis, K, mcg=True, mul1=False)
++# for _strip_words(K): the fp16 [16, 128] tile-basis weight, sm80 tile order.
++EXLLAMAV3_RECONSTRUCT_SHA256 = {
++    2: "e45f494665e37c04ff3b8f9672471f0fb00126cac4f020bfd7f84aa06fb5de72",
++    3: "cda4e8323139c8702a8465a813d161f54037922d759d8d5f5cd0e10afe62dd85",
++    4: "14fbf140e51b3105515eaf58d240df57bfd628d97a13fbcd3214737871c30437",
++}
++
++
++@pytest.mark.parametrize("K", [2, 3, 4])
++def test_decoder_matches_exllamav3(K):
++    w = exl3_decode_tiles(_strip_words(K), "mcg", "sm80")
++    digest = hashlib.sha256(w.numpy().tobytes()).hexdigest()
++    assert digest == EXLLAMAV3_RECONSTRUCT_SHA256[K]
++
++
++def test_tile_orders():
++    for order in ("sm80", "colmajor"):
++        perm = tile_perm(order)
++        assert torch.equal(perm.sort().values, torch.arange(256))
++    p = torch.arange(256)
++    assert torch.equal(tile_perm("colmajor"), (p % 16) * 16 + p // 16)
++    assert torch.equal(tile_perm("sm70_colmajor"), tile_perm("colmajor"))
++    # The same stream decodes to the same values in both orders, at the
++    # elements each order assigns to the positions.
++    words = _strip_words(2)
++    a = exl3_decode_tiles(words, "mcg", "sm80").view(16, 8, 16).permute(1, 0, 2)
++    b = exl3_decode_tiles(words, "mcg", "colmajor").view(16, 8, 16).permute(1, 0, 2)
++    a, b = a.reshape(8, 256), b.reshape(8, 256)
++    assert torch.equal(a[:, tile_perm("sm80")], b[:, tile_perm("colmajor")])
++
++
++@pytest.mark.parametrize("T,topk,E", [(1, 8, 16), (70, 8, 16), (300, 8, 288)])
++def test_group_slots(T, topk, E):
++    torch.manual_seed(0)
++    ids = torch.stack([torch.randperm(E)[:topk] for _ in range(T)]).int()
++    gexp, rows = exl3_group_slots(ids, E)
++    flat = ids.view(-1)
++    used = rows[rows >= 0]
++    assert torch.equal(used.sort().values, torch.arange(T * topk, dtype=torch.int32))
++    for g in range(rows.shape[0]):
++        slots = rows[g][rows[g] >= 0].long()
++        if slots.numel():
++            assert rows[g, 0] >= 0  # filled from the front
++            assert bool((flat[slots] == gexp[g]).all())
++
++
++def _make_layer(E, H, inter, K, device, seed=0):
++    g = torch.Generator(device="cpu").manual_seed(seed)
++
++    def trellis(*shape):
++        return torch.randint(-32768, 32768, shape, dtype=torch.int16, generator=g)
++
++    def signs(*shape):
++        s = torch.randint(0, 2, shape, generator=g).half() * 2 - 1
++        return s * (0.5 + torch.rand(shape, generator=g).half())
++
++    w = dict(
++        w13_trellis=trellis(2, E, H // 16, inter // 16, 16 * K),
++        w13_suh=signs(2, E, H) * 0.05,
++        w13_svh=signs(2, E, inter) * 0.05,
++        w2_trellis=trellis(E, inter // 16, H // 16, 16 * K),
++        w2_suh=signs(E, inter) * 0.05,
++        w2_svh=signs(E, H) * 0.05,
++    )
++    return {k: v.to(device) for k, v in w.items()}
++
++
++def _kernel_layout(layer):
++    """The ops read strip-major trellis tiles; the oracle keeps the checkpoint order."""
++    out = dict(layer)
++    for name in ("w13_trellis", "w2_trellis"):
++        out[name] = exl3_strip_major_(layer[name].clone())
++    return out
++
++
++def _oracle(x, ids, wts, layer, order):
++    """sum_j w * (silu(x Wg) * (x Wu)) Wd with weights from the decoder."""
++    E = layer["w2_trellis"].shape[0]
++    W = {}
++    for e in ids.unique().tolist():
++        W[e] = [
++            exl3_reconstruct(
++                layer["w13_trellis"][p, e],
++                layer["w13_suh"][p, e],
++                layer["w13_svh"][p, e],
++                "mcg",
++                order,
++            ).double()
++            for p in (0, 1)
++        ] + [
++            exl3_reconstruct(
++                layer["w2_trellis"][e],
++                layer["w2_suh"][e],
++                layer["w2_svh"][e],
++                "mcg",
++                order,
++            ).double()
++        ]
++    assert len(W) <= E
++    out = torch.zeros(x.shape, dtype=torch.float64, device=x.device)
++    for t in range(x.shape[0]):
++        xt = x[t].double()
++        for j in range(ids.shape[1]):
++            wg, wu, wd = W[ids[t, j].item()]
++            out[t] += wts[t, j].double() * ((F.silu(xt @ wg) * (xt @ wu)) @ wd)
++    return out
++
++
++@requires_kernels
++@pytest.mark.parametrize("order", ["sm80", "colmajor"])
++@pytest.mark.parametrize("K", [2, 3, 4])
++@pytest.mark.parametrize("T", [1, 5, 70, 300])
++def test_exl3_moe_kernel(order, K, T):
++    device = torch.device("cuda")
++    E, H, inter, topk = 16, 512, 512, 8
++    layer = _make_layer(E, H, inter, K, device, seed=K)
++    torch.manual_seed(T)
++    x = (torch.randn(T, H, device=device) * 0.5).half()
++    ids = torch.stack([torch.randperm(E, device=device)[:topk] for _ in range(T)]).int()
++    wts = torch.rand(T, topk, device=device)
++    y = exl3_moe_forward(
++        x, ids, wts, **_kernel_layout(layer), colmajor=order == "colmajor"
++    )
++    # Prefill shapes are checked on a sample of tokens (the oracle is slow).
++    rows = list(range(T)) if T <= 5 else [0, 1, T // 2, T - 2, T - 1]
++    ref = _oracle(x[rows], ids[rows], wts[rows], layer, order)
++    err = ((y[rows].double() - ref).norm() / ref.norm()).item()
++    assert torch.isfinite(y).all()
++    assert err < 2e-3, err
++
++
++@requires_kernels
++def test_exl3_moe_cuda_graph():
++    device = torch.device("cuda")
++    E, H, inter, topk, T = 16, 512, 512, 8, 4
++    layer = _kernel_layout(_make_layer(E, H, inter, 2, device))
++    x = torch.zeros(T, H, device=device, dtype=torch.half)
++    ids = torch.zeros(T, topk, device=device, dtype=torch.int32)
++    wts = torch.zeros(T, topk, device=device)
++    exl3_moe_forward(x, ids, wts, **layer, colmajor=True)  # warm up
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        y = exl3_moe_forward(x, ids, wts, **layer, colmajor=True)
++    torch.manual_seed(1)
++    x.copy_((torch.randn(T, H, device=device) * 0.5).half())
++    ids.copy_(torch.stack([torch.randperm(E, device=device)[:topk] for _ in range(T)]))
++    wts.copy_(torch.rand(T, topk, device=device))
++    graph.replay()
++    eager = exl3_moe_forward(x, ids, wts, **layer, colmajor=True)
++    torch.testing.assert_close(y, eager, rtol=0, atol=0)
++
++
++def _write_checkpoint(path, tensors):
++    from safetensors.torch import save_file
++
++    save_file(tensors, str(path / "model.safetensors"))
++
++
++def _expert_tensors(layer, K, E=2, mcg=True):
++    out = {}
++    for e in range(E):
++        for proj in ("gate_proj", "up_proj", "down_proj"):
++            p = f"model.language_model.layers.{layer}.mlp.experts.{e}.{proj}"
++            out[p + ".trellis"] = torch.zeros(32, 8, 16 * K, dtype=torch.int16)
++            out[p + ".suh"] = torch.zeros(512, dtype=torch.half)
++            out[p + ".svh"] = torch.zeros(128, dtype=torch.half)
++            if mcg:
++                out[p + ".mcg"] = torch.tensor(MCG_MARKER, dtype=torch.int32)
++            else:
++                out[p + ".mul1"] = torch.tensor(1, dtype=torch.int32)
++    return out
++
++
++def test_config_reads_expert_bits(tmp_path):
++    _write_checkpoint(tmp_path, {**_expert_tensors(3, 2), **_expert_tensors(45, 4)})
++    cfg = Exl3Config.from_config(
++        {
++            "quant_method": "exl3",
++            "bits": 2,
++            "codebook": "mcg",
++            "tile_order": "sm70_colmajor",
++        }
++    )
++    cfg.maybe_update_config(str(tmp_path))
++    assert cfg.expert_bits == {3: 2, 45: 4}
++    assert cfg.tile_order == "colmajor"
++
++
++def test_config_rejects_unsupported_experts(tmp_path):
++    _write_checkpoint(tmp_path, _expert_tensors(3, 2, mcg=False))
++    cfg = Exl3Config.from_config({"quant_method": "exl3", "codebook": "mul1"})
++    with pytest.raises(ValueError, match="mcg codebook"):
++        cfg.maybe_update_config(str(tmp_path))
++    mixed = {**_expert_tensors(3, 2)}
++    mixed["model.language_model.layers.3.mlp.experts.1.down_proj.trellis"] = (
++        torch.zeros(32, 8, 48, dtype=torch.int16)
++    )
++    _write_checkpoint(tmp_path, mixed)
++    with pytest.raises(ValueError, match="mixed bit widths"):
++        Exl3Config.from_config({"codebook": "mcg"}).maybe_update_config(str(tmp_path))
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++@pytest.mark.parametrize("order", ["sm80", "colmajor"])
++def test_dequantize_dense(order):
++    torch.manual_seed(0)
++    k, n, K = 256, 384, 4
++    trellis = torch.randint(
++        -32768, 32768, (k // 16, n // 16, 16 * K), dtype=torch.int16
++    )
++    suh, svh = torch.randn(k).half(), torch.randn(n).half()
++    cfg = Exl3Config(codebook="mcg", tile_order=order)
++    p = "model.layers.45.self_attn.o_proj"
++    expert = "model.layers.45.mlp.experts.0.gate_proj.trellis"
++    weights = [
++        (p + ".trellis", trellis),
++        (p + ".suh", suh),
++        (p + ".svh", svh),
++        (p + ".mcg", torch.tensor(MCG_MARKER, dtype=torch.int32)),
++        ("model.norm.weight", torch.ones(4)),
++        (expert, trellis),
++    ]
++    out = dict(cfg.dequantize_dense(iter(weights)))
++    assert set(out) == {"model.norm.weight", expert, p + ".weight"}
++    ref = exl3_reconstruct(trellis.cuda(), suh.cuda(), svh.cuda(), "mcg", order)
++    torch.testing.assert_close(out[p + ".weight"], ref.T.half().cpu())
++
++
++@pytest.mark.parametrize("K", [2, 4])
++def test_decode_tiles_chunked(K):
++    # The decoder works through the tiles in chunks to bound its memory; the
++    # result must not depend on the chunk size (incl. a partial last chunk).
++    words = _strip_words(K).repeat(3, 1, 1)
++    full = exl3_decode_tiles(words, "mcg", "sm80", chunk_tiles=1 << 20)
++    for chunk in (1, 5, 7):
++        torch.testing.assert_close(
++            exl3_decode_tiles(words, "mcg", "sm80", chunk_tiles=chunk),
++            full,
++            rtol=0,
++            atol=0,
++        )
++
++
++def test_dequantize_dense_skip():
++    cfg = Exl3Config(codebook="mcg")
++    p = "model.layers.45.self_attn.o_proj"
++    weights = [
++        (p + ".trellis", torch.zeros(16, 8, 64, dtype=torch.int16)),
++        (p + ".suh", torch.ones(256).half()),
++        (p + ".svh", torch.ones(128).half()),
++    ]
++    out = dict(cfg.dequantize_dense(iter(weights), skip=lambda n: ".layers.45." in n))
++    assert set(out) == {p + ".trellis", p + ".suh", p + ".svh"}
++
++
++def test_strip_major_is_a_tile_permutation():
++    t = torch.arange(2 * 3 * 8 * 4 * 32, dtype=torch.int16).view(2, 3, 8, 4, 32)
++    p = exl3_strip_major_(t.clone())
++    ref = t.view(2, 3, 8, 2, 2, 32).permute(0, 1, 3, 2, 4, 5).reshape(2, 3, 8, 4, 32)
++    assert torch.equal(p, ref)
++    # tiles move, words inside a tile do not
++    assert torch.equal(
++        p.view(-1, 32).sort(dim=0).values, t.view(-1, 32).sort(dim=0).values
++    )
++    with pytest.raises(ValueError):
++        exl3_strip_major_(torch.zeros(1, 4, 3, 32, dtype=torch.int16))
++
++
++@requires_kernels
++def test_exl3_moe_kernel_needs_strip_major():
++    """Mutation: the checkpoint tile order fed straight to the ops is wrong."""
++    device = torch.device("cuda")
++    E, H, inter, topk, T = 16, 512, 512, 8, 4
++    layer = _make_layer(E, H, inter, 2, device, seed=7)
++    torch.manual_seed(7)
++    x = (torch.randn(T, H, device=device) * 0.5).half()
++    ids = torch.stack([torch.randperm(E, device=device)[:topk] for _ in range(T)]).int()
++    wts = torch.rand(T, topk, device=device)
++    ref = _oracle(x, ids, wts, layer, "colmajor")
++    good = exl3_moe_forward(x, ids, wts, **_kernel_layout(layer), colmajor=True)
++    bad = exl3_moe_forward(x, ids, wts, **layer, colmajor=True)
++    assert ((good.double() - ref).norm() / ref.norm()).item() < 2e-3
++    assert ((bad.double() - ref).norm() / ref.norm()).item() > 0.1
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 1814d46fac..15efa8f12e 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -653,6 +653,83 @@ def _awq_gemm_fake(
+ 
+ 
+ # gptq
++
++
++# exl3 routed-expert MoE
++def exl3_moe_pre_out(
++    out: torch.Tensor,
++    out2: torch.Tensor | None,
++    x: torch.Tensor,
++    topk_ids: torch.Tensor,
++    suh: torch.Tensor,
++    suh2: torch.Tensor | None,
++) -> None:
++    torch.ops._C.exl3_moe_pre_out(out, out2, x, topk_ids, suh, suh2)
++
++
++def exl3_moe_gemv_out(
++    y: torch.Tensor,
++    y2: torch.Tensor | None,
++    x: torch.Tensor,
++    x2: torch.Tensor | None,
++    trellis: torch.Tensor,
++    trellis2: torch.Tensor | None,
++    expert_ids: torch.Tensor,
++    group_rows: torch.Tensor | None,
++    colmajor: bool,
++) -> None:
++    torch.ops._C.exl3_moe_gemv_out(
++        y, y2, x, x2, trellis, trellis2, expert_ids, group_rows, colmajor
++    )
++
++
++def exl3_moe_mid_out(
++    out: torch.Tensor,
++    yg: torch.Tensor,
++    yu: torch.Tensor,
++    topk_ids: torch.Tensor,
++    g_svh: torch.Tensor,
++    u_svh: torch.Tensor,
++    d_suh: torch.Tensor,
++) -> None:
++    torch.ops._C.exl3_moe_mid_out(out, yg, yu, topk_ids, g_svh, u_svh, d_suh)
++
++
++def exl3_moe_post_out(
++    out: torch.Tensor,
++    yd: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    d_svh: torch.Tensor,
++) -> None:
++    torch.ops._C.exl3_moe_post_out(out, yd, topk_ids, topk_weights, d_svh)
++
++
++def exl3_moe_available() -> bool:
++    return hasattr(torch.ops._C, "exl3_moe_gemv_out")
++
++
++if hasattr(torch.ops._C, "exl3_moe_gemv_out"):
++
++    @register_fake("_C::exl3_moe_pre_out")
++    def _exl3_moe_pre_out_fake(out, out2, x, topk_ids, suh, suh2) -> None:
++        return None
++
++    @register_fake("_C::exl3_moe_gemv_out")
++    def _exl3_moe_gemv_out_fake(
++        y, y2, x, x2, trellis, trellis2, expert_ids, group_rows, colmajor
++    ) -> None:
++        return None
++
++    @register_fake("_C::exl3_moe_mid_out")
++    def _exl3_moe_mid_out_fake(out, yg, yu, topk_ids, g_svh, u_svh, d_suh) -> None:
++        return None
++
++    @register_fake("_C::exl3_moe_post_out")
++    def _exl3_moe_post_out_fake(out, yd, topk_ids, topk_weights, d_svh) -> None:
++        return None
++
++
+ def gptq_gemm(
+     a: torch.Tensor,
+     b_q_weight: torch.Tensor,
+diff --git a/vllm/model_executor/layers/quantization/__init__.py b/vllm/model_executor/layers/quantization/__init__.py
+index dd5c3df1cf..236e04bd10 100644
+--- a/vllm/model_executor/layers/quantization/__init__.py
++++ b/vllm/model_executor/layers/quantization/__init__.py
+@@ -19,6 +19,7 @@
+     "modelopt_mxfp8",
+     "modelopt_mixed",
+     "gguf",
++    "exl3",
+     "auto_gptq",
+     "gptq",
+     "gptq_marlin",
+@@ -178,6 +179,7 @@ def get_quant_method(self, layer, prefix):
+     from .compressed_tensors.compressed_tensors import (
+         CompressedTensorsConfig,
+     )
++    from .exl3 import Exl3Config
+     from .experts_int8 import ExpertsInt8Config
+     from .fbgemm_fp8 import FBGEMMFp8Config
+     from .fp8 import Fp8Config
+@@ -205,6 +207,7 @@ def get_quant_method(self, layer, prefix):
+         "modelopt_mxfp8": ModelOptMxFp8Config,
+         "modelopt_mixed": ModelOptMixedPrecisionConfig,
+         "gguf": GGUFConfig,
++        "exl3": Exl3Config,
+         "auto_gptq": AutoGPTQConfig,
+         "gptq": AutoGPTQConfig,
+         "gptq_marlin": AutoGPTQConfig,
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+new file mode 100644
+index 0000000000..d8714a2c6f
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -0,0 +1,604 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""EXL3 (exllamav3 trellis-coded) checkpoints.
++
++Routed MoE experts stored as EXL3 run on kernels that decode the trellis inside
++the matmul; the weights are never dequantized to memory. Supported: the mcg
++codebook, K = 2, 3 or 4 bits (per layer, read from the checkpoint), and both
++tile orders exllamav3 can write ("sm80", its default, and "colmajor"). The
++kernels are built for compute capability 7.0.
++
++Every other linear layer is expected unquantized. The few dense EXL3 tensors a
++converter may emit besides the experts (an MTP head, for example) are
++dequantized to FP16 while loading, see ``Exl3Config.dequantize_dense``.
++
++EXL3 tensor format, per linear (in_features k, out_features n, y = x @ W):
++  trellis  int16 [k/16, n/16, 16K]  one 16x16 tile per cell, K bits per weight
++  suh      fp16  [k]                input sign/scale vector
++  svh      fp16  [n]                output sign/scale vector
++  mcg/mul1 int32 scalar marker      codebook (no marker: 3inst)
++Tile decode: a tile is a tail-biting stream of 256K bits stored as uint16 pairs
++half-swapped (MSB-first as big-endian u32). Position p's state is the 16 bits
++ending at bit (p + 1) K, its value codebook(state), and it holds tile element
++perm[p] (element = row * 16 + col). W = had_l(had_r(T) ...) with blockwise
++128-point Sylvester Hadamards: W = H T H * suh[:, None] * svh[None, :] in the
++order of ``exl3_reconstruct``.
++"""
++
++import json
++import math
++import os
++from collections.abc import Callable, Iterable, Iterator
++from functools import cache
++from typing import Any
++
++import regex as re
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe import (
++    FusedMoEConfig,
++    FusedMoEMethodBase,
++    FusedMoEQuantConfig,
++    RoutedExperts,
++    SharedExperts,
++)
++from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.quantization.base_config import (
++    QuantizationConfig,
++    QuantizeMethodBase,
++)
++
++logger = init_logger(__name__)
++
++MCG_MULT = 0xCBAC1FED
++MUL1_MULT = 0x83DCD12D
++MCG_MARKER = MCG_MULT - (1 << 32)  # the .mcg tensor: the multiplier as int32
++COLMAJOR_MARKER = 0x70C0  # the .tile_order tensor of a colmajor tensor
++HAD_DIM = 128
++TILE_ORDERS = ("sm80", "colmajor")
++
++_EXPERT_KEY = re.compile(r"\.experts\.\d+\.")
++_EXPERT_TRELLIS = re.compile(
++    r"layers\.(\d+)\..*\.experts\.\d+\.(?:gate|up|down)_proj\.trellis$"
++)
++_LAYER_INDEX = re.compile(r"layers\.(\d+)(?:\.|$)")
++
++
++def normalize_tile_order(tile_order: str) -> str:
++    """Tile order name; a platform prefix ("<arch>_colmajor") is accepted."""
++    name = (
++        tile_order.rpartition("_")[2] if tile_order.endswith("colmajor") else tile_order
++    )
++    if name not in TILE_ORDERS:
++        raise ValueError(f"Unknown EXL3 tile order {tile_order!r}")
++    return name
++
++
++# ---------------------------------------------------------------------------
++# Reference decoder (pure torch). Used to dequantize dense EXL3 tensors at load
++# time and as the oracle for the kernel tests.
++# ---------------------------------------------------------------------------
++
++
++@cache
++def tile_perm(tile_order: str) -> torch.Tensor:
++    """Position -> tile element (row * 16 + col) for a tile order."""
++    if normalize_tile_order(tile_order) == "colmajor":
++        return torch.tensor([(p % 16) * 16 + p // 16 for p in range(256)])
++    perm = [0] * 256
++    for t in range(32):
++        r0 = (t % 4) * 2
++        for j, c in enumerate((t // 4, t // 4 + 8)):
++            for i, r in enumerate((r0, r0 + 1, r0 + 8, r0 + 9)):
++                perm[t * 8 + j * 4 + i] = r * 16 + c
++    return torch.tensor(perm)
++
++
++def _trellis_states(trellis: torch.Tensor, K: int) -> torch.Tensor:
++    """int16 [..., 16K] -> int64 states [..., 256]."""
++    w = trellis.to(torch.int64) & 0xFFFF
++    w = w.view(*w.shape[:-1], 8 * K, 2).flip(-1).reshape(*w.shape[:-1], 16 * K)
++    shifts = torch.arange(15, -1, -1, device=w.device)
++    bits = ((w.unsqueeze(-1) >> shifts) & 1).reshape(*w.shape[:-1], 256 * K)
++    ends = (torch.arange(256, device=w.device) + 1) * K
++    idx = (ends.unsqueeze(1) - 16 + torch.arange(16, device=w.device)) % (256 * K)
++    weights = 1 << torch.arange(15, -1, -1, device=w.device)
++    return (bits[..., idx] * weights).sum(-1)
++
++
++def _halves_sum(x: torch.Tensor) -> torch.Tensor:
++    lo = (x & 0xFFFF).to(torch.int16).view(torch.float16).float()
++    hi = ((x >> 16) & 0xFFFF).to(torch.int16).view(torch.float16).float()
++    return (lo + hi).to(torch.float16)
++
++
++def _decode_states(states: torch.Tensor, codebook: str) -> torch.Tensor:
++    if codebook == "3inst":
++        x = (states * 89226354 + 64248484) & 0xFFFFFFFF
++        return _halves_sum((x & 0x8FFF8FFF) ^ 0x3B603B60)
++    if codebook == "mcg":
++        x = (states * MCG_MULT) & 0xFFFFFFFF
++        return _halves_sum((x & 0x8FFF8FFF) ^ 0x3B603B60)
++    if codebook == "mul1":
++        x = (states * MUL1_MULT) & 0xFFFFFFFF
++        s = 0x6400 + sum((x >> (8 * i)) & 0xFF for i in range(4))
++        h = (s & 0xFFFF).to(torch.int16).view(torch.float16).float()
++        k_inv = torch.tensor(0x1EEE, dtype=torch.int16).view(torch.float16).float()
++        k_bias = torch.tensor(0xC931 - 0x10000, dtype=torch.int16).view(torch.float16)
++        return (h * k_inv.item() + k_bias.float().item()).to(torch.float16)
++    raise ValueError(f"Unknown EXL3 codebook {codebook!r}")
++
++
++def exl3_decode_tiles(
++    trellis: torch.Tensor, codebook: str, tile_order: str, chunk_tiles: int = 4096
++) -> torch.Tensor:
++    """int16 [k/16, n/16, 16K] -> fp16 [k, n] in the trellis (rotated) basis.
++
++    Tiles are decoded chunk_tiles at a time: the intermediate state tensors
++    take ~70 KB per tile, so a whole layer at once would need gigabytes."""
++    tk, tn, words = trellis.shape
++    K = words // 16
++    flat = trellis.reshape(tk * tn, words)
++    perm = tile_perm(tile_order).to(trellis.device)
++    tiles = torch.empty(tk * tn, 256, dtype=torch.float16, device=trellis.device)
++    for start in range(0, tk * tn, chunk_tiles):
++        part = flat[start : start + chunk_tiles]
++        tiles[start : start + part.shape[0], perm] = _decode_states(
++            _trellis_states(part, K), codebook
++        )
++    return tiles.view(tk, tn, 16, 16).permute(0, 2, 1, 3).reshape(tk * 16, tn * 16)
++
++
++@cache
++def _hadamard(device: torch.device) -> torch.Tensor:
++    h = torch.ones(1, 1, dtype=torch.float64)
++    while h.shape[0] < HAD_DIM:
++        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
++    return (h / math.sqrt(HAD_DIM)).float().to(device)
++
++
++def exl3_reconstruct(
++    trellis: torch.Tensor,
++    suh: torch.Tensor,
++    svh: torch.Tensor,
++    codebook: str,
++    tile_order: str,
++) -> torch.Tensor:
++    """Full fp32 weight W [in_features, out_features] (y = x @ W)."""
++    t = exl3_decode_tiles(trellis, codebook, tile_order).float()
++    k, n = t.shape
++    h = _hadamard(t.device)
++    t = (h @ t.view(k // HAD_DIM, HAD_DIM, n)).view(k, n) * suh.float().unsqueeze(1)
++    t = (t.view(k, n // HAD_DIM, HAD_DIM) @ h).view(k, n)
++    return t * svh.float().unsqueeze(0)
++
++
++# ---------------------------------------------------------------------------
++# Config
++# ---------------------------------------------------------------------------
++
++
++def _read_safetensors_shapes(model_name: str, revision: str | None) -> dict:
++    """Tensor name -> shape from the checkpoint's safetensors headers."""
++    shapes: dict[str, list[int]] = {}
++    if os.path.isdir(model_name):
++        for fn in sorted(os.listdir(model_name)):
++            if not fn.endswith(".safetensors"):
++                continue
++            with open(os.path.join(model_name, fn), "rb") as f:
++                header = json.loads(f.read(int.from_bytes(f.read(8), "little")))
++            for key, info in header.items():
++                if key != "__metadata__":
++                    shapes[key] = info["shape"]
++        return shapes
++    from huggingface_hub import get_safetensors_metadata
++
++    metadata = get_safetensors_metadata(model_name, revision=revision)
++    for file_meta in metadata.files_metadata.values():
++        for key, info in file_meta.tensors.items():
++            shapes[key] = info.shape
++    return shapes
++
++
++def _layer_index(prefix: str) -> int | None:
++    """Decoder layer index of a module or tensor name (the roots differ between
++    checkpoint and model: "model.", "model.language_model.", ...)."""
++    found = _LAYER_INDEX.findall(prefix)
++    return int(found[-1]) if found else None
++
++
++class Exl3Config(QuantizationConfig):
++    """Config for EXL3 checkpoints (``quant_method: exl3``)."""
++
++    def __init__(
++        self, bits: float = 2, codebook: str = "mul1", tile_order: str = "sm80"
++    ):
++        super().__init__()
++        self.bits = bits
++        self.codebook = codebook
++        self.tile_order = normalize_tile_order(tile_order)
++        # Routed-expert bit width per decoder layer index, filled from the
++        # checkpoint headers by maybe_update_config.
++        self.expert_bits: dict[int, int] = {}
++
++    def __repr__(self) -> str:
++        return (
++            f"Exl3Config(bits={self.bits}, codebook={self.codebook}, "
++            f"tile_order={self.tile_order})"
++        )
++
++    @classmethod
++    def get_name(cls):
++        return "exl3"
++
++    @classmethod
++    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
++        return [torch.float16]
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        return 70
++
++    @staticmethod
++    def get_config_filenames() -> list[str]:
++        return []
++
++    @classmethod
++    def from_config(cls, config: dict[str, Any]) -> "Exl3Config":
++        return cls(
++            bits=config.get("bits", 2),
++            codebook=config.get("codebook", "mul1"),
++            tile_order=config.get("tile_order", "sm80"),
++        )
++
++    def maybe_update_config(self, model_name: str, hf_config=None, revision=None):
++        shapes = _read_safetensors_shapes(model_name, revision)
++        bits: dict[int, set[int]] = {}
++        for key, shape in shapes.items():
++            m = _EXPERT_TRELLIS.search(key)
++            if m:
++                bits.setdefault(int(m.group(1)), set()).add(shape[-1] // 16)
++        mixed = {k: sorted(v) for k, v in bits.items() if len(v) > 1}
++        if mixed:
++            raise ValueError(
++                f"EXL3: experts of one MoE layer use mixed bit widths: {mixed}"
++            )
++        self.expert_bits = {k: next(iter(v)) for k, v in bits.items()}
++        expert_keys = [k for k in shapes if _EXPERT_KEY.search(k)]
++        n_trellis = sum(k.endswith(".trellis") for k in expert_keys)
++        n_mcg = sum(k.endswith(".mcg") for k in expert_keys)
++        if n_trellis and (
++            n_mcg != n_trellis
++            or any(k.endswith((".mul1", ".su", ".sv")) for k in expert_keys)
++        ):
++            raise ValueError(
++                "EXL3 routed experts must use the mcg codebook with unpacked sign "
++                f"vectors (suh/svh); this checkpoint's codebook is {self.codebook!r}"
++            )
++
++    def get_quant_method(
++        self, layer: torch.nn.Module, prefix: str
++    ) -> QuantizeMethodBase | None:
++        if isinstance(layer, LinearBase):
++            return UnquantizedLinearMethod()
++        if isinstance(layer, RoutedExperts):
++            key = _layer_index(prefix)
++            if key not in self.expert_bits:
++                raise ValueError(f"EXL3: no routed-expert tensors found for {prefix}")
++            return Exl3MoEMethod(
++                layer.moe_config, self.expert_bits[key], self.tile_order == "colmajor"
++            )
++        return None
++
++    def dequantize_dense(
++        self, weights: Iterable[tuple], skip: Callable[[str], bool] | None = None
++    ) -> Iterator[tuple]:
++        """Pass a model's weight iterator through, replacing each dense EXL3
++        linear (trellis/suh/svh + codebook marker) by its FP16 ``.weight`` in
++        checkpoint orientation (out_features, in_features). Expert tensors, and
++        tensors ``skip`` selects (e.g. layers the model does not load), pass
++        through unchanged. The dequantized tensors are yielded at the end."""
++        parts: dict[str, dict[str, torch.Tensor]] = {}
++        suffixes = (".trellis", ".suh", ".svh", ".mcg", ".mul1", ".tile_order")
++        for item in weights:
++            name = item[0]
++            if (
++                name.endswith(suffixes)
++                and not _EXPERT_KEY.search(name)
++                and not (skip is not None and skip(name))
++            ):
++                prefix, _, kind = name.rpartition(".")
++                parts.setdefault(prefix, {})[kind] = item[1]
++                continue
++            yield item
++        for prefix, p in parts.items():
++            if not {"trellis", "suh", "svh"} <= p.keys():
++                raise ValueError(f"EXL3 tensor {prefix} is incomplete: {sorted(p)}")
++            codebook = "mcg" if "mcg" in p else "mul1" if "mul1" in p else "3inst"
++            w = exl3_reconstruct(
++                p["trellis"].cuda(),
++                p["suh"].cuda(),
++                p["svh"].cuda(),
++                codebook,
++                self.tile_order,
++            )
++            yield prefix + ".weight", w.T.contiguous().half().cpu()
++
++
++# ---------------------------------------------------------------------------
++# Routed experts
++# ---------------------------------------------------------------------------
++
++
++GROUP_MIN_TOKENS = 65  # from here on, decode each expert once per <= 8 slots
++
++
++def exl3_group_slots(
++    topk_ids: torch.Tensor, num_experts: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Group slots (s = token * topk + j) by expert, up to 8 per group, without
++    host syncs (CUDA-graph safe). Returns the expert of each group [G] and its
++    slots [G, 8] (-1 = empty) for the worst case G = S / 8 + min(E, S); the
++    groups beyond the real count are empty."""
++    ids = topk_ids.reshape(-1).long()
++    S = ids.numel()
++    G = S // 8 + min(num_experts, S)
++    es, order = torch.sort(ids, stable=True)
++    pos = torch.arange(S, device=ids.device)
++    first = torch.ones(S, dtype=torch.bool, device=ids.device)
++    first[1:] = es[1:] != es[:-1]
++    start = torch.cummax(torch.where(first, pos, torch.zeros_like(pos)), 0).values
++    in_run = pos - start
++    gid = torch.cumsum((in_run % 8 == 0).long(), 0) - 1
++    rows = torch.full((G * 8,), -1, dtype=torch.int32, device=ids.device)
++    rows[gid * 8 + in_run % 8] = order.int()
++    gexp = torch.zeros(G, dtype=torch.int32, device=ids.device)
++    gexp[gid] = es.int()
++    return gexp, rows.view(G, 8)
++
++
++def exl3_strip_major_(trellis: torch.Tensor) -> torch.Tensor:
++    """Reorder trellis tiles in place from [.., k/16, n/16, W] to the strip-major
++    order the SM70 MoE kernels read: [.., n/32, k/16, 2, W], so the two 16-column
++    tiles a warp needs per k step are contiguous and a strip streams along k.
++    A pure permutation of whole tiles; done per leading index to avoid a second
++    copy of the expert weights."""
++    *lead, a, b, w = trellis.shape
++    if b % 2:
++        raise ValueError("EXL3 strip-major order needs an even number of column tiles")
++    flat = trellis.reshape(-1, a, b, w)
++    for i in range(flat.shape[0]):
++        flat[i].view(-1).copy_(
++            flat[i].view(a, b // 2, 2, w).permute(1, 0, 2, 3).reshape(-1)
++        )
++    return trellis
++
++
++def exl3_moe_forward(
++    x: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    w13_trellis: torch.Tensor,
++    w13_suh: torch.Tensor,
++    w13_svh: torch.Tensor,
++    w2_trellis: torch.Tensor,
++    w2_suh: torch.Tensor,
++    w2_svh: torch.Tensor,
++    colmajor: bool,
++) -> torch.Tensor:
++    """Routed experts: x [T, H] fp16, topk_ids [T, topk] int32, topk_weights
++    [T, topk] fp32 -> this rank's partial output [T, H] fp32. Weights are laid
++    out as in Exl3MoEMethod, trellis tensors in strip-major order
++    (``exl3_strip_major_``)."""
++    T, H = x.shape
++    S = T * topk_ids.shape[1]
++    inter = w2_trellis.shape[1] * 16
++    f16 = dict(dtype=torch.float16, device=x.device)
++    f32 = dict(dtype=torch.float32, device=x.device)
++    xg, xu = torch.empty(S, H, **f16), torch.empty(S, H, **f16)
++    yg, yu = torch.empty(S, inter, **f32), torch.empty(S, inter, **f32)
++    hd, yd = torch.empty(S, inter, **f16), torch.empty(S, H, **f32)
++    out = torch.empty(T, H, **f32)
++    ops.exl3_moe_pre_out(xg, xu, x, topk_ids, w13_suh[0], w13_suh[1])
++    if T >= GROUP_MIN_TOKENS:
++        gexp, rows = exl3_group_slots(topk_ids, w2_trellis.shape[0])
++    else:
++        gexp, rows = topk_ids.reshape(-1), None
++    ops.exl3_moe_gemv_out(
++        yg, yu, xg, xu, w13_trellis[0], w13_trellis[1], gexp, rows, colmajor
++    )
++    ops.exl3_moe_mid_out(hd, yg, yu, topk_ids, w13_svh[0], w13_svh[1], w2_suh)
++    ops.exl3_moe_gemv_out(yd, None, hd, None, w2_trellis, None, gexp, rows, colmajor)
++    ops.exl3_moe_post_out(out, yd, topk_ids, topk_weights, w2_svh)
++    return out
++
++
++class Exl3MoEMethod(FusedMoEMethodBase):
++    """Routed experts decoded from the EXL3 trellis inside the expert matmuls.
++
++    Per layer the experts are stacked (inter = this rank's intermediate slice):
++      w13_trellis [2, E, H/16, inter/16, 16K]  gate (0) and up (1)
++      w13_suh     [2, E, H],  w13_svh [2, E, inter]
++      w2_trellis  [E, inter/16, H/16, 16K],  w2_suh [E, inter],  w2_svh [E, H]
++    Tensor parallelism slices the intermediate dimension at 128-column
++    boundaries, which keeps the Hadamard blocks rank-local.
++    """
++
++    MAX_GRID_Y = 65535
++
++    def __init__(self, moe: FusedMoEConfig, bits: int, colmajor: bool):
++        super().__init__(moe)
++        if bits not in (2, 3, 4):
++            raise ValueError(f"EXL3 MoE supports K = 2, 3 or 4 bits, got {bits}")
++        self.bits = bits
++        self.colmajor = colmajor
++
++    @property
++    def supports_eplb(self) -> bool:
++        return False
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        num_experts: int,
++        hidden_size: int,
++        intermediate_size_per_partition: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        if not ops.exl3_moe_available():
++            raise RuntimeError(
++                "EXL3 MoE kernels are not built for this GPU (compute capability 7.0)."
++            )
++        if layer.ep_size > 1:
++            raise ValueError("EXL3 MoE does not support expert parallelism.")
++        E, H, inter = num_experts, hidden_size, intermediate_size_per_partition
++        if H % 512 or inter % 512:
++            raise ValueError(
++                f"EXL3 MoE needs hidden and per-rank intermediate sizes divisible "
++                f"by 512, got {H} and {inter}"
++            )
++        K, rank = self.bits, layer.tp_rank
++        layer.exl3_loaded = set()
++
++        def register(name, shape, dtype, tp_dim, gate_up):
++            param = torch.nn.Parameter(
++                torch.empty(shape, dtype=dtype), requires_grad=False
++            )
++
++            def loader(
++                param, loaded, weight_name=None, shard_id=None, expert_id=None, **kwargs
++            ) -> bool:
++                dst = (
++                    param.data[0 if shard_id == "w1" else 1] if gate_up else param.data
++                )
++                dst = dst[expert_id]
++                if tp_dim is not None:
++                    unit = dst.shape[tp_dim]
++                    loaded = loaded.narrow(tp_dim, rank * unit, unit)
++                if dst.shape != loaded.shape or dst.dtype != loaded.dtype:
++                    raise ValueError(
++                        f"{weight_name}: checkpoint tensor {tuple(loaded.shape)} "
++                        f"{loaded.dtype} != expected {tuple(dst.shape)} {dst.dtype}"
++                    )
++                dst.copy_(loaded)
++                layer.exl3_loaded.add((name, shard_id, expert_id))
++                return True
++
++            param.weight_loader = loader  # type: ignore[attr-defined]
++            layer.register_parameter(name, param)
++
++        register(
++            "w13_trellis", (2, E, H // 16, inter // 16, 16 * K), torch.int16, 1, True
++        )
++        register("w13_suh", (2, E, H), torch.float16, None, True)
++        register("w13_svh", (2, E, inter), torch.float16, 0, True)
++        register("w13_mcg", (2, E), torch.int32, None, True)
++        register("w2_trellis", (E, inter // 16, H // 16, 16 * K), torch.int16, 0, False)
++        register("w2_suh", (E, inter), torch.float16, 0, False)
++        register("w2_svh", (E, H), torch.float16, None, False)
++        register("w2_mcg", (E,), torch.int32, None, False)
++        # Optional per-tensor tile order markers (checked against the config).
++        register("w13_tile_order", (2, E), torch.int32, None, True)
++        register("w2_tile_order", (E,), torch.int32, None, False)
++        layer.exl3_num_experts = E
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        # With a quantization config, vLLM does not check for parameters the
++        # checkpoint never filled; an absent tensor would stay uninitialized.
++        E = layer.exl3_num_experts
++        for name in ("trellis", "suh", "svh", "mcg"):
++            for shard in ("w1", "w3"):
++                got = sum(
++                    (f"w13_{name}", shard, e) in layer.exl3_loaded for e in range(E)
++                )
++                if got != E:
++                    raise ValueError(f"EXL3: {E - got} experts lack {shard} {name}")
++            got = sum((f"w2_{name}", "w2", e) in layer.exl3_loaded for e in range(E))
++            if got != E:
++                raise ValueError(f"EXL3: {E - got} experts lack w2 {name}")
++        if not (
++            bool((layer.w13_mcg == MCG_MARKER).all())
++            and bool((layer.w2_mcg == MCG_MARKER).all())
++        ):
++            raise ValueError("EXL3 MoE expects the mcg codebook marker on every expert")
++        marked = {
++            (n, s, e) for n, s, e in layer.exl3_loaded if n.endswith("tile_order")
++        }
++        if marked:
++            if not self.colmajor or len(marked) != 3 * E:
++                raise ValueError(
++                    "EXL3: per-tensor tile order markers disagree with "
++                    "quantization_config.tile_order"
++                )
++            if not (
++                bool((layer.w13_tile_order == COLMAJOR_MARKER).all())
++                and bool((layer.w2_tile_order == COLMAJOR_MARKER).all())
++            ):
++                raise ValueError("EXL3: unknown per-tensor tile order marker")
++        for name in ("w13_mcg", "w2_mcg", "w13_tile_order", "w2_tile_order"):
++            delattr(layer, name)
++        del layer.exl3_loaded
++        exl3_strip_major_(layer.w13_trellis.data)
++        exl3_strip_major_(layer.w2_trellis.data)
++        logger.info_once(
++            "EXL3 routed experts: mcg, K=%d, %s tile order, decoded in the matmul.",
++            self.bits,
++            "colmajor" if self.colmajor else "sm80",
++        )
++
++    def maybe_make_prepare_finalize(self, routing_tables=None):
++        # This method owns permutation, both expert matmuls and the reduction.
++        return None
++
++    def get_fused_moe_quant_config(
++        self, layer: torch.nn.Module
++    ) -> FusedMoEQuantConfig | None:
++        return None
++
++    def _forward(self, layer, x, topk_ids, topk_weights) -> torch.Tensor:
++        return exl3_moe_forward(
++            x,
++            topk_ids,
++            topk_weights,
++            layer.w13_trellis,
++            layer.w13_suh,
++            layer.w13_svh,
++            layer.w2_trellis,
++            layer.w2_suh,
++            layer.w2_svh,
++            self.colmajor,
++        )
++
++    def apply(
++        self,
++        layer: RoutedExperts,
++        x: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        shared_experts: SharedExperts | None,
++        shared_experts_input: torch.Tensor | None,
++    ) -> torch.Tensor:
++        del shared_experts, shared_experts_input
++        if not x.is_cuda or x.dtype != torch.float16 or x.ndim != 2:
++            raise TypeError("EXL3 MoE requires CUDA FP16 activations [tokens, hidden].")
++        num_tokens = x.shape[0]
++        if num_tokens == 0:
++            return x.new_empty((0, x.shape[1]))
++        x = x.contiguous()
++        ids = topk_ids.to(torch.int32).contiguous()
++        w = topk_weights.to(torch.float32).contiguous()
++        # Each launch covers 2 * tokens * topk grid rows (gate + up fused).
++        chunk = self.MAX_GRID_Y // (2 * ids.shape[1])
++        if num_tokens <= chunk:
++            return self._forward(layer, x, ids, w).to(x.dtype)
++        out = torch.empty_like(x)
++        for s in range(0, num_tokens, chunk):
++            e = min(s + chunk, num_tokens)
++            out[s:e] = self._forward(layer, x[s:e], ids[s:e], w[s:e]).to(x.dtype)
++        return out
++
++    def apply_monolithic(self, layer, x, router_logits, input_ids=None) -> torch.Tensor:
++        raise NotImplementedError("EXL3 MoE is not monolithic.")
+diff --git a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+index 341117e066..561a7e78f4 100644
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import os
+-from collections.abc import Iterable
++from collections.abc import Callable, Iterable
+ from typing import ClassVar, Literal
+ 
+ import torch
+@@ -43,6 +43,7 @@
+     hc_contract,
+ )
+ from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+ from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+     arm_dflash_nvfp4_trace,
+ )
+@@ -795,12 +796,40 @@ def _dflash_aux_hidden_state_key(layer_boundary: int) -> str:
+     return f"{_DFLASH_AUX_HIDDEN_STATE_PREFIX}{layer_boundary}"
+ 
+ 
++def exl3_checkpoint_weights(
++    weights: Iterable[tuple],
++    quant_config: QuantizationConfig | None,
++    skip: Callable[[str], bool] | None = None,
++) -> Iterable[tuple]:
++    """exllamav3 checkpoints: dequantize the dense EXL3 linears (except the
++    tensors ``skip`` selects, which the caller does not load) and split the
++    fused KDA tensors exllamav3 writes (self_attn.qkv_proj / self_attn.conv1d,
++    q | k | v along dim 0) back into the HF names."""
++    if not isinstance(quant_config, Exl3Config):
++        yield from weights
++        return
++    fused = {
++        ".self_attn.qkv_proj.weight": ("q_proj", "k_proj", "v_proj"),
++        ".self_attn.conv1d.weight": ("q_conv1d", "k_conv1d", "v_conv1d"),
++    }
++    for item in quant_config.dequantize_dense(weights, skip):
++        name = item[0]
++        suffix = next((s for s in fused if name.endswith(s)), None)
++        if suffix is None:
++            yield item
++            continue
++        base = name[: -len(suffix)] + ".self_attn."
++        for part, tensor in zip(fused[suffix], item[1].chunk(3, dim=0)):
++            yield (base + part + ".weight", tensor.contiguous(), *item[2:])
++
++
+ class Glm5NextModel(nn.Module, EagleModelMixin):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+         config = vllm_config.model_config.hf_config
+         self.config = config
++        self.quant_config = vllm_config.quant_config
+ 
+         self.vocab_size = config.vocab_size
+         self.device = current_platform.device_type
+@@ -1150,6 +1179,14 @@ def forward(
+         return hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        # The MTP layer is loaded by Glm5NextMTP; leave its tensors alone here.
++        weights = exl3_checkpoint_weights(
++            weights,
++            self.quant_config,
++            skip=lambda name: (
++                get_spec_layer_idx_from_weight_name(self.config, name) is not None
++            ),
++        )
+         stacked_params_mapping = [
+             # (param_name, shard_name, shard_id)
+             (".gate_up_proj", ".gate_proj", 0),
+diff --git a/vllm/models/glm5next/nvidia/mtp.py b/vllm/models/glm5next/nvidia/mtp.py
+index 20c3ac8c3d..e1ccfdec8b 100644
+--- a/vllm/models/glm5next/nvidia/mtp.py
++++ b/vllm/models/glm5next/nvidia/mtp.py
+@@ -30,6 +30,7 @@
+     Glm5NextMoE,
+     _try_load_fp8_attn_proj,
+     _try_load_fp8_indexer_wk,
++    exl3_checkpoint_weights,
+     get_spec_layer_idx_from_weight_name,
+ )
+ from .ops.fused_eh_norm import fused_eh_norm
+@@ -284,6 +285,7 @@ def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
+         return name
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        weights = exl3_checkpoint_weights(weights, self.quant_config)
+         stacked_params_mapping = [
+             ("gate_up_proj", "gate_proj", 0),
+             ("gate_up_proj", "up_proj", 1),

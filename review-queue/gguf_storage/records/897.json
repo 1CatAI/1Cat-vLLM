@@ -1,0 +1,211 @@
+{
+  "initial_inventory": {
+    "number": 897,
+    "title": "[Kernel] Add original and equal-byte IQ operators on SM70",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897",
+    "isDraft": true,
+    "headRefOid": "881ad90eae7ee4c7159ff7973bad0261b1a30ac8",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 897,
+    "title": "[Kernel] Add original and equal-byte IQ operators on SM70",
+    "body": "## Purpose\n\nAdd original-block and equal-byte IQ3_XXS/IQ3_S/IQ2_S operators for SM70. Preserve original block scales, grid indices and sign bits while supporting FP32 vector accumulation, Volta mma884, temporary FP16 prefill workspaces and GPU grouped experts. GPU permutations keep exactly 98/110/82 bytes per 256 weights.\n\nRegister operators in the normal extension and declare source-type/M capability bands with fallback reasons. Optional transient FP16 group-scale rounding uses independent tuning identities. Model storage integration follows the operator checks.\n\n## Test Plan\n\nCompare with official GGUF dequantization, independently invert every source bit, and replay full CUDA graphs with changed input and routing. Measure real 27B and Flash-Next TP4 shapes against current canonical dispatch with distinct weight banks exceeding twice V100 L2. Check DRAM reads with Nsight Compute.\n\n## Test Result\n\n- Ordinary CMake builds and whole-wheel installs expose all operators without private libraries or preload. All 212 dependencies are compatible. Pre-commit checks pass.\n- 183 focused checks pass after synchronizing main, covering byte inverses, split-K, graph replay, expert routing and FP32 overflow/cancellation. An IQ3_XXS operand proof covers 16,252,928 finite-scale/grid/sign combinations with zero FP16 bit mismatches. A partial-word reorder issue caught by odd-width inverses is fixed.\n- Equal-byte IQ3_XXS N160/K2560 projection times at M1/5/8/16/512 are 6.67/7.15/7.35/7.88/22.18 µs versus current canonical 15.74/17.49/13.06/12.54/23.17 µs. The prefill result uses a prepared FP32-reduction cuBLASLt plan for this runtime; its heuristic index is not a portable default.\n- E512/top-10/TP4 IQ3_XXS grouped C1/5/8/16/512 times are 30.38/37.78/53.63/80.36/325.79 µs versus 72.10/94.40/112.48/140.87/528.68 µs canonical. An expert bank occupies 80,281,600 rather than 104,857,600 bytes. Sorting and the remaining FFN are excluded. Relative L2 is 0.0202–0.0209% against official FP16 weights with FP32 dots.\n- Original IQ3_XXS M8 NCU reads 217,472 main-kernel bytes versus 197,760 bytes of original payload plus activation. Reduction adds 54,944 bytes; these totals include other traffic.\n- IQ3_S/IQ2_S grouped C8 improve to 54.61/57.56 versus 113.04/94.02 µs. Equal-byte planes improve expert M512 to 35.33/36.73 versus 68.63/64.23 µs with cold banks. Plane admission is restricted to measured faster expert shapes.\n- Flash dense IQ3_S M512 still has a 2.3–2.4% workspace gap after optional scale rounding. Rounded operator relative L2 is about 0.041%; accumulation stays FP32. Slower full-tile and decoder variants are removed or left explicit, with negative results recorded in the design document.\n- Existing main mixed-projection output support is restored during final diff review; its focused regression run is pending GPU availability.\n\nEnvironment: V100-SXM2-32GB, CUDA 12.8, Torch 2.10.0+cu128, FP16 activations, FP32 accumulation, full CUDA graphs. Model quality, full FFN latency and model step-time savings remain separate integration checks. MIT codebook attribution and pinned llama.cpp formula provenance are retained.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897",
+    "isDraft": true,
+    "headRefName": "codex/v100-gguf-raw-lattice-20261004-072153",
+    "headRefOid": "881ad90eae7ee4c7159ff7973bad0261b1a30ac8",
+    "baseRefName": "main",
+    "baseRefOid": "96903f9fd98902b4f01f175d6ba7590e6599e6f5",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 897,
+    "id": "PR_kwDORjYFXs8AAAABGhr-pg",
+    "state": "CLOSED",
+    "isDraft": true,
+    "headRefOid": "881ad90eae7ee4c7159ff7973bad0261b1a30ac8",
+    "title": "[Kernel] Add original and equal-byte IQ operators on SM70",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897",
+    "body": "## Purpose\n\nAdd original-block and equal-byte IQ3_XXS/IQ3_S/IQ2_S operators for SM70. Preserve original block scales, grid indices and sign bits while supporting FP32 vector accumulation, Volta mma884, temporary FP16 prefill workspaces and GPU grouped experts. GPU permutations keep exactly 98/110/82 bytes per 256 weights.\n\nRegister operators in the normal extension and declare source-type/M capability bands with fallback reasons. Optional transient FP16 group-scale rounding uses independent tuning identities. Model storage integration follows the operator checks.\n\n## Test Plan\n\nCompare with official GGUF dequantization, independently invert every source bit, and replay full CUDA graphs with changed input and routing. Measure real 27B and Flash-Next TP4 shapes against current canonical dispatch with distinct weight banks exceeding twice V100 L2. Check DRAM reads with Nsight Compute.\n\n## Test Result\n\n- Ordinary CMake builds and whole-wheel installs expose all operators without private libraries or preload. All 212 dependencies are compatible. Pre-commit checks pass.\n- 183 focused checks pass after synchronizing main, covering byte inverses, split-K, graph replay, expert routing and FP32 overflow/cancellation. An IQ3_XXS operand proof covers 16,252,928 finite-scale/grid/sign combinations with zero FP16 bit mismatches. A partial-word reorder issue caught by odd-width inverses is fixed.\n- Equal-byte IQ3_XXS N160/K2560 projection times at M1/5/8/16/512 are 6.67/7.15/7.35/7.88/22.18 µs versus current canonical 15.74/17.49/13.06/12.54/23.17 µs. The prefill result uses a prepared FP32-reduction cuBLASLt plan for this runtime; its heuristic index is not a portable default.\n- E512/top-10/TP4 IQ3_XXS grouped C1/5/8/16/512 times are 30.38/37.78/53.63/80.36/325.79 µs versus 72.10/94.40/112.48/140.87/528.68 µs canonical. An expert bank occupies 80,281,600 rather than 104,857,600 bytes. Sorting and the remaining FFN are excluded. Relative L2 is 0.0202–0.0209% against official FP16 weights with FP32 dots.\n- Original IQ3_XXS M8 NCU reads 217,472 main-kernel bytes versus 197,760 bytes of original payload plus activation. Reduction adds 54,944 bytes; these totals include other traffic.\n- IQ3_S/IQ2_S grouped C8 improve to 54.61/57.56 versus 113.04/94.02 µs. Equal-byte planes improve expert M512 to 35.33/36.73 versus 68.63/64.23 µs with cold banks. Plane admission is restricted to measured faster expert shapes.\n- Flash dense IQ3_S M512 still has a 2.3–2.4% workspace gap after optional scale rounding. Rounded operator relative L2 is about 0.041%; accumulation stays FP32. Slower full-tile and decoder variants are removed or left explicit, with negative results recorded in the design document.\n- Existing main mixed-projection output support is restored during final diff review; its focused regression run is pending GPU availability.\n\nEnvironment: V100-SXM2-32GB, CUDA 12.8, Torch 2.10.0+cu128, FP16 activations, FP32 accumulation, full CUDA graphs. Model quality, full FFN latency and model step-time savings remain separate integration checks. MIT codebook attribution and pinned llama.cpp formula provenance are retained.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/v100-gguf-raw-lattice-20261004-072153",
+    "comments": {
+      "totalCount": 7,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWSNQY8="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABZGGaVQ",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The DFlash2 GGUF path is reusing the main GGUF kernel work rather than maintaining separate IQ3_S or Q8_0 prototypes. The relevant single-request verify width is M=8, with M=1/2/4/16 also needed:\n\n- Qwen3.8-27B IQ3_S gate: TP4 local N=4352, K=5120 (`blk.5.ffn_gate.weight`).\n- IQ3_S down: N=5120, K=4352 (`blk.1.ffn_down.weight`). Canonical codes and metadata total 11,141,120 bytes for either projection.\n- DFlash2 Q8_0 context FC: N=1280, K=25600, partitioned on N. Canonical codes and metadata total 36,864,000 bytes.\n- Mixed gate/up and GDN qkv/z projections need to preserve each segment's format and output order.\n\nA graph-linked TP4 baseline attributes about 10.9 ms per verify round to canonical small-M TurboMind projections. Independent intrablock split-K/skinny-tile prototypes did not improve the existing routes and are stopped. Please include the FC shape in equal-byte reorder/pipeline measurements; report cold-L2 CUDA graph timing, actual buffer footprint and numerical error against official dequantization.\n\nThere is also a shared loading issue: GGUF BF16 `ssm_alpha`/`ssm_beta` currently become `GGUFLinearMethod` and miss the existing dense a/b and row-GEMV capability guards. For the 27B target each TP4 shard is N=12, K=5120; the baseline executes 96 one-CTA CUTLASS calls at about 106 us each (10.2 ms/round). This should be fixed centrally by preparing floating GGUF tensors as ordinary dense projections so the existing fast paths can admit them, including Flash-Next. The DFlash2 line will verify the selected paths after the loading fix merges.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897#issuecomment-5979085397",
+          "createdAt": "2026-10-04T10:37:00Z",
+          "updatedAt": "2026-10-04T10:37:00Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABZG6dQg",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "A separate small-M fused projection change is now in progress, reusing this PR's decoder rather than duplicating it. Its first gate is the actual TP4 `blk.6.ffn_gate/up.weight` pair: both IQ3_S, N=4352, K=5120, 19,148,800 source bytes total, M=8, cold L2, graph replay. The target is one launch including SiLU/multiply at <=30 us; failed candidates will be profiled before extending to other projections.\n\nThe experiment pins 9a70e6b2f319b52f664067532c7159e3fc0335d2 and includes `LatticeCompactDecoder` directly. It retains the equal-byte packet permutation and original two-level FP32 scale product. QPN's within-CTA split-K reduction and gated epilogue replace the lattice GEMM launch structure. No changes are being made to this branch or its model dispatch.\n\nMixed gate/up formats still need per-segment decoder admission: for example layer 5 is IQ3_S + IQ2_S. Final integration will reference the shared decoder headers and retain fallback capabilities for pairs not yet supported.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897#issuecomment-5979938114",
+          "createdAt": "2026-10-04T12:30:44Z",
+          "updatedAt": "2026-10-04T12:30:44Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABZHtQug",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The fused IQ3_S pair experiment has localized a shared decoder bottleneck on the real layer-6 TP4 shard (N=4352, K=5120, M=8). It still fails the 30 us gate, so no model default has changed.\n\nMoving each original K32 scale product to the FP32 subgroup dot preserves exact per-weight reconstruction and improves output relative L2 from 0.00050 to 0.000018. The best cold-L2 graph result is 91.1 us, versus 75.8 us for the existing separate canonical GEMMs/cat/production SiLU and 49.2 us for native NVFP4 using the shared TurboMind weight layout.\n\nNCU identifies 807,833 of 842,649 excessive shared wavefronts (95.9%) at the two grid word reads in `LatticeCompactDecoder::fragment`, lines 131–132. The launch uses 544 CTAs, 79 registers, 37.5% theoretical / 32.92% achieved occupancy. Original-scale FP32 arithmetic and FP32 accumulation remain unchanged. A CPU bank model reproduces those 807,833 codebook wavefronts exactly; simple bijective XOR bank permutations improve less than 1%, so they will not be GPU-tested.\n\nThe packet byte-plane reader preserves 110 bytes per source block and official FP32 dequantization exactly, but did not improve timing. A global read-only table regressed to 104.4 us and is rejected. The next isolated experiment removes codebook bank conflicts with interleaved lane replicas, reusing `LatticeRawDecoder::table_values`, while checking its shared-memory/occupancy cost. No second quantization formula or separate shape optimization of fallback llama.cpp kernels is being added.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897#issuecomment-5980770490",
+          "createdAt": "2026-10-04T13:57:04Z",
+          "updatedAt": "2026-10-04T13:57:04Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABZIU8fA",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The original-bit gated-pair experiment now uses the shared exact-half decoder with QPN's MMA/activation epilogue. Explicit K64 chunks measure 70.656 us at M8/N4352/K5120, versus a matched canonical pair + cat + production activation at 80.896 us and native NVFP4 at 49.152 us. Original source footprint is 19,148,800 bytes. Relative L2 against official FP32 dequantization/GEMM is 0.00049515; this still misses the 30 us target and has not changed model dispatch.\n\nI am testing a 4 KiB shared codebook containing the exact integer half operands, keeping all source index/sign/scale bytes unchanged. To avoid duplicating decoding arithmetic, the research version factors the existing sign/scale portion of `table_fragment<half>` into `scale_half_fragment`; both the byte-codebook decoder and the cached-half decoder call that same helper. Original scales, exact small-integer multiplication, final operand rounding, and FP32 accumulation are preserved. If this is faster, I will propose that small shared API refactor for this PR before connecting the pair route. The original helper files and this API experiment remain separate; no changes have been made to this branch.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897#issuecomment-5981420668",
+          "createdAt": "2026-10-04T15:10:19Z",
+          "updatedAt": "2026-10-04T15:10:19Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABZIY0tg",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "The cached exact-half codebook passes the GEMM oracle but measures 78.848 us at M8, versus matched canonical 79.872 us / NVFP4 49.152 us. It loses to the explicit K64 original byte-codebook prototype (70.656 us), so the proposed API refactor is not being promoted on this evidence. The original helper interface remains sufficient for the retained path.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897#issuecomment-5981484214",
+          "createdAt": "2026-10-04T15:17:18Z",
+          "updatedAt": "2026-10-04T15:17:18Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABZImdlQ",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "A smaller shared-decoder change improves the original-bit pair more substantially: in `LatticeCompactDecoder::Parameters`, use `std::conditional_t<Type == 21, uint32_t, uint64_t>` for `scales`. IQ3_S supplies only four scale bytes; IQ2_S keeps its eight-byte field. Original metadata and floating-point arithmetic are unchanged.\n\nAt M8/N4352/K5120, both explicit K32/K64 chunks now measure 61.440 us (311.67 source-weight GB/s), against matched canonical 75.776 us and NVFP4 48.128 us. All outputs are bitwise equal to the old scale-storage decoder at both chunk sizes and accumulator policies, as well as passing the official FP32 dequantization/GEMM oracle (relative L2 0.00049515). This is still a research extension result and still misses the 30 us pair target. The one-field change is worth considering for the common decoder; it avoids the 64-bit scale shifts observed in the K64 NCU samples without changing the format.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897#issuecomment-5981707669",
+          "createdAt": "2026-10-04T15:41:26Z",
+          "updatedAt": "2026-10-04T15:41:26Z"
+        },
+        {
+          "id": "IC_kwDORjYFXs8AAAABZI1Bjw",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "body": "Correction to the isolated speed attribution above: a same-process old/new/new/old comparison at recorded SM1530 MHz / memory877 MHz gives 62.464 / 61.440 / 61.440 / 61.440 us. Outputs remain bitwise equal. The scale-field change therefore has no established independent speed benefit; the approximately 9 us difference between earlier separate cohorts cannot be attributed to it. It should not be promoted as a performance change on these measurements. The retained original-interface gated pair is about 61–62 us under this workload, still short of the 30 us target.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897#issuecomment-5981946255",
+          "createdAt": "2026-10-04T16:10:44Z",
+          "updatedAt": "2026-10-04T16:10:44Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wOVQxMjo1MjowMVq0MjAyNi0xMS0wOVQxMjo1MjowMlrPAAAAAVtDBVE="
+      },
+      "nodes": [
+        {
+          "id": "PRR_kwDORjYFXs8AAAABW0MFUQ",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "state": "COMMENTED",
+          "body": "Ancestry audit verified this live head 881ad90eae7ee4c7159ff7973bad0261b1a30ac8 is retained in #959 at f02e37e081029791542a5dd43ca41d3a661ecc79. Closing this earlier stack entry as superseded and tracking review/validation in #959; source commits, authorship and the original discussion remain intact. This closure is not a main merge and does not qualify outstanding hardware/model/quality cases. Audit assisted by Codex.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897#pullrequestreview-5826086225",
+          "submittedAt": "2026-11-09T12:52:01Z",
+          "commit": {
+            "oid": "881ad90eae7ee4c7159ff7973bad0261b1a30ac8"
+          },
+          "comments": {
+            "totalCount": 0,
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            },
+            "nodes": []
+          }
+        }
+      ]
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 897,
+    "title": "[Kernel] Add original and equal-byte IQ operators on SM70",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/897",
+    "isDraft": true,
+    "headRefOid": "881ad90eae7ee4c7159ff7973bad0261b1a30ac8",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "CMakeLists.txt",
+      "benchmarks/kernels/benchmark_gguf_compact_grouped.py",
+      "benchmarks/kernels/benchmark_gguf_raw_lattice.py",
+      "csrc/ops.h",
+      "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/arch/config_sm70_s884.h",
+      "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/iterator_sm70.h",
+      "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu",
+      "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/lattice_transform.h",
+      "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/types.h",
+      "csrc/sm70_turbomind/ops/awq_sm70_gemm.cu",
+      "csrc/sm70_turbomind/ops/gguf_lattice_compact.cuh",
+      "csrc/sm70_turbomind/ops/gguf_lattice_lt_sm70.cpp",
+      "csrc/sm70_turbomind/ops/gguf_lattice_raw.cuh",
+      "csrc/sm70_turbomind/ops/gguf_lattice_raw_sm70.cu",
+      "csrc/torch_bindings.cpp",
+      "docs/design/gguf_mixed_projection_output.md",
+      "docs/design/gguf_turbomind_raw_lattice.md",
+      "tests/kernels/quantization/test_gguf_mixed_direct_output.py",
+      "tests/kernels/quantization/test_gguf_mixed_output_fallback.py",
+      "tests/kernels/quantization/test_gguf_planar_capabilities.py",
+      "tests/kernels/quantization/test_gguf_raw_lattice.py",
+      "vllm/model_executor/kernels/gguf.py",
+      "vllm/model_executor/layers/quantization/gguf.py",
+      "vllm/model_executor/layers/quantization/gguf_turbomind.py"
+    ],
+    "diff_bytes": 334788,
+    "diff_sha256": "22d16dc9aa369c0777565a17279205feb158b93f8d3d82c4502190bd6c60d2be"
+  },
+  "full_tree_diff_proof": null
+}

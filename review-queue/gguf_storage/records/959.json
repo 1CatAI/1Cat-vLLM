@@ -1,0 +1,99 @@
+{
+  "initial_inventory": {
+    "number": 959,
+    "title": "[Model] Use original-byte IQ3_XXS expert banks on SM70",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/959",
+    "isDraft": true,
+    "headRefOid": "f02e37e081029791542a5dd43ca41d3a661ecc79",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 959,
+    "title": "[Model] Use original-byte IQ3_XXS expert banks on SM70",
+    "body": "## Purpose\n\nIQ3_XXS expert preparation retains canonical carriers and additional original rows on GPU. Load calibrated SM70 TP4 gate/up experts directly into equal-byte packets and dispatch through the grouped operator from #897. One N160/K2560/E512 bank stores exactly 80,281,600 bytes; canonical weights alone occupy 104,857,600 bytes, before original-row retention and pointer tables.\n\nSkip canonical conversion and extra original-row buffers for admitted banks. Report storage layout, byte count and fallback reasons through existing admission metadata. Other expert geometries keep their current path. TP4 uses complete K blocks and the existing routing machinery.\n\n## Test Plan\n\nCheck capability admission and fallback, prove canonical preparation is skipped, assert buffer ownership and byte count, and replay full CUDA graphs with different expert weights, inputs and routing. Run model quality and matched decode/prefill comparisons after the storage path is connected.\n\n## Test Result\n\n- Normal whole-wheel packaging with the source-complete native wheel from #897 passes dependency checks for all 212 packages. The native core hash is unchanged. No private library or preload is needed.\n- 30 CPU dispatch/storage checks pass. The bank has one 80,281,600-byte uint8 buffer and no canonical stats/pointers or extra original-row buffer.\n- Native operator evidence in #897 passes 183 checks. Full-graph E512/top-10/TP4 IQ3_XXS grouped C1/5/8/16/512 times are 30.38/37.78/53.63/80.36/325.79 µs versus canonical 72.10/94.40/112.48/140.87/528.68 µs; routing sorting and the remaining FFN are excluded.\n- The new bank graph test and mixed-projection regressions are pending shared GPU availability. Model quality and end-to-end speed remain unmeasured for this storage change.\n\nEnvironment: V100-SXM2-32GB, CUDA12.8, Torch2.10.0+cu128, FP16 operands and FP32 accumulation. No model throughput gain is claimed from projection timings. Depends on #897.\n\nA matched gate/up pair benchmark now compares the compact banks with the current model-selected joint/vector/GEMM routes and preserves repeated top-k activations. Its first job times out before acquiring the shared GPU lock, so small-batch performance is still unverified against current model dispatch.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/959",
+    "isDraft": true,
+    "headRefName": "codex/v100-gguf-compact-experts-20261005-045330",
+    "headRefOid": "f02e37e081029791542a5dd43ca41d3a661ecc79",
+    "baseRefName": "codex/v100-gguf-raw-lattice-20261004-072153",
+    "baseRefOid": "881ad90eae7ee4c7159ff7973bad0261b1a30ac8",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 959,
+    "id": "PR_kwDORjYFXs8AAAABGozD4g",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "f02e37e081029791542a5dd43ca41d3a661ecc79",
+    "title": "[Model] Use original-byte IQ3_XXS expert banks on SM70",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/959",
+    "body": "## Purpose\n\nIQ3_XXS expert preparation retains canonical carriers and additional original rows on GPU. Load calibrated SM70 TP4 gate/up experts directly into equal-byte packets and dispatch through the grouped operator from #897. One N160/K2560/E512 bank stores exactly 80,281,600 bytes; canonical weights alone occupy 104,857,600 bytes, before original-row retention and pointer tables.\n\nSkip canonical conversion and extra original-row buffers for admitted banks. Report storage layout, byte count and fallback reasons through existing admission metadata. Other expert geometries keep their current path. TP4 uses complete K blocks and the existing routing machinery.\n\n## Test Plan\n\nCheck capability admission and fallback, prove canonical preparation is skipped, assert buffer ownership and byte count, and replay full CUDA graphs with different expert weights, inputs and routing. Run model quality and matched decode/prefill comparisons after the storage path is connected.\n\n## Test Result\n\n- Normal whole-wheel packaging with the source-complete native wheel from #897 passes dependency checks for all 212 packages. The native core hash is unchanged. No private library or preload is needed.\n- 30 CPU dispatch/storage checks pass. The bank has one 80,281,600-byte uint8 buffer and no canonical stats/pointers or extra original-row buffer.\n- Native operator evidence in #897 passes 183 checks. Full-graph E512/top-10/TP4 IQ3_XXS grouped C1/5/8/16/512 times are 30.38/37.78/53.63/80.36/325.79 µs versus canonical 72.10/94.40/112.48/140.87/528.68 µs; routing sorting and the remaining FFN are excluded.\n- The new bank graph test and mixed-projection regressions are pending shared GPU availability. Model quality and end-to-end speed remain unmeasured for this storage change.\n\nEnvironment: V100-SXM2-32GB, CUDA12.8, Torch2.10.0+cu128, FP16 operands and FP32 accumulation. No model throughput gain is claimed from projection timings. Depends on #897.\n\nA matched gate/up pair benchmark now compares the compact banks with the current model-selected joint/vector/GEMM routes and preserves repeated top-k activations. Its first job times out before acquiring the shared GPU lock, so small-batch performance is still unverified against current model dispatch.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/v100-gguf-compact-experts-20261005-045330",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 959,
+    "title": "[Model] Use original-byte IQ3_XXS expert banks on SM70",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/959",
+    "isDraft": true,
+    "headRefOid": "f02e37e081029791542a5dd43ca41d3a661ecc79",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/kernels/benchmark_gguf_compact_expert_pair.py",
+      "docs/design/gguf_compact_expert_storage.md",
+      "tests/kernels/quantization/test_gguf_compact_expert_storage.py",
+      "vllm/model_executor/kernels/gguf.py",
+      "vllm/model_executor/layers/quantization/gguf_turbomind_moe.py"
+    ],
+    "diff_bytes": 24072,
+    "diff_sha256": "fc166d2d08a41f28930d8261392f31d9a122db162ba8910f95a2d9c85ec44ba7"
+  },
+  "full_tree_diff_proof": null
+}

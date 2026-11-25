@@ -1,0 +1,135 @@
+{
+  "initial_inventory": {
+    "number": 1020,
+    "title": "[Core] Reduce GGUF TP4 loading and runtime memory",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1020",
+    "isDraft": true,
+    "headRefOid": "55915c7f16c593b2dc7388c80ded0ff52094edc8",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1020,
+    "title": "[Core] Reduce GGUF TP4 loading and runtime memory",
+    "body": "## Purpose\n\nFlash-Next GGUF plus FP16 MTP4 could not finish loading on four 16 GiB V100s because quantization expansion, replicated HC weights and loading-time copies exhausted memory before cache allocation.\n\n- Add explicit original-storage policies for expert, dense and embedding weights. Retain overlapping quantization boundary blocks when TP shards are not block-aligned.\n- Pack HC shards on CPU before transfer and use sharded projection collectives instead of per-rank replicated HC weights.\n- Bound temporary dequantization, avoid MTP I/O placeholder allocations before shared weights are bound, and bound fixed RoPE initialization by the engine context.\n- Keep CPU/meta model discovery and the PLE helper free of CUDA initialization. Skip full PLE prefault only when registered placements leave no CPU-served rows.\n- Retain EP rank metadata without allocating an unused EP GPU communicator in pure TP. Preserve device communication for EP, DP, PCP, EPLB and elastic EP.\n\nNo additional precision reduction is introduced. The host-backed active-KV design is documented separately; this PR does not implement active host-KV attention.\n\n## Test Plan\n\nValidate exact storage reconstruction and initialization on CPU, then check TP4 projection and collective routes from a normally installed SM70 wheel. Run IQ3_S target plus FP16 MTP4 with FP16 attention KV and FP32 recurrent state on four 16 GiB V100s.\n\n## Test Result\n\n- CPU checks pass for quantization boundaries, compact initialization, context-free discovery, PLE prefault admission and EP communicator admission.\n- TP4 checks cover HC M1/M5/M20/M32, original Q2_0 experts, packed embeddings and bounded Q6_K head reconstruction. Embedding rows are bitwise equal to the FP16 reference; HC mixing relative error is below 1.6e-6 and injection error below 1.1e-4.\n- M1/M5/M20/M128 TP all-gather and all-reduce outputs, including CUDA graph replay, are bitwise identical with EP device communication disabled or enabled. On the four-card 16 GiB NV2 topology, omitting the unused EP communicator saves exactly 244 MiB per rank. Explicit EP still creates its communicator.\n- The completed capacity run stores 13.058 GiB of target weights and 14.281 GiB including MTP per rank. Three natural prompts stop normally. Eager C1 measures 72.84 ms/round and 4.676 emitted tokens/round; the synthetic arithmetic probe accepts 201/220 draft tokens.\n- That run has a 0.40 GiB cache budget and queues the C4 cohort, so no fixed-width C4 result is claimed. A follow-up with PLE entirely on host lowers peak usage by 244 MiB/card, but the cache remains 0.40 GiB and C4 still queues. Natural outputs change, and the synthetic ignore-EOS probe falls to 23/928 accepted draft tokens and 1.009 emitted tokens/round. The combined configuration is rejected pending matched ablation; its 69.29 ms/round is not a qualified speedup.\n\nCapacity measurements use CUDA 12.8, Torch 2.10.0+cu128, TP4, maximum context 2048, token budget 128 and eager execution. They do not qualify FULL-graph latency, long-context prefill or matched natural-prompt acceptance parity. Storage accounting, limitations and the planned host-KV route are recorded in the design documents.\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1020",
+    "isDraft": true,
+    "headRefName": "codex/v100-gguf-4x16-memory-20261007-030139",
+    "headRefOid": "55915c7f16c593b2dc7388c80ded0ff52094edc8",
+    "baseRefName": "main",
+    "baseRefOid": "ec2e3946466f65da78c0a76f296fadff30726c0e",
+    "isCrossRepository": false,
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "1CatAI"
+    },
+    "maintainerCanModify": false,
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1020,
+    "id": "PR_kwDORjYFXs8AAAABHCtzHA",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "55915c7f16c593b2dc7388c80ded0ff52094edc8",
+    "title": "[Core] Reduce GGUF TP4 loading and runtime memory",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1020",
+    "body": "## Purpose\n\nFlash-Next GGUF plus FP16 MTP4 could not finish loading on four 16 GiB V100s because quantization expansion, replicated HC weights and loading-time copies exhausted memory before cache allocation.\n\n- Add explicit original-storage policies for expert, dense and embedding weights. Retain overlapping quantization boundary blocks when TP shards are not block-aligned.\n- Pack HC shards on CPU before transfer and use sharded projection collectives instead of per-rank replicated HC weights.\n- Bound temporary dequantization, avoid MTP I/O placeholder allocations before shared weights are bound, and bound fixed RoPE initialization by the engine context.\n- Keep CPU/meta model discovery and the PLE helper free of CUDA initialization. Skip full PLE prefault only when registered placements leave no CPU-served rows.\n- Retain EP rank metadata without allocating an unused EP GPU communicator in pure TP. Preserve device communication for EP, DP, PCP, EPLB and elastic EP.\n\nNo additional precision reduction is introduced. The host-backed active-KV design is documented separately; this PR does not implement active host-KV attention.\n\n## Test Plan\n\nValidate exact storage reconstruction and initialization on CPU, then check TP4 projection and collective routes from a normally installed SM70 wheel. Run IQ3_S target plus FP16 MTP4 with FP16 attention KV and FP32 recurrent state on four 16 GiB V100s.\n\n## Test Result\n\n- CPU checks pass for quantization boundaries, compact initialization, context-free discovery, PLE prefault admission and EP communicator admission.\n- TP4 checks cover HC M1/M5/M20/M32, original Q2_0 experts, packed embeddings and bounded Q6_K head reconstruction. Embedding rows are bitwise equal to the FP16 reference; HC mixing relative error is below 1.6e-6 and injection error below 1.1e-4.\n- M1/M5/M20/M128 TP all-gather and all-reduce outputs, including CUDA graph replay, are bitwise identical with EP device communication disabled or enabled. On the four-card 16 GiB NV2 topology, omitting the unused EP communicator saves exactly 244 MiB per rank. Explicit EP still creates its communicator.\n- The completed capacity run stores 13.058 GiB of target weights and 14.281 GiB including MTP per rank. Three natural prompts stop normally. Eager C1 measures 72.84 ms/round and 4.676 emitted tokens/round; the synthetic arithmetic probe accepts 201/220 draft tokens.\n- That run has a 0.40 GiB cache budget and queues the C4 cohort, so no fixed-width C4 result is claimed. A follow-up with PLE entirely on host lowers peak usage by 244 MiB/card, but the cache remains 0.40 GiB and C4 still queues. Natural outputs change, and the synthetic ignore-EOS probe falls to 23/928 accepted draft tokens and 1.009 emitted tokens/round. The combined configuration is rejected pending matched ablation; its 69.29 ms/round is not a qualified speedup.\n\nCapacity measurements use CUDA 12.8, Torch 2.10.0+cu128, TP4, maximum context 2048, token budget 128 and eager execution. They do not qualify FULL-graph latency, long-context prefill or matched natural-prompt acceptance parity. Storage accounting, limitations and the planned host-KV route are recorded in the design documents.\n",
+    "author": {
+      "login": "yangzhuxinyzx"
+    },
+    "headRepository": {
+      "nameWithOwner": "1CatAI/1Cat-vLLM"
+    },
+    "headRefName": "codex/v100-gguf-4x16-memory-20261007-030139",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1020,
+    "title": "[Core] Reduce GGUF TP4 loading and runtime memory",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1020",
+    "isDraft": true,
+    "headRefOid": "55915c7f16c593b2dc7388c80ded0ff52094edc8",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "docs/design/flashnext_host_kv.md",
+      "docs/design/gguf_expert_storage_memory.md",
+      "tests/distributed/test_ep_communicator_admission.py",
+      "tests/distributed/test_sm70_pynccl_gather_layout.py",
+      "tests/kernels/quantization/test_gguf_compact_storage.py",
+      "tests/kernels/quantization/test_gguf_expert_tp.py",
+      "tests/kernels/quantization/test_gguf_guarded_storage.py",
+      "tests/kernels/quantization/test_gguf_turbomind_model_moe.py",
+      "tests/model_executor/test_fla_context_free_import.py",
+      "tests/models/qwen4_exp/test_compact_initialization.py",
+      "tests/models/qwen4_exp/test_ple.py",
+      "tests/models/qwen4_exp/test_sm70_fp16_gemv.py",
+      "tests/v1/worker/test_ple_offload_worker.py",
+      "tests/vllm_flash_attn/test_fa2_library_per_device.py",
+      "vllm/config/kernel.py",
+      "vllm/distributed/device_communicators/cuda_communicator.py",
+      "vllm/distributed/parallel_state.py",
+      "vllm/model_executor/layers/fla/ops/chunk_delta_h.py",
+      "vllm/model_executor/layers/fla/ops/chunk_o.py",
+      "vllm/model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py",
+      "vllm/model_executor/layers/fla/ops/kda.py",
+      "vllm/model_executor/layers/fla/ops/utils.py",
+      "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+      "vllm/model_executor/layers/ple_offload_layer.py",
+      "vllm/model_executor/layers/quantization/gguf.py",
+      "vllm/model_executor/layers/quantization/gguf_moe.py",
+      "vllm/model_executor/layers/quantization/gguf_native.py",
+      "vllm/model_executor/model_loader/gguf_adapters/qwen35.py",
+      "vllm/model_executor/model_loader/gguf_adapters/qwen35_moe.py",
+      "vllm/model_executor/model_loader/gguf_loader.py",
+      "vllm/model_executor/models/qwen2_moe.py",
+      "vllm/model_executor/models/qwen3_5.py",
+      "vllm/model_executor/models/qwen3_next.py",
+      "vllm/models/qwen4_exp/nvidia/hyperconnection.py",
+      "vllm/models/qwen4_exp/nvidia/model.py",
+      "vllm/models/qwen4_exp/nvidia/mtp.py",
+      "vllm/models/qwen4_exp/nvidia/ple_layer.py",
+      "vllm/models/qwen4_exp/nvidia/qsa.py",
+      "vllm/models/qwen4_exp/nvidia/sm70_fp16_hc.py",
+      "vllm/v1/ple_offload/worker.py",
+      "vllm/vllm_flash_attn/flash_attn_interface.py"
+    ],
+    "diff_bytes": 122010,
+    "diff_sha256": "0c7799d64abcbc1ae951c8e678381e578cf36804e522ae59584862ca9a058c51"
+  },
+  "full_tree_diff_proof": null
+}
