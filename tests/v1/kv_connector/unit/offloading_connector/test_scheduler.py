@@ -249,6 +249,43 @@ def test_request_preemption(request_runner, async_scheduling: bool):
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
 
 
+def test_async_readmission_waits_for_offload_completion(request_runner):
+    runner = request_runner(
+        block_size=4,
+        block_size_factor=3,
+        num_gpu_blocks=100,
+        async_scheduling=True,
+    )
+    scheduler = runner.scheduler
+    connector = runner.connector_scheduler
+    free_queue = scheduler.kv_cache_manager.block_pool.free_block_queue
+    capacity = free_queue.num_free_blocks
+
+    runner.new_request(token_ids=[0] * 24)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0], complete_transfers=False)
+    runner.run(decoded_tokens=[0] * 20, complete_transfers=False)
+    pending = set(connector._req_status["0"].transfer_jobs)
+    assert pending
+
+    free_queue.num_free_blocks = 0
+    preemption = scheduler.schedule()
+    assert preemption.preempted_req_ids == {"0"}
+    assert pending <= preemption.kv_connector_metadata.jobs_to_flush
+
+    # Leave this preemption batch's output queued while scheduling again.
+    free_queue.num_free_blocks = capacity
+    assert scheduler.reset_prefix_cache()
+    connector._maximal_prefix_lookup = MagicMock(return_value=2)
+    readmission = scheduler.schedule()
+    assert not readmission.num_scheduled_tokens
+    assert not readmission.kv_connector_metadata.load_jobs
+    connector._maximal_prefix_lookup.assert_not_called()
+    assert connector._req_status["0"].transfer_jobs == pending
+
+
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_concurrent_lookups_of_the_same_prefix(request_runner, async_scheduling: bool):
     block_size = 4

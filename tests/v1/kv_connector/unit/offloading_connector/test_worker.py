@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -106,6 +107,76 @@ def _make_worker(kv_cache_config: KVCacheConfig):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_register_mapped_qsa_history_and_bounded_state():
+    state_blocks = 3
+    history_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=torch.int8,
+        host_backed=True,
+    )
+    state_spec = MambaSpec(
+        block_size=BLOCK_SIZE, shapes=((2, 4),), dtypes=(torch.float32,)
+    )
+    history_page = history_spec.page_size_bytes
+    scale_page = 2 * BLOCK_SIZE * 4
+    state_page = state_spec.page_size_bytes
+    caches = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        device_state_blocks=state_blocks,
+        device_state_group_ids=(1,),
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attention"], history_spec),
+            KVCacheGroupSpec(["mamba"], state_spec),
+        ],
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=NUM_BLOCKS * history_page,
+                shared_by=["attention"],
+                host_backed=True,
+                qsa_scale_page_size_bytes=scale_page,
+            ),
+            KVCacheTensor(
+                size=state_blocks * state_page,
+                shared_by=["mamba"],
+                physical_num_blocks=state_blocks,
+            ),
+        ],
+    )
+    history = torch.empty((2 * NUM_BLOCKS, history_page), dtype=torch.int8)
+    history = history[NUM_BLOCKS:]
+    scales = torch.empty((2 * NUM_BLOCKS * BLOCK_SIZE, 2), dtype=torch.float32)
+    scales = scales[NUM_BLOCKS * BLOCK_SIZE :]
+    states = torch.empty((state_blocks, 2, 4), dtype=torch.float32)
+    worker, spec = _make_worker(caches)
+    spec.vllm_config.compilation_config.static_forward_context = {
+        "attention": SimpleNamespace(
+            host_kv=SimpleNamespace(
+                history=history, scales=scales, fp8=True, device_reference=False
+            )
+        )
+    }
+
+    worker.register_kv_caches({"attention": history, "mamba": [states]})
+    canonical = spec.get_handlers.call_args[0][0]
+
+    assert [t.tensor.shape for t in canonical.tensors] == [
+        (NUM_BLOCKS, history_page),
+        (NUM_BLOCKS, scale_page),
+        (state_blocks, state_page),
+    ]
+    assert [t.tensor.data_ptr() for t in canonical.tensors] == [
+        history.data_ptr(),
+        scales.data_ptr(),
+        states.data_ptr(),
+    ]
+    assert canonical.group_data_refs == [
+        [CanonicalKVCacheRef(0, history_page), CanonicalKVCacheRef(1, scale_page)],
+        [CanonicalKVCacheRef(2, state_page)],
+    ]
 
 
 @pytest.mark.parametrize("backend", ATTN_BACKENDS)

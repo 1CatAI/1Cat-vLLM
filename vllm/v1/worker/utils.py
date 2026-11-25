@@ -972,32 +972,40 @@ class KVBlockZeroer:
                 BLOCK_SIZE=h_blk,
             )
 
-        if self._hot_inv_meta is not None:
-            (
-                ps_ptrs,
-                tag_ptrs,
-                stamp_ptrs,
-                pages_per_blk,
-                hot_nblocks,
-                hot_masks,
-                hot_chunks,
-                page_chunk,
-                n_owners,
-            ) = self._hot_inv_meta
-            _invalidate_hot_kv_blocks_kernel[(n_host_pairs, n_owners, hot_chunks)](
-                ps_ptrs,
-                tag_ptrs,
-                stamp_ptrs,
-                pages_per_blk,
-                hot_nblocks,
-                hot_masks,
-                h_dst,
-                h_grp,
-                HAS_PAIR_GROUPS=h_has_groups,
-                PAGE_CHUNK=page_chunk,
-            )
+        self._invalidate_hot_blocks(h_dst, h_grp if h_has_groups else None)
 
-    def zero_block_ids(self, block_ids: list[int]) -> None:
+    def _invalidate_hot_blocks(
+        self, dst: torch.Tensor, groups: torch.Tensor | None = None
+    ) -> None:
+        if self._hot_inv_meta is None:
+            return
+        (
+            ps_ptrs,
+            tag_ptrs,
+            stamp_ptrs,
+            pages_per_blk,
+            hot_nblocks,
+            hot_masks,
+            hot_chunks,
+            page_chunk,
+            n_owners,
+        ) = self._hot_inv_meta
+        _invalidate_hot_kv_blocks_kernel[(dst.numel(), n_owners, hot_chunks)](
+            ps_ptrs,
+            tag_ptrs,
+            stamp_ptrs,
+            pages_per_blk,
+            hot_nblocks,
+            hot_masks,
+            dst,
+            groups if groups is not None else dst,
+            HAS_PAIR_GROUPS=groups is not None,
+            PAGE_CHUNK=page_chunk,
+        )
+
+    def zero_block_ids(
+        self, block_ids: list[int], *, invalidate_host_hot: bool = False
+    ) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
@@ -1031,6 +1039,9 @@ class KVBlockZeroer:
             idx,
             BLOCK_SIZE=blk_size,
         )
+        if invalidate_host_hot:
+            # Connector loads can replace mapped history without updating hot tags.
+            self._invalidate_hot_blocks(idx)
 
     def warmup_kernel(self) -> bool:
         """JIT the zero/copy/invalidation kernels before the first real step."""

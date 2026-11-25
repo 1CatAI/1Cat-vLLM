@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
 from vllm.v1.worker.utils import AttentionGroup
@@ -260,6 +261,83 @@ def test_host_history_grows_without_growing_device_state():
 def test_host_state_pool_rejects_insufficient_active_capacity():
     with pytest.raises(ValueError, match="State pool needs at least"):
         _bounded_host_cache_config(state_blocks=2)
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize("spec_cls", [CPUOffloadingSpec, TieringOffloadingSpec])
+def test_host_offload_budgets_include_scales_and_physical_state_pages(
+    is_draft: bool,
+    spec_cls: type[CPUOffloadingSpec],
+) -> None:
+    config = _vllm_config()
+    config.is_speculative_draft = is_draft
+    config.use_v2_model_runner = not is_draft
+    config.model_config.revision = "weights-revision"
+    config.attention_config = SimpleNamespace(backend="FLASH_ATTN_V100")
+    config.compute_hash = lambda: "same-model-fingerprint"
+    config.parallel_config.decode_context_parallel_size = 2
+    config.parallel_config.data_parallel_size = 1
+    config.parallel_config.nnodes = 1
+    config.parallel_config.world_size = 4
+    config.cache_config.block_size = 16
+    config.cache_config.hash_block_size = 4
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.prefix_cache_retention_interval = 0
+    config.cache_config.mamba_cache_mode = "align"
+    config.kernel_config = SimpleNamespace(
+        qsa_host_kv_state_blocks=32,
+        qsa_host_kv_device_reference=False,
+        qsa_host_indexer_history=False,
+    )
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_module_path=None,
+        kv_connector_extra_config={
+            "cpu_bytes_to_use": 64 * 1024**2,
+            "spec_name": spec_cls.__name__,
+            "secondary_tiers": [{"type": "fs"}],
+        },
+    )
+    specs = _mixed_dcp_specs()
+    for name, spec in specs.items():
+        if type(spec) is FullAttentionSpec:
+            specs[name] = replace(spec, dtype=torch.int8, host_backed=True)
+        elif isinstance(spec, MambaSpec):
+            specs[name] = replace(spec, block_size=32, mamba_cache_mode="align")
+    groups = get_kv_cache_groups(config, specs)
+    worker_cache = get_kv_cache_config_from_groups(config, groups, 1 << 30)
+    scheduler_cache = generate_scheduler_kv_cache_config([worker_cache])
+    worker = spec_cls(config, worker_cache)
+    scheduler = spec_cls(config, scheduler_cache)
+    assert worker.num_blocks == scheduler.num_blocks > 0
+    assert worker.partition_by_group and scheduler.partition_by_group
+    assert worker.cpu_group_page_sizes == scheduler.cpu_group_page_sizes
+    host_bytes = sum(
+        t.qsa_scale_page_size_bytes
+        for t in worker_cache.kv_cache_tensors
+        if t.host_backed
+    )
+    assert host_bytes == (16 + 32) * 2 * 4
+    assert worker_cache.num_blocks > worker_cache.device_state_blocks == 32
+    for group_id, page_size in worker.cpu_group_page_sizes.items():
+        group = worker_cache.kv_cache_groups[group_id]
+        assert page_size == sum(
+            t.size // (t.physical_num_blocks or worker_cache.num_blocks)
+            + t.qsa_scale_page_size_bytes
+            for t in worker_cache.kv_cache_tensors
+            if not set(t.shared_by).isdisjoint(group.layer_names)
+        )
+    if isinstance(worker, TieringOffloadingSpec):
+        assert isinstance(scheduler, TieringOffloadingSpec)
+        manifest = worker.persistent_layout
+        assert manifest is not None and manifest == scheduler.persistent_layout
+        assert manifest["version"] == "grouped-qsa-host-kv-v1"
+        assert sum(t["scale_page_size"] for t in manifest["tensors"]) == host_bytes
+        assert [t["page_size"] for t in manifest["tensors"]] == [
+            t.size // (t.physical_num_blocks or worker_cache.num_blocks)
+            for t in worker_cache.kv_cache_tensors
+        ]
 
 
 @pytest.mark.parametrize(
