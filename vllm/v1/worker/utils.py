@@ -194,31 +194,6 @@ def allocate_host_kv_cache_pool(
     return tensors
 
 
-def _resolve_zeroer_kernel_layout(
-    spec: AttentionSpec,
-    group_kernel_block_size: int,
-) -> tuple[int, int]:
-    """Return the physical kernel block size and virtual-block ratio.
-
-    Compressed attention specs store fewer rows than their logical scheduler
-    block size. Their cache view is shaped with ``storage_block_size`` as one
-    physical page, so zeroing must mirror that layout instead of multiplying
-    the page span by the logical compression ratio a second time.
-    """
-    storage_block_size = spec.storage_block_size
-    kernel_block_size = (
-        storage_block_size
-        if storage_block_size != spec.block_size
-        else group_kernel_block_size
-    )
-    if storage_block_size % kernel_block_size:
-        raise ValueError(
-            "KV storage block size must be divisible by its kernel block size: "
-            f"{storage_block_size} vs {kernel_block_size}."
-        )
-    return kernel_block_size, storage_block_size // kernel_block_size
-
-
 def compressed_kernel_block_size(spec: AttentionSpec) -> int:
     storage = spec.storage_block_size
     max_page = max(PAGED_MQA_PAGE_SIZES)
@@ -226,6 +201,48 @@ def compressed_kernel_block_size(spec: AttentionSpec) -> int:
     if storage <= max_page:
         return storage
     return max_page if storage % max_page == 0 else min_page
+
+
+def kv_cache_view_page_rows(
+    spec: AttentionSpec,
+    group_kernel_block_size: int,
+    backend: type[AttentionBackend],
+) -> int:
+    """Return the rows per page of the cache view the runner builds for a group.
+
+    Single source of truth for the view layout: the V1/V2 runners shape the
+    view with it, the metadata builder derives its spec from it and the KV
+    block zeroer derives its block span from it. Compressed specs store fewer
+    rows than their scheduler block. Backends with a physical block table
+    address the whole storage block as one page; paged-MQA indexers consume
+    smaller virtual pages inside it. Everything else follows the group's
+    kernel block size.
+    """
+    if spec.storage_block_size == spec.block_size:
+        return group_kernel_block_size
+    if backend.get_builder_cls().uses_physical_block_table:
+        return spec.storage_block_size
+    return compressed_kernel_block_size(spec)
+
+
+def _resolve_zeroer_kernel_layout(
+    spec: AttentionSpec,
+    group_kernel_block_size: int,
+    backend: type[AttentionBackend],
+) -> tuple[int, int]:
+    """Return the cache view's page rows and the pages per storage block.
+
+    One storage block spans ``ratio`` view pages, so the zeroer must clear all
+    of them (a block id addresses a storage block, not one virtual page).
+    """
+    page_rows = kv_cache_view_page_rows(spec, group_kernel_block_size, backend)
+    storage_block_size = spec.storage_block_size
+    if storage_block_size % page_rows:
+        raise ValueError(
+            "KV storage block size must be divisible by its kernel block size: "
+            f"{storage_block_size} vs {page_rows}."
+        )
+    return page_rows, storage_block_size // page_rows
 
 
 def _infer_segment_block_strides(
@@ -596,7 +613,7 @@ class KVBlockZeroer:
             kv: torch.Tensor,
             group_kbs: int,
         ) -> list[tuple[int, int, int, int]]:
-            kernel_bs, ratio = _resolve_zeroer_kernel_layout(spec, group_kbs)
+            kernel_bs, ratio = _resolve_zeroer_kernel_layout(spec, group_kbs, backend)
             block_dim = backend.get_kv_cache_block_dim(
                 kernel_bs,
                 spec.num_kv_heads,
@@ -1061,7 +1078,10 @@ class AttentionGroup:
                 self.kv_cache_spec.block_size // self.kv_cache_spec.storage_block_size
             )
             kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
-                compressed_kernel_block_size(self.kv_cache_spec) * compress_ratio
+                kv_cache_view_page_rows(
+                    self.kv_cache_spec, kernel_block_size, self.backend
+                )
+                * compress_ratio
             )
         else:
             kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(

@@ -33,7 +33,7 @@ from vllm.v1.worker.utils import (
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_host_kv_cache_pool,
     bind_kv_cache,
-    compressed_kernel_block_size,
+    kv_cache_view_page_rows,
     prepare_kernel_block_sizes,
 )
 
@@ -210,16 +210,13 @@ def _reshape_kv_cache(
             isinstance(kv_cache_spec, AttentionSpec)
             and kv_cache_spec.storage_block_size != kv_cache_spec.block_size
         ):
-            uses_physical_block_table = (
-                group.backend.get_builder_cls().uses_physical_block_table
-            )
             # Paged-MQA indexers consume 32/64-entry virtual pages inside the
             # compressed storage block. Backends with physical block tables
             # (for example QSA side caches) address the whole storage block.
-            kernel_block_size = (
-                kv_cache_spec.storage_block_size
-                if uses_physical_block_table
-                else compressed_kernel_block_size(kv_cache_spec)
+            kernel_block_size = kv_cache_view_page_rows(
+                kv_cache_spec,
+                kernel_block_sizes[group.kv_cache_group_id],
+                group.backend,
             )
         else:
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
