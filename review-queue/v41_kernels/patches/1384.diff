@@ -1,0 +1,3862 @@
+diff --git a/benchmarks/deepseek_v41/expert_fast_check.py b/benchmarks/deepseek_v41/expert_fast_check.py
+new file mode 100644
+index 0000000000..0052e7eec2
+--- /dev/null
++++ b/benchmarks/deepseek_v41/expert_fast_check.py
+@@ -0,0 +1,505 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GPU check for VLLM_V41_EXPERT_FAST (one GPU, synthetic inputs).
++
++Role down:
++  Today:  down_rows(rows=4, dn_warps=8 or 4)     (VLLM_V41_ROWS_TILE '4,8')
++  Fast:   down_rows_fast(classes=8 or 4)         (fbook = fast_table(gtype))
++Role gate_up:
++  Today:  q8_aligned + gate_up7 (moe_plan inside), or q8_plan + gate_up7p
++          (VLLM_V41_PLAN_FUSE=1, the deployed stack)
++  Fast:   gate_up_fast(build_plan=True / False)  (fbook = fast_table(gtype))
++
++Role gate_up: bit equality per gtype, M = 1..6, both plan modes, the route
++mixes below, an activation scale drawn per trial from 1e-3..1e-1 (so the clamp
++at 10 is hit in some trials and not in others). The hq / hd buffer is prefilled
++with the same random bytes for both kernels and hd with NaN; the whole buffer
++(hq bytes, hd bits, the bytes past hd) and the whole 512-entry plan buffer are
++compared, and a NaN left in hd of a live route is a failure of its own. Timing
++as below for the deployed pair (gate_up7p vs gate_up_fast(build_plan=False)
++after q8_plan), GB/s = experts x 576 rows x 2 matrices x row bytes / time.
++Weight tensors in both roles have 64 bytes of slack after the last row (the
++old and new IQ2 loaders read the aligned word that ends a row).
++
++Role down:
++1. Bit equality, per down gtype (16 IQ2_XXS, 17 IQ2_XS, 29 IQ1_M), M = 1..6
++   tokens x top-6 routes, both accumulation-class counts (8 = the deployed
++   dn_warps, 4 = any other value), a random rank (row_base) per trial. Each
++   kernel writes a fresh NaN-poisoned [M, 5120] half output; the whole output
++   is compared as int16 (own rows and the other ranks' zeroed rows reported
++   separately), and a NaN left anywhere is a failure of its own. Route mixes as
++   plan_fuse_check: random experts from pools of 6..384 (repeats across rows),
++   dropped routes (id -1) in some rows, one expert in every row (6 members per
++   expert) and all routes dropped. The plan buffer is prefilled with garbage,
++   so stale entries past nu / cnt are live in both kernels, and the gathered
++   hd scales of dropped routes are NaN in every rank slot, so reading one shows
++   up as a mismatch. Weights are random bytes over the whole codebook range;
++   only the bytes that form the fp16 block scale are bounded (finite, < 4).
++2. Time per layer inside a CUDA graph, old vs fast, with cold weights: the
++   graph cycles over 8 layers whose experts come from disjoint slices of the
++   384, so consecutive launches share no weight rows (V100 L2 is 6 MB). Weight
++   GB/s = experts touched x 1280 rows x row bytes / time.
++
++Synthetic data only. Needs a v41k.so built from this tree (fast_table,
++gate_up_fast and down_rows_fast); pass it with --lib or VLLM_V41K_LIB. Exit
++status 1 on any difference. ``--no-time --trials 6`` is small enough for
++compute-sanitizer (with PYTORCH_NO_CUDA_MEMORY_CACHING=1 every tensor is its
++own allocation, so memcheck sees exact bounds).
++
++    python benchmarks/deepseek_v41/expert_fast_check.py --lib /path/v41k.so
++    python benchmarks/deepseek_v41/expert_fast_check.py --roles gate_up \\
++        --gtypes 29
++"""
++
++import argparse
++import contextlib
++import json
++import os
++import sys
++
++import torch
++
++E, N, ROWS_LOCAL, K_DIM, TOP_K = 384, 5120, 1280, 2304, 6
++GU_ROWS, GU_BLOCKS, DN_BLOCKS = 576, 20, 9  # gate/up rows per rank, K blocks
++# bytes per 256-weight block: IQ2_XXS 66, IQ2_XS 74, IQ1_M 56
++BLOCK_BYTES = {16: 66, 17: 74, 29: 56}
++LAYERS = 8  # timing: layers cycled inside one graph, disjoint expert slices
++
++
++def _library(path):
++    if not path:
++        here = os.path.dirname(os.path.abspath(__file__))
++        path = os.path.join(here, "v41k", "build", "v41k.so")
++    torch.ops.load_library(path)
++    for op in (
++        "q8_aligned",
++        "q8_plan",
++        "table",
++        "gate_up7",
++        "gate_up7p",
++        "down_rows",
++        "fast_table",
++        "gate_up_fast",
++        "down_rows_fast",
++    ):
++        if not hasattr(torch.ops.v41k, op):
++            sys.exit(f"{path} has no v41k.{op}; rebuild it from this tree")
++    return path
++
++
++def _stride(routes):
++    return (routes * 648 + 255) // 256 * 256
++
++
++def _ids(m, trial, g, dev, pool_experts=None):
++    """Flat [m * 6] int32 expert ids, the route mix chosen by trial."""
++    routes = m * TOP_K
++    kind = trial % 6
++    if pool_experts is not None:  # timing: distinct per row from a slice
++        n = pool_experts.numel()
++        ids = torch.stack(
++            [
++                pool_experts[torch.randperm(n, device=dev, generator=g)[:TOP_K]]
++                for _ in range(m)
++            ]
++        ).flatten()
++        return ids.to(torch.int32).contiguous()
++    if kind == 4:  # one expert in every row
++        ids = torch.arange(TOP_K, device=dev).repeat(m) + 7
++    elif kind == 5 and trial % 12 == 11:  # everything dropped
++        return torch.full((routes,), -1, dtype=torch.int32, device=dev)
++    else:
++        pool = (6, 8, 12, 24, 96, E)[(trial // 6) % 6]
++        perm = torch.randperm(E, device=dev, generator=g)[:pool]
++        ids = torch.stack(
++            [
++                perm[torch.randperm(pool, device=dev, generator=g)[:TOP_K]]
++                for _ in range(m)
++            ]
++        ).flatten()
++    ids = ids.to(torch.int32)
++    if kind in (1, 3, 5):  # drop the lowest-weight routes of some rows
++        view = ids.view(m, TOP_K)
++        for r in range(m):
++            keep = int(torch.randint(1, TOP_K + 1, (1,), device=dev, generator=g))
++            view[r, keep:] = -1
++    return ids.contiguous()
++
++
++def _weights(gtype, rows, blocks, g, dev):
++    """[E, rows, blocks] uint8 blocks, random except the fp16 scale bytes,
++    a contiguous view with 64 bytes of slack after the last row."""
++    bb = BLOCK_BYTES[gtype]
++    n = E * rows * blocks * bb
++    flat = torch.randint(0, 256, (n + 64,), dtype=torch.uint8, device=dev, generator=g)
++    w = flat[:n].view(E, rows, blocks, bb)
++    if gtype in (16, 17):  # d = fp16 bytes 0..1; high byte < 60 -> |d| < 1
++        w[..., 1] = w[..., 1] % 60
++    else:  # IQ1_M d = top nibbles of the 4 scale words; byte 55 < 64 -> < 4
++        w[..., 55] = w[..., 55] % 64
++    return w.view(E, rows, blocks * bb)
++
++
++def _garbage_plan(g, dev):
++    return torch.randint(
++        -(2**31), 2**31 - 1, (512,), dtype=torch.int32, device=dev, generator=g
++    )
++
++
++def _plan(m, ids, x, g, dev):
++    """The serving plan for ids (q8_plan), over a garbage-filled buffer."""
++    plan = _garbage_plan(g, dev)
++    xq = torch.empty((m, 160, 32), dtype=torch.int8, device=dev)
++    xd = torch.empty((m, 160), dtype=torch.float32, device=dev)
++    torch.ops.v41k.q8_plan(xq, xd, x, ids, plan)
++    return plan
++
++
++def _gathered(m, ids, g, dev):
++    """4 rank slots of [routes, 18, 32] int8 hq + [routes, 18] fp32 hd."""
++    routes = m * TOP_K
++    stride = _stride(routes)
++    buf = torch.randint(0, 256, (4, stride), dtype=torch.uint8, device=dev, generator=g)
++    hq = torch.randint(
++        -127, 128, (4, routes * 576), dtype=torch.int8, device=dev, generator=g
++    )
++    hd = torch.rand((4, routes, 18), device=dev, generator=g) * 1e-3 + 1e-5
++    hd[:, ids.long() < 0, :] = float("nan")  # dropped routes are never read
++    buf[:, : routes * 576] = hq.view(torch.uint8)
++    buf[:, routes * 576 : routes * 648] = hd.view(4, -1).view(torch.uint8)
++    return buf.flatten().contiguous()
++
++
++class Case:
++    def __init__(self, m, gtype, down, dbook, fbook, plan, gathered, rank):
++        self.m, self.gtype, self.rank = m, gtype, rank
++        self.routes = m * TOP_K
++        self.stride = _stride(self.routes)
++        self.down, self.dbook, self.fbook = down, dbook, fbook
++        self.plan, self.gathered = plan, gathered
++        dev = down.device
++        self.out_old = torch.empty((m, N), dtype=torch.float16, device=dev)
++        self.out_new = torch.empty((m, N), dtype=torch.float16, device=dev)
++
++    def old(self, warps):
++        torch.ops.v41k.down_rows(
++            self.out_old,
++            self.gathered,
++            self.stride,
++            self.routes,
++            self.down,
++            self.gtype,
++            self.rank * ROWS_LOCAL,
++            self.dbook,
++            4,
++            warps,
++            self.plan,
++        )
++
++    def new(self, classes):
++        torch.ops.v41k.down_rows_fast(
++            self.out_new,
++            self.gathered,
++            self.stride,
++            self.routes,
++            self.down,
++            self.gtype,
++            self.rank * ROWS_LOCAL,
++            self.fbook,
++            classes,
++            self.plan,
++        )
++
++
++def _compare(case):
++    """Failure counts (0/1 each) for one trial: own rows, other rows, NaN."""
++    a = case.out_old.view(torch.int16)
++    b = case.out_new.view(torch.int16)
++    own = slice(case.rank * ROWS_LOCAL, (case.rank + 1) * ROWS_LOCAL)
++    mask = torch.ones(N, dtype=torch.bool, device=a.device)
++    mask[own] = False
++    return {
++        "own_rows": int(not torch.equal(a[:, own], b[:, own])),
++        "other_rows": int(not torch.equal(a[:, mask], b[:, mask])),
++        "nan_old": int(bool(torch.isnan(case.out_old).any())),
++        "nan_new": int(bool(torch.isnan(case.out_new).any())),
++    }
++
++
++def _graph_us(fns, reps):
++    for fn in fns:
++        fn()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        for i in range(reps):
++            fns[i % len(fns)]()
++    graph.replay()
++    torch.cuda.synchronize()
++    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
++    best = float("inf")
++    for _ in range(7):
++        start.record()
++        graph.replay()
++        end.record()
++        torch.cuda.synchronize()
++        best = min(best, start.elapsed_time(end) * 1000.0 / reps)
++    return best
++
++
++def _nu(plan):
++    return int(plan[0].item())
++
++
++class GuCase:
++    """One gate/up layer: inputs shared by both kernels, separate outputs.
++
++    plan_fuse: q8_plan builds the plan before gate/up (old gate_up7p, new
++    build_plan=False); otherwise q8_aligned, and gate_up7 / gate_up_fast
++    (build_plan=True) rebuild it over the garbage-filled buffer.
++    """
++
++    def __init__(self, m, gtype, gate, up, obook, fbook, ids, scale, plan_fuse, g):
++        dev = gate.device
++        self.m, self.gtype, self.ids, self.plan_fuse = m, gtype, ids, plan_fuse
++        self.gate, self.up, self.obook, self.fbook = gate, up, obook, fbook
++        self.routes = m * TOP_K
++        self.stride = _stride(self.routes)
++        x = (torch.randn(m, N, device=dev, generator=g) * scale).half()
++        self.xq = torch.empty((m, 160, 32), dtype=torch.int8, device=dev)
++        self.xd = torch.empty((m, 160), dtype=torch.float32, device=dev)
++        self.plan0 = _garbage_plan(g, dev)
++        if plan_fuse:
++            torch.ops.v41k.q8_plan(self.xq, self.xd, x, ids, self.plan0)
++        else:
++            torch.ops.v41k.q8_aligned(self.xq, self.xd, x)
++        self.prob = torch.rand(self.routes, device=dev, generator=g)
++        self.plan_old, self.plan_new = self.plan0.clone(), self.plan0.clone()
++        self.buf_old = torch.empty(self.stride, dtype=torch.uint8, device=dev)
++        self.buf_new = torch.empty(self.stride, dtype=torch.uint8, device=dev)
++
++    def hq(self, buf):
++        return buf[: self.routes * 576].view(torch.int8).view(self.routes, 18, 32)
++
++    def hd(self, buf):
++        r = self.routes
++        return buf[r * 576 : r * 648].view(torch.float32).view(r, 18)
++
++    def poison(self, g):
++        junk = torch.randint(
++            0,
++            256,
++            (self.stride,),
++            dtype=torch.uint8,
++            device=self.gate.device,
++            generator=g,
++        )
++        for buf in (self.buf_old, self.buf_new):
++            buf.copy_(junk)
++            self.hd(buf).fill_(float("nan"))
++        self.plan_old.copy_(self.plan0)
++        self.plan_new.copy_(self.plan0)
++
++    def old(self):
++        op = torch.ops.v41k.gate_up7p if self.plan_fuse else torch.ops.v41k.gate_up7
++        op(
++            self.xq,
++            self.xd,
++            self.hq(self.buf_old),
++            self.hd(self.buf_old),
++            self.ids,
++            self.prob,
++            self.gate,
++            self.up,
++            self.gtype,
++            self.obook,
++            self.plan_old,
++        )
++
++    def new(self):
++        torch.ops.v41k.gate_up_fast(
++            self.xq,
++            self.xd,
++            self.hq(self.buf_new),
++            self.hd(self.buf_new),
++            self.ids,
++            self.prob,
++            self.gate,
++            self.up,
++            self.gtype,
++            self.fbook,
++            self.plan_new,
++            not self.plan_fuse,
++        )
++
++
++def _compare_gu(c):
++    """Failure counts (0/1 each) for one gate/up trial."""
++    r = c.routes
++    live = c.ids >= 0
++    hd_old, hd_new = c.hd(c.buf_old), c.hd(c.buf_new)
++    return {
++        "hq": int(not torch.equal(c.hq(c.buf_old), c.hq(c.buf_new))),
++        "hd": int(not torch.equal(hd_old.view(torch.int32), hd_new.view(torch.int32))),
++        "past_hd": int(not torch.equal(c.buf_old[r * 648 :], c.buf_new[r * 648 :])),
++        "plan": int(not torch.equal(c.plan_old, c.plan_new)),
++        "nan_old": int(bool(torch.isnan(hd_old[live]).any())),
++        "nan_new": int(bool(torch.isnan(hd_new[live]).any())),
++    }
++
++
++def check_gate_up(gtype, args, g, dev, report):
++    gate = _weights(gtype, GU_ROWS, GU_BLOCKS, g, dev)
++    up = _weights(gtype, GU_ROWS, GU_BLOCKS, g, dev)
++    obook = torch.ops.v41k.table(gtype, dev)
++    fbook = torch.ops.v41k.fast_table(gtype, dev)
++    row_bytes = GU_BLOCKS * BLOCK_BYTES[gtype]
++    bad = 0
++    res = {"mismatch": {}, "us": {}}
++    for m in range(1, 7):
++        per_m = {}
++        for plan_fuse in (True, False):
++            keys = ("hq", "hd", "past_hd", "plan", "nan_old", "nan_new")
++            fail = dict.fromkeys(keys, 0)
++            for trial in range(args.trials):
++                ids = _ids(m, trial, g, dev)
++                scale = 10 ** (-3 + 2 * float(torch.rand(1, device=dev, generator=g)))
++                case = GuCase(
++                    m, gtype, gate, up, obook, fbook, ids, scale, plan_fuse, g
++                )
++                case.poison(g)
++                case.old()
++                case.new()
++                torch.cuda.synchronize()
++                for k, v in _compare_gu(case).items():
++                    fail[k] += v
++            # counts of failing trials only; good trials are never added
++            bad += sum(fail.values())
++            per_m["gate_up7p" if plan_fuse else "gate_up7"] = fail
++        res["mismatch"][f"M{m}"] = per_m
++        if args.no_time:
++            continue
++        slices = torch.randperm(E, device=dev, generator=g).view(LAYERS, -1)
++        cases = []
++        for layer in range(LAYERS):
++            ids = _ids(m, 0, g, dev, pool_experts=slices[layer])
++            cases.append(GuCase(m, gtype, gate, up, obook, fbook, ids, 0.01, True, g))
++        nu = sum(_nu(c.plan0) for c in cases) / LAYERS
++        mb = nu * GU_ROWS * 2 * row_bytes / 1e6
++        t_old = _graph_us([lambda c=c: c.old() for c in cases], args.reps)
++        t_new = _graph_us([lambda c=c: c.new() for c in cases], args.reps)
++        res["us"][f"M{m}"] = {
++            "experts_per_layer": round(nu, 2),
++            "weight_MB": round(mb, 2),
++            "gate_up7p_us": round(t_old, 2),
++            "gate_up_fast_us": round(t_new, 2),
++            "gate_up7p_GBps": round(mb * 1e3 / t_old, 1),
++            "gate_up_fast_GBps": round(mb * 1e3 / t_new, 1),
++            "saved_per_layer_us": round(t_old - t_new, 2),
++            "speedup": round(t_old / t_new, 3),
++        }
++    report["gtype"].setdefault(str(gtype), {})["gate_up"] = res
++    del gate, up
++    torch.cuda.empty_cache()
++    return bad
++
++
++def check_down(gtype, args, g, dev, report):
++    down = _weights(gtype, ROWS_LOCAL, DN_BLOCKS, g, dev)
++    dbook = torch.ops.v41k.table(gtype, dev)
++    fbook = torch.ops.v41k.fast_table(gtype, dev)
++    row_bytes = DN_BLOCKS * BLOCK_BYTES[gtype]
++    bad = 0
++    res = {"mismatch": {}, "us": {}}
++    for m in range(1, 7):
++        per_m = {}
++        for classes in (8, 4):
++            fail = {"own_rows": 0, "other_rows": 0, "nan_old": 0, "nan_new": 0}
++            for trial in range(args.trials):
++                ids = _ids(m, trial, g, dev)
++                x = torch.randn(m, N, device=dev, generator=g).half()
++                plan = _plan(m, ids, x, g, dev)
++                gathered = _gathered(m, ids, g, dev)
++                rank = int(torch.randint(0, 4, (1,), device=dev, generator=g))
++                case = Case(m, gtype, down, dbook, fbook, plan, gathered, rank)
++                case.out_old.fill_(float("nan"))
++                case.out_new.fill_(float("nan"))
++                case.old(classes)
++                case.new(classes)
++                torch.cuda.synchronize()
++                for k, v in _compare(case).items():
++                    fail[k] += v
++            # every count is a count of failing trials; good trials are never
++            # added to the mismatch total
++            bad += sum(fail.values())
++            per_m[f"classes{classes}"] = fail
++        res["mismatch"][f"M{m}"] = per_m
++        if args.no_time:
++            continue
++        slices = torch.randperm(E, device=dev, generator=g).view(LAYERS, -1)
++        cases = []
++        for layer in range(LAYERS):
++            ids = _ids(m, 0, g, dev, pool_experts=slices[layer])
++            x = torch.randn(m, N, device=dev, generator=g).half()
++            plan = _plan(m, ids, x, g, dev)
++            gathered = _gathered(m, ids, g, dev)
++            cases.append(Case(m, gtype, down, dbook, fbook, plan, gathered, layer % 4))
++        nu = sum(_nu(c.plan) for c in cases) / LAYERS
++        mb = nu * ROWS_LOCAL * row_bytes / 1e6
++        t_old = _graph_us([lambda c=c: c.old(8) for c in cases], args.reps)
++        t_new = _graph_us([lambda c=c: c.new(8) for c in cases], args.reps)
++        res["us"][f"M{m}"] = {
++            "experts_per_layer": round(nu, 2),
++            "weight_MB": round(mb, 2),
++            "down_rows_4x8_us": round(t_old, 2),
++            "down_rows_fast_us": round(t_new, 2),
++            "down_rows_4x8_GBps": round(mb * 1e3 / t_old, 1),
++            "down_rows_fast_GBps": round(mb * 1e3 / t_new, 1),
++            "saved_per_layer_us": round(t_old - t_new, 2),
++            "speedup": round(t_old / t_new, 3),
++        }
++    report["gtype"].setdefault(str(gtype), {})["down"] = res
++    del down
++    torch.cuda.empty_cache()
++    return bad
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--lib", default=os.environ.get("VLLM_V41K_LIB", ""))
++    ap.add_argument("--gtypes", default="29,16,17")
++    ap.add_argument("--roles", default="gate_up,down")
++    ap.add_argument("--trials", type=int, default=48)
++    ap.add_argument("--reps", type=int, default=96)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--no-time", action="store_true")
++    args = ap.parse_args()
++    lib = _library(args.lib)
++    dev = torch.device("cuda")
++    g = torch.Generator(device=dev).manual_seed(args.seed)
++    report = {
++        "lib": os.path.basename(lib),
++        "device": torch.cuda.get_device_name(dev),
++        "trials_per_m_and_mode": args.trials,
++        "gtype": {},
++    }
++    with contextlib.suppress(Exception):  # needs pynvml; informational only
++        report["sm_clock_mhz"] = torch.cuda.clock_rate(dev)
++    roles = args.roles.split(",")
++    for role in roles:
++        if role not in ("gate_up", "down"):
++            sys.exit(f"unknown role {role!r} (gate_up, down)")
++    bad = 0
++    for gtype in (int(v) for v in args.gtypes.split(",")):
++        if "gate_up" in roles:
++            bad += check_gate_up(gtype, args, g, dev, report)
++        if "down" in roles:
++            bad += check_down(gtype, args, g, dev, report)
++    report["failing_trials"] = bad
++    report["ok"] = bad == 0
++    print(json.dumps(report, indent=1))
++    return 0 if bad == 0 else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/benchmarks/deepseek_v41/plan_fuse_check.py b/benchmarks/deepseek_v41/plan_fuse_check.py
+new file mode 100644
+index 0000000000..48f6072243
+--- /dev/null
++++ b/benchmarks/deepseek_v41/plan_fuse_check.py
+@@ -0,0 +1,240 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GPU check for VLLM_V41_PLAN_FUSE (one GPU, synthetic inputs).
++
++Today:    q8_aligned  -> gate_up7  (gate_up7 launches moe_plan, then gate/up)
++Fused:    q8_plan     -> gate_up7p (q8_plan builds the plan in grid row 0)
++
++1. Bit equality, M = 1..6 (6 routes per row): the whole 512-int plan buffer
++   (both prefilled with the same garbage, so untouched entries count too),
++   xq/xd, and the gate/up outputs hq/hd. Route mixes: random experts from
++   pools of 6..384 (many repeats across rows), dropped routes (id -1, as the
++   expert prune or a truncated verify position writes them), one expert in
++   every row, and all routes dropped.
++2. Time per layer inside a CUDA graph (``--reps`` layers per replay) for
++   q8 + gate/up both ways, and the q8 launch alone both ways.
++
++Synthetic data only. Needs a v41k.so built from this tree (q8_plan and
++gate_up7p); pass it with --lib or VLLM_V41K_LIB. Exit status 1 on any
++difference.
++
++    python benchmarks/deepseek_v41/plan_fuse_check.py --lib /path/v41k.so
++"""
++
++import argparse
++import json
++import os
++import sys
++
++import torch
++
++E, ROWS, K_DIM, TOP_K = 384, 576, 5120, 6
++# bytes per 256-weight block: IQ2_XXS 66, IQ2_XS 74, IQ1_M 56
++BLOCK_BYTES = {16: 66, 17: 74, 29: 56}
++
++
++def _library(path):
++    if not path:
++        here = os.path.dirname(os.path.abspath(__file__))
++        path = os.path.join(here, "v41k", "build", "v41k.so")
++    torch.ops.load_library(path)
++    for op in ("q8_aligned", "gate_up7", "q8_plan", "gate_up7p", "table"):
++        if not hasattr(torch.ops.v41k, op):
++            sys.exit(f"{path} has no v41k.{op}; rebuild it from this tree")
++    return path
++
++
++def _ids(m, trial, g, dev):
++    routes = m * TOP_K
++    kind = trial % 6
++    if kind == 4:  # one expert in every row
++        ids = torch.arange(TOP_K, device=dev).repeat(m) + 7
++    elif kind == 5 and trial % 12 == 11:  # everything dropped
++        return torch.full((routes,), -1, dtype=torch.int32, device=dev)
++    else:
++        pool = (6, 8, 12, 24, 96, E)[(trial // 6) % 6]
++        perm = torch.randperm(E, device=dev, generator=g)[:pool]
++        ids = torch.stack(
++            [
++                perm[torch.randperm(pool, device=dev, generator=g)[:TOP_K]]
++                for _ in range(m)
++            ]
++        ).flatten()
++    ids = ids.to(torch.int32)
++    if kind in (1, 3, 5):  # drop the lowest-weight routes of some rows
++        view = ids.view(m, TOP_K)
++        for r in range(m):
++            keep = int(torch.randint(1, TOP_K + 1, (1,), device=dev, generator=g))
++            view[r, keep:] = -1
++    return ids.contiguous()
++
++
++def _weights(gtype, g, dev):
++    stride = K_DIM // 256 * BLOCK_BYTES[gtype]
++
++    # Bytes 0..59: every fp16 scale these bytes can form is finite and below 1.
++    def one():
++        return torch.randint(
++            0, 60, (E, ROWS, stride), dtype=torch.uint8, device=dev, generator=g
++        )
++
++    return one(), one()
++
++
++class Layer:
++    def __init__(self, m, ids, x, prob, gate, up, gtype, book, garbage):
++        dev = x.device
++        routes = m * TOP_K
++        self.args = (ids, prob, gate, up, gtype, book)
++        self.x = x
++        self.xq = torch.zeros((m, 160, 32), dtype=torch.int8, device=dev)
++        self.xd = torch.zeros((m, 160), dtype=torch.float32, device=dev)
++        self.hq = torch.zeros((routes, 18, 32), dtype=torch.int8, device=dev)
++        self.hd = torch.zeros((routes, 18), dtype=torch.float32, device=dev)
++        self.plan = garbage.clone()
++
++    def today(self):
++        ids, prob, gate, up, gtype, book = self.args
++        torch.ops.v41k.q8_aligned(self.xq, self.xd, self.x)
++        torch.ops.v41k.gate_up7(
++            self.xq,
++            self.xd,
++            self.hq,
++            self.hd,
++            ids,
++            prob,
++            gate,
++            up,
++            gtype,
++            book,
++            self.plan,
++        )
++
++    def fused(self):
++        ids, prob, gate, up, gtype, book = self.args
++        torch.ops.v41k.q8_plan(self.xq, self.xd, self.x, ids, self.plan)
++        torch.ops.v41k.gate_up7p(
++            self.xq,
++            self.xd,
++            self.hq,
++            self.hd,
++            ids,
++            prob,
++            gate,
++            up,
++            gtype,
++            book,
++            self.plan,
++        )
++
++    def q8_today(self):
++        torch.ops.v41k.q8_aligned(self.xq, self.xd, self.x)
++
++    def q8_fused(self):
++        ids = self.args[0]
++        torch.ops.v41k.q8_plan(self.xq, self.xd, self.x, ids, self.plan)
++
++
++def _same(a, b):
++    if a.dtype == torch.float32:
++        a, b = a.view(torch.int32), b.view(torch.int32)
++    return torch.equal(a, b)
++
++
++def _graph_us(fn, reps):
++    fn()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        for _ in range(reps):
++            fn()
++    graph.replay()
++    torch.cuda.synchronize()
++    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
++    best = float("inf")
++    for _ in range(5):
++        start.record()
++        graph.replay()
++        end.record()
++        torch.cuda.synchronize()
++        best = min(best, start.elapsed_time(end) * 1000.0 / reps)
++    return best
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--lib", default=os.environ.get("VLLM_V41K_LIB", ""))
++    ap.add_argument("--gtype", type=int, default=16, choices=sorted(BLOCK_BYTES))
++    ap.add_argument("--trials", type=int, default=300)
++    ap.add_argument("--reps", type=int, default=100)
++    ap.add_argument("--seed", type=int, default=0)
++    ap.add_argument("--no-time", action="store_true", help="bit checks only")
++    args = ap.parse_args()
++    lib = _library(args.lib)
++    dev = torch.device("cuda")
++    g = torch.Generator(device=dev).manual_seed(args.seed)
++    gate, up = _weights(args.gtype, g, dev)
++    book = torch.ops.v41k.table(args.gtype, dev)
++    report = {"lib": os.path.basename(lib), "gtype": args.gtype, "mismatch": {}}
++    report["us"] = {}
++    bad = 0
++    for m in range(1, 7):
++        miss = {"plan": 0, "xq_xd": 0, "hq_hd": 0}
++        finite = 0
++        for trial in range(args.trials):
++            ids = _ids(m, trial, g, dev)
++            x = torch.randn(m, K_DIM, device=dev, generator=g).half()
++            prob = torch.rand(m, TOP_K, device=dev, generator=g)
++            garbage = torch.randint(
++                -(2**31),
++                2**31 - 1,
++                (512,),
++                dtype=torch.int32,
++                device=dev,
++                generator=g,
++            )
++            a = Layer(m, ids, x, prob, gate, up, args.gtype, book, garbage)
++            b = Layer(m, ids, x, prob, gate, up, args.gtype, book, garbage)
++            a.today()
++            b.fused()
++            miss["plan"] += int(not _same(a.plan, b.plan))
++            miss["xq_xd"] += int(not (_same(a.xq, b.xq) and _same(a.xd, b.xd)))
++            miss["hq_hd"] += int(not (_same(a.hq, b.hq) and _same(a.hd, b.hd)))
++            finite += int(torch.isfinite(a.hd).all())
++        bad += sum(miss.values())
++        # Synthetic weights keep every fp16 scale finite, so a non-finite hd is a
++        # kernel fault; gate it separately (it is a count of good trials).
++        bad += int(finite != args.trials)
++        report["mismatch"][f"M{m}"] = dict(miss, hd_all_finite_trials=finite)
++        if args.no_time:
++            continue
++        ids = _ids(m, 0, g, dev)
++        x = torch.randn(m, K_DIM, device=dev, generator=g).half()
++        prob = torch.rand(m, TOP_K, device=dev, generator=g)
++        lay = Layer(
++            m,
++            ids,
++            x,
++            prob,
++            gate,
++            up,
++            args.gtype,
++            book,
++            torch.zeros(512, dtype=torch.int32, device=dev),
++        )
++        us = {
++            "q8_aligned+gate_up7": _graph_us(lay.today, args.reps),
++            "q8_plan+gate_up7p": _graph_us(lay.fused, args.reps),
++            "q8_aligned": _graph_us(lay.q8_today, args.reps),
++            "q8_plan": _graph_us(lay.q8_fused, args.reps),
++        }
++        us["saved_per_layer"] = us["q8_aligned+gate_up7"] - us["q8_plan+gate_up7p"]
++        report["us"][f"M{m}"] = {k: round(v, 2) for k, v in us.items()}
++    report["trials_per_m"] = args.trials
++    report["ok"] = bad == 0
++    print(json.dumps(report, indent=1))
++    return 0 if bad == 0 else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/benchmarks/deepseek_v41/v41k/emu/dectest.cpp b/benchmarks/deepseek_v41/v41k/emu/dectest.cpp
+new file mode 100644
+index 0000000000..318a14f67a
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41k/emu/dectest.cpp
+@@ -0,0 +1,128 @@
++// Exhaustive decode check: old Group3<T> (verbatim, shared byte codebook) vs the
++// new PRMT-selector decode (dec16/dec17/dec29 over the replicated fast table).
++// Build as emu.cpp (same flags), run with no arguments; exit 1 on a mismatch.
++#include "shim.h"
++#include <cstdio>
++#include <random>
++#include "src/turbomind/kernels/gemm/lattice_codebooks.h"
++#define __CUDACC__ 1
++#include "v41k_fast.cuh"
++#include "old_extract.inc"
++
++template <class F> void run_serial(int grid, int block, F f) {
++  blockDim.x = block; gridDim.x = grid;
++  for (int b = 0; b < grid; ++b) for (int t = 0; t < block; ++t) { blockIdx.x = b; threadIdx.x = t; f(); }
++}
++template <int T> std::vector<uint32_t> old_book() {
++  const int words = turbomind::gemm::LatticeCodebook<T>::kBytes / 4;
++  std::vector<uint32_t> b(words);
++  run_serial((words + 255) / 256, 256, [&] { v41k::build_table<T>(b.data(), words); });
++  return b;
++}
++template <int T> std::vector<uint32_t> smem_book() {  // fast table, then fill_book's layout
++  using FB = v41k_fast::FastBook<T>;
++  std::vector<uint32_t> g(FB::kWords), s(FB::kSmemWords);
++  run_serial((FB::kWords + 255) / 256, 256, [&] { v41k_fast::build_fast_table<T>(g.data()); });
++  for (int i = 0; i < FB::kSmemWords; ++i) {
++    int src = i;
++    if constexpr (T != 29) src = i < FB::kSignBase ? i / FB::kGridR : FB::kGrid + (i - FB::kSignBase) / FB::kSignR;
++    s[i] = g[src];
++  }
++  return s;
++}
++
++template <int T>
++long check(const uint8_t* blk, int sub, int lane, const uint32_t* ob, const uint32_t* sb, long& n) {
++  uint32_t masks[16];
++  for (int i = 0; i < 16; ++i) masks[i] = sign_mask(i);
++  const v41k::Group3<T> g(blk, sub, ob, masks);
++  uint32_t w[8];
++  int m0, m1;
++  float d;
++  if constexpr (T == 29) {
++    uint32_t qs, s01, s23;
++    uint16_t qh;
++    std::memcpy(&qs, blk + 4 * sub, 4);
++    std::memcpy(&qh, blk + 32 + 2 * sub, 2);
++    std::memcpy(&s01, blk + 48, 4);
++    std::memcpy(&s23, blk + 52, 4);
++    v41k_fast::dec29(qs, qh, s01, s23, sub, sb, w, m0, m1);
++    d = __half2float(__ushort_as_half(v41k_fast::iq1m_d_bits(s01, s23)));
++  } else {
++    uint32_t w0, w1;
++    uint16_t dh;
++    std::memcpy(&w0, blk + 2 + 8 * sub, 4);
++    std::memcpy(&w1, blk + 6 + 8 * sub, 4);
++    std::memcpy(&dh, blk, 2);
++    const uint32_t lg = uint32_t(lane) * 4, ls = uint32_t(lane & 15) * 4;
++    if constexpr (T == 16) v41k_fast::dec16(w0, w1, sb, lg, ls, w, m0, m1);
++    else v41k_fast::dec17(w0, w1, blk[66 + sub], sb, ls, w, m0, m1);
++    d = __half2float(__ushort_as_half(dh));
++  }
++  ++n;
++  long bad = 0;
++  for (int i = 0; i < 8; ++i) bad += w[i] != g.w[i];
++  bad += m0 != g.m0 || m1 != g.m1;
++  uint32_t a, b;
++  std::memcpy(&a, &d, 4);
++  std::memcpy(&b, &g.d, 4);
++  bad += a != b;
++  return bad;
++}
++
++template <int T> long run(std::mt19937& rng, long& n) {
++  constexpr int BB = T == 16 ? 66 : T == 17 ? 74 : 56;
++  const auto ob = old_book<T>();
++  const auto sb = smem_book<T>();
++  alignas(16) uint8_t blk[BB + 16];
++  long bad = 0;
++  const int codes = T == 16 ? 32768 : T == 17 ? 65536 : 4096;
++  for (int sub = 0; sub < 8; ++sub)
++    for (int i = 0; i < codes; ++i) {
++      for (auto& x : blk) x = uint8_t(rng());
++      // every octet position o sees every code as i runs (different offsets per o)
++      for (int o = 0; o < 4; ++o) {
++        const int c = (i + o * 7919) % codes;
++        if constexpr (T == 16) {
++          blk[2 + 8 * sub + o] = uint8_t(c & 255);
++          uint32_t meta;
++          std::memcpy(&meta, blk + 6 + 8 * sub, 4);
++          meta = (meta & ~(127u << (7 * o))) | (uint32_t(c >> 8) << (7 * o));
++          if (o == 3) meta = (meta & 0x0fffffffu) | (uint32_t(i & 15) << 28);
++          std::memcpy(blk + 6 + 8 * sub, &meta, 4);
++        } else if constexpr (T == 17) {
++          const uint16_t c16 = uint16_t(c);
++          std::memcpy(blk + 2 + 8 * sub + 2 * o, &c16, 2);
++          blk[66 + sub] = uint8_t(i & 255);
++        } else {
++          blk[4 * sub + o] = uint8_t(c & 255);
++          uint16_t qh;
++          std::memcpy(&qh, blk + 32 + 2 * sub, 2);
++          qh = uint16_t((qh & ~(15u << (4 * o))) | (uint32_t(c >> 8) << (4 * o)));
++          std::memcpy(blk + 32 + 2 * sub, &qh, 2);
++        }
++      }
++      bad += check<T>(blk, sub, int(rng() & 31), ob.data(), sb.data(), n);
++    }
++  if constexpr (T == 29)  // scale fields: every 16-bit value of each scale word, every sub
++    for (int word = 0; word < 4; ++word)
++      for (int v = 0; v < 65536; ++v) {
++        for (auto& x : blk) x = uint8_t(rng());
++        const uint16_t vv = uint16_t(v);
++        std::memcpy(blk + 48 + 2 * word, &vv, 2);
++        bad += check<T>(blk, v & 7, 0, ob.data(), sb.data(), n);
++      }
++  return bad;
++}
++
++int main() {
++  std::mt19937 rng(12345);
++  long total = 0;
++  for (int T : {16, 17, 29}) {
++    long n = 0;
++    const long bad = T == 16 ? run<16>(rng, n) : T == 17 ? run<17>(rng, n) : run<29>(rng, n);
++    std::printf("type %d: %ld sub-block decodes, %ld mismatching fields\n", T, n, bad);
++    total += bad;
++  }
++  return total ? 1 : 0;
++}
+diff --git a/benchmarks/deepseek_v41/v41k/emu/emu.cpp b/benchmarks/deepseek_v41/v41k/emu/emu.cpp
+new file mode 100644
+index 0000000000..394f9666d7
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41k/emu/emu.cpp
+@@ -0,0 +1,296 @@
++// CPU emulation, bitwise, on synthetic weights / route mixes: old
++// down_rows<T, NW, 8> vs new v41k_fast::down_rows_fast<T, M>, and old
++// gate_up_em5<T> (plan mode) vs new v41k_fast::gate_up_fast<T> (the old kernels
++// verbatim from the base commit, see extract_old.py / old_extract.inc).
++// Host-only (no GPU): each CUDA thread is a std::thread, CTAs run in shuffled
++// order, outputs are NaN-poisoned, the plan tail is stale garbage, and routes
++// no plan member names carry NaN hd scales. From the repository root:
++//   g++ -std=c++20 -O2 -ffp-contract=off -pthread \
++//     -Icsrc/sm70_turbomind/lmdeploy -Ibenchmarks/deepseek_v41/v41k \
++//     -o /tmp/emu benchmarks/deepseek_v41/v41k/emu/emu.cpp
++//   /tmp/emu <type 16|17|29> <m_lo> <m_hi> <kinds mask, 63 = all> <seed> [gu]
++// (gu: gate_up_em5 vs gate_up_fast; default: down_rows vs down_rows_fast)
++// prints one line per case and "... type T: N failing cases" (exit 1 if N > 0).
++#include "shim.h"
++#include <algorithm>
++#include <cstdio>
++#include <random>
++#include "src/turbomind/kernels/gemm/lattice_codebooks.h"
++#define __CUDACC__ 1
++#include "old_extract.inc"
++#include "v41k_fast_gu.cuh"
++
++constexpr int E = 64, RL = 1280;
++
++template <class F> void run_serial(int grid, int block, F f) {
++  blockDim.x = block; gridDim.x = grid;
++  for (int b = 0; b < grid; ++b) for (int t = 0; t < block; ++t) { blockIdx.x = b; threadIdx.x = t; f(); }
++}
++template <int T> std::vector<uint32_t> old_book() {
++  const int words = turbomind::gemm::LatticeCodebook<T>::kBytes / 4;
++  std::vector<uint32_t> b(words);
++  run_serial((words + 255) / 256, 256, [&] { v41k::build_table<T>(b.data(), words); });
++  return b;
++}
++template <int T> std::vector<uint32_t> fast_book() {
++  const int words = v41k_fast::FastBook<T>::kWords;
++  std::vector<uint32_t> b(words);
++  run_serial((words + 255) / 256, 256, [&] { v41k_fast::build_fast_table<T>(b.data()); });
++  return b;
++}
++
++std::vector<int> make_ids(int m, int kind, std::mt19937& rng) {
++  std::vector<int> ids(m * 6);
++  auto rnd = [&](int n) { return int(rng() % n); };
++  for (int k = 0; k < m; ++k) {
++    std::vector<int> row;
++    if (kind == 0) {  // distinct per row, random across rows
++      while ((int)row.size() < 6) { int e = rnd(E); if (std::find(row.begin(), row.end(), e) == row.end()) row.push_back(e); }
++    } else if (kind == 1) {  // pool of 8, distinct per row, drop a tail
++      while ((int)row.size() < 6) { int e = rnd(8) + 3; if (std::find(row.begin(), row.end(), e) == row.end()) row.push_back(e); }
++      for (int i = 6 - rnd(4); i < 6; ++i) row[i] = -1;
++    } else if (kind == 2) {  // pool of 3 with repeats inside a row (cnt caps at 6)
++      for (int i = 0; i < 6; ++i) row.push_back(rnd(3) + 20);
++    } else if (kind == 3) {  // one expert in every row
++      row.push_back(7);
++      while ((int)row.size() < 6) { int e = rnd(E); if (std::find(row.begin(), row.end(), e) == row.end()) row.push_back(e); }
++      std::shuffle(row.begin(), row.end(), rng);
++    } else if (kind == 4) {  // all dropped
++      row.assign(6, -1);
++    } else {  // pool of 12, some drops anywhere
++      while ((int)row.size() < 6) { int e = rnd(12) + 30; if (std::find(row.begin(), row.end(), e) == row.end()) row.push_back(e); }
++      for (int i = 0; i < 6; ++i) if (rnd(4) == 0) row[i] = -1;
++    }
++    for (int i = 0; i < 6; ++i) ids[k * 6 + i] = row[i];
++  }
++  return ids;
++}
++// moe_plan semantics (first-occurrence order, routes ascending, cnt capped at 6);
++// entries it does not write keep stale garbage.
++void make_plan(const std::vector<int>& ids, std::vector<int>& plan) {
++  std::vector<int> ex;
++  for (int r = 0; r < (int)ids.size(); ++r) {
++    const int e = ids[r];
++    if (e < 0) continue;
++    int u = int(std::find(ex.begin(), ex.end(), e) - ex.begin());
++    if (u == (int)ex.size()) { ex.push_back(e); plan[37 + u] = 0; }
++    plan[1 + u] = e;
++    int c = 0;
++    for (int q = 0; q < r; ++q) c += ids[q] == e;
++    if (c < 6) plan[73 + 6 * u + c] = r;
++    int cnt = 0;
++    for (int q = 0; q < (int)ids.size(); ++q) cnt += ids[q] == e;
++    plan[37 + u] = std::min(cnt, 6);
++  }
++  plan[0] = (int)ex.size();
++}
++
++template <int T> void fill_weights(std::vector<uint8_t>& w, int bb, std::mt19937& rng) {
++  for (auto& x : w) x = uint8_t(rng());
++  const size_t blocks = (w.size() - 64) / bb;
++  for (size_t b = 0; b < blocks; ++b) {
++    uint8_t* p = w.data() + b * bb;
++    const uint16_t dbits = uint16_t(0x1000 + rng() % 0x1800);  // ~2^-11 .. 2^-4, positive
++    if constexpr (T == 29) {
++      uint16_t s[4];
++      std::memcpy(s, p + 48, 8);
++      for (int i = 0; i < 4; ++i) s[i] = uint16_t((s[i] & 0x0fff) | (((dbits >> (4 * i)) & 15) << 12));
++      std::memcpy(p + 48, s, 8);
++    } else {
++      std::memcpy(p, &dbits, 2);
++    }
++  }
++}
++
++template <int T>
++int run_case(int m, int kind, int classes, uint64_t seed, const std::vector<uint32_t>& ob,
++             const std::vector<uint32_t>& fb, const std::vector<uint8_t>& down, bool verbose) {
++  constexpr int bb = T == 16 ? 66 : T == 17 ? 74 : 56;
++  std::mt19937 rng(seed);
++  const int routes = 6 * m, rs = (routes * 648 + 255) / 256 * 256;
++  const int rank = int(rng() % 4), row_base = rank * RL;
++  std::vector<int> ids = make_ids(m, kind, rng);
++  std::vector<int> plan(512);
++  for (auto& x : plan) x = 0x40000000 + int(rng() % 1000);  // stale garbage
++  make_plan(ids, plan);
++  std::vector<uint8_t> gathered(4 * rs);
++  for (int r = 0; r < 4; ++r) {
++    uint8_t* slot = gathered.data() + r * rs;
++    for (int i = 0; i < routes * 576; ++i) slot[i] = uint8_t(int8_t(int(rng() % 255) - 127));
++    float* hd = reinterpret_cast<float*>(slot + routes * 576);
++    for (int i = 0; i < routes * 18; ++i) hd[i] = 0.001f + float(rng() % 100000) * 5e-7f;
++  }
++  {  // routes no plan member names (dropped, or past the cnt cap): NaN scales
++    std::vector<char> used(routes, 0);
++    for (int u = 0; u < plan[0]; ++u)
++      for (int c = 0; c < plan[37 + u]; ++c) used[plan[73 + 6 * u + c]] = 1;
++    for (int r = 0; r < 4; ++r) {
++      float* hd = reinterpret_cast<float*>(gathered.data() + r * rs + routes * 576);
++      for (int q = 0; q < routes; ++q)
++        if (!used[q])
++          for (int i = 0; i < 18; ++i) hd[q * 18 + i] = __builtin_nanf("");
++    }
++  }
++  std::vector<half> o_old(m * 5120), o_new(m * 5120), o_dirty(m * 5120);
++  for (auto& h : o_old) h.x = 0x7e00;
++  for (auto& h : o_new) h.x = 0x7e00;
++  std::vector<int> ord_old(RL / 4), ord_new(RL / 16);
++  for (int i = 0; i < (int)ord_old.size(); ++i) ord_old[i] = i;
++  for (int i = 0; i < (int)ord_new.size(); ++i) ord_new[i] = i;
++  std::shuffle(ord_new.begin(), ord_new.end(), rng);
++  const int row_stride = 9 * bb;
++  auto old_k = [&] {
++    if (classes == 8)
++      v41k::down_rows<T, 8, 8>((half*)o_old.data(), gathered.data(), rs, down.data(), row_stride, RL, row_base,
++                               ob.data(), routes, 6, m, 4, plan.data());
++    else
++      v41k::down_rows<T, 4, 8>((half*)o_old.data(), gathered.data(), rs, down.data(), row_stride, RL, row_base,
++                               ob.data(), routes, 6, m, 4, plan.data());
++  };
++  emu_launch(RL / 4, 32 * classes, old_k, ord_old);
++  auto new_k = [&](half* out, const int* pl) {
++    switch (m) {
++#define C(M) case M: v41k_fast::down_rows_fast<T, M>(out, gathered.data(), down.data(), row_stride, RL, row_base, fb.data(), classes, pl); break;
++      C(1) C(2) C(3) C(4) C(5) C(6)
++#undef C
++    }
++  };
++  // Dirty the static "shared memory" with a different plan first.
++  {
++    std::vector<int> ids2 = make_ids(m, 0, rng), plan2 = plan;
++    make_plan(ids2, plan2);
++    emu_launch(RL / 16, 512, [&] { new_k(o_dirty.data(), plan2.data()); }, ord_new);
++  }
++  emu_launch(RL / 16, 512, [&] { new_k(o_new.data(), plan.data()); }, ord_new);
++  int bad = 0, nan = 0, nz = 0;
++  for (int i = 0; i < m * 5120; ++i) {
++    if (o_old[i].x != o_new[i].x) {
++      if (bad < 5 && verbose)
++        std::printf("  mismatch k=%d n=%d old=%04x new=%04x\n", i / 5120, i % 5120, o_old[i].x, o_new[i].x);
++      ++bad;
++    }
++    nan += (o_new[i].x & 0x7c00) == 0x7c00;
++    nz += o_new[i].x != 0;
++  }
++  std::printf("T=%d M=%d kind=%d classes=%d rank=%d nu=%d: mismatches=%d nan=%d nonzero=%d\n", T, m, kind,
++              classes, rank, plan[0], bad, nan, nz);
++  return bad + nan;
++}
++
++// gate/up: old gate_up_em5<T> (plan mode, grid 18 x routes) vs the persistent
++// gate_up_fast<T> on grids of 80, 13 and 3 CTAs; hq / hd prefilled with
++// garbage / NaN, compared whole (entries no member writes must stay as they
++// were in both).
++template <int T>
++int run_case_gu(int m, int kind, uint64_t seed, const std::vector<uint32_t>& ob,
++                const std::vector<uint32_t>& fb, const std::vector<uint8_t>& gate,
++                const std::vector<uint8_t>& up, bool verbose) {
++  constexpr int bb = T == 16 ? 66 : T == 17 ? 74 : 56;
++  std::mt19937 rng(seed);
++  const int routes = 6 * m, row_stride = 20 * bb;
++  std::vector<int> ids = make_ids(m, kind, rng);
++  std::vector<int> plan(512);
++  for (auto& x : plan) x = 0x40000000 + int(rng() % 1000);  // stale garbage
++  make_plan(ids, plan);
++  std::vector<int8_t> xq(m * 160 * 32);
++  std::vector<float> xd(m * 160), prob(routes);
++  for (auto& v : xq) v = int8_t(int(rng() % 255) - 127);
++  for (auto& v : xd) v = 0.001f + float(rng() % 100000) * 9e-8f;
++  for (auto& v : prob) v = float(rng() % 100000) * 1e-5f;
++  const int grids[3] = {80, 13, 3};
++  std::vector<int8_t> hq0(routes * 18 * 32);
++  for (auto& v : hq0) v = int8_t(rng());
++  std::vector<float> hd0(routes * 18, __builtin_nanf(""));
++  std::vector<int8_t> hq_old = hq0;
++  std::vector<float> hd_old = hd0;
++  std::vector<int> ord_old(18 * routes);
++  for (int i = 0; i < (int)ord_old.size(); ++i) ord_old[i] = i;
++  std::shuffle(ord_old.begin(), ord_old.end(), rng);
++  emu_launch2(18, routes, 512, [&] {
++    v41k::gate_up_em5<T>(hq_old.data(), hd_old.data(), xq.data(), xd.data(), ids.data(), prob.data(),
++                         gate.data(), up.data(), row_stride, ob.data(), routes, 6, plan.data());
++  }, ord_old);
++  int fails = 0;
++  for (int g : grids) {
++    std::vector<int8_t> hq_new = hq0;
++    std::vector<float> hd_new = hd0;
++    std::vector<int> ord(g);
++    for (int i = 0; i < g; ++i) ord[i] = i;
++    std::shuffle(ord.begin(), ord.end(), rng);
++    {  // dirty the static "shared memory" with a different plan first
++      std::vector<int> ids2 = make_ids(m, 0, rng), plan2 = plan;
++      make_plan(ids2, plan2);
++      std::vector<int8_t> hq2 = hq0;
++      std::vector<float> hd2 = hd0;
++      emu_launch(g, 512, [&] {
++        v41k_fast::gate_up_fast<T>(hq2.data(), hd2.data(), xq.data(), xd.data(), prob.data(), gate.data(),
++                                   up.data(), row_stride, fb.data(), plan2.data());
++      }, ord);
++    }
++    emu_launch(g, 512, [&] {
++      v41k_fast::gate_up_fast<T>(hq_new.data(), hd_new.data(), xq.data(), xd.data(), prob.data(), gate.data(),
++                                 up.data(), row_stride, fb.data(), plan.data());
++    }, ord);
++    int bad = 0, written = 0, clamp = 0;
++    for (int i = 0; i < routes * 18; ++i) {
++      uint32_t a, b;
++      std::memcpy(&a, &hd_old[i], 4);
++      std::memcpy(&b, &hd_new[i], 4);
++      bad += a != b;
++      written += !std::isnan(hd_old[i]);
++      clamp += !std::isnan(hd_old[i]) && hd_old[i] > 9.9f / 127.f;
++      for (int j = 0; j < 32; ++j) bad += hq_old[i * 32 + j] != hq_new[i * 32 + j];
++    }
++    if (verbose)
++      std::printf("GU T=%d M=%d kind=%d grid=%d nu=%d: mismatches=%d groups_written=%d big=%d\n", T, m, kind, g,
++                  plan[0], bad, written, clamp);
++    fails += bad != 0;
++  }
++  return fails;
++}
++
++template <int T> int run_type_gu(uint64_t seed, int kinds_mask, int m_lo, int m_hi) {
++  constexpr int bb = T == 16 ? 66 : T == 17 ? 74 : 56;
++  std::mt19937 rng(seed);
++  std::vector<uint8_t> gate(size_t(E) * 576 * 20 * bb + 64), up(gate.size());
++  fill_weights<T>(gate, bb, rng);
++  fill_weights<T>(up, bb, rng);
++  const auto ob = old_book<T>();
++  const auto fb = fast_book<T>();
++  int fails = 0;
++  for (int m = m_lo; m <= m_hi; ++m)
++    for (int kind = 0; kind < 6; ++kind)
++      if (kinds_mask >> kind & 1) fails += run_case_gu<T>(m, kind, seed * 1000 + m * 10 + kind, ob, fb, gate, up, true) != 0;
++  return fails;
++}
++
++template <int T> int run_type(uint64_t seed, int kinds_mask, int m_lo, int m_hi) {
++  constexpr int bb = T == 16 ? 66 : T == 17 ? 74 : 56;
++  std::mt19937 rng(seed);
++  std::vector<uint8_t> down(size_t(E) * RL * 9 * bb + 64);
++  fill_weights<T>(down, bb, rng);
++  const auto ob = old_book<T>();
++  const auto fb = fast_book<T>();
++  int fails = 0;
++  for (int m = m_lo; m <= m_hi; ++m)
++    for (int kind = 0; kind < 6; ++kind)
++      if (kinds_mask >> kind & 1)
++        fails += run_case<T>(m, kind, (m + kind) % 2 ? 8 : 4, seed * 1000 + m * 10 + kind, ob, fb, down, true) != 0;
++  return fails;
++}
++
++int main(int argc, char** argv) {
++  const int type = argc > 1 ? std::atoi(argv[1]) : 29;
++  const int m_lo = argc > 2 ? std::atoi(argv[2]) : 1, m_hi = argc > 3 ? std::atoi(argv[3]) : 6;
++  const int kinds = argc > 4 ? std::atoi(argv[4]) : 63;
++  const uint64_t seed = argc > 5 ? std::atoll(argv[5]) : 1;
++  const bool gu = argc > 6 && std::strcmp(argv[6], "gu") == 0;
++  int fails = gu ? (type == 16 ? run_type_gu<16>(seed, kinds, m_lo, m_hi)
++                    : type == 17 ? run_type_gu<17>(seed, kinds, m_lo, m_hi)
++                                 : run_type_gu<29>(seed, kinds, m_lo, m_hi))
++                 : (type == 16 ? run_type<16>(seed, kinds, m_lo, m_hi)
++                    : type == 17 ? run_type<17>(seed, kinds, m_lo, m_hi)
++                                 : run_type<29>(seed, kinds, m_lo, m_hi));
++  std::printf("%s type %d: %d failing cases\n", gu ? "gate/up" : "down", type, fails);
++  return fails ? 1 : 0;
++}
+diff --git a/benchmarks/deepseek_v41/v41k/emu/extract_old.py b/benchmarks/deepseek_v41/v41k/emu/extract_old.py
+new file mode 100644
+index 0000000000..18921122e6
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41k/emu/extract_old.py
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Write old_extract.inc: the old v41k kernels the emulator compares against.
++
++Cuts line ranges out of v41k.cu at a base commit (default 8a7bd7b, the
++EXPERT_FAST branch point), checks each range's first line, and applies the
++marked edits that make the host build follow the old SASS: Group3::apply
++returns d * xd * S, and each accumulation is FFMA(that, 0.125, acc).
++
++    python benchmarks/deepseek_v41/v41k/emu/extract_old.py [base]
++"""
++
++import os
++import subprocess
++import sys
++
++BASE = sys.argv[1] if len(sys.argv) > 1 else "8a7bd7b"
++HERE = os.path.dirname(os.path.abspath(__file__))
++SRC = "benchmarks/deepseek_v41/v41k/v41k.cu"
++# (first, last, first line starts with)
++RANGES = [
++    (19, 36, "template <int Type>"),  # block_bytes, build_table
++    (565, 578, "__device__ __forceinline__ void ld3("),  # ld3, ld16
++    (583, 672, "template <int Type>"),  # Group3, book_words
++    (674, 686, "__device__ __forceinline__ int find_distinct("),
++    (1264, 1288, "__device__ __forceinline__ void load_q8("),  # + q8_warp_aligned
++    (1290, 1392, "#ifndef V41K_GU_MINB"),  # gate_up_em5
++    (1657, 1750, "// Row-split down (G3)"),  # down_rows
++]
++EDITS = [
++    (
++        "    return d * xd * float(s0 * m0 + s1 * m1) * 0.125f;",
++        (
++            "    return d * xd * float(s0 * m0 + s1 * m1);  // EDIT 1: the x0.125 is"
++            " the FFMA below (old SASS)"
++        ),
++    ),
++    (
++        "        gs[c] += dg.apply(q, d);",
++        (
++            "        gs[c] = __builtin_fmaf(dg.apply(q, d), 0.125f, gs[c]);  // EDIT 2:"
++            " FFMA(x, 0.125, acc) as in the old SASS"
++        ),
++    ),
++    (
++        "        us[c] += du.apply(q, d);",
++        "        us[c] = __builtin_fmaf(du.apply(q, d), 0.125f, us[c]);  // EDIT 3",
++    ),
++    (
++        "            dot[c] += w.apply(qv, d);",
++        (
++            "            dot[c] = __builtin_fmaf(w.apply(qv, d), 0.125f, dot[c]);"
++            "  // EDIT 4: FFMA(x, 0.125, dot) as in the old SASS"
++        ),
++    ),
++]
++
++
++def main():
++    root = subprocess.run(
++        ["git", "-C", HERE, "rev-parse", "--show-toplevel"],
++        check=True,
++        capture_output=True,
++        text=True,
++    ).stdout.strip()
++    lines = subprocess.run(
++        ["git", "-C", root, "show", f"{BASE}:{SRC}"],
++        check=True,
++        capture_output=True,
++        text=True,
++    ).stdout.split("\n")
++    out = [f"// Extracted verbatim from v41k.cu (base {BASE}) by extract_old.py;"]
++    out.append("// the marked EDIT lines are the only changes.")
++    out.append("namespace v41k {")
++    for first, last, head in RANGES:
++        chunk = lines[first - 1 : last]
++        assert chunk[0].startswith(head), (first, chunk[0])
++        out += chunk
++    out.append("}  // namespace v41k")
++    text = "\n".join(out) + "\n"
++    for old, new in EDITS:
++        assert text.count(old) == 1, old
++        text = text.replace(old, new)
++    with open(os.path.join(HERE, "old_extract.inc"), "w") as f:
++        f.write(text)
++    print("wrote", os.path.join(HERE, "old_extract.inc"))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/deepseek_v41/v41k/emu/old_extract.inc b/benchmarks/deepseek_v41/v41k/emu/old_extract.inc
+new file mode 100644
+index 0000000000..a4ec63d6a6
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41k/emu/old_extract.inc
+@@ -0,0 +1,361 @@
++// Extracted verbatim from v41k.cu (base 8a7bd7b) by extract_old.py;
++// the marked EDIT lines are the only changes.
++namespace v41k {
++template <int Type>
++constexpr int block_bytes() {
++  return Type == 16 ? 66 : Type == 17 ? 74 : 56;
++}
++
++template <int Type>
++__global__ void build_table(uint32_t* out, int words) {
++  using Book = turbomind::gemm::LatticeCodebook<Type>;
++  const int i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i >= words) return;
++  uint32_t word = Book::word(i) ^ 0x80808080U;
++  if constexpr (Type == 29) {
++    word = __vadd4(word, word);
++    word = __vadd4(word, word);
++    word = __vadd4(word, word);
++  }
++  out[i] = word;
++}
++__device__ __forceinline__ void ld3(const uint8_t* p, uint32_t& w0,
++                                    uint32_t& w1) {
++  // 8 bytes at any 2-byte-aligned address: three aligned words + funnel shifts.
++  const uintptr_t a = reinterpret_cast<uintptr_t>(p);
++  const uint32_t* q = reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
++  const uint32_t sh = (a & 3) * 8;
++  const uint32_t x0 = __ldg(q), x1 = __ldg(q + 1), x2 = __ldg(q + 2);
++  w0 = __funnelshift_r(x0, x1, sh);
++  w1 = __funnelshift_r(x1, x2, sh);
++}
++__device__ __forceinline__ uint32_t ld16(const uint8_t* p) {
++  return *reinterpret_cast<const uint16_t*>(p);
++}
++
++template <int Type>
++// Codebook entries as one 64-bit LDS; sign masks computed (PRMT), not looked
++// up.
++#ifndef V41K_SMEM_MASKS
++  #define V41K_MASK(n) sign_mask(n)
++#else
++  #define V41K_MASK(n) masks[n]
++#endif
++struct Group3 {
++  uint32_t w[8];
++  float d;
++  int m0, m1;
++  __device__ __forceinline__ Group3(const uint8_t* row, int group,
++                                    const uint32_t* book,
++                                    const uint32_t* masks) {
++    const uint8_t* b = row + (group >> 3) * block_bytes<Type>();
++    const int sub = group & 7;
++    if constexpr (Type == 29) {
++      const uint32_t qs = __ldg(reinterpret_cast<const uint32_t*>(b + 4 * sub));
++      const uint32_t qh = ld16(b + 32 + 2 * sub);
++      const uint2 sc = __ldg(reinterpret_cast<const uint2*>(b + 48));
++#pragma unroll
++      for (int octet = 0; octet < 4; ++octet) {
++        const int high = (qh >> (4 * octet)) & 15;
++        const int index = ((qs >> (8 * octet)) & 255) | ((high & 7) << 8);
++        const uint32_t bias = (high >> 3) ? 0xffffffffU : 0x01010101U;
++        const uint2 e = reinterpret_cast<const uint2*>(book)[index];
++        w[2 * octet] = __vadd4(e.x, bias);
++        w[2 * octet + 1] = __vadd4(e.y, bias);
++      }
++      const uint32_t s01 = sc.x, s23 = sc.y;
++      const uint16_t bits =
++          ((s01 & 0xffff) >> 12) | (((s01 >> 16) >> 8) & 0xf0) |
++          (((s23 & 0xffff) >> 4) & 0xf00) | ((s23 >> 16) & 0xf000);
++      d = __half2float(__ushort_as_half(bits));
++      const uint64_t all = (uint64_t(s23) << 32) | s01;
++      const int f = sub * 2;
++      // scales[f/4] >> 3*(f%4) on 16-bit lanes
++      m0 = 2 * ((all >> (16 * (f / 4) + 3 * (f % 4))) & 7) + 1;
++      m1 = 2 * ((all >> (16 * ((f + 1) / 4) + 3 * ((f + 1) % 4))) & 7) + 1;
++    } else {
++      uint32_t w0, w1;
++      ld3(b + 2 + 8 * sub, w0, w1);
++      d = __half2float(__ushort_as_half(ld16(b)));
++      if constexpr (Type == 16) {
++        const uint32_t meta = w1;
++#pragma unroll
++        for (int octet = 0; octet < 4; ++octet) {
++          const int index = (w0 >> (8 * octet)) & 255;
++          int signs = (meta >> (7 * octet)) & 127;
++          signs |= (__popc(signs) & 1) << 7;
++          const uint32_t lo = V41K_MASK(signs & 15), hi = V41K_MASK(signs >> 4);
++          const uint2 e = reinterpret_cast<const uint2*>(book)[index];
++          w[2 * octet] = __vsub4(e.x ^ lo, lo);
++          w[2 * octet + 1] = __vsub4(e.y ^ hi, hi);
++        }
++        m0 = m1 = 1 + 2 * (meta >> 28);
++      } else {
++#pragma unroll
++        for (int octet = 0; octet < 4; ++octet) {
++          const uint32_t code =
++              ((octet < 2 ? w0 : w1) >> (16 * (octet & 1))) & 0xffff;
++          const int index = code & 511;
++          int signs = code >> 9;
++          signs |= (__popc(signs) & 1) << 7;
++          const uint32_t lo = V41K_MASK(signs & 15), hi = V41K_MASK(signs >> 4);
++          const uint2 e = reinterpret_cast<const uint2*>(book)[index];
++          w[2 * octet] = __vsub4(e.x ^ lo, lo);
++          w[2 * octet + 1] = __vsub4(e.y ^ hi, hi);
++        }
++        const int sc = b[66 + sub];
++        m0 = 1 + 2 * (sc & 15);
++        m1 = 1 + 2 * (sc >> 4);
++      }
++    }
++  }
++  __device__ __forceinline__ float apply(const int* qs, float xd) const {
++    int s0 = 0, s1 = 0;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) s0 = __dp4a(int(w[i]), qs[i], s0);
++#pragma unroll
++    for (int i = 4; i < 8; ++i) s1 = __dp4a(int(w[i]), qs[i], s1);
++    return d * xd * float(s0 * m0 + s1 * m1);  // EDIT 1: the x0.125 is the FFMA below (old SASS)
++  }
++};
++
++template <int Type>
++constexpr int book_words() {
++  return turbomind::gemm::LatticeCodebook<Type>::kBytes / 4;
++}
++__device__ __forceinline__ int find_distinct(const int* ids, int routes,
++                                             int u) {
++  int e = -1, distinct = 0;
++  for (int r = 0; r < routes && e < 0; ++r) {
++    bool seen = false;
++    for (int q = 0; q < r; ++q) seen |= ids[q] == ids[r];
++    if (!seen) {
++      if (distinct == u) e = ids[r];
++      ++distinct;
++    }
++  }
++  return e;
++}
++__device__ __forceinline__ void load_q8(const int8_t* qs, const float* ds,
++                                        int64_t idx, int (&q)[8], float& d) {
++  const int4* p = reinterpret_cast<const int4*>(qs + idx * 32);
++  const int4 a = __ldg(p), b = __ldg(p + 1);
++  q[0] = a.x;
++  q[1] = a.y;
++  q[2] = a.z;
++  q[3] = a.w;
++  q[4] = b.x;
++  q[5] = b.y;
++  q[6] = b.z;
++  q[7] = b.w;
++  d = __ldg(ds + idx);
++}
++
++__device__ __forceinline__ void q8_warp_aligned(int8_t* qs, float* ds,
++                                                int64_t idx, float value) {
++  const int lane = threadIdx.x % 32;
++  float m = fabsf(value);
++#pragma unroll
++  for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffU, m, o));
++  const float d = m / 127.f;
++  qs[idx * 32 + lane] = m == 0.f ? 0 : int8_t(roundf(value / d));
++  if (!lane) ds[idx] = __half2float(__float2half_rn(d));
++}
++#ifndef V41K_GU_MINB
++  #define V41K_GU_MINB 2
++#endif
++template <int Type>
++__global__ void __launch_bounds__(512, V41K_GU_MINB)
++    gate_up_em5(int8_t* __restrict__ hq, float* __restrict__ hd,
++                const int8_t* __restrict__ xq, const float* __restrict__ xd,
++                const int* ids, const float* __restrict__ prob,
++                const uint8_t* __restrict__ gate,
++                const uint8_t* __restrict__ up, int row_stride,
++                const uint32_t* __restrict__ gbook, int routes, int top_k,
++                const int* __restrict__ plan) {
++  constexpr int GROUPS = 160, BW = book_words<Type>();
++  __shared__ __align__(16) uint32_t book[BW];
++  __shared__ int s_expert, s_cnt, s_route[6], s_tok[6];
++  __shared__ uint32_t masks[16];
++  __shared__ float red[6][2][32];
++  const int t = threadIdx.x, warp = t / 32, lane = t % 32;
++  if (plan != nullptr) {
++    // per-layer plan: [0] distinct count, [1+u] expert, [37+u] routes,
++    // [73+6u+c] route
++    const int u = blockIdx.y;
++    if (u >= __ldg(plan)) return;
++    for (int i = t; i < BW; i += blockDim.x) book[i] = __ldg(gbook + i);
++    if (t < 16) masks[t] = sign_mask(t);
++    if (t < 6) {
++      const int cnt = __ldg(plan + 37 + u);
++      const int r = t < cnt ? __ldg(plan + 73 + 6 * u + t) : 0;
++      s_route[t] = r;
++      s_tok[t] = r / top_k;
++      if (t == 0) {
++        s_expert = __ldg(plan + 1 + u);
++        s_cnt = cnt;
++      }
++    }
++  } else if (t == 0) {
++    const int e = find_distinct(ids, routes, blockIdx.y);
++    int cnt = 0;
++    if (e >= 0)
++      for (int r = 0; r < routes; ++r)
++        if (ids[r] == e && cnt < 6) {
++          s_route[cnt] = r;
++          s_tok[cnt] = r / top_k;
++          ++cnt;
++        }
++    s_expert = e;
++    s_cnt = cnt;
++  }
++  __syncthreads();
++  const int e = s_expert, cnt = s_cnt;
++  if (plan == nullptr) {
++    if (e < 0) return;
++    for (int i = t; i < BW; i += blockDim.x) book[i] = __ldg(gbook + i);
++    if (t < 16) masks[t] = sign_mask(t);
++    __syncthreads();
++  }
++  const int lrow = warp * 2 + lane / 16;
++  const int row = blockIdx.x * 32 + lrow;
++  const uint8_t* g = gate + (int64_t(e) * 576 + row) * row_stride;
++  const uint8_t* u = up + (int64_t(e) * 576 + row) * row_stride;
++  int tok[6];
++#pragma unroll
++  for (int c = 0; c < 6; ++c) tok[c] = c < cnt ? s_tok[c] : 0;
++  float gs[6] = {}, us[6] = {};
++#pragma unroll kGuUnroll
++  for (int group = lane % 16; group < GROUPS; group += 16) {
++    const Group3<Type> dg(g, group, book, masks);
++    const Group3<Type> du(u, group, book, masks);
++#pragma unroll
++    for (int c = 0; c < 6; ++c)
++      if (c < cnt) {
++        int q[8];
++        float d;
++        load_q8(xq, xd, int64_t(tok[c]) * GROUPS + group, q, d);
++        gs[c] = __builtin_fmaf(dg.apply(q, d), 0.125f, gs[c]);  // EDIT 2: FFMA(x, 0.125, acc) as in the old SASS
++        us[c] = __builtin_fmaf(du.apply(q, d), 0.125f, us[c]);  // EDIT 3
++      }
++  }
++#pragma unroll
++  for (int c = 0; c < 6; ++c) {
++#pragma unroll
++    for (int o = 8; o; o >>= 1) {
++      gs[c] += __shfl_xor_sync(0xffffffffU, gs[c], o);
++      us[c] += __shfl_xor_sync(0xffffffffU, us[c], o);
++    }
++    if (c < cnt && lane % 16 == 0) {
++      red[c][0][lrow] = gs[c];
++      red[c][1][lrow] = us[c];
++    }
++  }
++  __syncthreads();
++  if (warp < cnt) {
++    const int route = s_route[warp];
++    float g16 = __half2float(__float2half_rn(red[warp][0][lane]));
++    float u16 = __half2float(__float2half_rn(red[warp][1][lane]));
++    g16 = g16 > 10.f ? 10.f : g16;
++    u16 = u16 > 10.f ? 10.f : (u16 < -10.f ? -10.f : u16);
++    const float act = __fdiv_rn(g16, __fadd_rn(1.f, expf(-g16)));
++    const float value = __half2float(
++        __float2half_rn(__fmul_rn(__fmul_rn(act, u16), prob[route])));
++    q8_warp_aligned(hq, hd, int64_t(route) * 18 + blockIdx.x, value);
++  }
++}
++// Row-split down (G3): each rank owns 1280 output rows of every expert with the
++// full K = 2304 (72 Q8 groups). The routed Q8 inputs of all four ranks are
++// gathered rank-major: rank r's block holds hq [routes, 18, 32] then hd
++// [routes, 18] at `rank_stride` bytes. Only rows [row_base, row_base + rows)
++// of out are written; the caller zeroes the rest before the TP all-reduce.
++template <int Type, int NW, int SUB>
++__global__ void __launch_bounds__(32 * NW, 8 / NW * 4)
++    down_rows(half* __restrict__ out, const uint8_t* __restrict__ gathered,
++              int64_t rank_stride, const uint8_t* __restrict__ down,
++              int row_stride, int rows_local, int row_base,
++              const uint32_t* __restrict__ gbook, int routes, int top_k,
++              int tokens, int rows_per_cta, const int* __restrict__ plan) {
++  constexpr int LG = 18, GROUPS = 72, N = 5120, BW = book_words<Type>(),
++                RT = 32 / SUB;
++  __shared__ __align__(16) uint32_t book[BW];
++  __shared__ int distinct_e[36], s_nu, member_route[36][6], member_cnt[36];
++  __shared__ uint32_t masks[16];
++  __shared__ float part[NW][8][6];
++  const int t = threadIdx.x, lane = t % 32, warp = t / 32;
++  for (int i = t; i < BW; i += blockDim.x) book[i] = __ldg(gbook + i);
++  if (t < 16) masks[t] = sign_mask(t);
++  for (int i = t; i < 36 + 36 + 216; i += blockDim.x) {
++    if (i < 36)
++      distinct_e[i] = __ldg(plan + 1 + i);
++    else if (i < 72)
++      member_cnt[i - 36] = __ldg(plan + 1 + i);
++    else
++      member_route[(i - 72) / 6][(i - 72) % 6] = __ldg(plan + 1 + i);
++  }
++  if (t == 0) s_nu = __ldg(plan);
++  __syncthreads();
++  const int nu = s_nu;
++  const int lrow = lane / SUB, sub = lane % SUB;
++  const int64_t q_bytes = int64_t(routes) * LG * 32;
++  for (int tile = 0; tile < rows_per_cta / RT; ++tile) {
++    const int row0 = (blockIdx.x * rows_per_cta / RT + tile) * RT;
++    const int row = row0 + lrow;
++    float acc[6] = {};
++    for (int q = warp; q < nu; q += NW) {
++      const int e = distinct_e[q], cnt = member_cnt[q];
++      const uint8_t* base = down + (int64_t(e) * rows_local + row) * row_stride;
++      int rt[6];
++#pragma unroll
++      for (int c = 0; c < 6; ++c) rt[c] = c < cnt ? member_route[q][c] : 0;
++      float dot[6] = {};
++      for (int g = sub; g < GROUPS; g += SUB) {
++        const Group3<Type> w(base, g, book, masks);
++        const uint8_t* rank_base = gathered + (g / LG) * rank_stride;
++        const int8_t* hq = reinterpret_cast<const int8_t*>(rank_base);
++        const float* hd = reinterpret_cast<const float*>(rank_base + q_bytes);
++        const int gl = g % LG;
++#pragma unroll
++        for (int c = 0; c < 6; ++c)
++          if (c < cnt) {
++            int qv[8];
++            float d;
++            load_q8(hq, hd, int64_t(rt[c]) * LG + gl, qv, d);
++            dot[c] = __builtin_fmaf(w.apply(qv, d), 0.125f, dot[c]);  // EDIT 4: FFMA(x, 0.125, dot) as in the old SASS
++          }
++      }
++#pragma unroll
++      for (int c = 0; c < 6; ++c) {
++#pragma unroll
++        for (int o = 1; o < SUB; o <<= 1)
++          dot[c] += __shfl_xor_sync(0xffffffffU, dot[c], o);
++      }
++#pragma unroll
++      for (int c = 0; c < 6; ++c)
++        if (c < cnt) {
++          const int token = rt[c] / top_k;
++          const float v = __half2float(__float2half_rn(dot[c]));
++#pragma unroll
++          for (int k = 0; k < 6; ++k)
++            if (k == token) acc[k] += v;
++        }
++    }
++    __syncthreads();
++    if (sub == 0)
++#pragma unroll
++      for (int k = 0; k < 6; ++k) part[warp][lrow][k] = acc[k];
++    __syncthreads();
++    if (t < RT * tokens) {
++      const int r = t / tokens, k = t % tokens;
++      float v = 0.f;
++#pragma unroll
++      for (int w8 = 0; w8 < NW; ++w8) v += part[w8][r][k];
++      out[k * N + row_base + row0 + r] = __float2half_rn(v);
++#pragma unroll
++      for (int o = 0; o < 4; ++o)
++        if (o * rows_local != row_base)
++          out[k * N + o * rows_local + row0 + r] = __float2half_rn(0.f);
++    }
++  }
++}
++}  // namespace v41k
+diff --git a/benchmarks/deepseek_v41/v41k/emu/shim.h b/benchmarks/deepseek_v41/v41k/emu/shim.h
+new file mode 100644
+index 0000000000..4224ef5318
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41k/emu/shim.h
+@@ -0,0 +1,143 @@
++// Host shim: runs CUDA kernel source as one std::thread per CUDA thread.
++// CTAs run one at a time, so `__shared__` = function-local static.
++#pragma once
++#include <atomic>
++#include <barrier>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <thread>
++#include <vector>
++
++#define __global__
++#define __device__
++#define __host__
++#define __forceinline__ inline
++#define __launch_bounds__(...)
++#define __restrict__
++#define __shared__ static
++#define __align__(n) __attribute__((aligned(n)))
++
++struct dim3 { unsigned x = 0, y = 0, z = 0; };
++inline thread_local dim3 threadIdx, blockIdx;
++inline dim3 blockDim, gridDim;
++
++struct alignas(16) int4 { int x, y, z, w; };
++struct alignas(8) uint2 { unsigned x, y; };
++
++struct half { uint16_t x; };
++using __half = half;
++inline half __float2half_rn(float f) { _Float16 h = (_Float16)f; half r; std::memcpy(&r.x, &h, 2); return r; }
++inline float __half2float(half h) { _Float16 v; std::memcpy(&v, &h.x, 2); return (float)v; }
++inline half __ushort_as_half(unsigned short u) { half r; r.x = u; return r; }
++
++template <class T> inline T __ldg(const T* p) { return *p; }
++inline uint32_t __funnelshift_r(uint32_t lo, uint32_t hi, uint32_t sh) {
++  return uint32_t(((uint64_t(hi) << 32) | lo) >> (sh & 31));
++}
++inline int __popc(unsigned x) { return __builtin_popcount(x); }
++inline int __dp4a(int a, int b, int c) {
++  for (int i = 0; i < 4; ++i) c += int(int8_t(uint32_t(a) >> (8 * i))) * int(int8_t(uint32_t(b) >> (8 * i)));
++  return c;
++}
++inline unsigned __vadd4(unsigned a, unsigned b) {
++  unsigned r = 0;
++  for (int i = 0; i < 4; ++i) r |= (((a >> (8 * i)) + (b >> (8 * i))) & 255u) << (8 * i);
++  return r;
++}
++inline unsigned __vsub4(unsigned a, unsigned b) {
++  unsigned r = 0;
++  for (int i = 0; i < 4; ++i) r |= (((a >> (8 * i)) - (b >> (8 * i))) & 255u) << (8 * i);
++  return r;
++}
++inline int atomicAdd(int* p, int v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
++
++// Sense-reversing spin barrier with yield (std::barrier's futex waits make
++// the 32-lane shuffle barriers very slow).
++struct SpinBarrier {
++  explicit SpinBarrier(int n) : n_(n) {}
++  void arrive_and_wait() {
++    const unsigned gen = gen_.load(std::memory_order_acquire);
++    if (count_.fetch_add(1, std::memory_order_acq_rel) + 1 == n_) {
++      count_.store(0, std::memory_order_relaxed);
++      gen_.fetch_add(1, std::memory_order_acq_rel);
++    } else {
++      while (gen_.load(std::memory_order_acquire) == gen) std::this_thread::yield();
++    }
++  }
++  int n_;
++  std::atomic<int> count_{0};
++  std::atomic<unsigned> gen_{0};
++};
++struct Cta {
++  std::unique_ptr<SpinBarrier> bar;
++  std::vector<std::unique_ptr<SpinBarrier>> wbar;
++  uint32_t slot[32][32];
++};
++inline Cta* g_cta = nullptr;
++inline void __syncthreads() { g_cta->bar->arrive_and_wait(); }
++template <class T> inline T shfl_from(T v, int src_lane) {
++  static_assert(sizeof(T) == 4);
++  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++  std::memcpy(&g_cta->slot[warp][lane], &v, 4);
++  g_cta->wbar[warp]->arrive_and_wait();
++  T r;
++  std::memcpy(&r, &g_cta->slot[warp][src_lane & 31], 4);
++  g_cta->wbar[warp]->arrive_and_wait();
++  return r;
++}
++template <class T> inline T __shfl_xor_sync(unsigned, T v, int o) { return shfl_from(v, (threadIdx.x & 31) ^ o); }
++template <class T> inline T __shfl_sync(unsigned, T v, int src) { return shfl_from(v, src); }
++
++// Runs every CTA (in the given order) with one team of `block` threads.
++template <class F>
++void emu_launch(int grid, int block, F f, const std::vector<int>& order) {
++  blockDim.x = block;
++  gridDim.x = grid;
++  Cta cta;
++  cta.bar = std::make_unique<SpinBarrier>(block);
++  for (int w = 0; w < block / 32; ++w) cta.wbar.push_back(std::make_unique<SpinBarrier>(32));
++  SpinBarrier edge(block);
++  g_cta = &cta;
++  std::vector<std::thread> th;
++  th.reserve(block);
++  for (int t = 0; t < block; ++t)
++    th.emplace_back([&, t] {
++      threadIdx.x = t;
++      for (int b : order) {
++        blockIdx.x = b;
++        f();
++        edge.arrive_and_wait();  // CTA boundary: shared statics are reused
++      }
++    });
++  for (auto& x : th) x.join();
++  g_cta = nullptr;
++}
++
++// 2-D grid (gx x gy), CTAs in the given order of linear ids x + gx * y.
++template <class F>
++void emu_launch2(int gx, int gy, int block, F f, const std::vector<int>& order) {
++  gridDim.y = gy;
++  std::vector<int> xs(order.size());
++  for (size_t i = 0; i < order.size(); ++i) xs[i] = order[i];
++  emu_launch(gx * gy, block, [&] {
++    const int id = int(blockIdx.x);
++    blockIdx.x = id % gx;
++    blockIdx.y = id / gx;
++    f();
++    blockIdx.x = id;
++  }, xs);
++  gridDim.x = gx;
++}
++inline float __fdiv_rn(float a, float b) { return a / b; }
++inline float __fadd_rn(float a, float b) { return a + b; }
++inline float __fmul_rn(float a, float b) { return a * b; }
++
++// Old sign_mask (LatticeDot<22>::sign_mask): prmt(nibble * 0x10204080, 0, 0xba98).
++inline uint32_t sign_mask(int nibble) {
++  const uint32_t bits = uint32_t(nibble) * 0x10204080U;
++  uint32_t r = 0;
++  for (int n = 0; n < 4; ++n) { uint32_t v = (bits >> (8 * n)) & 255; r |= ((v & 128) ? 255u : 0u) << (8 * n); }
++  return r;
++}
+diff --git a/benchmarks/deepseek_v41/v41k/v41k.cu b/benchmarks/deepseek_v41/v41k/v41k.cu
+index 2245702499..bae6940abd 100644
+--- a/benchmarks/deepseek_v41/v41k/v41k.cu
++++ b/benchmarks/deepseek_v41/v41k/v41k.cu
+@@ -1171,12 +1171,13 @@ __global__ void fp8_reduce(half* out, const float* partials, const half* bias,
+ }
+ 
+ // ---- v5: aligned activations (int8 qs as two int4 + float scale arrays) ----
+-__global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
+-                                  float* __restrict__ ds,
+-                                  const half* __restrict__ x, int K) {
+-  // one warp per 32-element group
++// one warp per 32-element group
++__device__ __forceinline__ void q8_aligned_row(int8_t* __restrict__ qs,
++                                               float* __restrict__ ds,
++                                               const half* __restrict__ x,
++                                               int K, int row) {
+   const int g = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+-  const int lane = threadIdx.x % 32, row = blockIdx.y, groups = K / 32;
++  const int lane = threadIdx.x % 32, groups = K / 32;
+   if (g >= groups) return;
+   const float v = __half2float(x[int64_t(row) * K + g * 32 + lane]);
+   float m = fabsf(v);
+@@ -1188,6 +1189,78 @@ __global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
+   if (!lane) ds[int64_t(row) * groups + g] = __half2float(__float2half_rn(d));
+ }
+ 
++__global__ void q8_aligned_kernel(int8_t* __restrict__ qs,
++                                  float* __restrict__ ds,
++                                  const half* __restrict__ x, int K) {
++  q8_aligned_row(qs, ds, x, K, blockIdx.y);
++}
++
++// The moe_plan plan (same entries, same values, other entries untouched) from
++// registers: each lane holds routes lane and lane + 32 and compares them with
++// every route broadcast by shuffle, so there is no shared memory and no serial
++// first-occurrence scan. One full warp calls it.
++__device__ __forceinline__ void plan_warp(int* __restrict__ plan,
++                                          const int* __restrict__ ids,
++                                          int routes) {
++  const int lane = threadIdx.x % 32;
++  int e[2], c[2] = {0, 0}, cnt[2] = {0, 0}, q0[2];
++  bool live[2];
++#pragma unroll
++  for (int h = 0; h < 2; ++h) {
++    const int r = lane + 32 * h;
++    e[h] = r < routes ? ids[r] : -1;
++    live[h] = r < routes && e[h] >= 0;  // id < 0: route dropped
++    q0[h] = r;
++  }
++  for (int q = 0; q < routes; ++q) {
++    const int v = __shfl_sync(0xffffffffU, q < 32 ? e[0] : e[1], q & 31);
++#pragma unroll
++    for (int h = 0; h < 2; ++h) {
++      const int r = lane + 32 * h;
++      if (live[h] && v == e[h]) {
++        if (q < r) {
++          ++c[h];  // earlier routes of this expert
++          q0[h] = min(q0[h], q);
++        } else {
++          ++cnt[h];  // this and later routes of this expert
++        }
++      }
++    }
++  }
++  const bool first0 = live[0] && c[0] == 0, first1 = live[1] && c[1] == 0;
++  const unsigned b0 = __ballot_sync(0xffffffffU, first0);
++  const unsigned b1 = __ballot_sync(0xffffffffU, first1);
++  const unsigned below = (1u << lane) - 1u;
++  const int own0 = __popc(b0 & below), own1 = __popc(b0) + __popc(b1 & below);
++#pragma unroll
++  for (int h = 0; h < 2; ++h) {
++    // distinct index of this route's expert = own index of its first route
++    const int u0 = __shfl_sync(0xffffffffU, own0, q0[h] & 31);
++    const int u1 = __shfl_sync(0xffffffffU, own1, q0[h] & 31);
++    const int u = q0[h] < 32 ? u0 : u1, r = lane + 32 * h;
++    if (!live[h]) continue;
++    if (c[h] < 6) plan[73 + 6 * u + c[h]] = r;
++    if (c[h] == 0) {
++      plan[1 + u] = e[h];
++      plan[37 + u] = cnt[h] < 6 ? cnt[h] : 6;
++    }
++  }
++  if (lane == 0) plan[0] = __popc(b0) + __popc(b1);
++}
++
++// q8_aligned for rows 0..M-1 (grid y 1..M) plus the expert plan (grid y 0, one
++// warp), so the plan needs no launch of its own and overlaps the quantization.
++__global__ void q8_plan_kernel(int8_t* __restrict__ qs, float* __restrict__ ds,
++                               const half* __restrict__ x, int K,
++                               int* __restrict__ plan,
++                               const int* __restrict__ ids, int routes) {
++  if (blockIdx.y == 0) {
++    if (blockIdx.x == 0 && threadIdx.x < 32) plan_warp(plan, ids, routes);
++    return;
++  }
++  q8_aligned_row(qs, ds, x, K, blockIdx.y - 1);
++}
++
+ __device__ __forceinline__ void load_q8(const int8_t* qs, const float* ds,
+                                         int64_t idx, int (&q)[8], float& d) {
+   const int4* p = reinterpret_cast<const int4*>(qs + idx * 32);
+@@ -2554,6 +2627,245 @@ torch::Tensor v41k_table(int64_t type, torch::Device device) {
+   return out;
+ }
+ 
++// ---- EXPERT_FAST (VLLM_V41_EXPERT_FAST=1): v41k_fast.cuh ------------------
++#include "v41k_fast.cuh"
++#include "v41k_fast_gu.cuh"
++
++torch::Tensor v41k_fast_table(int64_t type, torch::Device device) {
++  int words = 0;
++  if (type == 16)
++    words = v41k_fast::FastBook<16>::kWords;
++  else if (type == 17)
++    words = v41k_fast::FastBook<17>::kWords;
++  else if (type == 29)
++    words = v41k_fast::FastBook<29>::kWords;
++  else
++    TORCH_CHECK(false, "fast_table: type must be 16, 17 or 29");
++  const at::cuda::OptionalCUDAGuard guard(device);
++  auto out = torch::empty({words}, torch::dtype(torch::kInt32).device(device));
++  auto stream = at::cuda::getCurrentCUDAStream();
++  auto* p = reinterpret_cast<uint32_t*>(out.data_ptr());
++  const int blocks = (words + 255) / 256;
++  if (type == 16) v41k_fast::build_fast_table<16><<<blocks, 256, 0, stream>>>(p);
++  if (type == 17) v41k_fast::build_fast_table<17><<<blocks, 256, 0, stream>>>(p);
++  if (type == 29) v41k_fast::build_fast_table<29><<<blocks, 256, 0, stream>>>(p);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++  return out;
++}
++
++// Shared-memory carveout: the smallest sm_70 configuration (0/8/16/32/64/96
++// KB) that holds one CTA, leaving the rest of the 128 KB to L1 (weights and
++// the gathered activations).
++template <class F>
++static void v41k_fast_carveout(F* kernel) {
++  cudaFuncAttributes attr;
++  C10_CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
++  const int need = int(attr.sharedSizeBytes) + 1024;  // + per-CTA reserve
++  int kb = 96;
++  for (int c : {8, 16, 32, 64, 96})
++    if (c * 1024 >= need) {
++      kb = c;
++      break;
++    }
++  C10_CUDA_CHECK(cudaFuncSetAttribute(
++      kernel, cudaFuncAttributePreferredSharedMemoryCarveout, kb * 100 / 96));
++}
++
++// One (Type, M) instantiation: carveout set once, then the launch.
++template <int T, int M>
++static void v41k_down_rows_fast_launch(half* out, const uint8_t* gathered,
++                                       const uint8_t* down, int row_stride,
++                                       int rows_local, int row_base,
++                                       const uint32_t* fbook, int classes,
++                                       const int* plan, cudaStream_t stream) {
++  static bool carved = false;
++  if (!carved) {
++    v41k_fast_carveout(v41k_fast::down_rows_fast<T, M>);
++    carved = true;
++  }
++  v41k_fast::down_rows_fast<T, M>
++      <<<rows_local / v41k_fast::kDnRows, 32 * v41k_fast::kDnWarps, 0,
++         stream>>>(out, gathered, down, row_stride, rows_local, row_base,
++                   fbook, classes, plan);
++}
++
++template <int T>
++static void v41k_down_rows_fast_m(int tokens, half* out,
++                                  const uint8_t* gathered, const uint8_t* down,
++                                  int row_stride, int rows_local, int row_base,
++                                  const uint32_t* fbook, int classes,
++                                  const int* plan, cudaStream_t stream) {
++#define V41K_DNF(M)                                                         \
++  v41k_down_rows_fast_launch<T, M>(out, gathered, down, row_stride,         \
++                                   rows_local, row_base, fbook, classes,    \
++                                   plan, stream)
++  switch (tokens) {
++    case 1: V41K_DNF(1); break;
++    case 2: V41K_DNF(2); break;
++    case 3: V41K_DNF(3); break;
++    case 4: V41K_DNF(4); break;
++    case 5: V41K_DNF(5); break;
++    default: V41K_DNF(6); break;
++  }
++#undef V41K_DNF
++}
++
++// Bitwise-identical replacement for down_rows(..., rows = 4, dn_warps, ...)
++// with classes = 8 if dn_warps == 8 else 4: same arguments minus rows /
++// dn_warps, fbook = fast_table(dtype). M = out.size(0) tokens x top-6 routes,
++// gathered = 4 rank slots of (routes * 648 + 255) / 256 * 256 bytes.
++void v41k_down_rows_fast(torch::Tensor out, torch::Tensor gathered,
++                         int64_t rank_stride, int64_t routes,
++                         torch::Tensor down, int64_t dtype, int64_t row_base,
++                         torch::Tensor fbook, int64_t classes,
++                         torch::Tensor plan) {
++  const at::cuda::OptionalCUDAGuard guard(out.device());
++  TORCH_CHECK(dtype == 16 || dtype == 17 || dtype == 29,
++              "down_rows_fast: dtype must be 16, 17 or 29");
++  TORCH_CHECK(out.dim() == 2 && down.dim() == 3, "down_rows_fast: shapes");
++  const int tokens = out.size(0), rows_local = down.size(1);
++  const int bb = dtype == 16 ? 66 : dtype == 17 ? 74 : 56;
++  TORCH_CHECK(classes == 4 || classes == 8, "down_rows_fast: classes 4 or 8");
++  TORCH_CHECK(tokens >= 1 && tokens <= 6 && routes == 6 * int64_t(tokens),
++              "down_rows_fast: M = 1..6 tokens x top-6 routes");
++  TORCH_CHECK(rank_stride == (routes * 648 + 255) / 256 * 256,
++              "down_rows_fast: rank_stride must be (routes * 648 + 255) / 256 "
++              "* 256");
++  TORCH_CHECK(rows_local % v41k_fast::kDnRows == 0 && 4 * rows_local == 5120 &&
++                  row_base >= 0 && row_base < 5120 &&
++                  row_base % rows_local == 0 && down.size(2) == 9 * bb &&
++                  down.is_contiguous() && down.scalar_type() == torch::kUInt8,
++              "down_rows_fast: down must be [E, 1280, 9 blocks] uint8, "
++              "row_base a rank multiple of 1280");
++  TORCH_CHECK(out.size(1) == 5120 && out.scalar_type() == torch::kHalf &&
++                  out.is_contiguous(),
++              "down_rows_fast: out must be contiguous [M, 5120] half");
++  TORCH_CHECK(gathered.scalar_type() == torch::kUInt8 &&
++                  gathered.is_contiguous() &&
++                  gathered.numel() >= 4 * rank_stride,
++              "down_rows_fast: gathered must hold 4 rank slots");
++  TORCH_CHECK(fbook.scalar_type() == torch::kInt32 &&
++                  fbook.numel() == (dtype == 16   ? v41k_fast::FastBook<16>::kWords
++                                    : dtype == 17 ? v41k_fast::FastBook<17>::kWords
++                                                  : v41k_fast::FastBook<29>::kWords),
++              "down_rows_fast: fbook must be fast_table(dtype)");
++  TORCH_CHECK(plan.scalar_type() == torch::kInt32 && plan.numel() >= 289 &&
++                  plan.is_contiguous(),
++              "down_rows_fast: plan");
++  TORCH_CHECK(reinterpret_cast<uintptr_t>(gathered.data_ptr()) % 16 == 0 &&
++                  reinterpret_cast<uintptr_t>(down.data_ptr()) % 8 == 0,
++              "down_rows_fast: gathered must be 16-byte and down 8-byte "
++              "aligned");
++  auto stream = at::cuda::getCurrentCUDAStream();
++  auto* o = reinterpret_cast<half*>(out.data_ptr());
++  const auto* g = gathered.data_ptr<uint8_t>();
++  const auto* w = down.data_ptr<uint8_t>();
++  const auto* b = reinterpret_cast<const uint32_t*>(fbook.data_ptr());
++  const int* pl = plan.data_ptr<int>();
++  const int rs = int(down.size(2));
++  if (dtype == 16)
++    v41k_down_rows_fast_m<16>(tokens, o, g, w, rs, rows_local, int(row_base),
++                              b, int(classes), pl, stream);
++  else if (dtype == 17)
++    v41k_down_rows_fast_m<17>(tokens, o, g, w, rs, rows_local, int(row_base),
++                              b, int(classes), pl, stream);
++  else
++    v41k_down_rows_fast_m<29>(tokens, o, g, w, rs, rows_local, int(row_base),
++                              b, int(classes), pl, stream);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++template <int T>
++static void v41k_gate_up_fast_launch(int grid, int8_t* hq, float* hd,
++                                     const int8_t* xq, const float* xd,
++                                     const float* prob, const uint8_t* gate,
++                                     const uint8_t* up, int row_stride,
++                                     const uint32_t* fbook, const int* plan,
++                                     cudaStream_t stream) {
++  static bool carved = false;
++  if (!carved) {
++    v41k_fast_carveout(v41k_fast::gate_up_fast<T>);
++    carved = true;
++  }
++  v41k_fast::gate_up_fast<T><<<grid, 512, 0, stream>>>(
++      hq, hd, xq, xd, prob, gate, up, row_stride, fbook, plan);
++}
++
++// Bitwise-identical replacement for gate_up7 (build_plan = true: moe_plan
++// first) and gate_up7p (build_plan = false: plan from q8_plan): same
++// arguments, fbook = fast_table(gtype) in place of the old book. Persistent
++// grid of min(SMs, 18 * routes) CTAs; CTAs past 18 * nu exit at once.
++void v41k_gate_up_fast(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
++                       torch::Tensor hd, torch::Tensor ids32,
++                       torch::Tensor prob, torch::Tensor gate,
++                       torch::Tensor up, int64_t gtype, torch::Tensor fbook,
++                       torch::Tensor plan, bool build_plan) {
++  const at::cuda::OptionalCUDAGuard guard(xq.device());
++  TORCH_CHECK(gtype == 16 || gtype == 17 || gtype == 29,
++              "gate_up_fast: gtype must be 16, 17 or 29");
++  const int routes = ids32.numel();
++  const int bb = gtype == 16 ? 66 : gtype == 17 ? 74 : 56;
++  TORCH_CHECK(ids32.scalar_type() == torch::kInt32 && routes >= 6 &&
++                  routes <= 36 && routes % 6 == 0,
++              "gate_up_fast: ids32 must be int32, M = 1..6 tokens x top-6");
++  const int64_t tokens = routes / 6;
++  TORCH_CHECK(plan.scalar_type() == torch::kInt32 && plan.is_contiguous() &&
++                  plan.numel() >= 73 + 216,
++              "gate_up_fast: plan");
++  TORCH_CHECK(gate.dim() == 3 && up.sizes() == gate.sizes() &&
++                  gate.size(1) == 576 && gate.size(2) == 20 * bb &&
++                  gate.is_contiguous() && up.is_contiguous() &&
++                  gate.scalar_type() == torch::kUInt8 &&
++                  up.scalar_type() == torch::kUInt8,
++              "gate_up_fast: gate / up must be contiguous [E, 576, 20 blocks] "
++              "uint8");
++  TORCH_CHECK(reinterpret_cast<uintptr_t>(gate.data_ptr()) % 8 == 0 &&
++                  reinterpret_cast<uintptr_t>(up.data_ptr()) % 8 == 0,
++              "gate_up_fast: gate / up must be 8-byte aligned");
++  TORCH_CHECK(xq.scalar_type() == torch::kChar && xq.is_contiguous() &&
++                  xq.numel() >= tokens * 5120 &&
++                  xd.scalar_type() == torch::kFloat && xd.is_contiguous() &&
++                  xd.numel() >= tokens * 160,
++              "gate_up_fast: xq / xd must hold M x 160 Q8 groups");
++  TORCH_CHECK(reinterpret_cast<uintptr_t>(xq.data_ptr()) % 16 == 0,
++              "gate_up_fast: xq must be 16-byte aligned");
++  TORCH_CHECK(hq.scalar_type() == torch::kChar && hq.is_contiguous() &&
++                  hq.numel() >= int64_t(routes) * 576 &&
++                  hd.scalar_type() == torch::kFloat && hd.is_contiguous() &&
++                  hd.numel() >= int64_t(routes) * 18 &&
++                  prob.scalar_type() == torch::kFloat &&
++                  prob.numel() >= routes,
++              "gate_up_fast: hq / hd / prob sizes");
++  TORCH_CHECK(fbook.scalar_type() == torch::kInt32 &&
++                  fbook.numel() == (gtype == 16   ? v41k_fast::FastBook<16>::kWords
++                                    : gtype == 17 ? v41k_fast::FastBook<17>::kWords
++                                                  : v41k_fast::FastBook<29>::kWords),
++              "gate_up_fast: fbook must be fast_table(gtype)");
++  auto stream = at::cuda::getCurrentCUDAStream();
++  auto i8 = [](torch::Tensor& t) {
++    return reinterpret_cast<int8_t*>(t.data_ptr());
++  };
++  int* pl = plan.data_ptr<int>();
++  if (build_plan)
++    v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
++  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++  const int grid = std::min(sms, 18 * routes);
++  const auto* b = reinterpret_cast<const uint32_t*>(fbook.data_ptr());
++#define V41K_GUF(T)                                                          \
++  v41k_gate_up_fast_launch<T>(grid, i8(hq), hd.data_ptr<float>(), i8(xq),    \
++                              xd.data_ptr<float>(), prob.data_ptr<float>(),  \
++                              gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(), \
++                              int(gate.size(2)), b, pl, stream)
++  if (gtype == 16)
++    V41K_GUF(16);
++  else if (gtype == 17)
++    V41K_GUF(17);
++  else
++    V41K_GUF(29);
++#undef V41K_GUF
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ void v41k_gate_up(torch::Tensor down_in, torch::Tensor x, torch::Tensor ids32,
+                   torch::Tensor prob, torch::Tensor gate, torch::Tensor up,
+                   int64_t type, torch::Tensor book, int64_t lanes) {
+@@ -2873,6 +3185,21 @@ void v41k_fp8_gemv(torch::Tensor out, torch::Tensor x, torch::Tensor w,
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++// q8_aligned plus the moe_plan plan for ids32 in the same launch.
++void v41k_q8_plan(torch::Tensor qs, torch::Tensor ds, torch::Tensor x,
++                  torch::Tensor ids32, torch::Tensor plan) {
++  const at::cuda::OptionalCUDAGuard guard(x.device());
++  const int M = x.size(0), K = x.size(1), routes = ids32.numel();
++  TORCH_CHECK(routes <= 36 && plan.numel() >= 73 + 216);
++  TORCH_CHECK(ids32.is_contiguous() && plan.is_contiguous());
++  auto stream = at::cuda::getCurrentCUDAStream();
++  v41k::q8_plan_kernel<<<dim3((K / 32 + 7) / 8, M + 1), 256, 0, stream>>>(
++      reinterpret_cast<int8_t*>(qs.data_ptr()), ds.data_ptr<float>(),
++      reinterpret_cast<const half*>(x.data_ptr()), K, plan.data_ptr<int>(),
++      ids32.data_ptr<int>(), routes);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ void v41k_q8_aligned(torch::Tensor qs, torch::Tensor ds, torch::Tensor x) {
+   const at::cuda::OptionalCUDAGuard guard(x.device());
+   const int M = x.size(0), K = x.size(1);
+@@ -3301,10 +3628,11 @@ void v41k_swap_combined(torch::Tensor b0, torch::Tensor b1, torch::Tensor b2,
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+-void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+-                   torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
+-                   torch::Tensor gate, torch::Tensor up, int64_t gtype,
+-                   torch::Tensor gbook, torch::Tensor plan) {
++static void gate_up7_impl(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
++                          torch::Tensor hd, torch::Tensor ids32,
++                          torch::Tensor prob, torch::Tensor gate,
++                          torch::Tensor up, int64_t gtype, torch::Tensor gbook,
++                          torch::Tensor plan, bool build_plan) {
+   const at::cuda::OptionalCUDAGuard guard(xq.device());
+   const int routes = ids32.numel();
+   TORCH_CHECK(routes <= 36 && plan.numel() >= 73 + 216);
+@@ -3313,7 +3641,8 @@ void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+     return reinterpret_cast<int8_t*>(t.data_ptr());
+   };
+   int* pl = plan.data_ptr<int>();
+-  v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
++  if (build_plan)
++    v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
+ #define V41K_GU7R(T)                                                           \
+   v41k::gate_up_em5<T><<<dim3(18, routes), 512, 0, stream>>>(                  \
+       i8(hq), hd.data_ptr<float>(), i8(xq), xd.data_ptr<float>(),              \
+@@ -3329,6 +3658,23 @@ void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++void v41k_gate_up7(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
++                   torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
++                   torch::Tensor gate, torch::Tensor up, int64_t gtype,
++                   torch::Tensor gbook, torch::Tensor plan) {
++  gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,
++                true);
++}
++
++// gate_up7 with the plan already built by q8_plan (VLLM_V41_PLAN_FUSE).
++void v41k_gate_up7p(torch::Tensor xq, torch::Tensor xd, torch::Tensor hq,
++                    torch::Tensor hd, torch::Tensor ids32, torch::Tensor prob,
++                    torch::Tensor gate, torch::Tensor up, int64_t gtype,
++                    torch::Tensor gbook, torch::Tensor plan) {
++  gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,
++                false);
++}
++
+ void v41k_down_rows(torch::Tensor out, torch::Tensor gathered,
+                     int64_t rank_stride, int64_t routes, torch::Tensor down,
+                     int64_t dtype, int64_t row_base, torch::Tensor dbook,
+@@ -3443,6 +3789,17 @@ TORCH_LIBRARY(v41k, m) {
+       "plan) -> ()",
+       &v41k_down_rows);
+   m.def("table(int type, Device device) -> Tensor", &v41k_table);
++  m.def("fast_table(int type, Device device) -> Tensor", &v41k_fast_table);
++  m.def(
++      "down_rows_fast(Tensor(a!) out, Tensor gathered, int rank_stride, "
++      "int routes, Tensor down, int dtype, int row_base, Tensor fbook, "
++      "int classes, Tensor plan) -> ()",
++      &v41k_down_rows_fast);
++  m.def(
++      "gate_up_fast(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, "
++      "Tensor ids32, Tensor prob, Tensor gate, Tensor up, int gtype, "
++      "Tensor fbook, Tensor(c!) plan, bool build_plan) -> ()",
++      &v41k_gate_up_fast);
+   m.def(
+       "gate_up(Tensor(a!) down_in, Tensor x, Tensor ids32, Tensor prob, "
+       "Tensor gate, Tensor up, int type, Tensor book, int lanes) -> ()",
+@@ -3458,6 +3815,15 @@ TORCH_LIBRARY(v41k, m) {
+       &v41k_diag);
+   m.def("q8_aligned(Tensor(a!) qs, Tensor(b!) ds, Tensor x) -> ()",
+         &v41k_q8_aligned);
++  m.def(
++      "q8_plan(Tensor(a!) qs, Tensor(b!) ds, Tensor x, Tensor ids32, "
++      "Tensor(c!) plan) -> ()",
++      &v41k_q8_plan);
++  m.def(
++      "gate_up7p(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, Tensor "
++      "ids32, Tensor prob, "
++      "Tensor gate, Tensor up, int gtype, Tensor gbook, Tensor plan) -> ()",
++      &v41k_gate_up7p);
+   m.def(
+       "moe5(Tensor(a!) out, Tensor xq, Tensor xd, Tensor(b!) hq, Tensor(c!) "
+       "hd, Tensor ids32, "
+diff --git a/benchmarks/deepseek_v41/v41k/v41k_fast.cuh b/benchmarks/deepseek_v41/v41k/v41k_fast.cuh
+new file mode 100644
+index 0000000000..4bf11376cd
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41k/v41k_fast.cuh
+@@ -0,0 +1,561 @@
++// V4.1 routed experts, decode M = 1..6: EXPERT_FAST kernels
++// (VLLM_V41_EXPERT_FAST=1). New ops beside the old ones; old kernels untouched.
++//
++// Decode. The old path looks every 8-weight octet up in a byte codebook
++// (uint2 per entry, 16 KB for IQ1_M) and then applies signs or the IQ1 delta
++// with __vsub4/__vadd4 (emulated on sm_70, 4-5 instructions per word). Here
++// every codebook entry is one 32-bit PRMT selector word: nibble i of the word
++// picks byte i of the octet out of two constant registers POS/NEG,
++//   nibble = code (0..2) | negate_or_delta << 2,
++// so an octet is 1 LDS + 2 PRMT. IQ2_XXS/IQ2_XS magnitudes {8, 25, 43} are
++// codes 0..2, POS = {8, 25, 43}, NEG = {-8, -25, -43}, and the 7-bit sign
++// index (+ parity) is a second selector word OR-ed in. IQ1_M values
++// {-1, 0, 1} x 8 + delta are codes 0..2 with POS = {-7, 1, 9} (delta +1) and
++// NEG = {-9, -1, 7} (delta -1); the delta bit is folded into a 4096-entry
++// table indexed by (qh nibble << 8 | qs byte). The decoded int8 weights are
++// exactly the old ones (checked exhaustively by expert_fast_check.py and the
++// host test), so the integer dots are unchanged.
++//
++// Bank conflicts. The IQ2 tables are replicated across banks in shared
++// memory: word (i, r) at i * R + r, lane reads r = lane % R (grid R = 32 for
++// IQ2_XXS, 16 otherwise; signs R = 16), so a warp lookup is 1-2 wavefronts
++// instead of ~3.5 random ones. IQ1_M (4096 words) is not replicated.
++//
++// Numerics (down_rows_fast): bitwise identical to down_rows<T, NW, 8>
++// (ROWS_TILE rows = 4, NW = classes). Each (row, sub s) partial is the same
++// serial chain over the K blocks j = 0..8 (group g = s + 8 j), the 8 subs are
++// summed by the same xor 1, 2, 4 butterfly, rounded to half, accumulated per
++// token in the old warp-class order (class = q % NW, then q, then member c),
++// and the NW class partials are added in ascending class order from +0.
++// Empty classes are skipped: they contributed +0 to a total that starts at
++// +0 and therefore can never be -0, so the result is unchanged. Only the
++// assignment of rows/experts to warps and CTAs differs.
++#pragma once
++#include <cstdint>
++
++#if defined(__CUDACC__)
++  #define V41KF_HD __host__ __device__ __forceinline__
++#else
++  #define V41KF_HD inline
++#endif
++
++namespace v41k_fast {
++
++V41KF_HD uint32_t prmt(uint32_t a, uint32_t b, uint32_t c) {
++#if defined(__CUDA_ARCH__)
++  uint32_t d;
++  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
++  return d;
++#else
++  const uint64_t x = (uint64_t(b) << 32) | a;
++  uint32_t d = 0;
++  for (int n = 0; n < 4; ++n) {
++    const uint32_t s = (c >> (4 * n)) & 15;
++    uint32_t v = uint32_t(x >> (8 * (s & 7))) & 255;
++    if (s & 8) v = (v & 128) ? 255 : 0;
++    d |= v << (8 * n);
++  }
++  return d;
++#endif
++}
++
++V41KF_HD int dp4a(uint32_t a, int b, int c) {
++#if defined(__CUDA_ARCH__)
++  return __dp4a(int(a), b, c);
++#else
++  for (int i = 0; i < 4; ++i)
++    c += int(int8_t(a >> (8 * i))) * int(int8_t(uint32_t(b) >> (8 * i)));
++  return c;
++#endif
++}
++
++template <int Type>
++struct FastBook;
++template <>
++struct FastBook<16> {  // IQ2_XXS
++  static constexpr int kBlock = 66, kGrid = 256, kGridR = 32, kSigns = 128,
++                       kSignR = 16;
++  static constexpr int kWords = kGrid + kSigns;  // global table words
++  static constexpr int kSignBase = kGrid * kGridR;
++  static constexpr int kSmemWords = kSignBase + kSigns * kSignR;  // 40 KB
++  static constexpr uint32_t kPos = 0x002B1908u, kNeg = 0x00D5E7F8u;
++};
++template <>
++struct FastBook<17> {  // IQ2_XS
++  static constexpr int kBlock = 74, kGrid = 512, kGridR = 16, kSigns = 128,
++                       kSignR = 16;
++  static constexpr int kWords = kGrid + kSigns;
++  static constexpr int kSignBase = kGrid * kGridR;
++  static constexpr int kSmemWords = kSignBase + kSigns * kSignR;  // 40 KB
++  static constexpr uint32_t kPos = 0x002B1908u, kNeg = 0x00D5E7F8u;
++};
++template <>
++struct FastBook<29> {  // IQ1_M
++  static constexpr int kBlock = 56, kGrid = 4096, kGridR = 1, kSigns = 0,
++                       kSignR = 0;
++  static constexpr int kWords = kGrid;
++  static constexpr int kSignBase = kGrid;
++  static constexpr int kSmemWords = kGrid;  // 16 KB
++  static constexpr uint32_t kPos = 0x000901F9u, kNeg = 0x0007FFF7u;
++};
++
++// Global fast-table word i. value(k) = byte k of LatticeCodebook<Type>
++// (biased +128: IQ2 magnitudes 136/153/171, IQ1 values 127/128/129).
++template <int Type, class Value>
++V41KF_HD uint32_t fast_word(int i, Value value) {
++  using FB = FastBook<Type>;
++  if constexpr (Type == 29) {
++    const int index = i & 2047;
++    uint32_t sel = 0;
++    for (int b = 0; b < 8; ++b)
++      sel |= uint32_t(int(value(8 * index + b)) - 127) << (4 * b);
++    return (i >> 11) & 1 ? sel | 0x44444444u : sel;
++  } else {
++    if (i < FB::kGrid) {
++      uint32_t sel = 0;
++      for (int b = 0; b < 8; ++b) {
++        const int v = value(8 * i + b);
++        sel |= uint32_t(v == 136 ? 0 : v == 153 ? 1 : 2) << (4 * b);
++      }
++      return sel;
++    }
++    const int s7 = i - FB::kGrid;
++    int parity = 0;
++    for (int b = 0; b < 7; ++b) parity ^= (s7 >> b) & 1;
++    const int s8 = s7 | parity << 7;
++    uint32_t w = 0;
++    for (int b = 0; b < 8; ++b) w |= uint32_t((s8 >> b) & 1) << (4 * b + 2);
++    return w;
++  }
++}
++
++// ---- one 32-weight group (sub-block) of an original block -----------------
++// book: the CTA's shared table (FastBook<Type>::kSmemWords words).
++V41KF_HD uint32_t lds_byte_off(const uint32_t* book, uint32_t off) {
++  return *reinterpret_cast<const uint32_t*>(
++      reinterpret_cast<const char*>(book) + off);
++}
++
++// Lane byte offsets into the replicated tables: lg = 4 (lane % 32) for the
++// IQ2_XXS grid (R = 32), ls = 4 (lane % 16) for the R = 16 tables.
++// IQ2_XXS: w0 = 4 grid bytes, w1 = 4 x 7 sign bits + 4-bit scale.
++V41KF_HD void dec16(uint32_t w0, uint32_t w1, const uint32_t* book,
++                    uint32_t lg, uint32_t ls, uint32_t (&w)[8], int& m0,
++                    int& m1) {
++  using FB = FastBook<16>;
++#pragma unroll
++  for (int o = 0; o < 4; ++o) {
++    const uint32_t go = (o == 0 ? w0 << 7 : w0 >> (8 * o - 7)) & 0x7F80u;
++    const uint32_t so = (o == 0 ? w1 << 6 : w1 >> (7 * o - 6)) & 0x1FC0u;
++    const uint32_t sel = lds_byte_off(book, go | lg) |
++                         lds_byte_off(book, FB::kSignBase * 4 + (so | ls));
++    w[2 * o] = prmt(FB::kPos, FB::kNeg, sel);
++    w[2 * o + 1] = prmt(FB::kPos, FB::kNeg, sel >> 16);
++  }
++  m0 = m1 = 1 + 2 * int(w1 >> 28);
++}
++
++// IQ2_XS: four 16-bit codes (9-bit grid index, 7 sign bits); sc = scale byte.
++V41KF_HD void dec17(uint32_t w0, uint32_t w1, uint32_t sc,
++                    const uint32_t* book, uint32_t ls, uint32_t (&w)[8],
++                    int& m0, int& m1) {
++  using FB = FastBook<17>;
++#pragma unroll
++  for (int o = 0; o < 4; ++o) {
++    const uint32_t x = o < 2 ? w0 : w1;
++    const uint32_t go = ((o & 1) ? x >> 10 : x << 6) & 0x7FC0u;
++    const uint32_t so = ((o & 1) ? x >> 19 : x >> 3) & 0x1FC0u;
++    const uint32_t sel = lds_byte_off(book, go | ls) |
++                         lds_byte_off(book, FB::kSignBase * 4 + (so | ls));
++    w[2 * o] = prmt(FB::kPos, FB::kNeg, sel);
++    w[2 * o + 1] = prmt(FB::kPos, FB::kNeg, sel >> 16);
++  }
++  m0 = 1 + 2 * int(sc & 15);
++  m1 = 1 + 2 * int((sc >> 4) & 15);
++}
++
++// IQ1_M: qs = 4 index bytes, qh = 4 nibbles (3 index bits + delta), s01/s23 =
++// the block's four 16-bit scale words; sub = the sub-block (0..7).
++V41KF_HD uint16_t iq1m_d_bits(uint32_t s01, uint32_t s23) {
++  return uint16_t(((s01 & 0xffff) >> 12) | (((s01 >> 16) >> 8) & 0xf0) |
++                  (((s23 & 0xffff) >> 4) & 0xf00) | ((s23 >> 16) & 0xf000));
++}
++V41KF_HD void dec29(uint32_t qs, uint32_t qh, uint32_t s01, uint32_t s23,
++                    int sub, const uint32_t* book, uint32_t (&w)[8], int& m0,
++                    int& m1) {
++  using FB = FastBook<29>;
++  const uint32_t t = prmt(qh, 0, 0x4140);  // bytes qh0, 0, qh1, 0
++  const uint32_t hs = (t & 0x000F000Fu) | ((t << 4) & 0x0F000F00u);
++  const uint32_t i01 = prmt(qs, hs, 0x5140), i23 = prmt(qs, hs, 0x7362);
++#pragma unroll
++  for (int o = 0; o < 4; ++o) {
++    const uint32_t x = o < 2 ? i01 : i23;
++    const uint32_t off = ((o & 1) ? x >> 14 : x << 2) & 0x3FFCu;
++    const uint32_t sel = lds_byte_off(book, off);
++    w[2 * o] = prmt(FB::kPos, FB::kNeg, sel);
++    w[2 * o + 1] = prmt(FB::kPos, FB::kNeg, sel >> 16);
++  }
++  const uint32_t sw = sub < 4 ? s01 : s23;
++  const int sh = ((sub >> 1) & 1) * 16 + (sub & 1) * 6;
++  const uint32_t f6 = (sw >> sh) & 63;
++  m0 = 2 * int(f6 & 7) + 1;
++  m1 = 2 * int(f6 >> 3) + 1;
++}
++
++// The old Group3::apply followed by `dot += ...`, which nvcc contracts to
++// FMUL, FMUL, FFMA(x, 0.125, dot) (checked in the old SASS); written out
++// with explicit roundings so the new kernels cannot contract differently.
++V41KF_HD float fast_dot(const uint32_t (&w)[8], const int (&q)[8], float d,
++                        float xd, int m0, int m1, float acc) {
++  int s0 = 0, s1 = 0;
++#pragma unroll
++  for (int i = 0; i < 4; ++i) s0 = dp4a(w[i], q[i], s0);
++#pragma unroll
++  for (int i = 4; i < 8; ++i) s1 = dp4a(w[i], q[i], s1);
++#if defined(__CUDA_ARCH__)
++  return __fmaf_rn(__fmul_rn(__fmul_rn(d, xd), __int2float_rn(s0 * m0 + s1 * m1)),
++                   0.125f, acc);
++#else
++  const volatile float a = d * xd;
++  const volatile float b = a * float(s0 * m0 + s1 * m1);
++  return __builtin_fmaf(b, 0.125f, acc);
++#endif
++}
++
++#if defined(__CUDACC__)
++
++template <int Type>
++__global__ void build_fast_table(uint32_t* __restrict__ out) {
++  const int i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i >= FastBook<Type>::kWords) return;
++  out[i] = fast_word<Type>(i, [](int k) -> int {
++    return turbomind::gemm::LatticeCodebook<Type>::value(k);
++  });
++}
++
++// Global table -> replicated shared table.
++template <int Type>
++__device__ __forceinline__ void fill_book(uint32_t* book,
++                                          const uint32_t* __restrict__ g,
++                                          int t, int nt) {
++  using FB = FastBook<Type>;
++  for (int i = t; i < FB::kSmemWords; i += nt) {
++    int src = i;
++    if constexpr (Type != 29)
++      src = i < FB::kSignBase ? i / FB::kGridR
++                              : FB::kGrid + (i - FB::kSignBase) / FB::kSignR;
++    book[i] = __ldg(g + src);
++  }
++}
++
++__device__ __forceinline__ uint32_t ldg16(const uint8_t* p) {
++  return __ldg(reinterpret_cast<const unsigned short*>(p));
++}
++
++// Raw fields of the 9 K blocks of one (row, sub) of a 2304-wide down row,
++// loaded block by block so the next unit's loads can replace the current
++// unit's as soon as each block is decoded. Ptr holds the per-row base
++// pointers, so every block load is [base + immediate]; pin() makes them
++// opaque so ptxas keeps them in registers instead of rebuilding them from
++// the row offset at every block.
++template <class T>
++__device__ __forceinline__ void pin_ptr(T*& p) {
++#if defined(__CUDA_ARCH__)
++  asm volatile("" : "+l"(p));
++#endif
++}
++template <int Type>
++struct DnRaw;
++template <int BB>  // IQ2_XXS (66) / IQ2_XS (74): 8 sub-block bytes at 2 + 8 s
++struct DnPtrIQ2 {
++  const uint8_t* row;
++  const uint32_t *pe, *po;  // word-aligned sub-block base, even / odd blocks
++  uint32_t a;               // byte misalignment of block 0's sub-block
++  __device__ __forceinline__ DnPtrIQ2(const uint8_t* r, int sub) : row(r) {
++    const uintptr_t x = reinterpret_cast<uintptr_t>(r + 2 + 8 * sub);
++    pe = reinterpret_cast<const uint32_t*>(x & ~uintptr_t(3));
++    po = reinterpret_cast<const uint32_t*>((x + BB) & ~uintptr_t(3));
++    a = uint32_t(x) & 3;
++  }
++  // 8 bytes of block j as three aligned words; BB j = 2 j (mod 4).
++  __device__ __forceinline__ const uint32_t* words(int j) const {
++    return (j & 1 ? po : pe) + (BB / 2) * (j >> 1);
++  }
++  __device__ __forceinline__ void pin() {
++    pin_ptr(row);
++    pin_ptr(pe);
++    pin_ptr(po);
++  }
++};
++template <>
++struct DnRaw<16> {
++  using Ptr = DnPtrIQ2<66>;
++  uint32_t x[9][3], dh[9], a;
++  __device__ __forceinline__ void set(const Ptr& p) { a = p.a; }
++  __device__ __forceinline__ void load(int j, const Ptr& p) {
++    const uint32_t* q = p.words(j);
++    x[j][0] = __ldg(q);
++    x[j][1] = __ldg(q + 1);
++    x[j][2] = __ldg(q + 2);
++    dh[j] = ldg16(p.row + 66 * j);
++  }
++  __device__ __forceinline__ void decode(int j, const uint32_t* book,
++                                         uint32_t lg, uint32_t ls, int,
++                                         uint32_t (&w)[8], float& d, int& m0,
++                                         int& m1) const {
++    const uint32_t sh = ((a + 2 * j) & 3) * 8;
++    const uint32_t w0 = __funnelshift_r(x[j][0], x[j][1], sh);
++    const uint32_t w1 = __funnelshift_r(x[j][1], x[j][2], sh);
++    dec16(w0, w1, book, lg, ls, w, m0, m1);
++    d = __half2float(__ushort_as_half((unsigned short)dh[j]));
++  }
++};
++template <>
++struct DnRaw<17> {
++  struct Ptr : DnPtrIQ2<74> {
++    const uint8_t* scp;  // scale byte of sub-block s of block 0
++    __device__ __forceinline__ Ptr(const uint8_t* r, int sub)
++        : DnPtrIQ2<74>(r, sub), scp(r + 66 + sub) {}
++    __device__ __forceinline__ void pin() {
++      DnPtrIQ2<74>::pin();
++      pin_ptr(scp);
++    }
++  };
++  uint32_t x[9][3], dh[9], sc[9], a;
++  __device__ __forceinline__ void set(const Ptr& p) { a = p.a; }
++  __device__ __forceinline__ void load(int j, const Ptr& p) {
++    const uint32_t* q = p.words(j);
++    x[j][0] = __ldg(q);
++    x[j][1] = __ldg(q + 1);
++    x[j][2] = __ldg(q + 2);
++    dh[j] = ldg16(p.row + 74 * j);
++    sc[j] = __ldg(p.scp + 74 * j);
++  }
++  __device__ __forceinline__ void decode(int j, const uint32_t* book,
++                                         uint32_t, uint32_t ls, int,
++                                         uint32_t (&w)[8], float& d, int& m0,
++                                         int& m1) const {
++    const uint32_t sh = ((a + 2 * j) & 3) * 8;
++    const uint32_t w0 = __funnelshift_r(x[j][0], x[j][1], sh);
++    const uint32_t w1 = __funnelshift_r(x[j][1], x[j][2], sh);
++    dec17(w0, w1, sc[j], book, ls, w, m0, m1);
++    d = __half2float(__ushort_as_half((unsigned short)dh[j]));
++  }
++};
++template <>
++struct DnRaw<29> {
++  struct Ptr {
++    const uint8_t *row, *qsp, *qhp;
++    __device__ __forceinline__ Ptr(const uint8_t* r, int sub)
++        : row(r), qsp(r + 4 * sub), qhp(r + 32 + 2 * sub) {}
++    __device__ __forceinline__ void pin() {
++      pin_ptr(row);
++      pin_ptr(qsp);
++      pin_ptr(qhp);
++    }
++  };
++  uint32_t qs[9], qh[9], s01[9], s23[9];
++  __device__ __forceinline__ void set(const Ptr&) {}
++  __device__ __forceinline__ void load(int j, const Ptr& p) {
++    qs[j] = __ldg(reinterpret_cast<const uint32_t*>(p.qsp + 56 * j));
++    qh[j] = ldg16(p.qhp + 56 * j);
++    const uint2 sc = __ldg(reinterpret_cast<const uint2*>(p.row + 56 * j + 48));
++    s01[j] = sc.x;
++    s23[j] = sc.y;
++  }
++  __device__ __forceinline__ void decode(int j, const uint32_t* book, uint32_t,
++                                         uint32_t, int sub, uint32_t (&w)[8],
++                                         float& d, int& m0, int& m1) const {
++    dec29(qs[j], qh[j], s01[j], s23[j], sub, book, w, m0, m1);
++    d = __half2float(__ushort_as_half(iq1m_d_bits(s01[j], s23[j])));
++  }
++};
++
++__device__ __forceinline__ void load_act(const uint8_t* pq, const float* px,
++                                         int (&q)[8], float& d) {
++  const int4* p = reinterpret_cast<const int4*>(pq);
++  const int4 a = __ldg(p), b = __ldg(p + 1);
++  q[0] = a.x;
++  q[1] = a.y;
++  q[2] = a.z;
++  q[3] = a.w;
++  q[4] = b.x;
++  q[5] = b.y;
++  q[6] = b.z;
++  q[7] = b.w;
++  d = __ldg(px);
++}
++
++// Gathered activations of group g = sub + 8 j (K block j of a lane): rank
++// block g / 18, group g % 18. With the rank stride RS a compile-time constant
++// the offsets from the per-route base (gathered + rt * 576 + 32 sub for hq,
++// gathered + QB + rt * 72 + 4 sub for hd) are immediates, except for j = 2, 4,
++// 6, where lanes with sub >= j fall in the next rank block.
++__device__ __forceinline__ int act_rank(int j, int sub) {
++  constexpr int lo[9] = {0, 0, 0, 1, 1, 2, 2, 3, 3};
++  return lo[j] + int((j == 2 || j == 4 || j == 6) && sub >= j);
++}
++
++// Row-split down, same contract as down_rows (see v41k.cu) for M tokens x
++// top-6 routes: rows [row_base, row_base + rows_local) of out are written,
++// the other ranks' rows zeroed. 16 rows per CTA (grid = rows_local / 16 = 80,
++// one per SM), 16 warps. A unit is (distinct expert q, 4-row slab): one warp,
++// lane = (row r = lane / 8, sub s = lane % 8), K block j = 0..8 -> group
++// s + 8 j. Each block is decoded once; member 0 of the expert always runs,
++// members 1..5 behind a warp-uniform early exit. Units are claimed
++// dynamically one ahead, and the next unit's raw blocks are loaded into the
++// registers of the current unit's blocks right after each is decoded.
++constexpr int kDnRows = 16, kDnWarps = 16;
++
++template <int Type, int M>
++__global__ void __launch_bounds__(32 * kDnWarps, 1)
++    down_rows_fast(half* __restrict__ out, const uint8_t* __restrict__ gathered,
++                   const uint8_t* __restrict__ down, int row_stride,
++                   int rows_local, int row_base,
++                   const uint32_t* __restrict__ fbook, int classes,
++                   const int* __restrict__ plan) {
++  using FB = FastBook<Type>;
++  constexpr int LG = 18, N = 5120, TOP_K = 6, ROUTES = M * TOP_K;
++  constexpr int RS = (ROUTES * 648 + 255) / 256 * 256, QB = ROUTES * 576;
++  __shared__ __align__(16) uint32_t book[FB::kSmemWords];
++  __shared__ int s_e[36], s_cnt[36], s_route[36][6], s_key[36], s_nu, s_next;
++  __shared__ half s_v[36][kDnRows];
++  const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++  const int r4 = lane >> 3, sub = lane & 7;
++  const int row0 = blockIdx.x * kDnRows;
++
++  if (t < 36) {
++    s_e[t] = __ldg(plan + 1 + t);
++    s_cnt[t] = __ldg(plan + 37 + t);
++    s_key[t] = -1;
++  } else if (t >= 64 && t < 64 + 216) {
++    s_route[(t - 64) / 6][(t - 64) % 6] = __ldg(plan + 73 + (t - 64));
++  } else if (t == 40) {
++    s_nu = __ldg(plan);
++    s_next = kDnWarps;
++  }
++  // First unit's weights in flight while the table is built.
++  const int units = 4 * __ldg(plan);
++  int u = warp;
++  DnRaw<Type> raw;
++  using Ptr = typename DnRaw<Type>::Ptr;
++  if (u < units) {
++    const Ptr p0(down + (int64_t(__ldg(plan + 1 + (u >> 2))) * rows_local +
++                         row0 + (u & 3) * 4 + r4) *
++                            row_stride,
++                 sub);
++    raw.set(p0);
++#pragma unroll
++    for (int j = 0; j < 9; ++j) raw.load(j, p0);
++  }
++  // Lane byte offsets into the replicated tables, kept in registers (opaque
++  // to the compiler, which would otherwise re-mask the lane per lookup).
++  uint32_t lg = uint32_t(lane) * 4, ls = uint32_t(lane & 15) * 4;
++#if defined(__CUDA_ARCH__)
++  asm volatile("" : "+r"(lg), "+r"(ls));
++#endif
++  fill_book<Type>(book, fbook, t, 32 * kDnWarps);
++  __syncthreads();
++  const int nu = s_nu;
++  if (warp == kDnWarps - 1) {
++    // Old accumulation order of token k: class q % classes, then q, then c.
++    for (int i = lane; i < 216; i += 32) {
++      const int q = i / 6, c = i % 6;
++      if (q < nu && c < s_cnt[q])
++        s_key[s_route[q][c]] = (q % classes) << 16 | q << 3 | c;
++    }
++  }
++  const uint8_t* const gq = gathered + 32 * sub;
++  const float* const gd = reinterpret_cast<const float*>(gathered + QB) + sub;
++  while (u < units) {
++    int nxt = 0;
++    if (lane == 0) nxt = atomicAdd(&s_next, 1);
++    nxt = __shfl_sync(0xffffffffU, nxt, 0);
++    const bool more = nxt < units;
++    Ptr np(down + (more ? (int64_t(s_e[nxt >> 2]) * rows_local + row0 +
++                           (nxt & 3) * 4 + r4) *
++                              row_stride
++                        : 0),
++           sub);
++    np.pin();
++    const int q = u >> 2, slab = u & 3, cnt = s_cnt[q];
++    int rt[6];
++#pragma unroll
++    for (int c = 0; c < 6; ++c) rt[c] = s_route[q][c];
++    const uint8_t* const pq0 = gq + rt[0] * (LG * 32);
++    const float* const pd0 = gd + rt[0] * LG;
++    float p[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++#pragma unroll
++    for (int j = 0; j < 9; ++j) {
++      uint32_t w[8];
++      float d;
++      int m0, m1;
++      raw.decode(j, book, lg, ls, sub, w, d, m0, m1);
++      if (more) raw.load(j, np);
++      const int rank = act_rank(j, sub);  // (sub + 8 j) / 18
++      const int qo = 256 * j + rank * (RS - LG * 32);
++      const int dof = 8 * j + rank * ((RS - LG * 4) / 4);
++      {
++        int qv[8];
++        float xd;
++        load_act(pq0 + qo, pd0 + dof, qv, xd);
++        p[0] = fast_dot(w, qv, d, xd, m0, m1, p[0]);
++      }
++#pragma unroll
++      for (int c = 1; c < 6; ++c) {
++        if (c >= cnt) break;
++        int qv[8];
++        float xd;
++        load_act(gq + rt[c] * (LG * 32) + qo, gd + rt[c] * LG + dof, qv, xd);
++        p[c] = fast_dot(w, qv, d, xd, m0, m1, p[c]);
++      }
++    }
++#pragma unroll
++    for (int c = 0; c < 6; ++c) {
++      if (c >= cnt) break;
++      p[c] += __shfl_xor_sync(0xffffffffU, p[c], 1);
++      p[c] += __shfl_xor_sync(0xffffffffU, p[c], 2);
++      p[c] += __shfl_xor_sync(0xffffffffU, p[c], 4);
++      if (sub == 0) s_v[rt[c]][slab * 4 + r4] = __float2half_rn(p[c]);
++    }
++    if (more) raw.set(np);
++    u = nxt;
++  }
++  __syncthreads();
++  if (t < kDnRows * M) {
++    const int k = t / kDnRows, rl = t % kDnRows;
++    int key[TOP_K];
++#pragma unroll
++    for (int i = 0; i < TOP_K; ++i) key[i] = s_key[k * TOP_K + i];
++    float total = 0.f, acc = 0.f;
++    int last = -1, cls = -1;
++#pragma unroll
++    for (int n = 0; n < TOP_K; ++n) {
++      int best = 0x7fffffff, bi = 0;
++#pragma unroll
++      for (int i = 0; i < TOP_K; ++i)
++        if (key[i] > last && key[i] < best) {
++          best = key[i];
++          bi = i;
++        }
++      if (best != 0x7fffffff) {
++        last = best;
++        if ((best >> 16) != cls) {
++          if (cls >= 0) total += acc;
++          acc = 0.f;
++          cls = best >> 16;
++        }
++        acc += __half2float(s_v[k * TOP_K + bi][rl]);
++      }
++    }
++    if (cls >= 0) total += acc;
++    out[k * N + row_base + row0 + rl] = __float2half_rn(total);
++#pragma unroll
++    for (int o = 0; o < 4; ++o)
++      if (o * rows_local != row_base)
++        out[k * N + o * rows_local + row0 + rl] = __float2half_rn(0.f);
++  }
++}
++
++#endif  // __CUDACC__
++}  // namespace v41k_fast
+diff --git a/benchmarks/deepseek_v41/v41k/v41k_fast_gu.cuh b/benchmarks/deepseek_v41/v41k/v41k_fast_gu.cuh
+new file mode 100644
+index 0000000000..be87fa3bd8
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41k/v41k_fast_gu.cuh
+@@ -0,0 +1,268 @@
++// EXPERT_FAST gate/up (VLLM_V41_EXPERT_FAST=1): gate_up_fast<Type>, a
++// bit-identical replacement for v41k::gate_up_em5<Type> in plan mode (the
++// kernel gate_up7 and gate_up7p launch).
++//
++// Same 512 threads per (expert, 32-row slab) and the same thread -> work map:
++// row = slab * 32 + warp * 2 + lane / 16, lane l = lane % 16 takes groups l +
++// 16 i (i = 0..9) of the 160 K groups, block (l / 8) + 2 i, sub-block l % 8.
++// The grid is persistent (one CTA per SM walks the 18 nu units) instead of
++// one CTA per unit. Per member c the gate
++// and up partials are the same serial chain FFMA(FMUL(FMUL(d, xd), I2F(s0 m0
++// + s1 m1)), 0.125, acc) from +0 over i, the same xor 8, 4, 2, 1 butterfly,
++// and the epilogue (half rounding, clamp 10, silu with expf, x up x prob,
++// half rounding, q8_warp_aligned) is the old code. Only the decode differs:
++// PRMT selectors over the bank-replicated fast table (v41k_fast.cuh, proved
++// equal to Group3 for every code), filled once per CTA while the first
++// weights are in flight, and weights loaded two steps ahead.
++//
++// Included by v41k.cu after v41k::load_q8 and v41k::q8_warp_aligned.
++#pragma once
++#include "v41k_fast.cuh"
++
++#if defined(__CUDACC__)
++namespace v41k_fast {
++
++// One sub-block (32 weights) of one row for step i = block (l / 8) + 2 i.
++template <int Type>
++struct GuRaw;
++template <>
++struct GuRaw<29> {  // IQ1_M, 56-byte blocks; a step advances 112 bytes
++  struct Ptr {
++    const uint8_t *qsp, *qhp, *scp;
++    __device__ __forceinline__ Ptr(const uint8_t* blk, int sub)
++        : qsp(blk + 4 * sub), qhp(blk + 32 + 2 * sub), scp(blk + 48) {}
++    __device__ __forceinline__ void pin() {
++      pin_ptr(qsp);
++      pin_ptr(qhp);
++      pin_ptr(scp);
++    }
++  };
++  uint32_t qs, qh, s01, s23;
++  __device__ __forceinline__ void load(const Ptr& p, int i) {
++    qs = __ldg(reinterpret_cast<const uint32_t*>(p.qsp + 112 * i));
++    qh = ldg16(p.qhp + 112 * i);
++    const uint2 sc = __ldg(reinterpret_cast<const uint2*>(p.scp + 112 * i));
++    s01 = sc.x;
++    s23 = sc.y;
++  }
++  int sub;
++  __device__ __forceinline__ void decode(const uint32_t* book, uint32_t,
++                                         uint32_t, uint32_t, uint32_t (&w)[8],
++                                         float& d, int& m0, int& m1) const {
++    dec29(qs, qh, s01, s23, sub, book, w, m0, m1);
++    d = __half2float(__ushort_as_half(iq1m_d_bits(s01, s23)));
++  }
++};
++// IQ2_XXS / IQ2_XS: the 8 sub-block bytes at block + 2 + 8 sub as three
++// aligned words. Rows start 4-byte aligned (checked by the host) and BB = 2
++// (mod 4), so block l / 8 + 2 i starts 2 (l < 8) or 0 bytes into a word: the
++// funnel shift is 16 or 0 bits, fixed per lane.
++template <int BB>
++struct GuPtrIQ2 {
++  const uint32_t* pw;  // aligned word holding the sub-block's first byte
++  const uint8_t* dp;   // block start (fp16 d)
++  __device__ __forceinline__ GuPtrIQ2(const uint8_t* blk, int sub) : dp(blk) {
++    const uintptr_t x = reinterpret_cast<uintptr_t>(blk + 2 + 8 * sub);
++    pw = reinterpret_cast<const uint32_t*>(x & ~uintptr_t(3));
++  }
++  __device__ __forceinline__ void pin() {
++    pin_ptr(pw);
++    pin_ptr(dp);
++  }
++};
++template <>
++struct GuRaw<16> {  // IQ2_XXS, 66-byte blocks; a step advances 132 bytes
++  using Ptr = GuPtrIQ2<66>;
++  uint32_t x0, x1, x2, dh;
++  __device__ __forceinline__ void load(const Ptr& p, int i) {
++    x0 = __ldg(p.pw + 33 * i);
++    x1 = __ldg(p.pw + 33 * i + 1);
++    x2 = __ldg(p.pw + 33 * i + 2);
++    dh = ldg16(p.dp + 132 * i);
++  }
++  __device__ __forceinline__ void decode(const uint32_t* book, uint32_t lg,
++                                         uint32_t ls, uint32_t sh,
++                                         uint32_t (&w)[8], float& d, int& m0,
++                                         int& m1) const {
++    dec16(__funnelshift_r(x0, x1, sh), __funnelshift_r(x1, x2, sh), book, lg,
++          ls, w, m0, m1);
++    d = __half2float(__ushort_as_half((unsigned short)dh));
++  }
++};
++template <>
++struct GuRaw<17> {  // IQ2_XS, 74-byte blocks; a step advances 148 bytes
++  struct Ptr : GuPtrIQ2<74> {
++    const uint8_t* scp;  // scale byte of the sub-block
++    __device__ __forceinline__ Ptr(const uint8_t* blk, int sub)
++        : GuPtrIQ2<74>(blk, sub), scp(blk + 66 + sub) {}
++    __device__ __forceinline__ void pin() {
++      GuPtrIQ2<74>::pin();
++      pin_ptr(scp);
++    }
++  };
++  uint32_t x0, x1, x2, dh, sc;
++  __device__ __forceinline__ void load(const Ptr& p, int i) {
++    x0 = __ldg(p.pw + 37 * i);
++    x1 = __ldg(p.pw + 37 * i + 1);
++    x2 = __ldg(p.pw + 37 * i + 2);
++    dh = ldg16(p.dp + 148 * i);
++    sc = __ldg(p.scp + 148 * i);
++  }
++  __device__ __forceinline__ void decode(const uint32_t* book, uint32_t,
++                                         uint32_t ls, uint32_t sh,
++                                         uint32_t (&w)[8], float& d, int& m0,
++                                         int& m1) const {
++    dec17(__funnelshift_r(x0, x1, sh), __funnelshift_r(x1, x2, sh), sc, book,
++          ls, w, m0, m1);
++    d = __half2float(__ushort_as_half((unsigned short)dh));
++  }
++};
++
++// Per-unit plan entries: expert, member count, member Q8 row offsets.
++struct GuUnit {
++  int u, e, cnt, tok[6];  // tok[c] = (route / 6) * 160
++};
++__device__ __forceinline__ GuUnit gu_unit(const int* __restrict__ plan,
++                                          int unit) {
++  GuUnit g;
++  g.u = unit / 18;
++  g.e = __ldg(plan + 1 + g.u);
++  g.cnt = __ldg(plan + 37 + g.u);
++#pragma unroll
++  for (int c = 0; c < 6; ++c)
++    g.tok[c] = c < g.cnt ? __ldg(plan + 73 + 6 * g.u + c) / 6 * 160 : 0;
++  return g;
++}
++
++// Persistent: gridDim.x CTAs (one per SM) walk units = (distinct expert u,
++// 32-row slab) round-robin, unit = blockIdx.x + k gridDim.x < 18 nu. The
++// table is filled once per CTA. Weights are loaded two steps ahead (even /
++// odd raw sets); the last two steps of a unit load the next unit's first two.
++template <int Type>
++__global__ void __launch_bounds__(512, 1)
++    gate_up_fast(int8_t* __restrict__ hq, float* __restrict__ hd,
++                 const int8_t* __restrict__ xq, const float* __restrict__ xd,
++                 const float* __restrict__ prob,
++                 const uint8_t* __restrict__ gate,
++                 const uint8_t* __restrict__ up, int row_stride,
++                 const uint32_t* __restrict__ fbook,
++                 const int* __restrict__ plan) {
++  using FB = FastBook<Type>;
++  using Raw = GuRaw<Type>;
++  using Ptr = typename Raw::Ptr;
++  constexpr int STEPS = 10, SLABS = 18;
++  __shared__ __align__(16) uint32_t book[FB::kSmemWords];
++  __shared__ float red[2][6][2][32];
++  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++  const int units = SLABS * __ldg(plan);
++  int unit = blockIdx.x;
++  if (unit >= units) return;
++  const int l = lane & 15, sub = l & 7;
++  const int lrow = warp * 2 + lane / 16;
++  const int boff = (l >> 3) * FB::kBlock;
++  auto rows = [&](int un, int e) {
++    return (int64_t(e) * 576 + (un % SLABS) * 32 + lrow) * row_stride + boff;
++  };
++  GuUnit cur = gu_unit(plan, unit);
++  Ptr pg(gate + rows(unit, cur.e), sub), pu(up + rows(unit, cur.e), sub);
++  pg.pin();
++  pu.pin();
++  Raw ga, ua, gb, ub;  // steps 2k / 2k + 1
++  if constexpr (Type == 29) ga.sub = ua.sub = gb.sub = ub.sub = sub;
++  ga.load(pg, 0);  // in flight while the table is filled
++  ua.load(pu, 0);
++  gb.load(pg, 1);
++  ub.load(pu, 1);
++  uint32_t lg = uint32_t(lane) * 4, ls = uint32_t(lane & 15) * 4;
++  uint32_t sh = l < 8 ? 16 : 0;
++#if defined(__CUDA_ARCH__)
++  asm volatile("" : "+r"(lg), "+r"(ls), "+r"(sh));
++#endif
++  fill_book<Type>(book, fbook, t, 512);
++  __syncthreads();
++  int buf = 0;
++  while (true) {
++    const int nunit = unit + int(gridDim.x);
++    const bool more = nunit < units;
++    const GuUnit nxt = more ? gu_unit(plan, nunit) : cur;
++    float gs[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++    float us[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
++    auto step = [&](Raw& rg, Raw& ru, int i, int ahead) {
++      uint32_t wg[8], wu[8];
++      float dg, du;
++      int mg0, mg1, mu0, mu1;
++      rg.decode(book, lg, ls, sh, wg, dg, mg0, mg1);
++      ru.decode(book, lg, ls, sh, wu, du, mu0, mu1);
++      rg.load(pg, ahead);
++      ru.load(pu, ahead);
++      const int group = l + 16 * i;
++      {
++        int q[8];
++        float d;
++        v41k::load_q8(xq, xd, cur.tok[0] + group, q, d);
++        gs[0] = fast_dot(wg, q, dg, d, mg0, mg1, gs[0]);
++        us[0] = fast_dot(wu, q, du, d, mu0, mu1, us[0]);
++      }
++#pragma unroll
++      for (int c = 1; c < 6; ++c) {
++        if (c >= cur.cnt) break;  // block-uniform
++        int q[8];
++        float d;
++        v41k::load_q8(xq, xd, cur.tok[c] + group, q, d);
++        gs[c] = fast_dot(wg, q, dg, d, mg0, mg1, gs[c]);
++        us[c] = fast_dot(wu, q, du, d, mu0, mu1, us[c]);
++      }
++    };
++#pragma unroll 1
++    for (int k = 0; k < STEPS / 2; ++k) {
++      int ahead = 2 * k + 2;
++      if (k == STEPS / 2 - 1) {  // steps 8, 9: load the next unit's 0, 1
++        ahead = 0;
++        if (more) {
++          pg = Ptr(gate + rows(nunit, nxt.e), sub);
++          pu = Ptr(up + rows(nunit, nxt.e), sub);
++          pg.pin();
++          pu.pin();
++        }  // else: harmless reload of this unit's steps 0, 1
++      }
++      step(ga, ua, 2 * k, ahead);
++      step(gb, ub, 2 * k + 1, ahead + 1);
++    }
++#pragma unroll
++    for (int c = 0; c < 6; ++c) {
++      if (c >= cur.cnt) break;
++#pragma unroll
++      for (int o = 8; o; o >>= 1) {
++        gs[c] += __shfl_xor_sync(0xffffffffU, gs[c], o);
++        us[c] += __shfl_xor_sync(0xffffffffU, us[c], o);
++      }
++      if (lane % 16 == 0) {
++        red[buf][c][0][lrow] = gs[c];
++        red[buf][c][1][lrow] = us[c];
++      }
++    }
++    // red[buf] is rewritten two units later, after the next barrier, which
++    // every thread reaches only after this unit's epilogue.
++    __syncthreads();
++    // Epilogue: v41k::gate_up_em5's, verbatim.
++    if (warp < cur.cnt) {
++      const int route = __ldg(plan + 73 + 6 * cur.u + warp);
++      float g16 = __half2float(__float2half_rn(red[buf][warp][0][lane]));
++      float u16 = __half2float(__float2half_rn(red[buf][warp][1][lane]));
++      g16 = g16 > 10.f ? 10.f : g16;
++      u16 = u16 > 10.f ? 10.f : (u16 < -10.f ? -10.f : u16);
++      const float act = __fdiv_rn(g16, __fadd_rn(1.f, expf(-g16)));
++      const float value = __half2float(
++          __float2half_rn(__fmul_rn(__fmul_rn(act, u16), prob[route])));
++      v41k::q8_warp_aligned(hq, hd, int64_t(route) * 18 + unit % SLABS,
++                            value);
++    }
++    if (!more) break;
++    unit = nunit;
++    cur = nxt;
++    buf ^= 1;
++  }
++}
++
++}  // namespace v41k_fast
++#endif  // __CUDACC__
+diff --git a/tests/models/test_deepseek_v41_expert_fast.py b/tests/models/test_deepseek_v41_expert_fast.py
+new file mode 100644
+index 0000000000..968c79e273
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_expert_fast.py
+@@ -0,0 +1,259 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""VLLM_V41_EXPERT_FAST: registration and dispatch of the fast expert ops (CPU).
++
++The functions _v41_experts_rows, _v41_experts_rows_fast and _expert_fast_book
++are compiled from gguf_v41_moe.py and run against recorded fake ops: with the
++knob off gate/up and down are today's gate_up7 (gate_up7p after q8_plan with
++VLLM_V41_PLAN_FUSE) and down_rows calls; with it on gate/up is gate_up_fast
++with the same arguments, fast_table(source type) and build_plan exactly when
++gate_up7 would build the plan, and down is down_rows_fast with the same
++gathered buffer, stride, routes, row base and plan, classes 8 for dn_warps 8
++and 4 otherwise; rows != 4 and a library without the ops raise.
++
++Scope: Python dispatch only. Kernel equality is checked on the GPU by
++benchmarks/deepseek_v41/expert_fast_check.py (and on the host by the C++
++emulator in benchmarks/deepseek_v41/v41k/emu).
++
++    python tests/models/test_deepseek_v41_expert_fast.py   # or pytest
++"""
++
++import ast
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++CU = ROOT / "benchmarks/deepseek_v41/v41k/v41k.cu"
++MOE = ROOT / "vllm/model_executor/layers/quantization/gguf_v41_moe.py"
++FUNCS = ("_v41_experts_rows", "_v41_experts_rows_fast", "_expert_fast_book")
++
++
++class FakeTensor:
++    """Named stand-in; slices compose, so a name is the base buffer and the
++    absolute byte range (own[a:b][c:d] is own[a + c:a + d])."""
++
++    def __init__(self, name, shape=(1,), base=None, start=0, stop=None):
++        self.name, self.shape, self.device = name, shape, "dev"
++        self.base, self.start, self.stop = base or name, start, stop
++
++    def __getitem__(self, key):
++        lo = self.start + (key.start or 0)
++        hi = self.stop if key.stop is None else self.start + key.stop
++        return FakeTensor(f"{self.base}[{lo}:{hi}]", None, self.base, lo, hi)
++
++    def view(self, *args):
++        return self
++
++    def contiguous(self):
++        return self
++
++
++def _module(fast, ops, peer, plan_fuse=False):
++    tree = ast.parse(MOE.read_text())
++    fns = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in FUNCS]
++    assert sorted(n.name for n in fns) == sorted(FUNCS)
++    calls, logs = [], []
++
++    def op(name):
++        def call(*args):
++            calls.append((name, args))
++            if name == "fast_table":
++                return FakeTensor(f"fbook{args[0]}")
++
++        return call
++
++    def gate_up7(*args):
++        calls.append(("gate_up7", args))
++
++    def gate_up7p(*args):
++        calls.append(("gate_up7p", args))
++
++    def q8_and_plan(xq, xd, x, ids, plan):  # the contract of _q8_and_plan
++        if plan_fuse:
++            calls.append(("q8_plan", (xq, xd, x, ids, plan)))
++            return gate_up7p
++        calls.append(("q8_aligned", (xq, xd, x)))
++        return gate_up7
++
++    nccl = types.SimpleNamespace(all_gather=lambda dst, src: calls.append(("ag",)))
++    torch = types.SimpleNamespace(
++        ops=types.SimpleNamespace(
++            v41k=types.SimpleNamespace(**{n: op(n) for n in ops})
++        ),
++        empty=lambda shape, **k: FakeTensor("empty", shape),
++        empty_like=lambda x: FakeTensor("result"),
++        int8="int8",
++        float32="float32",
++        uint8="uint8",
++    )
++    own = FakeTensor("own")
++    ns = {
++        "torch": torch,
++        "_EXPERT_FAST": fast,
++        "_PLAN_FUSE": plan_fuse,
++        "_EM": {"books": {}},
++        "default_v41k_library": lambda: "/x/v41k.so",
++        "logger": types.SimpleNamespace(
++            info_once=lambda msg, *args, scope="local": logs.append((msg, scope))
++        ),
++        "_plan": lambda device: FakeTensor("plan"),
++        "_q8_and_plan": q8_and_plan,
++        "_PEER": {"dev": (2, (11, 12, 13, 14), own, 7)} if peer else {},
++        "_rows_context": lambda device: (1, nccl),
++        "_book": lambda kind, device: FakeTensor(f"book{kind}"),
++        "ROWS_FLAGS": 99,
++    }
++    exec(compile(ast.Module(fns, []), str(MOE), "exec"), ns)
++    return ns["_v41_experts_rows"], calls, logs
++
++
++def _run(fn, m=3, rows=4, warps=8, down_type=29):
++    x = FakeTensor("x", (m, 5120))
++    down = FakeTensor("down", (384, 1280, 504))
++    ids = FakeTensor("ids")
++    return fn(x, ids, FakeTensor("p"), "gate", "up", down, 16, down_type, rows, warps)
++
++
++OLD_OPS = ["down_rows", "peer_gather", "table"]
++NEW_OPS = OLD_OPS + ["fast_table", "gate_up_fast", "down_rows_fast"]
++# the v41k.so of 05dd566: down_rows_fast but no gate_up_fast
++DOWN_ONLY_OPS = OLD_OPS + ["fast_table", "down_rows_fast"]
++ROLE = {
++    "gate_up7": "gate/up",
++    "gate_up7p": "gate/up",
++    "gate_up_fast": "gate/up",
++    "down_rows": "down",
++    "down_rows_fast": "down",
++}
++
++
++def _down(calls):
++    return [c for c in calls if c[0] in ("down_rows", "down_rows_fast")]
++
++
++def _gate_up(calls):
++    return [c for c in calls if c[0] in ("gate_up7", "gate_up7p", "gate_up_fast")]
++
++
++def _names(args):
++    return [getattr(a, "name", a) for a in args]
++
++
++def _sequence(calls):
++    return [ROLE.get(c[0], c[0]) for c in calls if c[0] != "fast_table"]
++
++
++@pytest.mark.parametrize("peer", [True, False])
++@pytest.mark.parametrize("plan_fuse", [True, False])
++def test_knob_off_is_todays_gate_up_and_down_rows(peer, plan_fuse):
++    fn, calls, logs = _module(False, NEW_OPS, peer, plan_fuse)
++    _run(fn)
++    (gu,) = _gate_up(calls)
++    assert gu[0] == ("gate_up7p" if plan_fuse else "gate_up7")
++    assert gu[1][9].name == "book16" and gu[1][10].name == "plan"
++    (down,) = _down(calls)
++    assert down[0] == "down_rows" and down[1][8:10] == (4, 8)
++    assert down[1][7].name == "book29" and not logs
++    assert not any(
++        c[0] in ("fast_table", "gate_up_fast", "down_rows_fast") for c in calls
++    )
++
++
++@pytest.mark.parametrize("peer", [True, False])
++@pytest.mark.parametrize("plan_fuse", [True, False])
++def test_knob_on_gate_up_matches_gate_up7_arguments(peer, plan_fuse):
++    m = 4
++    fn_old, calls_old, _ = _module(False, NEW_OPS, peer, plan_fuse)
++    fn_new, calls_new, _ = _module(True, NEW_OPS, peer, plan_fuse)
++    _run(fn_old, m=m)
++    _run(fn_new, m=m)
++    (old,) = _gate_up(calls_old)
++    (new,) = _gate_up(calls_new)
++    assert new[0] == "gate_up_fast" and len(new[1]) == 12
++    # xq, xd, hq, hd, ids32, prob, gate, up, gtype: as gate_up7 / gate_up7p
++    assert _names(new[1][:9]) == _names(old[1][:9])
++    assert new[1][8] == 16 and new[1][6:8] == ("gate", "up")
++    assert new[1][9].name == "fbook16" and old[1][9].name == "book16"
++    assert new[1][10].name == old[1][10].name == "plan"
++    # build_plan: gate_up7 builds the plan (moe_plan), gate_up7p does not
++    assert new[1][11] is (not plan_fuse)
++    q8 = "q8_plan" if plan_fuse else "q8_aligned"
++    gather = "peer_gather" if peer else "ag"
++    assert (
++        _sequence(calls_new) == _sequence(calls_old) == [q8, "gate/up", gather, "down"]
++    )
++
++
++@pytest.mark.parametrize("peer", [True, False])
++@pytest.mark.parametrize("warps,classes", [(8, 8), (4, 4), (16, 4)])
++def test_knob_on_matches_down_rows_arguments(peer, warps, classes):
++    m = 5
++    fn_old, calls_old, _ = _module(False, NEW_OPS, peer)
++    fn_new, calls_new, logs = _module(True, NEW_OPS, peer)
++    _run(fn_old, m=m, warps=warps)
++    _run(fn_new, m=m, warps=warps)
++    (old,) = _down(calls_old)
++    (new,) = _down(calls_new)
++    assert new[0] == "down_rows_fast"
++    stride = (m * 6 * 648 + 255) // 256 * 256
++    rank = 2 if peer else 1
++    # out, gathered, stride, routes, down, dtype, row_base: as down_rows
++    assert [getattr(a, "name", a) for a in new[1][:7]] == [
++        getattr(a, "name", a) for a in old[1][:7]
++    ]
++    assert new[1][2:4] == (stride, m * 6) and new[1][6] == rank * 1280
++    assert new[1][1].name == ("own" if peer else "empty")
++    assert new[1][7].name == "fbook29" and new[1][8] == classes
++    assert new[1][9].name == old[1][10].name == "plan"
++    # the same launches in the same order
++    assert _sequence(calls_new) == _sequence(calls_old)
++    assert len(logs) == 2 and "VLLM_V41_EXPERT_FAST=1" in logs[0][0]
++    # every PP / TP worker logs its activation line, not only rank 0
++    assert all(scope == "process" for _, scope in logs)
++
++
++def test_fast_table_built_once_per_type():
++    fn, calls, logs = _module(True, NEW_OPS, True)
++    for down_type in (29, 16, 29, 16, 17):
++        _run(fn, down_type=down_type)
++    built = [c[1][0] for c in calls if c[0] == "fast_table"]
++    # gate/up source type 16 first, then the down types as they appear
++    assert built == [16, 29, 17] and len(logs) == 3  # info_once dedups in vLLM
++
++
++def test_knob_on_other_row_tile_raises():
++    fn, calls, _ = _module(True, NEW_OPS, True)
++    with pytest.raises(ValueError, match="rows=4"):
++        _run(fn, rows=8)
++    assert not calls
++
++
++@pytest.mark.parametrize("ops", [OLD_OPS, DOWN_ONLY_OPS])
++def test_knob_on_with_an_old_library_raises(ops):
++    fn, calls, _ = _module(True, ops, True)
++    with pytest.raises(RuntimeError, match="VLLM_V41_EXPERT_FAST=1 needs") as err:
++        _run(fn)
++    assert "gate_up_fast" in str(err.value) and "/x/v41k.so" in str(err.value)
++    assert not calls
++
++
++def test_registration():
++    src = CU.read_text()
++    assert '#include "v41k_fast.cuh"' in src
++    assert '#include "v41k_fast_gu.cuh"' in src
++    assert '"gate_up_fast(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, "' in src
++    assert '"Tensor fbook, Tensor(c!) plan, bool build_plan) -> ()",' in src
++    assert '"fast_table(int type, Device device) -> Tensor"' in src
++    assert '"down_rows_fast(Tensor(a!) out, Tensor gathered, int rank_stride, "' in src
++    envs = (ROOT / "vllm/envs.py").read_text()
++    assert '    VLLM_V41_EXPERT_FAST: str = "0"\n' in envs
++    assert 'lambda: os.getenv("VLLM_V41_EXPERT_FAST", "0")' in envs
++    assert '_EXPERT_FAST = envs.VLLM_V41_EXPERT_FAST == "1"' in MOE.read_text()
++    ast.parse((ROOT / "benchmarks/deepseek_v41/expert_fast_check.py").read_text())
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-q"]))
+diff --git a/tests/models/test_deepseek_v41_plan_fuse.py b/tests/models/test_deepseek_v41_plan_fuse.py
+new file mode 100644
+index 0000000000..d389c24da2
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_plan_fuse.py
+@@ -0,0 +1,228 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""VLLM_V41_PLAN_FUSE: the register plan must write moe_plan's plan (CPU).
++
++``plan_warp`` (v41k.cu, run inside the q8_plan launch) replaces the
++shared-memory ``moe_plan`` kernel. Both are modelled here lane by lane as
++written in CUDA and must write the same entries with the same values for any
++ids (repeats across rows, dropped routes id < 0, 0..36 routes). The dispatch
++test runs ``_q8_and_plan`` against recorded fake ops.
++
++Scope: a Python model of the two kernels, not the GPU. The GPU check is
++benchmarks/deepseek_v41/plan_fuse_check.py.
++
++    python tests/models/test_deepseek_v41_plan_fuse.py   # or pytest
++"""
++
++import ast
++import random
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++CU = ROOT / "benchmarks/deepseek_v41/v41k/v41k.cu"
++MOE = ROOT / "vllm/model_executor/layers/quantization/gguf_v41_moe.py"
++
++
++def _popc(x):
++    return bin(x & 0xFFFFFFFF).count("1")
++
++
++def moe_plan(ids, routes):
++    """v41k::moe_plan, one warp, as written (shared s_ids, serial scans)."""
++    plan = {}
++    s_ids = [ids[r] if r < routes else -1 for r in range(64)]
++    e = {(lane, h): s_ids[lane + 32 * h] for lane in range(32) for h in range(2)}
++    first = {}
++    for lane in range(32):
++        for h in range(2):
++            r = lane + 32 * h
++            f = r < routes and e[lane, h] >= 0
++            q = 0
++            while q < r and f:
++                f = s_ids[q] != e[lane, h]
++                q += 1
++            first[lane, h] = f
++    b0 = sum(1 << lane for lane in range(32) if first[lane, 0])
++    b1 = sum(1 << lane for lane in range(32) if first[lane, 1])
++    s_first_u = {}
++    for lane in range(32):
++        below = (1 << lane) - 1
++        for h in range(2):
++            r = lane + 32 * h
++            u = _popc(b0 & below) if h == 0 else _popc(b0) + _popc(b1 & below)
++            if first[lane, h]:
++                s_first_u[r] = u
++    for lane in range(32):
++        for h in range(2):
++            r = lane + 32 * h
++            if r >= routes or e[lane, h] < 0:
++                continue
++            q0 = 0
++            while s_ids[q0] != e[lane, h]:
++                q0 += 1
++            c = sum(s_ids[q] == e[lane, h] for q in range(q0, r))
++            u = s_first_u[q0]
++            if c < 6:
++                plan[73 + 6 * u + c] = r
++            if first[lane, h]:
++                cnt = sum(s_ids[q] == e[lane, h] for q in range(r, routes))
++                plan[1 + u] = e[lane, h]
++                plan[37 + u] = min(cnt, 6)
++    plan[0] = _popc(b0) + _popc(b1)
++    return plan
++
++
++def plan_warp(ids, routes):
++    """v41k::plan_warp, one warp, as written (registers and shuffles)."""
++    plan = {}
++    lanes = range(32)
++    e = {
++        (ln, h): ids[ln + 32 * h] if ln + 32 * h < routes else -1
++        for ln in lanes
++        for h in range(2)
++    }
++    live = {k: k[0] + 32 * k[1] < routes and e[k] >= 0 for k in e}
++    c = dict.fromkeys(e, 0)
++    cnt = dict.fromkeys(e, 0)
++    q0 = {k: k[0] + 32 * k[1] for k in e}
++    for q in range(routes):
++        src = {ln: e[ln, 0] if q < 32 else e[ln, 1] for ln in lanes}
++        v = src[q & 31]  # __shfl_sync(src, q & 31): same value in every lane
++        for ln, h in e:
++            r = ln + 32 * h
++            if live[ln, h] and v == e[ln, h]:
++                if q < r:
++                    c[ln, h] += 1
++                    q0[ln, h] = min(q0[ln, h], q)
++                else:
++                    cnt[ln, h] += 1
++    b0 = sum(1 << ln for ln in lanes if live[ln, 0] and c[ln, 0] == 0)
++    b1 = sum(1 << ln for ln in lanes if live[ln, 1] and c[ln, 1] == 0)
++    own0 = {ln: _popc(b0 & ((1 << ln) - 1)) for ln in lanes}
++    own1 = {ln: _popc(b0) + _popc(b1 & ((1 << ln) - 1)) for ln in lanes}
++    for ln, h in e:
++        u0, u1 = own0[q0[ln, h] & 31], own1[q0[ln, h] & 31]
++        u, r = (u0 if q0[ln, h] < 32 else u1), ln + 32 * h
++        if not live[ln, h]:
++            continue
++        if c[ln, h] < 6:
++            plan[73 + 6 * u + c[ln, h]] = r
++        if c[ln, h] == 0:
++            plan[1 + u] = e[ln, h]
++            plan[37 + u] = min(cnt[ln, h], 6)
++    plan[0] = _popc(b0) + _popc(b1)
++    return plan
++
++
++def _cases():
++    rng = random.Random(0)
++    yield [], 0
++    yield [-1] * 36, 36
++    yield [5] * 36, 36  # one expert: 36 routes, only 6 recorded
++    yield list(range(6)) * 6, 36
++    for _ in range(400):
++        rows = rng.randint(1, 6)
++        pool = rng.choice([6, 7, 8, 12, 24, 96, 384])
++        experts = rng.sample(range(384), pool)
++        ids = []
++        for _ in range(rows):
++            row = rng.sample(experts, 6)
++            keep = rng.choice([6, 6, 6, 5, 3, 1])
++            ids += row[:keep] + [-1] * (6 - keep)
++        yield ids, len(ids)
++
++
++@pytest.mark.parametrize("case", list(_cases()), ids=lambda c: f"r{c[1]}")
++def test_register_plan_writes_moe_plan_entries(case):
++    ids, routes = case
++    want = moe_plan(ids, routes)
++    got = plan_warp(ids, routes)
++    assert got == want
++    assert all(0 <= k < 73 + 216 for k in got)
++
++
++def test_kernel_sources_and_ops():
++    src = CU.read_text()
++    assert "void plan_warp(int* __restrict__ plan," in src
++    assert (
++        "if (blockIdx.x == 0 && threadIdx.x < 32) plan_warp(plan, ids, routes);" in src
++    )
++    assert "q8_aligned_row(qs, ds, x, K, blockIdx.y - 1);" in src
++    assert "q8_aligned_row(qs, ds, x, K, blockIdx.y);" in src
++    # gate_up7 keeps its own moe_plan launch; gate_up7p skips it.
++    assert (
++        "gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,\n"
++        "                true);" in src
++    )
++    assert (
++        "gate_up7_impl(xq, xd, hq, hd, ids32, prob, gate, up, gtype, gbook, plan,\n"
++        "                false);" in src
++    )
++    assert '"q8_plan(Tensor(a!) qs, Tensor(b!) ds, Tensor x, Tensor ids32, "' in src
++    assert (
++        '"gate_up7p(Tensor xq, Tensor xd, Tensor(a!) hq, Tensor(b!) hd, Tensor "' in src
++    )
++    envs = (ROOT / "vllm/envs.py").read_text()
++    assert '    VLLM_V41_PLAN_FUSE: str = "0"\n' in envs
++    assert 'lambda: os.getenv("VLLM_V41_PLAN_FUSE", "0")' in envs
++    assert '_PLAN_FUSE = envs.VLLM_V41_PLAN_FUSE == "1"' in MOE.read_text()
++    ast.parse((ROOT / "benchmarks/deepseek_v41/plan_fuse_check.py").read_text())
++
++
++def _dispatch(fuse, ops):
++    tree = ast.parse(MOE.read_text())
++    fn = next(
++        n
++        for n in tree.body
++        if isinstance(n, ast.FunctionDef) and n.name == "_q8_and_plan"
++    )
++    calls = []
++
++    def op(name):
++        def call(*a):
++            calls.append(name)
++
++        call.name = name
++        return call
++
++    v41k = types.SimpleNamespace(**{n: op(n) for n in ops})
++    ns = {
++        "torch": types.SimpleNamespace(ops=types.SimpleNamespace(v41k=v41k)),
++        "_PLAN_FUSE": fuse,
++        "default_v41k_library": lambda: "/x/v41k.so",
++        "_PLAN_FUSE_LOGGED": False,
++        "logger": types.SimpleNamespace(
++            info=lambda msg, *a: calls.append(("log", msg))
++        ),
++    }
++    exec(compile(ast.Module([fn], []), str(MOE), "exec"), ns)
++    return ns["_q8_and_plan"], calls
++
++
++def test_dispatch_off_is_todays_ops():
++    fn, calls = _dispatch(False, ["q8_aligned", "gate_up7"])
++    nxt = fn(1, 2, 3, 4, 5)
++    assert calls == ["q8_aligned"] and nxt.name == "gate_up7"
++
++
++def test_dispatch_on_uses_fused_ops():
++    fn, calls = _dispatch(True, ["q8_aligned", "gate_up7", "q8_plan", "gate_up7p"])
++    nxt = fn(1, 2, 3, 4, 5)
++    fn(1, 2, 3, 4, 5)
++    log = ("log", "VLLM_V41_PLAN_FUSE=1: expert plan built in q8_plan, gate_up7p")
++    # the fused ops on every call; the activation logged once
++    assert calls == [log, "q8_plan", "q8_plan"] and nxt.name == "gate_up7p"
++
++
++def test_dispatch_on_with_an_old_library_raises():
++    fn, _ = _dispatch(True, ["q8_aligned", "gate_up7"])
++    with pytest.raises(RuntimeError, match="VLLM_V41_PLAN_FUSE=1 needs"):
++        fn(1, 2, 3, 4, 5)
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-q"]))
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..764b6d5793 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -474,6 +474,7 @@
+     VLLM_V41_EMPTY_CACHE_TOKENS: str = "2048"
+     VLLM_V41_ENGRAM_READERS: str | None = None
+     VLLM_V41_EXACT_GEMM: str = "0"
++    VLLM_V41_EXPERT_FAST: str = "0"
+     VLLM_V41_EXPERT_FAST_HIT: str = "1"
+     VLLM_V41_FP8_GEMV: str = "1"
+     VLLM_V41_FREE_SLOTS: str | None = None
+@@ -500,6 +501,7 @@
+     VLLM_V41_MAX_LEN: str = "16384"
+     VLLM_V41_MISS_HIST: str = "0"
+     VLLM_V41_PACKED_KV: str | None = None
++    VLLM_V41_PLAN_FUSE: str = "0"
+     VLLM_V41_PLAN_STATS: str | None = None
+     VLLM_V41_PRED_STATS: str = "0"
+     VLLM_V41_PREFETCH: str = "0"
+@@ -7386,6 +7388,24 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_EXPERT_FAST": env_var(
++        lambda: os.getenv("VLLM_V41_EXPERT_FAST", "0"),
++        description=(
++            "DS-V4.1 TP4 row-split experts: 1 = gate/up on the v41k"
++            " gate_up_fast kernel and the down projection on down_rows_fast"
++            " (PRMT selector decode, bank-replicated codebooks, one CTA per"
++            " SM). Bit-identical to gate_up7 / gate_up7p and to down_rows at"
++            " row tile rows=4 (the default '4,8'; other tiles raise); needs a"
++            " v41k build with fast_table, gate_up_fast and down_rows_fast,"
++            " otherwise raises at first use."
++        ),
++        category="tuning",
++        declared_default="'0'",
++        effective_default="'0'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
+     "VLLM_V41_EXPERT_FAST_HIT": env_var(
+         lambda: os.getenv("VLLM_V41_EXPERT_FAST_HIT", "1"),
+         description=("DS-V4.1 SM70 runtime switch (developer)."),
+@@ -7666,6 +7686,20 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_PLAN_FUSE": env_var(
++        lambda: os.getenv("VLLM_V41_PLAN_FUSE", "0"),
++        description=(
++            "DS-V4.1 TP4 row-split experts: 1 = build the per-layer expert "
++            "plan inside the q8 activation launch (v41k q8_plan + gate_up7p) "
++            "instead of a separate moe_plan launch; same plan bit for bit."
++        ),
++        category="tuning",
++        declared_default="'0'",
++        effective_default="'0'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
+     "VLLM_V41_PLAN_STATS": env_var(
+         lambda: os.getenv("VLLM_V41_PLAN_STATS"),
+         description=("DS-V4.1 SM70 runtime switch (developer)."),
+diff --git a/vllm/model_executor/layers/quantization/gguf_v41_moe.py b/vllm/model_executor/layers/quantization/gguf_v41_moe.py
+index 86f874a9ea..0633957383 100644
+--- a/vllm/model_executor/layers/quantization/gguf_v41_moe.py
++++ b/vllm/model_executor/layers/quantization/gguf_v41_moe.py
+@@ -9,9 +9,12 @@
+ 
+ import vllm.envs as envs
+ from vllm._sm70.policy import register_policy_op
++from vllm.logger import init_logger
+ 
+ from .gguf_native import native_dense
+ 
++logger = init_logger(__name__)
++
+ 
+ def v41_fp16_experts(
+     x,
+@@ -145,6 +148,33 @@ def _expert_major_ready():
+ os.environ.setdefault("VLLM_V41_EM8", "0")  # single-barrier down: no gain measured
+ 
+ 
++_PLAN_FUSE = envs.VLLM_V41_PLAN_FUSE == "1"
++_PLAN_FUSE_LOGGED = False
++
++
++def _q8_and_plan(xq, xd, x, ids32, plan):
++    """Quantize x for the expert rows path and build this layer's expert plan.
++
++    Returns the gate/up op to call next: gate_up7 builds the plan itself in a
++    separate moe_plan launch; with VLLM_V41_PLAN_FUSE=1 q8_plan builds the
++    same plan inside the quantization launch and gate_up7p skips moe_plan.
++    """
++    if not _PLAN_FUSE:
++        torch.ops.v41k.q8_aligned(xq, xd, x)
++        return torch.ops.v41k.gate_up7
++    if not hasattr(torch.ops.v41k, "q8_plan"):
++        raise RuntimeError(
++            "VLLM_V41_PLAN_FUSE=1 needs a v41k.so with q8_plan and gate_up7p "
++            "(rebuild benchmarks/deepseek_v41/v41k); loaded: " + default_v41k_library()
++        )
++    global _PLAN_FUSE_LOGGED
++    if not _PLAN_FUSE_LOGGED:
++        _PLAN_FUSE_LOGGED = True
++        logger.info("VLLM_V41_PLAN_FUSE=1: expert plan built in q8_plan, gate_up7p")
++    torch.ops.v41k.q8_plan(xq, xd, x, ids32, plan)
++    return torch.ops.v41k.gate_up7p
++
++
+ def _plan(device):
+     key = ("plan", device)
+     if key not in _EM["books"]:  # type: ignore[operator]
+@@ -188,24 +218,132 @@ def _rows_context(device):
+     return _ROWS[device]
+ 
+ 
++_EXPERT_FAST = envs.VLLM_V41_EXPERT_FAST == "1"
++
++
++def _expert_fast_book(kind, device):
++    """v41k fast_table(kind) once per device; checks the library has the ops."""
++    key = ("fast", kind, device)
++    if key not in _EM["books"]:  # type: ignore[operator]
++        missing = [
++            op
++            for op in ("fast_table", "gate_up_fast", "down_rows_fast")
++            if not hasattr(torch.ops.v41k, op)
++        ]
++        if missing:
++            raise RuntimeError(
++                "VLLM_V41_EXPERT_FAST=1 needs a v41k.so with "
++                + " and ".join(missing)
++                + " (rebuild benchmarks/deepseek_v41/v41k); loaded: "
++                + default_v41k_library()
++            )
++        logger.info_once(
++            "VLLM_V41_EXPERT_FAST=1: routed experts on v41k gate_up_fast and "
++            "down_rows_fast (bit-identical to gate_up7 / gate_up7p and to "
++            "down_rows at row tile rows=4)",
++            scope="process",
++        )
++        book = torch.ops.v41k.fast_table(kind, device)
++        _EM["books"][key] = book  # type: ignore[index]
++    return _EM["books"][key]  # type: ignore[index]
++
++
++def _v41_experts_rows_fast(
++    x, ids32, probabilities, gate, up, down, source_type, down_type, rows, warps
++):
++    """_v41_experts_rows with gate/up on gate_up_fast and down on down_rows_fast.
++
++    gate_up_fast reproduces gate_up7 (build_plan=True: moe_plan first) and
++    gate_up7p (build_plan=False: the plan q8_plan built under
++    VLLM_V41_PLAN_FUSE) bit for bit. down_rows_fast reproduces
++    down_rows(rows=4, dn_warps=warps) bit for bit (warps == 8: eight
++    accumulation classes, anything else: four, as in down_rows); other row
++    tiles change the FP order, so they are refused.
++    """
++    if rows != 4:
++        raise ValueError(
++            "VLLM_V41_EXPERT_FAST=1 matches down_rows only at row tile rows=4 "
++            f"(VLLM_V41_ROWS_TILE '4,8'); got rows={rows}"
++        )
++    gbook = _expert_fast_book(source_type, x.device)
++    fbook = _expert_fast_book(down_type, x.device)
++    m = x.shape[0]
++    routes = m * 6
++    stride = (routes * 648 + 255) // 256 * 256
++    xq = torch.empty((m, 160, 32), dtype=torch.int8, device=x.device)
++    xd = torch.empty((m, 160), dtype=torch.float32, device=x.device)
++    plan = _plan(x.device)
++    # q8_aligned, or q8_plan + plan under VLLM_V41_PLAN_FUSE; gate_up_fast
++    # then builds the plan itself exactly when gate_up7 would have.
++    _q8_and_plan(xq, xd, x.contiguous(), ids32, plan)
++    peer = _PEER.get(x.device)
++    if peer is not None and hasattr(torch.ops.v41k, "peer_gather"):
++        rank, pointers, own, epoch = peer
++        hq = own[rank * stride : rank * stride + routes * 576]
++        hd = own[rank * stride + routes * 576 : rank * stride + routes * 648]
++        gathered = own
++    else:
++        rank, nccl = _rows_context(x.device)
++        packed = torch.empty(stride, dtype=torch.uint8, device=x.device)
++        hq = packed[: routes * 576]
++        hd = packed[routes * 576 : routes * 648]
++    torch.ops.v41k.gate_up_fast(
++        xq,
++        xd,
++        hq.view(torch.int8).view(routes, 18, 32),
++        hd.view(torch.float32).view(routes, 18),
++        ids32,
++        probabilities.contiguous(),
++        gate,
++        up,
++        source_type,
++        gbook,
++        plan,
++        not _PLAN_FUSE,
++    )
++    if peer is not None and hasattr(torch.ops.v41k, "peer_gather"):
++        torch.ops.v41k.peer_gather(*pointers, rank, stride, ROWS_FLAGS, epoch)
++    else:
++        gathered = torch.empty(4 * stride, dtype=torch.uint8, device=x.device)
++        nccl.all_gather(gathered, packed)
++    result = torch.empty_like(x)  # down_rows_fast writes zeros in other rows
++    torch.ops.v41k.down_rows_fast(
++        result,
++        gathered,
++        stride,
++        routes,
++        down,
++        down_type,
++        rank * down.shape[1],
++        fbook,
++        8 if warps == 8 else 4,
++        plan,
++    )
++    return result
++
++
+ def _v41_experts_rows(
+     x, ids32, probabilities, gate, up, down, source_type, down_type, rows, warps
+ ):
+     """Row-split down: local Q8 h groups are gathered, then 1280 rows per rank."""
++    if _EXPERT_FAST:
++        return _v41_experts_rows_fast(
++            x, ids32, probabilities, gate, up, down, source_type, down_type, rows, warps
++        )
+     m = x.shape[0]
+     routes = m * 6
+     stride = (routes * 648 + 255) // 256 * 256
+     xq = torch.empty((m, 160, 32), dtype=torch.int8, device=x.device)
+     xd = torch.empty((m, 160), dtype=torch.float32, device=x.device)
+-    torch.ops.v41k.q8_aligned(xq, xd, x.contiguous())
++    plan = _plan(x.device)
++    gate_up7 = _q8_and_plan(xq, xd, x.contiguous(), ids32, plan)
+     peer = _PEER.get(x.device)
+     if peer is not None and hasattr(torch.ops.v41k, "peer_gather"):
+         rank, pointers, own, epoch = peer
+         slot = own[rank * stride : rank * stride + routes * 648]
+         hq = slot[: routes * 576].view(torch.int8).view(routes, 18, 32)
+         hd = slot[routes * 576 :].view(torch.float32).view(routes, 18)
+-        plan = _plan(x.device)
+-        torch.ops.v41k.gate_up7(
++        gate_up7(
+             xq,
+             xd,
+             hq,
+@@ -238,8 +376,7 @@ def _v41_experts_rows(
+     packed = torch.empty(stride, dtype=torch.uint8, device=x.device)
+     hq = packed[: routes * 576].view(torch.int8).view(routes, 18, 32)
+     hd = packed[routes * 576 : routes * 648].view(torch.float32).view(routes, 18)
+-    plan = _plan(x.device)
+-    torch.ops.v41k.gate_up7(
++    gate_up7(
+         xq,
+         xd,
+         hq,

@@ -1,0 +1,1633 @@
+diff --git a/benchmarks/deepseek_v41/v41idx/build.py b/benchmarks/deepseek_v41/v41idx/build.py
+new file mode 100644
+index 0000000000..19844e0298
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41idx/build.py
+@@ -0,0 +1,37 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Build the V4.1 v41idx CUDA extension (SM70) into ./build/v41idx.so.
++
++VLLM_V41_INDEX_TILED loads it from VLLM_V41_INDEX_TILED_LIB, defaulting to
++benchmarks/deepseek_v41/v41idx/build/v41idx.so beside VLLM_V41K_LIB's v41k
++directory. V41IDX_BUILD_DIR overrides the build directory. The nvcc flags are
++v41k's (no fast-math: the kernel must round exactly like v41k's reference).
++"""
++
++import os
++
++from torch.utils import cpp_extension as ce
++
++here = os.path.dirname(os.path.abspath(__file__))
++build = os.environ.get("V41IDX_BUILD_DIR") or os.path.join(here, "build")
++os.makedirs(build, exist_ok=True)
++ce.load(
++    name="v41idx",
++    sources=[os.path.join(here, "v41idx.cu")],
++    extra_cuda_cflags=[
++        "-O3",
++        "-gencode",
++        "arch=compute_70,code=sm_70",
++        "--expt-relaxed-constexpr",
++        "-std=c++20",
++        "-U__CUDA_NO_HALF_OPERATORS__",
++        "-U__CUDA_NO_HALF_CONVERSIONS__",
++        "-U__CUDA_NO_HALF2_OPERATORS__",
++        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
++    ],
++    extra_cflags=["-O3", "-std=c++20"],
++    is_python_module=False,
++    build_directory=build,
++    verbose=False,
++)
++print("built", os.path.join(build, "v41idx.so"))
+diff --git a/benchmarks/deepseek_v41/v41idx/check_v41idx.py b/benchmarks/deepseek_v41/v41idx/check_v41idx.py
+new file mode 100644
+index 0000000000..c4e46f7d0f
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41idx/check_v41idx.py
+@@ -0,0 +1,370 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GPU check of v41idx.index_scores_tiled (run with no serving workload).
++
++Every case runs three kernels on the same inputs and NaN-poisoned outputs:
++  v41k   torch.ops.v41k.index_scores_decode from the reference v41k.so (--v41k)
++  ref    torch.ops.v41idx.index_scores_ref (the embedded verbatim copy)
++  tiled  torch.ops.v41idx.index_scores_tiled (the new kernel)
++and requires tiled == v41k and ref == v41k BITWISE over the whole output row
++(written columns and the poison past the live end), plus a minimum number of
++written / finite values so the comparison is not of poison alone.
++
++Matrix: heads 8 (tokens 1..8) and 4 (tokens 1..16); capacities 1, 63, 64, 65,
++1000, 4097, 65536, 131072; live ends 0, 1, 31, 32, 63, 64, 65, 1000, 37500,
++75000 and the capacity, plus stale ends 64 keys beyond aligned capacity;
++ratio 1, 4, 8 (positions[-1] at
++every offset inside the ratio group); realistic keys (scale exponents near
++the observed range) and full-range keys (every scale byte, NaN/Inf scales);
++normal and extreme q / weights (+-65504, Inf, NaN); a plain output and a
++bank-like one (rows of a wider [16, width] buffer, as bank.partial[:tokens]).
++Then CUDA graphs: one capture replayed with changed positions (live ends
++5 .. capacity + 64) against eager v41k, and, in a fresh process, a capture whose
++first-ever tiled call is inside the capture (T 6 and T 8). Then timing in
++graphs (TIME lines, us per call, tiled vs reference v41k).
++
++  --quick      reduced matrix (TP4 runs); --sanitize: small grid for
++  compute-sanitizer (one capacity past 2 CTAs x SMs so the persistent loop
++  turns), no graphs, no timing; --no-time; --json PATH. Exit 0 only when every check
++  passes ("ALL OK"); any mismatch or exception -> "FAILED", exit 1.
++"""
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import time
++
++import torch
++
++POISON_BASE = 0x7E00
++
++
++def load(lib, v41k):
++    torch.ops.load_library(v41k)
++    torch.ops.load_library(lib)
++    assert hasattr(torch.ops.v41k, "index_scores_decode"), v41k
++    assert int(torch.ops.v41idx.version()) == 1, lib
++
++
++def poison(rows, width, dev):
++    p = (
++        torch.arange(rows * width, device=dev, dtype=torch.int32) & 0x1FF
++    ) | POISON_BASE
++    return p.to(torch.int16).view(torch.float16).reshape(rows, width)
++
++
++def make_keys(cap, mode, gen, dev):
++    k = torch.randint(0, 256, (cap, 68), generator=gen, dtype=torch.uint8, device="cpu")
++    if mode == "real":
++        # biased E8M0 exponents around the observed index-key range (2^-12 .. 2^4)
++        k[:, 64:] = torch.randint(115, 132, (cap, 4), generator=gen, dtype=torch.uint8)
++    else:
++        k[:, 64:] = torch.randint(0, 256, (cap, 4), generator=gen, dtype=torch.uint8)
++        if cap >= 4:
++            k[0, 64:] = 255  # NaN/Inf scale
++            k[1, 64:] = 0  # zero scale
++            k[2, 64:] = 254
++            k[3, 64:] = 1
++    return k.to(dev)
++
++
++def make_qw(rows, mode, gen, dev):
++    q = torch.randn(rows, 128, generator=gen, dtype=torch.float32)
++    w = torch.randn(rows, generator=gen, dtype=torch.float32) * 0.5
++    if mode == "extreme":
++        q[0, 0] = 65504.0
++        q[0, 1] = -65504.0
++        q[0, 5] = float("inf")
++        w[0] = 65504.0
++        if rows > 1:
++            q[1, 7] = float("nan")
++            w[1] = float("-inf")
++        if rows > 2:
++            q[2, :] = 1000.0
++            w[2] = -0.0
++        if rows > 3:
++            w[3] = float("nan")
++    return q.half().to(dev).contiguous(), w.half().to(dev).contiguous()
++
++
++def positions_for(tokens, end, ratio, off):
++    """tokens consecutive positions whose last one gives (p + 1) // ratio == end."""
++    last = ratio - 2 - off if end == 0 else end * ratio - 1 + off
++    return torch.arange(last - tokens + 1, last + 1, dtype=torch.int64).clamp_min(0)
++
++
++class Stats:
++    def __init__(self):
++        self.cases = 0
++        self.bad = []
++        self.written = 0
++        self.finite = 0
++
++    def ok(self):
++        return not self.bad
++
++
++def run_case(st, H, T, keys, q, w, pos, ratio, bank, tag):
++    dev = keys.device
++    cap = keys.shape[0]
++    width = cap + 40 if bank else cap
++    outs = {}
++    for name in ("v41k", "ref", "tiled"):
++        if bank:
++            buf = poison(16, width, dev)
++            o = buf[:T]
++        else:
++            o = poison(T, width, dev)
++        args = (o, q, w, keys, pos, H, ratio)
++        if name == "v41k":
++            torch.ops.v41k.index_scores_decode(*args)
++        elif name == "ref":
++            torch.ops.v41idx.index_scores_ref(*args)
++        else:
++            torch.ops.v41idx.index_scores_tiled(*args)
++        outs[name] = o
++    a = outs["v41k"].view(torch.int16)
++    st.cases += 1
++    for name in ("ref", "tiled"):
++        b = outs[name].view(torch.int16)
++        if not torch.equal(a, b):
++            n = int((a != b).sum().item())
++            st.bad.append(f"{tag} {name}!=v41k ({n} values)")
++    pz = poison(T, width, dev).view(torch.int16)
++    if bank and not torch.equal(outs["tiled"].view(torch.int16)[:, cap:], pz[:, cap:]):
++        st.bad.append(f"{tag} tiled wrote guard columns beyond capacity")
++    written = a != pz
++    st.written += int(written.sum().item())
++    st.finite += int((written & torch.isfinite(outs["v41k"])).sum().item())
++
++
++def matrix(st, dev, quick, sanitize, seed=517):
++    gen = torch.Generator().manual_seed(seed)
++    if sanitize:
++        # 12000 keys = 188 blocks > 2 CTAs x 80 SMs: the persistent loop runs twice
++        caps, hts = [65, 12000], [(8, 1), (8, 6), (8, 8), (4, 16)]
++    elif quick:
++        caps = [64, 65, 4097, 131072]
++        hts = [(8, t) for t in (1, 2, 6, 8)] + [(4, t) for t in (1, 6, 16)]
++    else:
++        caps = [1, 63, 64, 65, 1000, 4097, 65536, 131072]
++        hts = [(8, t) for t in range(1, 9)] + [(4, t) for t in range(1, 17)]
++    ends_all = [0, 1, 31, 32, 63, 64, 65, 1000, 37500, 75000]
++    ratios = [1, 4] if sanitize else [1, 4, 8]
++    for cap in caps:
++        for kmode in ("real", "full"):
++            keys = make_keys(cap, kmode, gen, dev)
++            ends = sorted({e for e in ends_all if e <= cap} | {cap})
++            if sanitize or quick:
++                ends = sorted({e for e in (0, 1, 63, 65, cap // 2, cap) if e <= cap})
++            # A full reference CTA ends exactly at aligned capacity; stale live
++            # positions must not make the tiled loop exceed that allocation.
++            if cap % 32 == 0:
++                ends = sorted(set(ends) | {cap + 64})
++            for H, T in hts:
++                for qmode in ("normal",) if sanitize else ("normal", "extreme"):
++                    q, w = make_qw(T * H, qmode, gen, dev)
++                    for ratio in ratios:
++                        for end in ends:
++                            if end == 0 and ratio < 2:
++                                continue
++                            offs = {0, ratio - 1} if end else {0}
++                            for off in sorted(offs):
++                                if end == 0 and off > ratio - 2:
++                                    continue
++                                pos = positions_for(T, end, ratio, off).to(dev)
++                                for bank in (True,) if sanitize else (False, True):
++                                    tag = (
++                                        f"H{H} T{T} cap{cap} {kmode}/{qmode} r{ratio} "
++                                        f"end{end}+{off} {'bank' if bank else 'plain'}"
++                                    )
++                                    run_case(
++                                        st, H, T, keys, q, w, pos, ratio, bank, tag
++                                    )
++    torch.cuda.synchronize()
++
++
++def graph_replay(st, dev):
++    """One capture, replayed with changed positions; compared with eager v41k."""
++    gen = torch.Generator().manual_seed(7)
++    H, T, cap = 8, 6, 131072
++    keys = make_keys(cap, "real", gen, dev)
++    q, w = make_qw(T * H, "normal", gen, dev)
++    pos = positions_for(T, 1, 4, 0).to(dev)
++    out = poison(T, cap + 40, dev)
++    torch.ops.v41idx.index_scores_tiled(out, q, w, keys, pos, H, 4)  # warm (eager)
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        torch.ops.v41idx.index_scores_tiled(out, q, w, keys, pos, H, 4)
++    for end in (5, 64, 65, 1000, 37500, 75000, cap - 1, cap, cap + 64):
++        for off in (0, 3):
++            pos.copy_(positions_for(T, end, 4, off).to(dev))
++            out.copy_(poison(T, cap + 40, dev))
++            g.replay()
++            ref = poison(T, cap + 40, dev)
++            torch.ops.v41k.index_scores_decode(ref, q, w, keys, pos, H, 4)
++            torch.cuda.synchronize()
++            st.cases += 1
++            if not torch.equal(out.view(torch.int16), ref.view(torch.int16)):
++                st.bad.append(f"graph replay end{end}+{off}: tiled!=v41k")
++            guard = poison(T, 40, dev).view(torch.int16)
++            if not torch.equal(out.view(torch.int16)[:, cap:], guard):
++                st.bad.append(f"graph replay end{end}+{off}: guard columns changed")
++
++
++FIRST_IN_CAPTURE = r"""
++import sys, torch
++sys.path.insert(0, {here!r})
++import check_v41idx as c
++c.load({lib!r}, {v41k!r})
++dev = torch.device("cuda:0")
++torch.cuda.init()
++gen = torch.Generator().manual_seed(11)
++H, T, cap = 8, {T}, 65536
++keys = c.make_keys(cap, "real", gen, dev)
++q, w = c.make_qw(T * H, "normal", gen, dev)
++pos = c.positions_for(T, 30000, 4, 1).to(dev)
++out = c.poison(T, cap, dev)
++torch.cuda.synchronize()
++g = torch.cuda.CUDAGraph()
++with torch.cuda.graph(g):
++    torch.ops.v41idx.index_scores_tiled(out, q, w, keys, pos, H, 4)
++g.replay()
++ref = c.poison(T, cap, dev)
++torch.ops.v41k.index_scores_decode(ref, q, w, keys, pos, H, 4)
++torch.cuda.synchronize()
++print("FIRSTCAP", "OK" if torch.equal(out.view(torch.int16), ref.view(torch.int16)) else "MISMATCH")
++"""
++
++
++def first_call_in_capture(st, lib, v41k):
++    here = os.path.dirname(os.path.abspath(__file__))
++    for T in (6, 8):
++        r = subprocess.run(
++            [
++                sys.executable,
++                "-I",
++                "-c",
++                FIRST_IN_CAPTURE.format(here=here, lib=lib, v41k=v41k, T=T),
++            ],
++            capture_output=True,
++            text=True,
++        )
++        st.cases += 1
++        if r.returncode != 0 or "FIRSTCAP OK" not in r.stdout:
++            st.bad.append(
++                f"first call inside capture T{T}: rc={r.returncode} "
++                f"{(r.stdout + r.stderr)[-300:]}"
++            )
++
++
++def timing(dev, lines):
++    gen = torch.Generator().manual_seed(3)
++    H, T = 8, 6
++    for cap in (65536, 131072):
++        keys = make_keys(cap, "real", gen, dev)
++        q, w = make_qw(T * H, "normal", gen, dev)
++        for end in (1000, 10000, 37500, 75000, 131072):
++            if end > cap:
++                continue
++            pos = positions_for(T, end, 4, 0).to(dev)
++            res = {}
++            for name in ("v41k", "tiled"):
++                out = poison(T, cap, dev)
++                op = (
++                    torch.ops.v41k.index_scores_decode
++                    if name == "v41k"
++                    else torch.ops.v41idx.index_scores_tiled
++                )
++                op(out, q, w, keys, pos, H, 4)
++                torch.cuda.synchronize()
++                g = torch.cuda.CUDAGraph()
++                with torch.cuda.graph(g):
++                    for _ in range(20):
++                        op(out, q, w, keys, pos, H, 4)
++                for _ in range(5):
++                    g.replay()
++                s, e = (
++                    torch.cuda.Event(enable_timing=True),
++                    torch.cuda.Event(enable_timing=True),
++                )
++                s.record()
++                for _ in range(50):
++                    g.replay()
++                e.record()
++                torch.cuda.synchronize()
++                res[name] = s.elapsed_time(e) * 1000.0 / (50 * 20)
++            line = (
++                f"TIME H{H} T{T} cap{cap} keys{end}: v41k {res['v41k']:.1f} us "
++                f"tiled {res['tiled']:.1f} us ({res['v41k'] / res['tiled']:.2f}x)"
++            )
++            print(line, flush=True)
++            lines.append(line)
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--lib", required=True, help="v41idx.so under test")
++    ap.add_argument(
++        "--v41k", required=True, help="the reference v41k.so (VLLM_V41K_LIB)"
++    )
++    ap.add_argument("--quick", action="store_true")
++    ap.add_argument("--sanitize", action="store_true")
++    ap.add_argument("--no-time", action="store_true")
++    ap.add_argument("--json")
++    a = ap.parse_args()
++    t0 = time.time()
++    load(a.lib, a.v41k)
++    dev = torch.device("cuda:0")
++    print(
++        f"DEVICE {torch.cuda.get_device_name(dev)} SMs "
++        f"{torch.cuda.get_device_properties(dev).multi_processor_count} "
++        f"grid(131072)={int(torch.ops.v41idx.grid_for(131072, 0))}",
++        flush=True,
++    )
++    st = Stats()
++    matrix(st, dev, a.quick, a.sanitize)
++    print(
++        f"MATRIX {st.cases} cases, {st.written} values written by v41k "
++        f"({st.finite} finite), {len(st.bad)} mismatched cases",
++        flush=True,
++    )
++    min_written = 2000 if a.sanitize else 100000
++    if st.written < min_written or st.finite < min_written // 2:
++        st.bad.append(f"coverage too low: written {st.written} finite {st.finite}")
++    if not a.sanitize:
++        graph_replay(st, dev)
++        first_call_in_capture(st, a.lib, a.v41k)
++        print(f"GRAPHS done, {len(st.bad)} mismatched cases so far", flush=True)
++    lines = []
++    if not (a.no_time or a.sanitize):
++        timing(dev, lines)
++    for b in st.bad[:20]:
++        print("FAIL", b)
++    ok = st.ok()
++    print(
++        ("ALL OK" if ok else "FAILED")
++        + f" ({st.cases} cases, {time.time() - t0:.0f} s)"
++    )
++    if a.json:
++        with open(a.json, "w") as f:
++            json.dump(
++                {
++                    "ok": ok,
++                    "cases": st.cases,
++                    "written": st.written,
++                    "finite": st.finite,
++                    "bad": st.bad[:200],
++                    "time": lines,
++                },
++                f,
++                indent=1,
++            )
++    sys.exit(0 if ok else 1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/deepseek_v41/v41idx/v41idx.cu b/benchmarks/deepseek_v41/v41idx/v41idx.cu
+new file mode 100644
+index 0000000000..e922ff2f41
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41idx/v41idx.cu
+@@ -0,0 +1,415 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// v41idx: VLLM_V41_INDEX_TILED decode index scorer for DeepSeek-V4.1 on SM70
++// Bitwise replacement of v41k::index_scores_decode on allocated live keys.
++//
++// Contract (the same as v41k::index_scores_decode, which stays the reference):
++//   q   fp16 [tokens * heads, 128]  (token-major rows), w fp16 [tokens * heads]
++//   keys uint8 [capacity, 68]: 64 B E2M1 nibbles (even element low) + 4 biased
++//        power-of-two scale exponents, one per 32 elements
++//   positions int64 [>= tokens]; end = min((last_position + 1) / ratio, capacity)
++//   out fp16, row stride out.size(1): out[t, n] for n < end only =
++//     fp16( sum_h fp16( relu( fp16( q[t,h] . k[n] ) ) * w[t,h] ) )
++//   with q . k accumulated as ONE fmaf chain over d = 0..127 in order, from
++//   0.f, the key values rounded to fp16 first, and the head sum in h order.
++//   Columns n >= end are never written.
++//
++// Why it is faster: the reference launches capacity / 32 CTAs (4096 at the
++// stage-2 capacity of 131072 rows) and each thread computes one (key, token)
++// pair with two shared-memory loads per FMA; at short context almost all CTAs
++// only read positions and exit (25.6 / 48.9 us per call MEASURED at 0 keys),
++// and at 300K keys it runs ~1.2 TFLOP/s (497 / 1061 us per call). Here:
++//   - a persistent grid (<= 2 CTAs per SM) loops over 64-key blocks of the
++//     live prefix only;
++//   - q (FP32) and w are staged once per CTA; each 64-key block is decoded
++//     once into shared memory as fp16 (exactly the reference's rounded key);
++//   - each thread owns one token x H heads x 4 keys (4 * H accumulators) and
++//     reads operands with 128-bit (q) / 64-bit (k) shared loads.
++// Every (row, key) dot product is still the same fmaf chain in the same order
++// on the same operand values, and the epilogue is the reference's, so the
++// CPU host-compiled bodies below check bitwise equality. check_v41idx.py
++// supplies GPU/reference and capture checks, which still require qualification
++// after a rebase.
++//
++// The stage/tile bodies are __host__ __device__ so that v41idx_host_test.cu
++// runs the exact kernel code on the CPU (no GPU) with the CTA schedule.
++
++#include <cstdint>
++#include <cstring>
++#include <cmath>
++#include <cuda_fp16.h>
++
++#ifndef V41IDX_HOST_TEST
++  #include <mutex>
++  #include <torch/all.h>
++  #include <ATen/cuda/CUDAContext.h>
++  #include <c10/cuda/CUDAGuard.h>
++  #include <c10/cuda/CUDAException.h>
++#endif
++
++namespace v41idx {
++
++constexpr int KB = 64;      // keys per block
++constexpr int KL = 16;      // key lanes per token (threads per token)
++constexpr int KJ = KB / KL; // keys per thread (4): kl, kl + 16, kl + 32, kl + 48
++constexpr int QS = 132;     // q row stride in floats (528 B: 16-B aligned)
++constexpr int KS = 132;     // key row stride in halves (264 B: 8-B aligned; 16
++                            // consecutive rows start on banks 0, 2, .., 30)
++constexpr int KEY_BYTES = 68;
++constexpr int MAX_ROWS = 64;
++constexpr int MAX_THREADS = 256;
++
++__host__ __device__ constexpr int smem_bytes(int rows) {
++  return rows * QS * 4 + ((rows + 3) & ~3) * 4 + KB * KS * 2;
++}
++
++__host__ __device__ inline float bits_float(uint32_t u) {
++#ifdef __CUDA_ARCH__
++  return __uint_as_float(u);
++#else
++  float f;
++  memcpy(&f, &u, 4);
++  return f;
++#endif
++}
++
++// The reference's v41k_e2m1, operation for operation.
++__host__ __device__ inline float e2m1(int code) {
++  const int m = code & 7;
++  const float mag = m < 2 ? 0.5f * m
++                          : bits_float(uint32_t(((m >> 1) + 126) << 23) |
++                                       uint32_t((m & 1) << 22));
++  return (code & 8) ? -mag : mag;
++}
++
++// q rows -> FP32 shared rows (exactly __half2float of the input), w -> ws.
++__host__ __device__ inline void stage_q(int tid, int nt, const __half* q,
++                                        const __half* w, int rows, float* qs,
++                                        float* ws) {
++  for (int i = tid; i < rows * 128; i += nt) {
++    const int r = i / 128, d = i % 128;
++    qs[r * QS + d] = __half2float(q[r * 128 + d]);
++  }
++  for (int r = tid; r < rows; r += nt) ws[r] = __half2float(w[r]);
++}
++
++// Decode keys [n0, n0 + KB) into ks (fp16), zeros past end (never read for
++// output). One item = one 4-byte word = 8 elements of one key row.
++__host__ __device__ inline void stage_keys(int tid, int nt,
++                                           const uint8_t* keys, int64_t n0,
++                                           int64_t end, __half* ks) {
++  for (int i = tid; i < KB * 16; i += nt) {
++    const int k = i / 16, wd = i % 16;
++    const int64_t n = n0 + k;
++    __half h[8];
++    if (n < end) {
++      const uint8_t* row = keys + n * KEY_BYTES;
++      uint32_t word;
++#ifdef __CUDA_ARCH__
++      word = *reinterpret_cast<const uint32_t*>(row + 4 * wd);
++#else
++      memcpy(&word, row + 4 * wd, 4);
++#endif
++      // byte b = 4 wd + c; its scale is row[64 + (2 b) / 32] = row[64 + wd / 4]
++      const float scale = bits_float(uint32_t(row[64 + wd / 4]) << 23);
++#pragma unroll
++      for (int c = 0; c < 4; ++c) {
++        const int byte = int((word >> (8 * c)) & 255u);
++        const float lo = e2m1(byte & 15) * scale;
++        const float hi = e2m1((byte >> 4) & 15) * scale;
++        h[2 * c] = __float2half_rn(lo);
++        h[2 * c + 1] = __float2half_rn(hi);
++      }
++    } else {
++#pragma unroll
++      for (int c = 0; c < 8; ++c) h[c] = __float2half_rn(0.f);
++    }
++    __half* dst = ks + k * KS + 8 * wd;
++#ifdef __CUDA_ARCH__
++    uint2 a, b;
++    memcpy(&a, h, 8);
++    memcpy(&b, h + 4, 8);
++    reinterpret_cast<uint2*>(dst)[0] = a;
++    reinterpret_cast<uint2*>(dst)[1] = b;
++#else
++    memcpy(dst, h, 16);
++#endif
++  }
++}
++
++// One thread: token t, key lane kl (keys kl + 16 j), all H heads of t.
++template <int H>
++__host__ __device__ inline void tile(int t, int kl, const float* qs,
++                                     const __half* ks, const float* ws,
++                                     int64_t n0, int64_t end, __half* out,
++                                     int64_t n_out) {
++  float acc[H][KJ];
++#pragma unroll
++  for (int h = 0; h < H; ++h)
++#pragma unroll
++    for (int j = 0; j < KJ; ++j) acc[h][j] = 0.f;
++#ifdef V41IDX_MUTANT_ORDER
++  // CPU-test mutant only: reversed d order (must be caught as a mismatch).
++  for (int d = 124; d >= 0; d -= 4) {
++#else
++  for (int d = 0; d < 128; d += 4) {
++#endif
++    float kv[KJ][4];
++#pragma unroll
++    for (int j = 0; j < KJ; ++j) {
++      const __half* kp = ks + (kl + KL * j) * KS + d;
++      __half2 a, b;
++#ifdef __CUDA_ARCH__
++      const uint2 raw = *reinterpret_cast<const uint2*>(kp);
++      memcpy(&a, &raw.x, 4);
++      memcpy(&b, &raw.y, 4);
++#else
++      memcpy(&a, kp, 4);
++      memcpy(&b, kp + 2, 4);
++#endif
++      kv[j][0] = __low2float(a);
++      kv[j][1] = __high2float(a);
++      kv[j][2] = __low2float(b);
++      kv[j][3] = __high2float(b);
++    }
++#pragma unroll
++    for (int h = 0; h < H; ++h) {
++      const float* qp = qs + (t * H + h) * QS + d;
++      float qv[4];
++#ifdef __CUDA_ARCH__
++      const float4 q4 = *reinterpret_cast<const float4*>(qp);
++      qv[0] = q4.x;
++      qv[1] = q4.y;
++      qv[2] = q4.z;
++      qv[3] = q4.w;
++#else
++      memcpy(qv, qp, 16);
++#endif
++#ifdef V41IDX_MUTANT_ORDER
++#pragma unroll
++      for (int c = 3; c >= 0; --c)
++#else
++#pragma unroll
++      for (int c = 0; c < 4; ++c)
++#endif
++#pragma unroll
++        for (int j = 0; j < KJ; ++j)
++          acc[h][j] = fmaf(qv[c], kv[j][c], acc[h][j]);
++    }
++  }
++#pragma unroll
++  for (int j = 0; j < KJ; ++j) {
++    const int64_t n = n0 + kl + KL * j;
++    if (n >= end) continue;
++    float total = 0.f;
++#pragma unroll
++    for (int h = 0; h < H; ++h) {
++      float s = __half2float(__float2half_rn(acc[h][j]));
++      s = s > 0.f ? s : 0.f;
++      total += __half2float(__float2half_rn(s * ws[t * H + h]));
++    }
++    out[int64_t(t) * n_out + n] = __float2half_rn(total);
++  }
++}
++
++// Shared host/device bound: stale positions cannot extend an allocation.
++__host__ __device__ inline int64_t live_end(int64_t position, int ratio,
++                                           int64_t capacity) {
++  const int64_t end = (position + 1) / ratio;
++  return end < capacity ? end : capacity;
++}
++
++// Shared-memory carve-up for `rows` rows.
++struct Smem {
++  float* qs;
++  float* ws;
++  __half* ks;
++};
++__host__ __device__ inline Smem carve(unsigned char* base, int rows) {
++  Smem s;
++  s.qs = reinterpret_cast<float*>(base);
++  s.ws = s.qs + rows * QS;
++  s.ks = reinterpret_cast<__half*>(s.ws + ((rows + 3) & ~3));
++  return s;
++}
++
++#ifndef V41IDX_HOST_TEST
++template <int H>
++__global__ void __launch_bounds__(MAX_THREADS)
++    index_scores_tiled(const __half* __restrict__ q,
++                       const __half* __restrict__ w,
++                       const uint8_t* __restrict__ keys,
++                       const int64_t* __restrict__ positions,
++                       __half* __restrict__ out, int tokens, int64_t n_out,
++                       int ratio, int64_t capacity) {
++  extern __shared__ __align__(16) unsigned char smem[];
++  const int64_t end = live_end(positions[tokens - 1], ratio, capacity);
++  int64_t n0 = int64_t(blockIdx.x) * KB;
++  if (n0 >= end) return;
++  const int rows = tokens * H;
++  const Smem s = carve(smem, rows);
++  const int tid = threadIdx.x, nt = blockDim.x;
++  stage_q(tid, nt, q, w, rows, s.qs, s.ws);
++  const int t = tid / KL, kl = tid % KL;
++  for (; n0 < end; n0 += int64_t(gridDim.x) * KB) {
++    stage_keys(tid, nt, keys, n0, end, s.ks);
++    __syncthreads();
++    if (t < tokens) tile<H>(t, kl, s.qs, s.ks, s.ws, n0, end, out, n_out);
++    __syncthreads();
++  }
++}
++#endif
++
++}  // namespace v41idx
++
++#ifndef V41IDX_HOST_TEST
++  #include "v41idx_ref.cuh"
++
++namespace {
++
++int sm_count(int device) {
++  static std::mutex mu;
++  static int counts[64] = {0};
++  std::lock_guard<std::mutex> lock(mu);
++  TORCH_CHECK(device >= 0 && device < 64, "v41idx: device index out of range");
++  if (counts[device] == 0) {
++    int c = 0;
++    C10_CUDA_CHECK(cudaDeviceGetAttribute(&c, cudaDevAttrMultiProcessorCount,
++                                          device));
++    counts[device] = c;
++  }
++  return counts[device];
++}
++
++template <int H>
++void allow_smem(int device) {
++  static std::mutex mu;
++  static bool done[64] = {false};
++  std::lock_guard<std::mutex> lock(mu);
++  if (!done[device]) {
++    C10_CUDA_CHECK(cudaFuncSetAttribute(
++        v41idx::index_scores_tiled<H>,
++        cudaFuncAttributeMaxDynamicSharedMemorySize,
++        v41idx::smem_bytes(v41idx::MAX_ROWS)));
++    done[device] = true;
++  }
++}
++
++void check_args(const torch::Tensor& out, const torch::Tensor& q,
++                const torch::Tensor& w, const torch::Tensor& keys,
++                const torch::Tensor& positions, int64_t heads, int64_t ratio,
++                bool tiled) {
++  const int64_t tokens = out.dim() == 2 ? out.size(0) : -1;
++  TORCH_CHECK(out.is_cuda() && q.device() == out.device() &&
++                  w.device() == out.device() &&
++                  keys.device() == out.device() &&
++                  positions.device() == out.device(),
++              "v41idx: all tensors must be on one CUDA device");
++  TORCH_CHECK(out.dim() == 2 && out.scalar_type() == torch::kHalf &&
++                  out.stride(1) == 1 && out.stride(0) == out.size(1),
++              "v41idx: out must be fp16 [tokens, n_out] with row stride n_out");
++  if (tiled)
++    TORCH_CHECK(heads == 4 || heads == 8,
++                "v41idx: tiled scorer supports 4 or 8 index heads per rank, got ",
++                heads);
++  TORCH_CHECK(heads >= 1 && tokens >= 1 && tokens * heads <= 64,
++              "v41idx: need 1 <= tokens * heads <= 64");
++  TORCH_CHECK(q.scalar_type() == torch::kHalf && q.is_contiguous() &&
++                  q.dim() == 2 && q.size(0) == tokens * heads &&
++                  q.size(1) == 128,
++              "v41idx: q must be contiguous fp16 [tokens * heads, 128]");
++  TORCH_CHECK(w.scalar_type() == torch::kHalf && w.is_contiguous() &&
++                  w.numel() == tokens * heads,
++              "v41idx: w must be contiguous fp16 [tokens * heads]");
++  TORCH_CHECK(keys.scalar_type() == torch::kUInt8 && keys.is_contiguous() &&
++                  keys.dim() == 2 && keys.size(1) == 68 && keys.size(0) > 0,
++              "v41idx: keys must be contiguous uint8 [capacity > 0, 68]");
++  TORCH_CHECK(positions.scalar_type() == torch::kInt64 &&
++                  positions.is_contiguous() && positions.numel() >= tokens,
++              "v41idx: positions must be contiguous int64 with >= tokens entries");
++  TORCH_CHECK(out.size(1) >= keys.size(0),
++              "v41idx: output width must cover key capacity");
++  TORCH_CHECK(ratio >= 1, "v41idx: ratio must be >= 1");
++}
++
++void index_scores_tiled(torch::Tensor out, torch::Tensor q, torch::Tensor w,
++                        torch::Tensor keys, torch::Tensor positions,
++                        int64_t heads, int64_t ratio) {
++  check_args(out, q, w, keys, positions, heads, ratio, true);
++  const at::cuda::OptionalCUDAGuard guard(out.device());
++  const int device = out.get_device();
++  const int tokens = int(out.size(0));
++  const int rows = tokens * int(heads);
++  const int threads = ((tokens * v41idx::KL + 31) / 32) * 32;
++  const int smem = v41idx::smem_bytes(rows);
++  const int64_t blocks = (keys.size(0) + v41idx::KB - 1) / v41idx::KB;
++  const int grid = int(std::min<int64_t>(blocks, 2 * int64_t(sm_count(device))));
++  auto stream = at::cuda::getCurrentCUDAStream();
++  const auto* qp = reinterpret_cast<const __half*>(q.data_ptr());
++  const auto* wp = reinterpret_cast<const __half*>(w.data_ptr());
++  auto* op = reinterpret_cast<__half*>(out.data_ptr());
++  if (heads == 8) {
++    allow_smem<8>(device);
++    v41idx::index_scores_tiled<8><<<grid, threads, smem, stream>>>(
++        qp, wp, keys.data_ptr<uint8_t>(), positions.data_ptr<int64_t>(), op,
++        tokens, out.size(1), int(ratio), keys.size(0));
++  } else {
++    allow_smem<4>(device);
++    v41idx::index_scores_tiled<4><<<grid, threads, smem, stream>>>(
++        qp, wp, keys.data_ptr<uint8_t>(), positions.data_ptr<int64_t>(), op,
++        tokens, out.size(1), int(ratio), keys.size(0));
++  }
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// Public v41k reference and launch configuration for check_v41idx.py;
++// the independently loaded v41k operation is its primary reference.
++void index_scores_ref(torch::Tensor out, torch::Tensor q, torch::Tensor w,
++                      torch::Tensor keys, torch::Tensor positions,
++                      int64_t heads, int64_t ratio) {
++  check_args(out, q, w, keys, positions, heads, ratio, false);
++  const at::cuda::OptionalCUDAGuard guard(out.device());
++  const int tokens = out.size(0);
++  auto stream = at::cuda::getCurrentCUDAStream();
++  constexpr int KB = 32;
++  const int blocks = (keys.size(0) + KB - 1) / KB;
++  v41idx_ref::index_scores_decode<KB><<<blocks, 256, 0, stream>>>(
++      reinterpret_cast<const half*>(q.data_ptr()),
++      reinterpret_cast<const half*>(w.data_ptr()), keys.data_ptr<uint8_t>(),
++      positions.data_ptr<int64_t>(), reinterpret_cast<half*>(out.data_ptr()),
++      tokens, int(heads), out.size(1), int(ratio));
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++int64_t version() { return 1; }
++
++int64_t grid_for(int64_t capacity, int64_t device) {
++  const int64_t blocks = (capacity + v41idx::KB - 1) / v41idx::KB;
++  return std::min<int64_t>(blocks, 2 * int64_t(sm_count(int(device))));
++}
++
++}  // namespace
++
++TORCH_LIBRARY(v41idx, m) {
++  m.def(
++      "index_scores_tiled(Tensor(a!) out, Tensor q, Tensor w, Tensor keys, "
++      "Tensor positions, int heads, int ratio) -> ()",
++      &index_scores_tiled);
++  m.def(
++      "index_scores_ref(Tensor(a!) out, Tensor q, Tensor w, Tensor keys, "
++      "Tensor positions, int heads, int ratio) -> ()",
++      &index_scores_ref);
++  m.def("version() -> int", &version);
++  m.def("grid_for(int capacity, int device) -> int", &grid_for);
++}
++// Shape-only capture/fake implementation. The out tensor is mutated in place.
++namespace {
++void index_scores_meta(torch::Tensor out, torch::Tensor q, torch::Tensor w,
++                       torch::Tensor keys, torch::Tensor positions,
++                       int64_t heads, int64_t ratio) {}
++}
++TORCH_LIBRARY_IMPL(v41idx, Meta, m) {
++  m.impl("index_scores_tiled", &index_scores_meta);
++}
++#endif
+diff --git a/benchmarks/deepseek_v41/v41idx/v41idx_host_test.cu b/benchmarks/deepseek_v41/v41idx/v41idx_host_test.cu
+new file mode 100644
+index 0000000000..ee6bbba63d
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41idx/v41idx_host_test.cu
+@@ -0,0 +1,288 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// v41idx_host_test.cu: CPU-only proof that the VLLM_V41_INDEX_TILED kernel
++// bodies (stage_q / stage_keys / tile from v41idx.cu, compiled for the HOST,
++// run with the kernel's own persistent-CTA schedule) give bitwise the same
++// output as the public reference v41k::index_scores_decode.
++//
++// Expected values do not come from v41idx.cu:
++//   1. key decode: every (nibble byte, scale byte) pair against the OCP MX
++//      E2M1 table {0, .5, 1, 1.5, 2, 3, 4, 6} (sign bit 8) and the IEEE meaning
++//      of the scale byte as an FP32 exponent field (0 -> 0, 255 -> inf);
++//   2. scores: ref_scores(), a line-by-line transliteration of the public reference
++//      kernel's loops (v41k.cu index_scores_decode: decode into float ks, one
++//      fmaf chain per (row, key), relu/weight/head-sum epilogue), with its own
++//      decode from item 1.
++// Build and run (no GPU, no kernel launch):
++//   nvcc -std=c++17 -O2 -DV41IDX_HOST_TEST v41idx_host_test.cu -o host_test && ./host_test
++//   nvcc ... -DV41IDX_MUTANT_ORDER ... && ./host_test --expect-mismatch   (mutant must be caught)
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cmath>
++#include <vector>
++#include <string>
++
++#include "v41idx.cu"
++
++using v41idx::KB;
++using v41idx::KEY_BYTES;
++
++static uint64_t rng_state = 0x9E3779B97F4A7C15ull;
++static uint64_t rnd() {
++  uint64_t x = rng_state;
++  x ^= x << 13;
++  x ^= x >> 7;
++  x ^= x << 17;
++  return rng_state = x;
++}
++static float uni() { return float(rnd() >> 40) / float(1ull << 24); }  // [0, 1)
++static float gauss() {
++  float u = uni() + 1e-7f, v = uni();
++  return std::sqrt(-2.f * std::log(u)) * std::cos(6.2831853f * v);
++}
++static uint16_t hbits(__half h) {
++  uint16_t u;
++  memcpy(&u, &h, 2);
++  return u;
++}
++static __half hfrom(uint16_t u) {
++  __half h;
++  memcpy(&h, &u, 2);
++  return h;
++}
++
++// --- independent spec decode -------------------------------------------
++static float spec_e2m1(int code) {
++  static const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
++  const float m = mag[code & 7];
++  return (code & 8) ? -m : m;  // code 8 -> -0.0f
++}
++static float spec_scale(int e) {
++  if (e == 0) return 0.f;          // exponent field 0, mantissa 0
++  if (e == 255) return INFINITY;   // exponent field all ones, mantissa 0
++  return std::ldexp(1.f, e - 127);
++}
++
++// --- transliteration of the public reference kernel (v41k.cu, G4b decode indexer) --
++static void ref_scores(const std::vector<__half>& q, const std::vector<__half>& w,
++                       const std::vector<uint8_t>& keys, int64_t cap,
++                       const std::vector<int64_t>& positions, std::vector<__half>& out,
++                       int tokens, int heads, int64_t n_out, int ratio) {
++  const int64_t end = (positions[tokens - 1] + 1) / ratio;
++  const int RB = 32;
++  const int64_t blocks = (cap + RB - 1) / RB;
++  for (int64_t blk = 0; blk < blocks; ++blk) {
++    const int64_t n0 = blk * RB;
++    if (n0 >= end) continue;
++    for (int k = 0; k < RB; ++k) {
++      const int64_t n = n0 + k;
++      if (n >= end) continue;
++      float ks[128];
++      for (int b = 0; b < 64; ++b) {
++        const uint8_t* row = keys.data() + n * 68;
++        const int byte = row[b];
++        const float scale = spec_scale(row[64 + (2 * b) / 32]);
++        const float lo = spec_e2m1(byte & 15) * scale;
++        const float hi = spec_e2m1((byte >> 4) & 15) * scale;
++        ks[2 * b] = __half2float(__float2half_rn(lo));
++        ks[2 * b + 1] = __half2float(__float2half_rn(hi));
++      }
++      for (int tok = 0; tok < tokens; ++tok) {
++        float total = 0.f;
++        for (int h = 0; h < heads; ++h) {
++          const int r = tok * heads + h;
++          float dot = 0.f;
++          for (int d = 0; d < 128; ++d)
++            dot = std::fma(__half2float(q[r * 128 + d]), ks[d], dot);
++          float s = __half2float(__float2half_rn(dot));
++          s = s > 0.f ? s : 0.f;
++          total += __half2float(__float2half_rn(s * __half2float(w[r])));
++        }
++        out[tok * n_out + n] = __float2half_rn(total);
++      }
++    }
++  }
++}
++
++// --- the kernel bodies, run with the kernel's schedule ---------------------
++template <int H>
++static void tiled_host(const std::vector<__half>& q, const std::vector<__half>& w,
++                       const std::vector<uint8_t>& keys, int64_t cap,
++                       const std::vector<int64_t>& positions, std::vector<__half>& out,
++                       int tokens, int64_t n_out, int ratio, int grid_cap) {
++  const int64_t end = v41idx::live_end(positions[tokens - 1], ratio, cap);
++  const int rows = tokens * H;
++  const int nt = ((tokens * v41idx::KL + 31) / 32) * 32;
++  const int64_t blocks = (cap + KB - 1) / KB;
++  const int64_t grid = blocks < grid_cap ? blocks : grid_cap;
++  std::vector<float> buf((v41idx::smem_bytes(rows) + 15) / 4 + 4);
++  unsigned char* base = reinterpret_cast<unsigned char*>(buf.data());
++  for (int64_t cta = 0; cta < grid; ++cta) {
++    int64_t n0 = cta * KB;
++    if (n0 >= end) continue;
++    // fresh, poisoned shared memory per CTA
++    for (auto& f : buf) f = NAN;
++    const v41idx::Smem s = v41idx::carve(base, rows);
++    for (int tid = 0; tid < nt; ++tid)
++      v41idx::stage_q(tid, nt, q.data(), w.data(), rows, s.qs, s.ws);
++    for (; n0 < end; n0 += grid * KB) {
++      for (int tid = 0; tid < nt; ++tid)
++        v41idx::stage_keys(tid, nt, keys.data(), n0, end, s.ks);
++      for (int tid = 0; tid < nt; ++tid) {
++        const int t = tid / v41idx::KL, kl = tid % v41idx::KL;
++        if (t < tokens)
++          v41idx::tile<H>(t, kl, s.qs, s.ks, s.ws, n0, end, out.data(), n_out);
++      }
++    }
++  }
++}
++
++static long decode_test() {
++  long bad = 0;
++  std::vector<uint8_t> row(68 * KB, 0);
++  std::vector<__half> ks(KB * v41idx::KS);
++  // row k: nibble byte (k + 64 * rep) in every one of its 64 bytes, scale byte e
++  for (int e = 0; e < 256; ++e) {
++    for (int rep = 0; rep < 4; ++rep) {
++      for (int k = 0; k < KB; ++k) {
++        for (int b = 0; b < 64; ++b) row[k * 68 + b] = uint8_t(k + 64 * rep);
++        for (int g = 0; g < 4; ++g) row[k * 68 + 64 + g] = uint8_t(e);
++      }
++      for (int tid = 0; tid < 96; ++tid)
++        v41idx::stage_keys(tid, 96, row.data(), 0, KB, ks.data());
++      for (int k = 0; k < KB; ++k) {
++        const int byte = k + 64 * rep;
++        const __half elo = __float2half_rn(spec_e2m1(byte & 15) * spec_scale(e));
++        const __half ehi = __float2half_rn(spec_e2m1((byte >> 4) & 15) * spec_scale(e));
++        for (int b = 0; b < 64; ++b) {
++          if (hbits(ks[k * v41idx::KS + 2 * b]) != hbits(elo)) ++bad;
++          if (hbits(ks[k * v41idx::KS + 2 * b + 1]) != hbits(ehi)) ++bad;
++        }
++      }
++    }
++  }
++  // mixed scales per 32-element group (byte b uses scale 64 + b / 16)
++  for (int k = 0; k < KB; ++k)
++    for (int i = 0; i < 68; ++i) row[k * 68 + i] = uint8_t(rnd());
++  for (int tid = 0; tid < 96; ++tid) v41idx::stage_keys(tid, 96, row.data(), 0, KB, ks.data());
++  for (int k = 0; k < KB; ++k)
++    for (int b = 0; b < 64; ++b) {
++      const int byte = row[k * 68 + b], e = row[k * 68 + 64 + b / 16];
++      if (hbits(ks[k * v41idx::KS + 2 * b]) != hbits(__float2half_rn(spec_e2m1(byte & 15) * spec_scale(e)))) ++bad;
++      if (hbits(ks[k * v41idx::KS + 2 * b + 1]) != hbits(__float2half_rn(spec_e2m1(byte >> 4) * spec_scale(e)))) ++bad;
++    }
++  return bad;
++}
++
++// A stale live position must not consume the guarded allocation beyond capacity.
++// The reference grid has exactly two 32-key blocks for this aligned capacity.
++static int capacity_test() {
++  constexpr int cap = 64, allocated = 128, heads = 8;
++  std::vector<__half> q(heads * 128, __float2half_rn(1.f));
++  std::vector<__half> w(heads, __float2half_rn(0.125f));
++  // Guard rows make a missing bound deterministic instead of invoking host UB.
++  // An actual keys allocation of cap rows would be read out of bounds.
++  std::vector<uint8_t> keys(allocated * KEY_BYTES, 0);
++  std::vector<int64_t> positions(1, allocated - 1);
++  std::vector<__half> expected(allocated, __float2half_rn(-7.f));
++  auto actual = expected;
++  ref_scores(q, w, keys, cap, positions, expected, 1, heads, allocated, 1);
++  tiled_host<heads>(q, w, keys, cap, positions, actual, 1, allocated, 1, 1);
++  for (int n = 0; n < allocated; ++n) {
++    if (hbits(actual[n]) != hbits(expected[n])) {
++      std::printf("CAPACITY FAILED at column %d\n", n);
++      return 1;
++    }
++  }
++  std::printf("CAPACITY OK: stale end is bounded by 64 keys\n");
++  return 0;
++}
++
++int main(int argc, char** argv) {
++  if (argc > 1 && std::string(argv[1]) == "--capacity-only") return capacity_test();
++  if (capacity_test() != 0) return 1;
++  const bool expect_mismatch = argc > 1 && std::string(argv[1]) == "--expect-mismatch";
++  long cases = 0, mismatch_cases = 0, mismatched = 0, compared = 0, nonfinite = 0, written = 0, written_finite = 0;
++  long decode_bad = decode_test();
++  std::printf("DECODE exhaustive 256 bytes x 256 scale bytes + mixed groups: %ld mismatches\n", decode_bad);
++  const int caps[] = {1, 63, 64, 65, 300};
++  const int grids[] = {1, 3, 160};
++  for (int heads : {8, 4}) {
++    for (int tokens = 1; tokens * heads <= 64; ++tokens) {
++      for (int cap : caps) {
++        for (int ratio : {1, 4}) {
++          for (int mode = 0; mode < 2; ++mode) {
++            const int64_t full = int64_t(cap) * ratio;  // positions[T-1] + 1 -> end = cap
++            const int64_t ends_pos[] = {0, 1, int64_t(ratio), full / 2, full - 1, full};
++            for (int64_t p1 : ends_pos) {
++              for (int grid : grids) {
++                const int rows = tokens * heads;
++                std::vector<__half> q(rows * 128), w(rows);
++                for (auto& v : q) {
++                  float f = gauss();
++                  if (mode == 1) {  // extremes: large, overflowing dots, some inf / nan
++                    const float r = uni();
++                    f = r < 0.02f ? (r < 0.01f ? INFINITY : NAN) : f * 30000.f;
++                  }
++                  v = __float2half_rn(f);
++                }
++                for (auto& v : w) v = __float2half_rn(mode == 1 ? gauss() * 300.f : gauss() * 0.1f);
++                std::vector<uint8_t> keys(size_t(cap) * 68);
++                for (int64_t n = 0; n < cap; ++n) {
++                  for (int b = 0; b < 64; ++b) keys[n * 68 + b] = uint8_t(rnd());
++                  for (int g = 0; g < 4; ++g)
++                    keys[n * 68 + 64 + g] = mode == 1 ? uint8_t(rnd()) : uint8_t(118 + rnd() % 14);
++                }
++                std::vector<int64_t> positions(tokens);
++                for (int t = 0; t < tokens; ++t) positions[t] = p1 - 1 - (tokens - 1 - t);
++                const int64_t n_out = cap + 7;
++                std::vector<__half> a(tokens * n_out), b(tokens * n_out);
++                for (size_t i = 0; i < a.size(); ++i) a[i] = b[i] = hfrom(uint16_t(0x7E00 | (i & 0x1FF)));
++                ref_scores(q, w, keys, cap, positions, a, tokens, heads, n_out, ratio);
++                if (heads == 8)
++                  tiled_host<8>(q, w, keys, cap, positions, b, tokens, n_out, ratio, grid);
++                else
++                  tiled_host<4>(q, w, keys, cap, positions, b, tokens, n_out, ratio, grid);
++                long m = 0;
++                for (size_t i = 0; i < a.size(); ++i) {
++                  if (hbits(a[i]) != hbits(b[i])) ++m;
++                  if (!std::isfinite(__half2float(a[i]))) ++nonfinite;
++                  if (hbits(a[i]) != uint16_t(0x7E00 | (i & 0x1FF))) {
++                    ++written;
++                    if (std::isfinite(__half2float(a[i]))) ++written_finite;
++                  }
++                }
++                compared += long(a.size());
++                mismatched += m;
++                ++cases;
++                if (m) {
++                  ++mismatch_cases;
++                  if (!expect_mismatch && mismatch_cases <= 5)
++                    std::printf("MISMATCH heads %d tokens %d cap %d ratio %d mode %d p1 %lld grid %d: %ld\n",
++                                heads, tokens, cap, ratio, mode, (long long)p1, grid, m);
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++  std::printf("SCORES %ld cases, %ld values compared (%ld non-finite incl. poison; %ld written by the reference, %ld of them finite), %ld mismatched values in %ld cases\n",
++              cases, compared, nonfinite, written, written_finite, mismatched, mismatch_cases);
++  if (!expect_mismatch && (written < 100000 || written_finite < 50000)) {
++    std::printf("FAILED: too few written values for a meaningful comparison\n");
++    return 1;
++  }
++  if (expect_mismatch) {
++    const bool killed = mismatched > 0;
++    std::printf("%s\n", killed ? "MUTANT KILLED" : "MUTANT SURVIVED");
++    return killed ? 0 : 1;
++  }
++  const bool ok = decode_bad == 0 && mismatched == 0;
++  std::printf("%s\n", ok ? "ALL OK" : "FAILED");
++  return ok ? 0 : 1;
++}
+diff --git a/benchmarks/deepseek_v41/v41idx/v41idx_ref.cuh b/benchmarks/deepseek_v41/v41idx/v41idx_ref.cuh
+new file mode 100644
+index 0000000000..dfdcde161c
+--- /dev/null
++++ b/benchmarks/deepseek_v41/v41idx/v41idx_ref.cuh
+@@ -0,0 +1,73 @@
++// Copy of index_scores_decode from benchmarks/deepseek_v41/v41k/v41k.cu (#1277).
++// Wrapped in namespace v41idx_ref; used only by the check op index_scores_ref. Do not edit.
++namespace v41idx_ref {
++// ---- G4b decode indexer: scores over packed FP4 index keys ----------------
++// Packed key row (68 B): 64 B E2M1 nibbles (even element in the low nibble)
++// then 4 power-of-two scale exponents (biased) for groups of 32. Rows q/w are
++// (token, head) pairs padded to 64. Output fp16 out[t, n] =
++//   sum_h fp16(fp16(relu(fp16(q[t,h] . k[n]))) * w[t,h]), for n < live end.
++__device__ __forceinline__ float v41k_e2m1(int code) {
++  const int m = code & 7;
++  const float mag = m < 2 ? 0.5f * m
++                          : __uint_as_float(uint32_t(((m >> 1) + 126) << 23) |
++                                            uint32_t((m & 1) << 22));
++  return (code & 8) ? -mag : mag;
++}
++
++template <int KB>
++__global__ void __launch_bounds__(256)
++    index_scores_decode(const half* __restrict__ q, const half* __restrict__ w,
++                        const uint8_t* __restrict__ keys,
++                        const int64_t* __restrict__ positions,
++                        half* __restrict__ out, int tokens, int heads,
++                        int64_t n_out, int ratio) {
++  __shared__ half qs[64][136];
++  __shared__ float ks[KB][129];
++  __shared__ float ws[64];
++  const int t = threadIdx.x;
++  const int64_t end = (positions[tokens - 1] + 1) / ratio;
++  const int64_t n0 = int64_t(blockIdx.x) * KB;
++  if (n0 >= end) return;
++  const int rows = tokens * heads;
++  for (int i = t; i < 64 * 128; i += 256) {
++    const int r = i / 128, d = i % 128;
++    qs[r][d] = r < rows ? q[r * 128 + d] : __float2half(0.f);
++  }
++  if (t < 64) ws[t] = t < rows ? __half2float(w[t]) : 0.f;
++  for (int i = t; i < KB * 64; i += 256) {
++    const int k = i / 64, b = i % 64;
++    const int64_t n = n0 + k;
++    float lo = 0.f, hi = 0.f;
++    if (n < end) {
++      const uint8_t* row = keys + n * 68;
++      const int byte = row[b];
++      const float scale =
++          __uint_as_float(uint32_t(row[64 + (2 * b) / 32]) << 23);
++      lo = v41k_e2m1(byte & 15) * scale;
++      hi = v41k_e2m1((byte >> 4) & 15) * scale;
++    }
++    // Round like the FP16 cache values (exact for these products).
++    ks[k][2 * b] = __half2float(__float2half_rn(lo));
++    ks[k][2 * b + 1] = __half2float(__float2half_rn(hi));
++  }
++  __syncthreads();
++  // Each thread: one key column (k), a stripe of (token) outputs.
++  for (int item = t; item < KB * tokens; item += 256) {
++    const int k = item % KB, tok = item / KB;
++    const int64_t n = n0 + k;
++    if (n >= end) continue;
++    float total = 0.f;
++    for (int h = 0; h < heads; ++h) {
++      const int r = tok * heads + h;
++      float dot = 0.f;
++#pragma unroll 16
++      for (int d = 0; d < 128; ++d)
++        dot = fmaf(__half2float(qs[r][d]), ks[k][d], dot);
++      float s = __half2float(__float2half_rn(dot));
++      s = s > 0.f ? s : 0.f;
++      total += __half2float(__float2half_rn(s * ws[r]));
++    }
++    out[int64_t(tok) * n_out + n] = __float2half_rn(total);
++  }
++}
++}  // namespace v41idx_ref
+diff --git a/docs/configuration/env_var_reference.md b/docs/configuration/env_var_reference.md
+index 0cd2a4f70a..ae78a729ca 100644
+--- a/docs/configuration/env_var_reference.md
++++ b/docs/configuration/env_var_reference.md
+@@ -336,6 +336,8 @@ This is the user reference. Internal tuning, diagnostics and compatibility alias
+ | `VLLM_V1_OUTPUT_PROC_CHUNK_SIZE` | tuning | Controls the maximum number of requests to handle in a single asyncio task when processing per-token outputs in the V1 AsyncLLM interface. It is applicable when handling a high concurrency of streaming requests. Setting this too high can result in a higher variance of inter-message latencies. Setting it too low can negatively impact TTFT and overall throughput. | 128 | 128 | None | No SM70 path association |
+ | `VLLM_V1_USE_OUTLINES_CACHE` | configuration | Whether to turn on the outlines cache for V1 This cache is unbounded and on disk, so it's not safe to use in an environment with potentially malicious users. | False | False | None | No SM70 path association |
+ | `VLLM_V2_CUDAGRAPH_MEM_MIB` | configuration | Explicit CUDA graph memory reservation for the V2 GPU model runner, which does not profile graph memory yet. The default preserves upstream behavior. Set this from a measured capture result when sizing a tight KV cache pool. | 0.0 | 0.0 | None | No SM70 path association |
++| `VLLM_V41_INDEX_TILED` | experimental | Enable the exact SM70 packed V4.1 tiled decode index scorer. | False | False | None | DeepSeek V4.1 SM70 |
++| `VLLM_V41_INDEX_TILED_LIB` | experimental | Library for the SM70 packed V4.1 tiled index scorer; empty selects the repository build. | '' | '' | None | DeepSeek V4.1 SM70 |
+ | `VLLM_VIDEO_FETCH_TIMEOUT` | configuration | Timeout for fetching videos when serving multimodal models Default is 30 seconds | 30 | 30 | None | No SM70 path association |
+ | `VLLM_VIDEO_LOADER_BACKEND` | configuration | Backend for Video IO — selects the frame-sampling algorithm. - "opencv": uniform sampling. - "opencv\_dynamic": duration-aware dynamic sampling. - "identity": returns raw video bytes for model processor to handle.  Custom backend implementations can be registered via `@VIDEO_LOADER_REGISTRY.register("my_custom_video_loader")` and imported at runtime. If a non-existing backend is used, an AssertionError will be thrown. | 'opencv' | 'opencv' | None | No SM70 path association |
+ | `VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY` | configuration | Disable using pytorch's pin memory for CPU offloading. | False | False | None | No SM70 path association |
+diff --git a/docs/design/architecture/runtime_reference.md b/docs/design/architecture/runtime_reference.md
+index fec78b664f..1b6ead6135 100644
+--- a/docs/design/architecture/runtime_reference.md
++++ b/docs/design/architecture/runtime_reference.md
+@@ -11,7 +11,8 @@ identify initialization/hash code; they do not evaluate its semantics.
+ 
+ | Type | Owner paths | Lifecycle / hash methods | Source |
+ | --- | --- | --- | --- |
+-| `vllm.config.attention.AttentionConfig` | attention_config | compute_hash: [vllm/config/attention.py](../../../vllm/config/attention.py#L101) | [vllm/config/attention.py](../../../vllm/config/attention.py#L16) |
++| `vllm.config.attention.AttentionConfig` | attention_config | compute_hash: [vllm/config/attention.py](../../../vllm/config/attention.py#L121) | [vllm/config/attention.py](../../../vllm/config/attention.py#L33) |
++| `vllm.config.attention.V41IndexTiledPolicy` | attention_config.v41_index_tiled | resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L29); compute_hash: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L37) | [vllm/config/attention.py](../../../vllm/config/attention.py#L17) |
+ | `vllm.config.cache.CacheConfig` | cache_config | compute_hash: [vllm/config/cache.py](../../../vllm/config/cache.py#L207) | [vllm/config/cache.py](../../../vllm/config/cache.py#L43) |
+ | `vllm.config.compilation.CUDAGraphMode` | compilation_config.cudagraph_mode |  | [vllm/config/compilation.py](../../../vllm/config/compilation.py#L54) |
+ | `vllm.config.compilation.CompilationConfig` | compilation_config | compute_hash: [vllm/config/compilation.py](../../../vllm/config/compilation.py#L790); __post_init__: [vllm/config/compilation.py](../../../vllm/config/compilation.py#L916) | [vllm/config/compilation.py](../../../vllm/config/compilation.py#L391) |
+diff --git a/tests/config/test_v41_index_tiled_policy.py b/tests/config/test_v41_index_tiled_policy.py
+new file mode 100644
+index 0000000000..58961b1b58
+--- /dev/null
++++ b/tests/config/test_v41_index_tiled_policy.py
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Real initialization/serialization contracts; no native operation replaced."""
++
++import pickle
++
++import pytest
++
++from vllm import envs
++from vllm.config.attention import AttentionConfig, V41IndexTiledPolicy
++
++
++def test_inputs_are_frozen_serialized_and_hash_only_when_bound(monkeypatch):
++    envs.disable_envs_cache()
++    monkeypatch.setenv("VLLM_V41_INDEX_TILED", "1")
++    monkeypatch.setenv("VLLM_V41_INDEX_TILED_LIB", "relative/v41idx.so")
++    config = AttentionConfig()
++    before = config.compute_hash()
++    config.v41_index_tiled.resolve()
++    assert config.compute_hash() == before
++    copy = pickle.loads(pickle.dumps(config.v41_index_tiled))
++    monkeypatch.setenv("VLLM_V41_INDEX_TILED", "invalid-after-initialization")
++    copy.resolve()
++    assert copy.enabled is True and copy.library == "relative/v41idx.so"
++    config.v41_index_tiled.active = True
++    assert config.compute_hash() != before
++
++
++def test_explicit_typed_values_override_invalid_legacy(monkeypatch):
++    envs.disable_envs_cache()
++    monkeypatch.setenv("VLLM_V41_INDEX_TILED", "invalid")
++    policy = V41IndexTiledPolicy(enabled=False, library="")
++    policy.resolve()
++    assert policy.enabled is False
++    assert policy.sources["enabled"] == "typed"
++
++
++@pytest.mark.parametrize("value", ["2", " ", "true"])
++def test_invalid_legacy_flag_raises(monkeypatch, value):
++    envs.disable_envs_cache()
++    monkeypatch.setenv("VLLM_V41_INDEX_TILED", value)
++    with pytest.raises(ValueError, match="VLLM_V41_INDEX_TILED"):
++        V41IndexTiledPolicy().resolve()
++
++
++def test_empty_legacy_flag_preserves_disabled_contract(monkeypatch):
++    envs.disable_envs_cache()
++    monkeypatch.setenv("VLLM_V41_INDEX_TILED", "")
++    policy = V41IndexTiledPolicy()
++    policy.resolve()
++    assert policy.enabled is False
+diff --git a/tests/models/test_deepseek_v41_index_tiled.py b/tests/models/test_deepseek_v41_index_tiled.py
+new file mode 100644
+index 0000000000..3e5e01799b
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_index_tiled.py
+@@ -0,0 +1,65 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU unit contracts for scorer admission and packed caller dispatch."""
++
++import pytest
++import torch
++
++from vllm.models.deepseek_v41 import attention_ops, index_topk
++from vllm.models.deepseek_v41.index_tiled import IndexTiledScorer
++
++
++@pytest.mark.parametrize("heads", [0, 3, 16])
++def test_unsupported_heads_refuse_before_library_load(heads):
++    with pytest.raises(ValueError, match="4 or 8"):
++        IndexTiledScorer(None, heads)
++
++
++@pytest.mark.parametrize("enabled", [False, True])
++def test_packed_decode_dispatch_preserves_tensors(monkeypatch, enabled):
++    q = torch.arange(1024, dtype=torch.float16).reshape(1, 8, 128)
++    weights = torch.arange(8, dtype=torch.float16).reshape(1, 8)
++    keys = torch.zeros(64, 68, dtype=torch.uint8)
++    positions = torch.tensor([63], dtype=torch.int64)
++    valid = torch.tensor([True])
++    calls = []
++
++    def score(out, actual_q, actual_w, actual_keys, actual_pos, heads, ratio):
++        torch.testing.assert_close(actual_q, q.reshape(8, 128), rtol=0, atol=0)
++        torch.testing.assert_close(actual_w, weights.reshape(8), rtol=0, atol=0)
++        assert actual_keys is keys
++        torch.testing.assert_close(actual_pos, positions)
++        assert (heads, ratio) == (8, 1)
++        out.copy_(torch.arange(64, dtype=torch.float16))
++
++    class RecordingScorer:
++        def scores(self, *args):
++            calls.append("tiled")
++            score(*args)
++
++    def legacy_score(*args):
++        calls.append("legacy")
++        score(*args)
++
++    # Only the adapter is under test: CPU sinks stand in for GPU-only providers.
++    def topk(out, scores, actual_pos, actual_valid, ratio, count):
++        assert actual_pos is positions and actual_valid is valid
++        out.copy_(torch.topk(scores, count, dim=1).indices.to(torch.int32))
++
++    monkeypatch.setattr(index_topk, "index_topk", topk)
++    monkeypatch.setattr(attention_ops, "_cuda_index_scores", lambda: True)
++    monkeypatch.setattr(
++        torch.ops.v41k, "index_scores_decode", legacy_score, raising=False
++    )
++    result = attention_ops.select_packed_positions(
++        q,
++        weights,
++        keys,
++        positions,
++        valid,
++        1,
++        lambda value: value,
++        top_k=4,
++        scorer=RecordingScorer() if enabled else None,
++    )
++    assert calls == ["tiled" if enabled else "legacy"]
++    assert result.tolist() == [[63, 62, 61, 60]]
+diff --git a/vllm/config/attention.py b/vllm/config/attention.py
+index 6f03507d36..c801e9277e 100644
+--- a/vllm/config/attention.py
++++ b/vllm/config/attention.py
+@@ -1,17 +1,34 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from typing import Any, Literal
++from typing import Any, ClassVar, Literal
+ 
+ from pydantic import Field, field_validator
+ 
+ from vllm.config.execution_policy import FlashV100Policy
++from vllm.config.execution_policy_base import ExecutionPolicy
+ from vllm.config.sm70_triton_attention import Sm70TritonAttentionPolicy
+ from vllm.config.utils import config
+ from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+ 
++@config
++class V41IndexTiledPolicy(ExecutionPolicy):
++    """Initialization-only selection of the exact packed V4.1 scorer."""
++
++    enabled: bool | None = None
++    """Opt in to the register-tiled packed decode scorer."""
++    library: str | None = None
++    """Library filename; empty selects the repository's v41idx build."""
++    active: bool = Field(default=False, init=False)
++    """Set only by a packed V4.1 indexer before graph compilation."""
++    aliases: ClassVar[dict[str, str]] = {
++        "enabled": "VLLM_V41_INDEX_TILED",
++        "library": "VLLM_V41_INDEX_TILED_LIB",
++    }
++
++
+ @config
+ class AttentionConfig:
+     """Configuration for attention mechanisms in vLLM."""
+@@ -24,6 +41,9 @@ class AttentionConfig:
+     )
+     """SM70 fallback schedule; independent of the Flash-V100 backend policy."""
+ 
++    v41_index_tiled: V41IndexTiledPolicy = Field(default_factory=V41IndexTiledPolicy)
++    """Packed V4.1 scorer; inactive models retain their graph hash."""
++
+     backend: AttentionBackendEnum | None = None
+     """Attention backend to use. Use "auto" or None for automatic selection."""
+ 
+@@ -108,10 +128,12 @@ def compute_hash(self) -> str:
+         """
+         from vllm.config.utils import get_hash_factors, hash_factors
+ 
+-        ignored_factors: set[str] = set()
++        ignored_factors: set[str] = {"v41_index_tiled"}
+         factors = get_hash_factors(self, ignored_factors)
+         factors["flash_v100"] = self.flash_v100.compute_hash()
+         factors["sm70_triton"] = self.sm70_triton.compute_hash()
++        if self.v41_index_tiled.active:
++            factors["v41_index_tiled"] = self.v41_index_tiled.compute_hash()
+         return hash_factors(factors)
+ 
+     @field_validator("backend", mode="before")
+diff --git a/vllm/config/execution_policy.py b/vllm/config/execution_policy.py
+index 95e85a0301..5ae26efb11 100644
+--- a/vllm/config/execution_policy.py
++++ b/vllm/config/execution_policy.py
+@@ -792,6 +792,7 @@ def gib_bytes(self, field: str) -> int | None:
+     "offload_config.ple": "PlePlacementPolicy",
+     "attention_config.flash_v100": "FlashV100Policy",
+     "attention_config.sm70_triton": "Sm70TritonAttentionPolicy",
++    "attention_config.v41_index_tiled": "V41IndexTiledPolicy",
+     "attention_config.flash_v100.turboquant": "TurboQuantRuntimePolicy",
+ }
+ 
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..13cae412a6 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -475,6 +475,8 @@
+     VLLM_V41_ENGRAM_READERS: str | None = None
+     VLLM_V41_EXACT_GEMM: str = "0"
+     VLLM_V41_EXPERT_FAST_HIT: str = "1"
++    VLLM_V41_INDEX_TILED: bool = False
++    VLLM_V41_INDEX_TILED_LIB: str = ""
+     VLLM_V41_FP8_GEMV: str = "1"
+     VLLM_V41_FREE_SLOTS: str | None = None
+     VLLM_V41_FUSED_SPARSE: str = "0"
+@@ -7396,6 +7398,29 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_INDEX_TILED": env_var(
++        lambda: env_with_choices("VLLM_V41_INDEX_TILED", "0", ["0", "1", ""])() == "1",
++        description="Enable the exact SM70 packed V4.1 tiled decode index scorer.",
++        category="experimental",
++        declared_default="False",
++        effective_default="False",
++        automatic_conditions=(),
++        acceleration_paths=("DeepSeek V4.1 SM70",),
++        user_visible=True,
++    ),
++    "VLLM_V41_INDEX_TILED_LIB": env_var(
++        lambda: os.getenv("VLLM_V41_INDEX_TILED_LIB", ""),
++        description=(
++            "Library for the SM70 packed V4.1 tiled index scorer; empty "
++            "selects the repository build."
++        ),
++        category="experimental",
++        declared_default="''",
++        effective_default="''",
++        automatic_conditions=(),
++        acceleration_paths=("DeepSeek V4.1 SM70",),
++        user_visible=True,
++    ),
+     "VLLM_V41_FP8_GEMV": env_var(
+         lambda: os.getenv("VLLM_V41_FP8_GEMV", "1"),
+         description=("DS-V4.1 SM70 runtime switch (developer)."),
+diff --git a/vllm/models/deepseek_v41/attention_ops.py b/vllm/models/deepseek_v41/attention_ops.py
+index f9dfadc1cb..8ad750f3c8 100644
+--- a/vllm/models/deepseek_v41/attention_ops.py
++++ b/vllm/models/deepseek_v41/attention_ops.py
+@@ -778,7 +778,16 @@ def _cuda_index_scores():
+ 
+ 
+ def select_packed_positions(
+-    q, weights, keys, positions, valid_tokens, ratio, all_reduce, *, top_k=512
++    q,
++    weights,
++    keys,
++    positions,
++    valid_tokens,
++    ratio,
++    all_reduce,
++    *,
++    top_k=512,
++    scorer=None,
+ ):
+     """select_compressed_positions over packed, position-addressed index keys."""
+     from vllm.models.deepseek_v41.index_topk import index_topk
+@@ -789,7 +798,17 @@ def select_packed_positions(
+         scores = torch.empty(
+             tokens, keys.shape[0], dtype=torch.float16, device=q.device
+         )
+-        if _cuda_index_scores():
++        if scorer is not None:
++            scorer.scores(
++                scores,
++                q.reshape(-1, 128).contiguous(),
++                weights.reshape(-1).contiguous(),
++                keys,
++                positions.long(),
++                heads,
++                ratio,
++            )
++        elif _cuda_index_scores():
+             # Volta: Triton dots fall back to FMA; the CUDA kernel is bounded too.
+             torch.ops.v41k.index_scores_decode(
+                 scores,
+diff --git a/vllm/models/deepseek_v41/index_tiled.py b/vllm/models/deepseek_v41/index_tiled.py
+new file mode 100644
+index 0000000000..90524924c4
+--- /dev/null
++++ b/vllm/models/deepseek_v41/index_tiled.py
+@@ -0,0 +1,58 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Exact register-tiled packed index scores, owned by the model indexer."""
++
++from pathlib import Path
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++class IndexTiledScorer:
++    """Load/admit once before graph capture; calls consume no environment."""
++
++    def __init__(self, library: str | None, heads: int) -> None:
++        if heads not in (4, 8):
++            raise ValueError("V4.1 tiled index requires 4 or 8 heads per rank")
++        if library is None:
++            raise RuntimeError("V4.1 index library policy was not initialized")
++        path = (
++            Path(library)
++            if library
++            else (
++                Path(__file__).resolve().parents[3]
++                / "benchmarks/deepseek_v41/v41idx/build/v41idx.so"
++            )
++        )
++        if torch.cuda.get_device_capability() != (7, 0):
++            raise ValueError("V4.1 tiled index is qualified only on SM70")
++        torch.ops.load_library(str(path))
++        if not all(
++            hasattr(torch.ops.v41idx, name)
++            for name in ("version", "index_scores_tiled")
++        ):
++            raise RuntimeError(
++                f"V4.1 tiled index library lacks required operations: {path}"
++            )
++        if torch.ops.v41idx.version() != 1:
++            raise RuntimeError("V4.1 tiled index library ABI must be version 1")
++        self.operation = torch.ops.v41idx.index_scores_tiled
++        self.logged = False
++
++    def scores(
++        self,
++        out: torch.Tensor,
++        q: torch.Tensor,
++        weights: torch.Tensor,
++        keys: torch.Tensor,
++        positions: torch.Tensor,
++        heads: int,
++        ratio: int,
++    ) -> None:
++        if not self.logged:
++            logger.info("V4.1 tiled index scorer active: heads=%d", heads)
++            self.logged = True
++        self.operation(out, q, weights, keys, positions, heads, ratio)
+diff --git a/vllm/models/deepseek_v41/model.py b/vllm/models/deepseek_v41/model.py
+index 1a224cb554..333a016a77 100644
+--- a/vllm/models/deepseek_v41/model.py
++++ b/vllm/models/deepseek_v41/model.py
+@@ -248,6 +248,21 @@ def forward(self, x, positions, profile=False):
+ class V41Indexer(nn.Module):
+     def __init__(self, c, quant_config, source, ratio, prefix):
+         super().__init__()
++        from vllm.config import get_current_vllm_config
++
++        from .index_tiled import IndexTiledScorer
++
++        policy = get_current_vllm_config().attention_config.v41_index_tiled
++        if not isinstance(policy.enabled, bool):
++            raise RuntimeError("V4.1 tiled index policy was not initialized")
++        if policy.enabled and not _PACKED_KV:
++            raise ValueError("V4.1 tiled index requires packed KV")
++        self.heads = c.index_n_heads // 4
++        # The model adapter binds the effective policy before graph-key creation.
++        policy.active = bool(_PACKED_KV and policy.enabled)
++        self.index_scorer = (
++            IndexTiledScorer(policy.library, self.heads) if policy.active else None
++        )
+         kwargs = dict(bias=False, return_bias=False, quant_config=quant_config)
+         self.wq_b = ColumnParallelLinear(
+             c.q_lora_rank,
+@@ -258,7 +273,6 @@ def __init__(self, c, quant_config, source, ratio, prefix):
+         self.weights_proj = ColumnParallelLinear(
+             c.hidden_size, c.index_n_heads, prefix=prefix + ".weights_proj", **kwargs
+         )
+-        self.heads = c.index_n_heads // 4
+         if source:
+             self.wk = ReplicatedLinear(512, 128, prefix=prefix + ".wk", **kwargs)
+             self.k_norm = V41Norm(128)
+@@ -323,6 +337,7 @@ def forward(
+                 valid_tokens,
+                 ratio,
+                 tensor_model_parallel_all_reduce,
++                scorer=self.index_scorer,
+             )
+         metadata = source_cache.metadata()
+         keys = gather_index_keys(

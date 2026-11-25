@@ -1,0 +1,100 @@
+{
+  "initial_inventory": {
+    "number": 1382,
+    "title": "[Perf][SM70] Admit small aligned FP16 sum2 messages to the TP4 push all-reduce (VLLM_V41_SUM2_PUSH_ANY, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1382",
+    "isDraft": false,
+    "headRefOid": "d488114cd1753a411f26248945ebeb822fe891ae",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1382,
+    "title": "[Perf][SM70] Admit small aligned FP16 sum2 messages to the TP4 push all-reduce (VLLM_V41_SUM2_PUSH_ANY, default off)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nIndependent of our other PRs; applies to `main` alone.\n\n## Purpose\n\nThe fused add + all-reduce (`allreduce_sum2`) takes the SM70 TP4 one-stage push kernel only for the Qwen3.8 and Qwen4 shape selectors. Other models' small sum2 messages fall back to the generic one-stage path, even when ordinary TP4 all-reduce already admits the same size to the push kernel.\n\nWith **`VLLM_V41_SUM2_PUSH_ANY=1`** (default off) together with the existing `VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES=1`, any captured sum2 message on a fully connected SM70 TP4 communicator that ordinary TP4 admits (16-byte aligned, at most the M8 bound) takes the same push kernel, with ordinary TP4's block count (`sm70_tp4_push_allreduce_blocks(..., allow_generic=true)`, unchanged). Unset or `0` keeps sum2's existing selectors exactly.\n\n- `custom_all_reduce.cuh`: the generic admission beside the shape selectors; the first generic push logs once per rank.\n- `custom_all_reduce_policy*.{h,inc}`, `config/sm70_native.py`: a communicator-owned policy field; the policy constructor rejects any value other than `0` or `1`.\n- `envs.py`: the variable, registered with metadata.\n\nUse: DeepSeek-V4.1's MoE add + all-reduce (`VLLM_SM70_MOE_ADD_ALLREDUCE=1`) goes through sum2. On its own that switch lost time in our runs (+0.28 ms per decode round); with this admission its decode messages take the push kernel and it wins (below).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\nCUDA_VISIBLE_DEVICES= pytest -q tests/config/test_collective_policy.py tests/distributed/test_custom_all_reduce_dispatch.py \\\n  tests/tools/test_config_inventory.py tests/tools/test_sm70_path_explanations.py\nnvcc -std=c++17 -gencode arch=compute_70,code=sm_70 -O2 -c csrc/custom_all_reduce.cu ...   # torch + python includes\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| sum2 generic push | FP16 | SM70, TP4, fully connected, captured graph, both switches `1`, 16-byte aligned, <= M8 bytes | TP4 one-stage push kernel | measured on 8x V100 (PP2 x TP4, each stage a TP4 group); sm_70 compile | single-node TP4 without PP not measured |\n| sum2, switch off | FP16 | default | existing Qwen3.8 / Qwen4 selectors, else the generic path | source (the new term is false); policy tests | — |\n| Bad value | — | `VLLM_V41_SUM2_PUSH_ANY` not 0/1 | policy constructor throws | source | not executed (needs the rebuilt `_C`) |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_SUM2_PUSH_ANY` defaults off.\n- Required CLI options and environment switches: `VLLM_V41_SUM2_PUSH_ANY=1`, `VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES=1`; for the measurement below also `VLLM_SM70_MOE_ADD_ALLREDUCE=1`.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port and our other default-off levers; this branch is the change alone, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none (requires a `_C` rebuild).\n- User-entry route-hit, speed, and output-quality evidence: below; the route logs \"sum2 generic push active\" once per rank.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: one experimental variable with metadata; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +1 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-04,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark, one request, paired ABBAABBA arms, the three switches above on vs off: decode **-0.180 ms per round** (95 % interval -0.278 to -0.081). Output texts identical. (`VLLM_SM70_MOE_ADD_ALLREDUCE=1` alone, 2026-11-03: +0.284 ms per round, slower.)\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- `nvcc` sm_70 compile of `csrc/custom_all_reduce.cu`: OK. (`custom_all_reduce_test.cu` needs MPI, not installed; not built.)\n- pytest, the four files above, CPU only: 110 passed.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass (architecture reference regenerated in this commit).\n- ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: a full `_C` build, any GPU test (a TP4 push needs four connected GPUs) or serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1382",
+    "isDraft": false,
+    "headRefName": "pli/sm70-sum2-push-any",
+    "headRefOid": "d488114cd1753a411f26248945ebeb822fe891ae",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1382,
+    "id": "PR_kwDORjYFXs8AAAABNJO--A",
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefOid": "d488114cd1753a411f26248945ebeb822fe891ae",
+    "title": "[Perf][SM70] Admit small aligned FP16 sum2 messages to the TP4 push all-reduce (VLLM_V41_SUM2_PUSH_ANY, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1382",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\nIndependent of our other PRs; applies to `main` alone.\n\n## Purpose\n\nThe fused add + all-reduce (`allreduce_sum2`) takes the SM70 TP4 one-stage push kernel only for the Qwen3.8 and Qwen4 shape selectors. Other models' small sum2 messages fall back to the generic one-stage path, even when ordinary TP4 all-reduce already admits the same size to the push kernel.\n\nWith **`VLLM_V41_SUM2_PUSH_ANY=1`** (default off) together with the existing `VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES=1`, any captured sum2 message on a fully connected SM70 TP4 communicator that ordinary TP4 admits (16-byte aligned, at most the M8 bound) takes the same push kernel, with ordinary TP4's block count (`sm70_tp4_push_allreduce_blocks(..., allow_generic=true)`, unchanged). Unset or `0` keeps sum2's existing selectors exactly.\n\n- `custom_all_reduce.cuh`: the generic admission beside the shape selectors; the first generic push logs once per rank.\n- `custom_all_reduce_policy*.{h,inc}`, `config/sm70_native.py`: a communicator-owned policy field; the policy constructor rejects any value other than `0` or `1`.\n- `envs.py`: the variable, registered with metadata.\n\nUse: DeepSeek-V4.1's MoE add + all-reduce (`VLLM_SM70_MOE_ADD_ALLREDUCE=1`) goes through sum2. On its own that switch lost time in our runs (+0.28 ms per decode round); with this admission its decode messages take the push kernel and it wins (below).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check\npython -m tools.config_inventory --check\npython tools/pre_commit/check_env_metadata.py\npython tools/pre_commit/check_env_registration.py\npython -m tools.generate_architecture_reference --check\nCUDA_VISIBLE_DEVICES= pytest -q tests/config/test_collective_policy.py tests/distributed/test_custom_all_reduce_dispatch.py \\\n  tests/tools/test_config_inventory.py tests/tools/test_sm70_path_explanations.py\nnvcc -std=c++17 -gencode arch=compute_70,code=sm_70 -O2 -c csrc/custom_all_reduce.cu ...   # torch + python includes\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| sum2 generic push | FP16 | SM70, TP4, fully connected, captured graph, both switches `1`, 16-byte aligned, <= M8 bytes | TP4 one-stage push kernel | measured on 8x V100 (PP2 x TP4, each stage a TP4 group); sm_70 compile | single-node TP4 without PP not measured |\n| sum2, switch off | FP16 | default | existing Qwen3.8 / Qwen4 selectors, else the generic path | source (the new term is false); policy tests | — |\n| Bad value | — | `VLLM_V41_SUM2_PUSH_ANY` not 0/1 | policy constructor throws | source | not executed (needs the rebuilt `_C`) |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_SUM2_PUSH_ANY` defaults off.\n- Required CLI options and environment switches: `VLLM_V41_SUM2_PUSH_ANY=1`, `VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES=1`; for the measurement below also `VLLM_SM70_MOE_ADD_ALLREDUCE=1`.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port and our other default-off levers; this branch is the change alone, rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: none (requires a `_C` rebuild).\n- User-entry route-hit, speed, and output-quality evidence: below; the route logs \"sum2 generic push active\" once per rank.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: one experimental variable with metadata; env, config-inventory and architecture references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: +1 registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-04,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark, one request, paired ABBAABBA arms, the three switches above on vs off: decode **-0.180 ms per round** (95 % interval -0.278 to -0.081). Output texts identical. (`VLLM_SM70_MOE_ADD_ALLREDUCE=1` alone, 2026-11-03: +0.284 ms per round, slower.)\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- `nvcc` sm_70 compile of `csrc/custom_all_reduce.cu`: OK. (`custom_all_reduce_test.cu` needs MPI, not installed; not built.)\n- pytest, the four files above, CPU only: 110 passed.\n- `generate_env_reference --check`, `config_inventory --check`, `check_env_metadata.py`, `check_env_registration.py`, `generate_architecture_reference --check`: all pass (architecture reference regenerated in this commit).\n- ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: a full `_C` build, any GPU test (a TP4 push needs four connected GPUs) or serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/sm70-sum2-push-any",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1382,
+    "title": "[Perf][SM70] Admit small aligned FP16 sum2 messages to the TP4 push all-reduce (VLLM_V41_SUM2_PUSH_ANY, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1382",
+    "isDraft": false,
+    "headRefOid": "d488114cd1753a411f26248945ebeb822fe891ae",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "csrc/custom_all_reduce.cuh",
+      "csrc/custom_all_reduce_policy.h",
+      "csrc/custom_all_reduce_policy_fields.inc",
+      "docs/design/architecture/runtime_reference.md",
+      "vllm/config/sm70_native.py",
+      "vllm/envs.py"
+    ],
+    "diff_bytes": 10749,
+    "diff_sha256": "64c340a56f48b043c97ddb937d47ddf665e2465d78090df2ed561aa6bdc72534"
+  },
+  "full_tree_diff_proof": null
+}

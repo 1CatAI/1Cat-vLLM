@@ -1,0 +1,130 @@
+{
+  "initial_inventory": {
+    "number": 1384,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Fast routed-expert decode kernels (VLLM_V41_EXPERT_FAST, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1384",
+    "isDraft": false,
+    "headRefOid": "c32b74a62cd14fda8ea0b5d356ea048598dce26e",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1384,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Fast routed-expert decode kernels (VLLM_V41_EXPERT_FAST, default off)",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1383.** This branch is #1383 (one commit), then one commit; review only the last commit. `gguf_v41_moe.py`'s fast path takes #1383's plan mode (`_PLAN_FUSE`). Our instruction-diet PR builds on this one.\n\n## Purpose\n\nNew v41k kernels for the DeepSeek-V4.1 TP4 row-split routed experts at decode (M = 1..6), beside the old ones, selected by **`VLLM_V41_EXPERT_FAST=1`** (default off). The old kernels are not touched.\n\n- `gate_up_fast` replaces `q8 + gate_up7` / `gate_up7p` (both plan modes); `down_rows_fast` replaces `down_rows` at row tile 4 (other tiles raise).\n- Decode: every codebook entry is one 32-bit PRMT selector word, so an IQ2_XXS / IQ2_XS / IQ1_M octet is 1 LDS + 2 PRMT instead of a byte-codebook lookup plus `__vsub4` / `__vadd4` (emulated on sm_70, 4-5 instructions per word). The IQ2 tables are replicated across shared-memory banks (1-2 wavefronts per warp lookup instead of ~3.5).\n- Numerics: bitwise identical to the old kernels: same per-lane serial chains, butterflies and accumulation order; only the assignment of rows and experts to warps and CTAs differs (empty classes add +0 to a total that starts at +0).\n- `benchmarks/deepseek_v41/expert_fast_check.py`: one-GPU bit check, both roles, gtypes 29 / 16 / 17 (IQ1_M, IQ2_XXS, IQ2_XS), M = 1..6, both plan modes, whole output and plan buffers compared, NaN-prefilled outputs. `v41k/emu`: host emulator that checks the decoded int8 weights exhaustively against the old decode.\n- `tests/models/test_deepseek_v41_expert_fast.py`: CPU dispatch tests (same launches in the same order, arguments, logging).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_expert_fast.py tests/models/test_deepseek_v41_plan_fuse.py\npython benchmarks/deepseek_v41/v41k/build.py                                  # sm_70\npython benchmarks/deepseek_v41/expert_fast_check.py --lib v41k.so --no-time   # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Fast experts | GGUF IQ1_M / IQ2_XXS / IQ2_XS routed experts | SM70, TP4 row split, decode M <= 6, `VLLM_V41_EXPERT_FAST=1` | `gate_up_fast` + `down_rows_fast`; other row tiles raise | GPU bit check (one V100); CPU dispatch tests; measured on 8x V100 | other gtypes |\n| Switch off | all | default | old kernels, unchanged | CPU dispatch tests | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_EXPERT_FAST` defaults off.\n- Required CLI options and environment switches: `VLLM_V41_EXPERT_FAST=1` (with `VLLM_V41_PLAN_FUSE=1` as measured) and a `v41k.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port and our other default-off levers; this branch is rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41k.so` (this tree's `benchmarks/deepseek_v41/v41k`).\n- User-entry route-hit, speed, and output-quality evidence: below; the route logs its activation once.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; the old kernels are not touched.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: variables registered with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: new variables registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark 5, one request, paired ABBA arms, ms per round (two runs each): the down kernel **-0.68 / -0.84 at T=0, -0.62 / -0.63 at T=1**; the gate/up kernel a further **-0.82 / -0.53 at T=0, -0.64 / -0.58 at T=1**. Output texts identical. Long context with the full stack: 32K 28.84, 64K 30.05, 128K 32.80 ms per round, vs 29.51 / 30.73 / 33.62 without this switch.\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- sm_70 build of `v41k.so` from this tree, then `expert_fast_check.py --no-time` on one V100-SXM2-32GB, both roles, gtypes 29 / 16 / 17, M = 1..6, both plan modes, 48 trials per M and mode: **0 failing trials** (0 differing bytes in hq / hd / past hd / plan; 0 differing own or other rows in down; no NaN in either kernel's output). The kernel sources of the build are identical to this branch's (the only later change is #1383's test file).\n\n- pytest, the two files above, CPU only: 427 passed.\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: timing (the GPU check ran with `--no-time`), sanitizers and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1384",
+    "isDraft": false,
+    "headRefName": "pli/v41-expert-fast",
+    "headRefOid": "c32b74a62cd14fda8ea0b5d356ea048598dce26e",
+    "baseRefName": "main",
+    "baseRefOid": "3c051b52ed873475b01da07be3e9e1fe9ab8ae7e",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "ProprietaryLegal"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1384,
+    "id": "PR_kwDORjYFXs8AAAABNJhcNA",
+    "state": "CLOSED",
+    "isDraft": false,
+    "headRefOid": "c32b74a62cd14fda8ea0b5d356ea048598dce26e",
+    "title": "[Perf][SM70][DeepSeek-V4.1] Fast routed-expert decode kernels (VLLM_V41_EXPERT_FAST, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1384",
+    "body": "\nContributed by PLI Labs (Proprietary Legal Intelligence). Written with AI assistance (Claude Code).\n\n**Depends on #1383.** This branch is #1383 (one commit), then one commit; review only the last commit. `gguf_v41_moe.py`'s fast path takes #1383's plan mode (`_PLAN_FUSE`). Our instruction-diet PR builds on this one.\n\n## Purpose\n\nNew v41k kernels for the DeepSeek-V4.1 TP4 row-split routed experts at decode (M = 1..6), beside the old ones, selected by **`VLLM_V41_EXPERT_FAST=1`** (default off). The old kernels are not touched.\n\n- `gate_up_fast` replaces `q8 + gate_up7` / `gate_up7p` (both plan modes); `down_rows_fast` replaces `down_rows` at row tile 4 (other tiles raise).\n- Decode: every codebook entry is one 32-bit PRMT selector word, so an IQ2_XXS / IQ2_XS / IQ1_M octet is 1 LDS + 2 PRMT instead of a byte-codebook lookup plus `__vsub4` / `__vadd4` (emulated on sm_70, 4-5 instructions per word). The IQ2 tables are replicated across shared-memory banks (1-2 wavefronts per warp lookup instead of ~3.5).\n- Numerics: bitwise identical to the old kernels: same per-lane serial chains, butterflies and accumulation order; only the assignment of rows and experts to warps and CTAs differs (empty classes add +0 to a total that starts at +0).\n- `benchmarks/deepseek_v41/expert_fast_check.py`: one-GPU bit check, both roles, gtypes 29 / 16 / 17 (IQ1_M, IQ2_XXS, IQ2_XS), M = 1..6, both plan modes, whole output and plan buffers compared, NaN-prefilled outputs. `v41k/emu`: host emulator that checks the decoded int8 weights exhaustively against the old decode.\n- `tests/models/test_deepseek_v41_expert_fast.py`: CPU dispatch tests (same launches in the same order, arguments, logging).\n\n## Test Plan\n\n```bash\nruff check / ruff format --check   # ruff 0.14.0, changed .py files\npython -m tools.generate_env_reference --check   # and the other four 1Cat reference checks\nCUDA_VISIBLE_DEVICES= pytest -q tests/models/test_deepseek_v41_expert_fast.py tests/models/test_deepseek_v41_plan_fuse.py\npython benchmarks/deepseek_v41/v41k/build.py                                  # sm_70\npython benchmarks/deepseek_v41/expert_fast_check.py --lib v41k.so --no-time   # one V100\n```\n\n## Path coverage\n\n| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |\n| --- | --- | --- | --- | --- | --- |\n| Fast experts | GGUF IQ1_M / IQ2_XXS / IQ2_XS routed experts | SM70, TP4 row split, decode M <= 6, `VLLM_V41_EXPERT_FAST=1` | `gate_up_fast` + `down_rows_fast`; other row tiles raise | GPU bit check (one V100); CPU dispatch tests; measured on 8x V100 | other gtypes |\n| Switch off | all | default | old kernels, unchanged | CPU dispatch tests | — |\n\n## Acceleration and benchmark contract (required for performance changes)\n\n- Default enabled or opt-in: opt-in; `VLLM_V41_EXPERT_FAST` defaults off.\n- Required CLI options and environment switches: `VLLM_V41_EXPERT_FAST=1` (with `VLLM_V41_PLAN_FUSE=1` as measured) and a `v41k.so` built from this tree.\n- KV cache dtype used for the benchmark: the #1277 packed-KV default.\n- Wheel SHA or source commit: measured on our build of the #1277 merge (`899e9ed33`) with the PP2 x TP4 port and our other default-off levers; this branch is rebased onto `main` `3c051b52e`.\n- PYTHONPATH, source overlays, or external native libraries used: `v41k.so` (this tree's `benchmarks/deepseek_v41/v41k`).\n- User-entry route-hit, speed, and output-quality evidence: below; the route logs its activation once.\n- Existing kernel/backend registry and capability-rejection reasons: unchanged; the old kernels are not touched.\n- Per-engine configuration and deprecated-variable compatibility: no variable renamed or removed.\n- New/changed environment metadata and generated reference check: variables registered with metadata; references pass.\n- Route snapshot command and intentional changed rows: none.\n- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after: new variables registered, 0 unregistered reads.\n\n## Test Result\n\n**MEASURED, 2026-11-03,** 8x V100-SXM2-32GB, DeepSeek-V4.1 PP2 x TP4, DSpark 5, one request, paired ABBA arms, ms per round (two runs each): the down kernel **-0.68 / -0.84 at T=0, -0.62 / -0.63 at T=1**; the gate/up kernel a further **-0.82 / -0.53 at T=0, -0.64 / -0.58 at T=1**. Output texts identical. Long context with the full stack: 32K 28.84, 64K 30.05, 128K 32.80 ms per round, vs 29.51 / 30.73 / 33.62 without this switch.\n\n**Re-run for this PR, 2026-11-05,** on this branch rebased onto `main` `3c051b52e`:\n\n- sm_70 build of `v41k.so` from this tree, then `expert_fast_check.py --no-time` on one V100-SXM2-32GB, both roles, gtypes 29 / 16 / 17, M = 1..6, both plan modes, 48 trials per M and mode: **0 failing trials** (0 differing bytes in hq / hd / past hd / plan; 0 differing own or other rows in down; no NaN in either kernel's output). The kernel sources of the build are identical to this branch's (the only later change is #1383's test file).\n\n- pytest, the two files above, CPU only: 427 passed.\n- the five 1Cat reference checks: all pass; ruff 0.14.0 `check` and `format --check`: pass.\n\nNot re-run: timing (the GPU check ran with `--no-time`), sanitizers and serving.\n\n---\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01MwyB6zKAxdiCWdY1pAaPEZ\n",
+    "author": {
+      "login": "ProprietaryLegal"
+    },
+    "headRepository": {
+      "nameWithOwner": "ProprietaryLegal/1Cat-vLLM"
+    },
+    "headRefName": "pli/v41-expert-fast",
+    "comments": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviews": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMS0wOVQxMjo1MDozNVq0MjAyNi0xMS0wOVQxMjo1MDozNVrPAAAAAVtCxw8="
+      },
+      "nodes": [
+        {
+          "id": "PRR_kwDORjYFXs8AAAABW0LHDw",
+          "author": {
+            "login": "yangzhuxinyzx"
+          },
+          "state": "COMMENTED",
+          "body": "Ancestry audit: current head c32b74a62cd14fda8ea0b5d356ea048598dce26e is included in the still-open #1385 head 2fe80a0f046cce68fcb3d2ca43903b8708216428, verified against live heads and commit history. Closing this earlier stack entry as superseded so review and outstanding validation are tracked in #1385. This is not a merge or a claim that unexecuted hardware/model cases passed. The original commits, authorship and discussion are preserved. Audit assisted by Codex.",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1384#pullrequestreview-5826070287",
+          "submittedAt": "2026-11-09T12:50:35Z",
+          "commit": {
+            "oid": "c32b74a62cd14fda8ea0b5d356ea048598dce26e"
+          },
+          "comments": {
+            "totalCount": 0,
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            },
+            "nodes": []
+          }
+        }
+      ]
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1384,
+    "title": "[Perf][SM70][DeepSeek-V4.1] Fast routed-expert decode kernels (VLLM_V41_EXPERT_FAST, default off)",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1384",
+    "isDraft": false,
+    "headRefOid": "c32b74a62cd14fda8ea0b5d356ea048598dce26e",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "benchmarks/deepseek_v41/expert_fast_check.py",
+      "benchmarks/deepseek_v41/plan_fuse_check.py",
+      "benchmarks/deepseek_v41/v41k/emu/dectest.cpp",
+      "benchmarks/deepseek_v41/v41k/emu/emu.cpp",
+      "benchmarks/deepseek_v41/v41k/emu/extract_old.py",
+      "benchmarks/deepseek_v41/v41k/emu/old_extract.inc",
+      "benchmarks/deepseek_v41/v41k/emu/shim.h",
+      "benchmarks/deepseek_v41/v41k/v41k.cu",
+      "benchmarks/deepseek_v41/v41k/v41k_fast.cuh",
+      "benchmarks/deepseek_v41/v41k/v41k_fast_gu.cuh",
+      "tests/models/test_deepseek_v41_expert_fast.py",
+      "tests/models/test_deepseek_v41_plan_fuse.py",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/quantization/gguf_v41_moe.py"
+    ],
+    "diff_bytes": 157813,
+    "diff_sha256": "8143f1c7e0cfcb030f6fc97d314ca2847e5837e1350fcc4052d43d1072622c56"
+  },
+  "full_tree_diff_proof": null
+}
