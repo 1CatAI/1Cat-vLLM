@@ -1295,7 +1295,13 @@ def flash_v100_dense_prefill(
 
 
 def flash_v100_dense_prefill_lse_available() -> bool:
-    return _ops.get_flash_dense_forward() is not None
+    # MLA prefill backend selection can run while the model is being built,
+    # before the worker has bound its Flash-V100 resources, and resolving the
+    # bound op then raises. Availability only needs the op to exist.
+    try:
+        return _ops.get_flash_dense_forward() is not None
+    except RuntimeError:
+        return _ops._flash_attn_forward_lse is not None
 
 
 def flash_v100_dense_prefill_lse(
