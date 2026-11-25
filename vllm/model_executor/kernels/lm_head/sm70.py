@@ -461,7 +461,7 @@ def _maybe_sm70_lm_head_forward(
 
     tm_weight = getattr(state, "_sm70_f16_tm_weight", None)
     k_ld = getattr(state, "_sm70_f16_k_ld", None)
-    if tm_weight is not None and k_ld is not None:
+    if tm_weight is not None and k_ld is not None and tm_weight.shape[0] % 32 == 0:
         out = torch.empty(
             (x_2d.size(0), tm_weight.shape[0]),
             dtype=x_2d.dtype,

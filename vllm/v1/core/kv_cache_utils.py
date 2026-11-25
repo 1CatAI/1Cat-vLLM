@@ -834,12 +834,13 @@ def _check_enough_kv_cache_memory(
         if estimated_max_len > 0:
             estimated_msg = (
                 "Based on the available memory, "
-                f"the estimated maximum model length is {estimated_max_len}. "
+                f"the estimated maximum model length is {estimated_max_len} "
+                f"(try `--max-model-len {estimated_max_len}`). "
             )
 
         raise ValueError(
             f"To serve at least one request with the model's max seq len "
-            f"({max_model_len}), ({format_gib(needed_memory)} GiB KV "
+            f"({max_model_len}), {format_gib(needed_memory)} GiB KV "
             f"cache is needed, which is larger than the available KV cache "
             f"memory ({format_gib(available_memory)} GiB). {estimated_msg}"
             f"Try increasing `gpu_memory_utilization` (which also controls "

@@ -1086,8 +1086,11 @@ def prepare_sharded_hc_storage(model, vllm_config) -> None:
             else communicator.status["reason"]
         )
         if not getattr(vllm_config.kernel_config, "hc_weight_storage_auto", False):
-            raise ValueError(
-                f"Sharded HC storage requires qualified TP4 transport: {reason}"
+            logger.warning_once(
+                "hc_weight_storage='sharded' requested, but TP4 NVLink LL "
+                "transport is unavailable (%s). Automatically falling back to "
+                "hc_weight_storage='replicated' for PCIe/non-NVLink safety.",
+                reason,
             )
         target_dev = getattr(group.device_communicator, "device", None)
         if target_dev is not None:

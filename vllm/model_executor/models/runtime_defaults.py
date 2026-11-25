@@ -358,7 +358,16 @@ def apply_runtime_defaults(cfg, defaults, phase: str, *, is_sm70: bool):
             )
             if compile_graph is not False:
                 defaults.setdefault("VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE", "1")
-        if is_sm70 and _is_sm70_mtp_verifier_contract(*args):
+        if is_sm70 and (
+            _is_sm70_mtp_verifier_contract(*args)
+            or (
+                cfg.model_config is not None
+                and getattr(cfg.model_config.hf_text_config, "model_type", None)
+                in ("glm5_next", "glm5_next_text")
+                and cfg.speculative_config is not None
+                and cfg.speculative_config.method == "mtp"
+            )
+        ):
             # Keep M=1..B draft graphs independent of verifier query width so
             # single-request draft steps run at exact M=1 instead of M=q and
             # concurrent draft steps capture up to max_num_seqs.
