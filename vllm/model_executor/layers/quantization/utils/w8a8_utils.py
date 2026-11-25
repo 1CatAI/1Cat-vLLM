@@ -35,6 +35,11 @@ def cutlass_block_fp8_supported() -> bool:
     return _cutlass_capability_probe("cutlass_scaled_mm_supports_block_fp8", capability)
 
 
+def cutlass_int8_supported(capability: int) -> bool:
+    """Whether the native library has a CUTLASS INT8 GEMM for ``capability``."""
+    return _cutlass_capability_probe("cutlass_scaled_mm_supports_int8", capability)
+
+
 def cutlass_group_gemm_supported() -> bool:
     if not current_platform.is_cuda():
         return False

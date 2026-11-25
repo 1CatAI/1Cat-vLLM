@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     CUTLASS_BLOCK_FP8_SUPPORTED,
     convert_to_channelwise,
+    cutlass_int8_supported,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -36,6 +37,20 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_cuda():
             return False, "requires CUDA."
+        # The op is always registered, but a build without a CUTLASS INT8
+        # kernel for this capability rejects every call; the build answers
+        # which capabilities it covers (a library without the query answers
+        # no, like the other CUTLASS capability probes).
+        if compute_capability is not None and not cutlass_int8_supported(
+            compute_capability
+        ):
+            return (
+                False,
+                (
+                    "this build has no CUTLASS INT8 GEMM for compute capability "
+                    f"{compute_capability}."
+                ),
+            )
         return True, None
 
     @classmethod
