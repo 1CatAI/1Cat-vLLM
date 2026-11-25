@@ -30,6 +30,25 @@ MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
 the per-request row width allocated by the sampler's `LogprobTokenIdsState`."""
 
+# Model Runner V2 keeps the following per request in fixed-width GPU rows
+# (`LogitBiasState` and `BadWordsState`), so a request over one of these limits
+# cannot be run there. `SamplingParams.verify_v2_sampler_capacity` checks them.
+MAX_NUM_ALLOWED_TOKEN_IDS = 1024
+"""Upper bound on `SamplingParams.allowed_token_ids` list length."""
+
+MAX_NUM_LOGIT_BIAS_TOKENS = 1024
+"""Upper bound on the number of `SamplingParams.logit_bias` entries."""
+
+MAX_NUM_STOP_TOKEN_IDS = 128
+"""Upper bound on `SamplingParams.all_stop_token_ids` (user stop ids plus the
+EOS ids) when `min_tokens > 0`, since min_tokens masks each of them."""
+
+MAX_NUM_BAD_WORDS = 128
+"""Upper bound on the number of tokenized bad-word sequences."""
+
+MAX_BAD_WORDS_TOTAL_TOKENS = 1024
+"""Upper bound on the total number of tokens of all bad-word sequences."""
+
 
 def validate_thinking_token_budget(value: int | float | bool | None) -> int | None:
     """Validate ``thinking_token_budget``; return ``None`` if unset."""
@@ -719,6 +738,60 @@ class SamplingParams(
         self._validate_allowed_token_ids(model_config, tokenizer)
         self._validate_spec_decode(speculative_config)
         self._validate_structured_outputs(structured_outputs_config, tokenizer)
+
+    def verify_v2_sampler_capacity(self) -> None:
+        """Raise if this request does not fit the sampler rows of Model Runner
+        V2.
+
+        The V2 workers check the same limits when the request is added, but
+        an error there fails every worker and takes the engine down. Call this
+        after `update_from_generation_config` and `update_from_tokenizer`: they
+        add the EOS ids and tokenize `bad_words`, which is what the sampler
+        stores.
+        """
+
+        def check(count: int, limit: int, what: str, parameter: str) -> None:
+            if count > limit:
+                raise VLLMValidationError(
+                    f"Too many {what}: {count}. The max size is {limit}.",
+                    parameter=parameter,
+                    value=count,
+                )
+
+        if self.allowed_token_ids:
+            check(
+                len(self.allowed_token_ids),
+                MAX_NUM_ALLOWED_TOKEN_IDS,
+                "allowed token IDs",
+                "allowed_token_ids",
+            )
+        if self.logit_bias:
+            check(
+                len(self.logit_bias),
+                MAX_NUM_LOGIT_BIAS_TOKENS,
+                "logit bias tokens",
+                "logit_bias",
+            )
+        if self.min_tokens > 0:
+            check(
+                len(self.all_stop_token_ids),
+                MAX_NUM_STOP_TOKEN_IDS,
+                "stop token IDs (including EOS) with min_tokens > 0",
+                "stop_token_ids",
+            )
+        if bad_words_token_ids := self.bad_words_token_ids:
+            check(
+                len(bad_words_token_ids),
+                MAX_NUM_BAD_WORDS,
+                "bad word sequences (each word may be tokenized two ways)",
+                "bad_words",
+            )
+            check(
+                sum(len(word) for word in bad_words_token_ids),
+                MAX_BAD_WORDS_TOTAL_TOKENS,
+                "total bad word tokens",
+                "bad_words",
+            )
 
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
         max_logprobs = model_config.max_logprobs

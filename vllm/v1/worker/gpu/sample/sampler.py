@@ -51,6 +51,9 @@ class Sampler:
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
     ) -> None:
+        # The input processor runs the same check, so this only fires for a
+        # request that bypassed it; fail before staging any of its state.
+        sampling_params.verify_v2_sampler_capacity()
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
