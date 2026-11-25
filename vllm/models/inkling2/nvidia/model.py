@@ -201,7 +201,18 @@ class Inkling2DecoderLayer(nn.Module):
         )
         self.mlp_norm = Inkling2RMSNorm(config.hidden_size, eps)
         expert_format: QuantFormat
-        if layer_id in getattr(config, "gguf_dense_expert_layers", ()):
+        dense_layers = getattr(config, "gguf_dense_expert_layers", None)
+        if (
+            dense_layers is None
+            and quant_config is not None
+            and quant_config.get_name() == "gguf"
+        ):
+            raise RuntimeError(
+                "Inkling2 GGUF: per-layer expert formats are unknown; the "
+                "Inkling2 GGUF adapter must build its name map before the "
+                "model is constructed"
+            )
+        if layer_id in (dense_layers or ()):
             expert_format = "fp16"
         elif isinstance(
             quant_config, Inkling2QuantConfig

@@ -34,12 +34,12 @@ reads per token (Q4), V100 bandwidth would allow ~250 tok/s.
 - Same request files for both, with 512 output tokens and prompts not shared between
   requests.
 
-| | GGUF Q4, 1 GPU | GGUF Q8, 1 GPU | #1598 TP=2 | #1598 TP=1 |
+| | standalone port, GGUF Q4, 1 GPU | standalone port, GGUF Q8, 1 GPU | #1598 TP=2 | #1598 TP=1 |
 | --- | --- | --- | --- | --- |
 | decode tok/s (short / 4k / 16k prompt) | 87.1 / 78.3 / 68.5 | 71.5 / 65.4 / 58.4 | 47.2 / 44.8 / 42.9 | 45.3 / 42.5 / 39.3 |
 | prefill tok/s (4k / 16k) | 1201 / 1253 | 1308 / 1267 | 1331 / 1316 | 793 / 773 |
 | 4 concurrent, total tok/s | 168 | 160 | 115 | 112 |
-| largest context on one card | 262k | ~164k | n/a | ~28k |
+| largest context on one card | 262k | ~164k served (~175k KV capacity) | n/a | ~28k |
 | time to first token, next turn of a 41k conversation | 40 s | 40 s | 0.4 s | n/a |
 | HumanEval / HumanEval+ (164) | 97.6 / 94.5 | 98.2 / 93.3 | 97.6 / 93.9 | n/a |
 | LiveCodeBench v6, 60 problems | 80.0 | 90.0 | 85.0 | n/a |
@@ -59,7 +59,9 @@ What this shows:
    standalone port is 1.5–1.6× faster.
 3. **KV memory per token is much higher in #1598 on one card.** Weights are similar in
    size (22.6 GiB for #1598, 21.5 GiB for the GGUF Q8), but #1598 has 4.66 GiB of KV
-   giving 25,239 tokens. The GGUF Q8 has ~6.1 GiB giving ~175k.
+   giving 25,239 tokens. The standalone port with the GGUF Q8 has ~6.1 GiB of KV, giving
+   ~175k tokens (served at 164k). Through #1598 (this PR), both GGUFs take #1598's memory
+   and KV capacity: 25,239 tokens on one card (see Implementation status).
    - At TP=2, #1598 uses ~30 KB per token per GPU, where its half of the 8 full-attention
      visits needs 16 KB.
    - Suspected cause: the hybrid KV allocator sizing the sliding-window groups like the
@@ -116,8 +118,10 @@ Globals:
 | `output_res_query` | `model.llm.attn_res.output_query` |
 | `loop_res_query` / `loop_kv_res_query` `[24,2304]` | `model.llm.middle_cycle_cross_pass_queries` / `..._kv_queries` |
 
-The per-visit index of the residual queries, and every transpose, are checked against the
-FP32 GGUF reference forward (`tools/inkling2/gguf_reference.py` in the standalone port).
+The per-visit index of the residual queries, and every transpose, are checked in this PR
+by comparing the adapter's output with the official checkpoint tensors
+(`tests/models/inkling2/test_gguf_adapter.py`). The standalone port also has an FP32
+reference forward of the GGUF model; that tool is not part of this PR.
 
 ## Design of the GGUF route
 
@@ -127,28 +131,28 @@ FP32 GGUF reference forward (`tools/inkling2/gguf_reference.py` in the standalon
    - Add the o200k pre-tokenizer for `tokenizer.ggml.pre = inkling2`.
    - Both pieces exist in the standalone port.
 2. **Quantisation config.**
-   - #1598's `model.py` requires `Inkling2QuantConfig`.
-   - The GGUF route needs dense and embedding layers through 1Cat's GGUF linear methods
-     (Q8_0 or BF16) and experts through #1598's SM70 expert path.
-   - Plan: a GGUF variant of the Inkling2 quant config that returns the GGUF linear
-     method for dense layers and the existing expert method for experts. This avoids new
-     dispatch.
+   - #1598's `model.py` required `Inkling2QuantConfig`. It now also accepts the GGUF quant
+     config that 1Cat's GGUF loader sets.
+   - #1598's dense layers are built without a quant method and its attention reads
+     `qkvr.weight` directly, so in this PR the dense and embedding layers stay
+     unquantized: Q8_0 tensors are dequantized at load. Experts use #1598's SM70 expert
+     path.
+   - Keeping Q8_0 quantized (less memory and faster dense GEMV) needs changes to #1598's
+     attention forward. It is a follow-up.
 3. **Weights.** An adapter yields official parameter names (table above), converting:
    - **Dense, BF16 / F32:** as is, with transposes where noted.
-   - **Dense, Q8_0:** raw GGML rows, kept quantised (GGUF linear).
+   - **Dense, Q8_0:** dequantized to FP16 at load, in row chunks (no full FP32 copy).
    - **Experts, NVFP4:** repacked into the layout #1598's `Fp4MoECodec` path expects.
      - Same element format (E2M1, 16-element blocks, E4M3 block scales).
      - The per-expert global scale must be translated between GGUF `scale` and
        `amax` / `outer_scale_denominator`.
      - Verified by dequantising both and comparing.
    - **Experts, layers 20–23:** BF16 (Q8) or Q8_0 (Q4), fed to the FP16 expert GEMV path
-     that #1598 already uses after MXFP8 dequantisation. Q8_0 can keep its 8-bit storage
-     later (memory), dequantising on load at first.
+     that #1598 already uses after MXFP8 dequantisation (a dense `"fp16"` expert
+     format). Keeping Q8_0 expert storage is a follow-up.
 4. **TP.**
-   - TP=1 is the target.
-   - TP=2 needs GGUF row sharding of the Q8_0 dense layers, which 1Cat's GGUF linears
-     support for other models. It will be checked, but it is not required for the first
-     PR.
+   - TP=1 and TP=2 both work. Dense weights arrive unquantized, so #1598's own weight
+     loaders shard them as they do for the official checkpoint (measured at TP=2 below).
 
 ## Validation plan
 

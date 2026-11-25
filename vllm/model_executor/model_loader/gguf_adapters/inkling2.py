@@ -95,11 +95,21 @@ def _interleave_gate_up(w: torch.Tensor) -> torch.Tensor:
     return torch.stack((w[:, :half], w[:, half:]), dim=2).reshape(w.shape)
 
 
-def _dense_tensor(t) -> torch.Tensor:
+def _dense_tensor(t, dtype: torch.dtype) -> torch.Tensor:
+    """F32 / F16 / BF16 tensors keep their dtype (the model casts them);
+    quantized ones are dequantized in row chunks straight into ``dtype``,
+    so no full-size float32 copy of a large tensor is made."""
     if t.tensor_type in _FLOAT:
         return _float_tensor(t)
     shape = tuple(int(x) for x in reversed(t.shape))
-    return torch.from_numpy(dequantize(t.data, t.tensor_type)).reshape(shape)
+    data = t.data  # [leading rows..., row bytes], leading dims == shape[:-1]
+    out = torch.empty(shape, dtype=dtype)
+    rows, flat = data.reshape(-1, data.shape[-1]), out.view(-1, shape[-1])
+    step = 4096
+    for i in range(0, rows.shape[0], step):
+        chunk = dequantize(rows[i : i + step], t.tensor_type)
+        flat[i : i + step] = torch.from_numpy(chunk).reshape(-1, shape[-1])
+    return out
 
 
 class Inkling2Adapter:
@@ -119,7 +129,10 @@ class Inkling2Adapter:
         n_layers = self.config.num_hidden_layers
         # Layers whose expert banks are not NVFP4 (the official MXFP8 layers:
         # BF16 in UD-Q8_K_XL, Q8_0 in UD-Q4_K_XL) load as dense FP16 banks.
-        # Read by the model when it builds its experts.
+        # The GGUF loader builds this name map before the model, which reads
+        # the list to choose each layer's expert format (and refuses a GGUF
+        # checkpoint without it). It needs tensor types, which the metadata-
+        # only config path does not read.
         self.config.gguf_dense_expert_layers = sorted(
             int(raw.split(".")[1])
             for raw, t in tensors.items()
@@ -130,8 +143,14 @@ class Inkling2Adapter:
                 result[raw] = _GLOBALS[raw]
                 continue
             m = re.fullmatch(r"blk\.(\d+)\.(.+)", raw)
-            if m is None or int(m[1]) >= n_layers:
+            if m is None:
                 raise ValueError(f"Unmapped Inkling2 GGUF tensor: {raw}")
+            if int(m[1]) >= n_layers:
+                raise ValueError(
+                    f"Inkling2 GGUF tensor {raw} is past the {n_layers} physical "
+                    "layers derived from block_count and the loop metadata "
+                    "(extra blocks such as MTP layers are not supported)"
+                )
             layer, suffix = int(m[1]), m[2]
             if suffix in _EXPERT_SCALES:
                 result[raw] = f"{_P}layers.{layer}.mlp.experts.{suffix}"
@@ -168,9 +187,9 @@ class Inkling2Adapter:
                 continue  # emitted with the expert bank
             t = tensors[raw]
             if name.endswith(("experts.w13_weight", "experts.w2_weight")):
-                yield from self._experts(tensors, raw, name, t)
+                yield from self._experts(tensors, raw, name, t, dtype)
             else:
-                yield name, self._layout(raw, name, _dense_tensor(t))
+                yield name, self._layout(raw, name, _dense_tensor(t, dtype))
 
     @staticmethod
     def _layout(raw: str, name: str, w: torch.Tensor) -> torch.Tensor:
@@ -185,7 +204,9 @@ class Inkling2Adapter:
         return w
 
     @staticmethod
-    def _experts(tensors, raw: str, name: str, t) -> Iterator[tuple[str, torch.Tensor]]:
+    def _experts(
+        tensors, raw: str, name: str, t, dtype: torch.dtype
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         if t.tensor_type == Q.NVFP4:
             scale_raw = raw.removesuffix(".weight") + ".scale"
             if scale_raw not in tensors:
@@ -203,7 +224,7 @@ class Inkling2Adapter:
             yield name + "_amax", amax.reshape(-1)
             yield name + "_outer_scale_denominator", torch.ones(1, dtype=torch.float32)
         elif t.tensor_type in (*_FLOAT, Q.Q8_0):
-            w = _dense_tensor(t)
+            w = _dense_tensor(t, dtype)
             yield name, _interleave_gate_up(w) if name.endswith("w13_weight") else w
         else:
             raise ValueError(f"{raw}: unsupported expert type {t.tensor_type.name}")

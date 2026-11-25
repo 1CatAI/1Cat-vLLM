@@ -770,8 +770,10 @@ class ModelConfig:
                     "disable the cache with --mm-processor-cache-gb 0."
                 )
 
-        # Multimodal GGUF models must use original repo for mm processing
-        # (not needed when only the language model runs).
+        # Multimodal GGUF models must use original repo for mm processing.
+        # This applies to every multimodal-capable architecture: with
+        # --language-model-only no multimodal processor runs, so the GGUF's
+        # own tokenizer suffices.
         if (
             is_gguf(self.tokenizer)
             and self.multimodal_config is not None

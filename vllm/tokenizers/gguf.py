@@ -187,7 +187,7 @@ def tokenizer_from_gguf_metadata(metadata, **kwargs):
     if metadata.get("tokenizer.ggml.add_bos_token", False) or metadata.get(
         "tokenizer.ggml.add_eos_token", False
     ):
-        raise ValueError("GGUF Qwen tokenizer requests unsupported BOS/EOS insertion")
+        raise ValueError("GGUF tokenizer requests unsupported BOS/EOS insertion")
     tokenizer = _QwenGGUFTokenizer(
         tokenizer_object=backend,
         additional_special_tokens=special,
