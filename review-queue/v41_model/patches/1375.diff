@@ -1,0 +1,1394 @@
+diff --git a/tests/models/test_deepseek_v41_coupled_drafts.py b/tests/models/test_deepseek_v41_coupled_drafts.py
+new file mode 100644
+index 0000000000..bc4bc94ca0
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_coupled_drafts.py
+@@ -0,0 +1,332 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""V4.1 coupled sampled drafts with keyed-draw verification (CPU).
++
++``coupled_draw`` gives every (request key, output position, token) one Gumbel
++draw from a 32-bit hash. The target samples argmax(logits + G); the drafter
++picks argmax(draft_logits / (T x 0.5) + G) with the same G, and verification
++accepts the longest draft prefix equal to the target's keyed samples (token
++matching). The checks: the hash equals a pure-Python lowbias32; the draws are
++Gumbel and independent across positions; Gumbel-max follows the target; a
++simulated speculative loop emits exactly the non-speculative keyed sequence
++whatever the drafts are (exactness), and coupling raises acceptance over an
++independent draft. The module is loaded from its file (torch only); the
++sampler, runner and drafter glue and the env registration are checked from
++source.
++
++    python tests/models/test_deepseek_v41_coupled_drafts.py   # or pytest
++"""
++
++import os
++import sys
++
++import pytest
++
++if "triton" in sys.modules and os.environ.get("TRITON_INTERPRET") != "1":
++    pytest.skip(
++        "needs TRITON_INTERPRET=1 in the environment: triton was imported "
++        "before this file could turn the interpreter on",
++        allow_module_level=True,
++    )
++os.environ["TRITON_INTERPRET"] = "1"  # before triton is imported
++
++import ast  # noqa: E402
++import importlib.util  # noqa: E402
++import math  # noqa: E402
++import types  # noqa: E402
++from pathlib import Path  # noqa: E402
++
++import torch  # noqa: E402
++import triton  # noqa: E402
++import triton.language as tl  # noqa: E402
++
++ROOT = Path(__file__).resolve().parents[2]
++SRC = ROOT / "vllm" / "v1" / "spec_decode" / "coupled_draw.py"
++
++
++def _load():
++    sys.modules.setdefault("vllm", types.ModuleType("vllm"))
++    if "vllm.triton_utils" not in sys.modules:
++        tu = types.ModuleType("vllm.triton_utils")
++        tu.tl, tu.triton = tl, triton
++        sys.modules["vllm.triton_utils"] = tu
++    name = "v41_coupled_draw_under_test"
++    spec = importlib.util.spec_from_file_location(name, SRC)
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++CD = _load()
++
++
++def _py_lowbias32(x):
++    x &= 0xFFFFFFFF
++    x ^= x >> 16
++    x = (x * 0x7FEB352D) & 0xFFFFFFFF
++    x ^= x >> 15
++    x = (x * 0x846CA68B) & 0xFFFFFFFF
++    x ^= x >> 16
++    return x
++
++
++def test_mix32_matches_python_lowbias32():
++    g = torch.Generator().manual_seed(0)
++    xs = torch.randint(0, 1 << 32, (4096,), generator=g, dtype=torch.int64)
++    xs[:4] = torch.tensor([0, 1, 0xFFFFFFFF, 0x80000000])
++    got = CD.mix32(xs).tolist()
++    assert got == [_py_lowbias32(x) for x in xs.tolist()]
++
++
++def test_draws_are_deterministic_finite_and_keyed():
++    keys = torch.tensor([1, 1, 2, (1 << 62) + 5])
++    pos = torch.tensor([10, 11, 10, 10])
++    g1 = CD.keyed_gumbel(keys, pos, 1000)
++    g2 = CD.keyed_gumbel(keys.clone(), pos.clone(), 1000)
++    assert torch.equal(g1, g2)
++    assert torch.isfinite(g1).all()
++    for a in range(4):
++        for b in range(a + 1, 4):
++            assert not torch.equal(g1[a], g1[b])
++    # A row's draws do not depend on the other rows or on the vocab width.
++    solo = CD.keyed_gumbel(keys[2:3], pos[2:3], 600)
++    assert torch.equal(solo[0], g1[2, :600])
++
++
++def test_draws_are_standard_gumbel():
++    keys = torch.arange(64, dtype=torch.int64) * 7919
++    pos = torch.arange(64, dtype=torch.int64) + 100
++    g = CD.keyed_gumbel(keys, pos, 4096).double().flatten()
++    # Gumbel(0, 1): mean = Euler-Mascheroni, variance = pi^2 / 6.
++    assert abs(g.mean().item() - 0.5772156649) < 0.01
++    assert abs(g.var().item() - math.pi**2 / 6) < 0.02
++    # The CDF exp(-exp(-g)) is uniform: deciles within 1 % of 0.1 each.
++    u = torch.exp(-torch.exp(-g))
++    counts = torch.histc(u, bins=10, min=0.0, max=1.0) / u.numel()
++    assert (counts - 0.1).abs().max().item() < 0.01
++
++
++def _chi2_ok(observed, expected, dof):
++    chi2 = (((observed - expected) ** 2) / expected).sum().item()
++    # Generous bound: mean dof, sd sqrt(2 dof); 6 sd.
++    return chi2 < dof + 6 * math.sqrt(2 * dof)
++
++
++def test_gumbel_max_follows_the_target_distribution():
++    logits = torch.tensor([2.0, 1.0, 0.5, 0.0, -0.5, -1.0, -3.0, 0.2])
++    n = 40000
++    keys = torch.full((n,), 12345, dtype=torch.int64)
++    pos = torch.arange(n, dtype=torch.int64)
++    rows = logits.expand(n, -1)
++    sampled = CD.keyed_sample(rows, keys, pos, torch.ones(n, dtype=torch.bool))
++    observed = torch.bincount(sampled, minlength=8).double()
++    expected = logits.double().softmax(0) * n
++    assert _chi2_ok(observed, expected, 7)
++
++
++def test_draws_are_independent_across_positions_and_keys():
++    logits = torch.zeros(4)
++    n = 40000
++    keys = torch.arange(n, dtype=torch.int64) // 2  # pairs share a key
++    pos = torch.arange(n, dtype=torch.int64) % 2 + 7  # adjacent positions
++    s = CD.keyed_sample(logits.expand(n, -1), keys, pos, torch.ones(n, dtype=bool))
++    joint = torch.bincount(s[0::2] * 4 + s[1::2], minlength=16).double()
++    assert _chi2_ok(joint, torch.full((16,), n / 2 / 16.0), 15)
++    keys2 = torch.arange(n, dtype=torch.int64)
++    pos2 = torch.full((n,), 3, dtype=torch.int64)
++    s2 = CD.keyed_sample(logits.expand(n, -1), keys2, pos2, torch.ones(n, dtype=bool))
++    joint2 = torch.bincount(s2[0::2] * 4 + s2[1::2], minlength=16).double()
++    assert _chi2_ok(joint2, torch.full((16,), n / 2 / 16.0), 15)
++
++
++def test_greedy_rows_take_argmax():
++    logits = torch.randn(6, 50, generator=torch.Generator().manual_seed(1))
++    keys = torch.arange(6, dtype=torch.int64)
++    pos = torch.arange(6, dtype=torch.int64)
++    random_rows = torch.tensor([True, False, True, False, False, True])
++    s = CD.keyed_sample(logits, keys, pos, random_rows)
++    assert torch.equal(s[~random_rows], logits[~random_rows].argmax(-1))
++    g = CD.keyed_gumbel(keys, pos, 50)
++    temperature = torch.tensor([1.0, 0.0, 0.7, 0.0, 0.0, 2.0])
++    d = CD.coupled_pick(logits, temperature, g, scale=0.5)
++    assert torch.equal(d[temperature == 0], logits[temperature == 0].argmax(-1))
++    want = (logits[0] / 0.5 + g[0]).argmax()
++    assert d[0] == want and d[2] == (logits[2] / 0.35 + g[2]).argmax()
++
++
++def test_request_keys():
++    a = CD.request_key(7, "req-a", 0)
++    assert a == CD.request_key(7, "req-b", 99)  # seeded: the seed alone
++    assert CD.request_key(None, "req-a", 0) != CD.request_key(None, "req-b", 0)
++    assert CD.request_key(None, "req-a", 0) != CD.request_key(None, "req-a", 1)
++    assert CD.request_key(None, "req-a", 0) == CD.request_key(None, "req-a", 0)
++    assert 0 <= a < (1 << 63)
++
++
++def test_keys_buffer_is_persistent():
++    b1 = CD.keys_buffer(torch.device("cpu"), 8)
++    b2 = CD.keys_buffer(torch.device("cpu"), 4)
++    assert b1.data_ptr() == b2.data_ptr() and b2.numel() == 8
++
++
++# Simulated speculative decoding on a Markov "model" over a small vocab.
++
++V = 24
++K = 5
++
++
++def _tables(seed, noise):
++    g = torch.Generator().manual_seed(seed)
++    target = torch.randn(V, V, generator=g) * 2.0
++    draft = target + torch.randn(V, V, generator=g) * noise
++    return target, draft
++
++
++def _keyed(target, prev, key, pos, temperature):
++    logits = (target[prev] / (temperature or 1.0)).unsqueeze(0)
++    return int(
++        CD.keyed_sample(
++            logits,
++            torch.tensor([key]),
++            torch.tensor([pos]),
++            torch.tensor([temperature > 0]),
++        )
++    )
++
++
++def _plain(target, key, temperature, n, start=0):
++    seq = [start]
++    while len(seq) < n:
++        seq.append(_keyed(target, seq[-1], key, len(seq), temperature))
++    return seq
++
++
++def _speculative(target, draft, key, temperature, n, draft_key=None, start=0):
++    """Rounds of K coupled drafts + keyed token-matching verification."""
++    seq, rounds, accepted = [start], 0, 0
++    dkey = key if draft_key is None else draft_key
++    while len(seq) < n:
++        base = len(seq)  # output position of draft 0
++        prev, drafts = seq[-1], []
++        for s in range(K):
++            g = CD.keyed_gumbel(torch.tensor([dkey]), torch.tensor([base + s]), V)
++            d = CD.coupled_pick(
++                draft[prev].unsqueeze(0), torch.tensor([temperature]), g, 0.5
++            )
++            prev = int(d)
++            drafts.append(prev)
++        # Verify: row j sees context seq + drafts[:j] and predicts base + j.
++        ctx = seq[-1]
++        out = []
++        for j in range(K + 1):
++            t = _keyed(target, ctx, key, base + j, temperature)
++            out.append(t)
++            if j == K or t != drafts[j]:
++                break
++            ctx = drafts[j]
++        rounds += 1
++        accepted += len(out) - 1
++        seq.extend(out)
++    return seq[:n], rounds, accepted
++
++
++@pytest.mark.parametrize("temperature", [1.0, 0.6])
++@pytest.mark.parametrize("noise", [0.0, 0.5, 3.0, 50.0])
++def test_speculative_output_equals_plain_keyed_sampling(temperature, noise):
++    target, draft = _tables(3, noise)
++    for key in (11, 12345, (1 << 62) + 3):
++        want = _plain(target, key, temperature, 120)
++        got, _, _ = _speculative(target, draft, key, temperature, 120)
++        assert got == want
++        # Drafts with an unrelated key change nothing in the output either.
++        got2, _, _ = _speculative(target, draft, key, temperature, 120, key + 1)
++        assert got2 == want
++
++
++def test_greedy_requests_are_plain_argmax():
++    target, draft = _tables(4, 0.5)
++    seq = _plain(target, 5, 0.0, 40)
++    for a, b in zip(seq, seq[1:]):
++        assert b == int(target[a].argmax())
++    got, _, _ = _speculative(target, draft, 5, 0.0, 40)
++    assert got == seq
++
++
++def test_coupling_raises_acceptance_over_an_independent_draft():
++    target, draft = _tables(5, 0.5)
++    coupled = independent = rounds_c = rounds_i = 0
++    for key in range(20):
++        _, r, a = _speculative(target, draft, 1000 + key, 1.0, 200)
++        coupled += a
++        rounds_c += r
++        _, r, a = _speculative(target, draft, 1000 + key, 1.0, 200, 777 + key)
++        independent += a
++        rounds_i += r
++    per_round_c = coupled / rounds_c
++    per_round_i = independent / rounds_i
++    assert per_round_c > 1.3 * per_round_i, (per_round_c, per_round_i)
++
++
++def _src(rel):
++    return (ROOT / rel).read_text()
++
++
++def test_sampler_runner_and_drafter_glue():
++    rs = _src("vllm/v1/sample/rejection_sampler.py")
++    assert "coupled_rows, self._coupled_rows = self._coupled_rows, None" in rs
++    assert "def _sample_coupled(" in rs
++    assert "token_match_sample(metadata, sampled)" in rs
++    tree = ast.parse(rs)
++    fn = next(
++        n
++        for n in ast.walk(tree)
++        if isinstance(n, ast.FunctionDef) and n.name == "_coupled_sampling_enabled"
++    )
++    body = ast.unparse(fn)
++    for needle in (
++        "max_num_logprobs",
++        "logprob_token_ids",
++        "no_penalties",
++        "allowed_token_ids_mask",
++        "bad_words_token_ids",
++        "thinking_budget_state_holder",
++    ):
++        assert needle in body
++    runner = _src("vllm/v1/worker/gpu_model_runner.py")
++    flag = '_COUPLED_DRAFTS = os.getenv("VLLM_V41_COUPLED_DRAFTS", "0") == "1"'
++    assert flag in runner
++    assert "self._set_coupled_rows(spec_decode_metadata, logits)" in runner
++    rows = "positions = self.positions[metadata.logits_indices.long()] + 1"
++    assert rows in runner
++    # greedy batches skip every coupled op; keys copy pinned, only on change
++    assert "if _COUPLED_DRAFTS and not sampling_metadata.all_greedy:" in runner
++    assert "buffer[:num_reqs].copy_(staged, non_blocking=True)" in runner
++    assert "and not sampling_metadata.all_greedy\n        ):\n" in runner
++    fused = (
++        "sampled = coupled_draw.keyed_argmax(processed, temperature, keys, positions)"
++    )
++    assert fused in rs
++    dspark = _src("vllm/v1/spec_decode/dspark.py")
++    assert "coupled_draw.keyed_argmax(" in dspark
++    assert "coupled_draw.keyed_gumbel" not in dspark
++    pos = "positions = (self.positions[: batch_size * k] + 1).view(batch_size, k)"
++    assert pos in dspark
++
++
++def test_env_knobs_registered_and_not_compile_factors():
++    src = _src("vllm/envs.py")
++    for name, d in (
++        ("VLLM_V41_COUPLED_DRAFTS", "0"),
++        ("VLLM_V41_COUPLED_DRAFT_TEMP", "0.5"),
++        ("VLLM_V41_COUPLED_TRACE", ""),
++    ):
++        assert f'    {name}: str = "{d}"\n' in src
++        assert f'lambda: os.getenv("{name}", "{d}")' in src
++        start = src.index("ignored_factors: set[str] = {")
++        assert f'        "{name}",\n' in src[start : src.index("}", start)]
++    assert CD.ENABLED is False and CD.DRAFT_TEMP_SCALE == 0.5
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-q"]))
+diff --git a/tests/models/test_deepseek_v41_coupled_fused.py b/tests/models/test_deepseek_v41_coupled_fused.py
+new file mode 100644
+index 0000000000..d895653dcc
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_coupled_fused.py
+@@ -0,0 +1,190 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""V4.1 coupled drafts: fused keyed kernels against the torch definitions (CPU).
++
++``coupled_draw.keyed_argmax`` (sampler and drafter) and
++``markov_coupled.coupled_markov_tokens`` (drafter, Markov bias in registers)
++compute the keyed Gumbel draws inline. They must give the torch reference
++picks: argmax(logits + keyed_gumbel) for the sampler, coupled_pick on
++logits + Markov bias for the drafter, greedy rows plain argmax, ties to the
++lowest id. Kernels run in the Triton interpreter (TRITON_INTERPRET=1), so
++this proves the hash, indexing and reduction logic, not GPU float rounding.
++
++    python tests/models/test_deepseek_v41_coupled_fused.py   # or pytest
++"""
++
++import os
++import sys
++
++import pytest
++
++if "triton" in sys.modules and os.environ.get("TRITON_INTERPRET") != "1":
++    pytest.skip(
++        "needs TRITON_INTERPRET=1 in the environment: triton was imported "
++        "before this file could turn the interpreter on",
++        allow_module_level=True,
++    )
++os.environ["TRITON_INTERPRET"] = "1"  # before triton is imported
++
++import importlib.util  # noqa: E402
++import types  # noqa: E402
++from pathlib import Path  # noqa: E402
++
++import torch  # noqa: E402
++import triton  # noqa: E402
++import triton.language as tl  # noqa: E402
++
++ROOT = Path(__file__).resolve().parents[2]
++PKG = ROOT / "vllm" / "models" / "deepseek_v41"
++
++
++def _load(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def _modules():
++    sys.modules.setdefault("vllm", types.ModuleType("vllm"))
++    if "vllm.triton_utils" not in sys.modules:
++        tu = types.ModuleType("vllm.triton_utils")
++        tu.tl, tu.triton = tl, triton
++        sys.modules["vllm.triton_utils"] = tu
++    cd = _load(
++        "vllm.v1.spec_decode.coupled_draw",
++        ROOT / "vllm" / "v1" / "spec_decode" / "coupled_draw.py",
++    )
++    pkg = types.ModuleType("v41fused")
++    pkg.__path__ = [str(PKG)]
++    sys.modules["v41fused"] = pkg
++    _load("v41fused.markov_fused", PKG / "markov_fused.py")
++    mc = _load("v41fused.markov_coupled", PKG / "markov_coupled.py")
++    mf = sys.modules["v41fused.markov_fused"]
++    return cd, mf, mc
++
++
++CD, MF, MC = _modules()
++
++
++def _keys(n, seed):
++    g = torch.Generator().manual_seed(seed)
++    keys = torch.randint(0, 1 << 62, (n,), generator=g, dtype=torch.int64)
++    pos = torch.randint(0, 1 << 20, (n,), generator=g, dtype=torch.int64)
++    return keys, pos
++
++
++def test_inline_draws_match_keyed_gumbel():
++    @triton.jit
++    def draws(keys, pos, out, V: tl.constexpr):
++        r = tl.program_id(0)
++        v = tl.arange(0, V)
++        seed = CD.row_seed(tl.load(keys + r), tl.load(pos + r))
++        tl.store(out + r * V + v, CD.gumbel(seed, v.to(tl.int64)))
++
++    keys, pos = _keys(5, 0)
++    keys[0], pos[0] = (1 << 63) - 1, (1 << 32) + 7  # top bits and wide positions
++    out = torch.empty(5, 256)
++    draws[(5,)](keys, pos, out, V=256)
++    torch.testing.assert_close(out, CD.keyed_gumbel(keys, pos, 256))
++
++
++@pytest.mark.parametrize("vocab", [1000, 3000])
++def test_sampler_keyed_argmax_matches_torch(vocab):
++    g = torch.Generator().manual_seed(vocab)
++    rows = 7
++    logits = torch.randn(rows, vocab, generator=g) * 3.0
++    logits[2, 100:] = float("-inf")  # top-k masked row
++    keys, pos = _keys(rows, 1)
++    temperature = torch.tensor([1.0, 0.7, 1.3, 0.0, 1.0, 0.0, 2.0])
++    random_rows = temperature > 0
++    got = CD.keyed_argmax(logits, temperature, keys, pos)
++    want = CD.keyed_sample(logits, keys, pos, random_rows)
++    assert got.dtype == torch.int64 and torch.equal(got, want)
++    assert torch.equal(got[~random_rows], logits[~random_rows].argmax(-1))
++
++
++def test_drafter_keyed_argmax_matches_coupled_pick_with_strided_positions():
++    g = torch.Generator().manual_seed(5)
++    batch, steps, vocab = 3, 4, 2048
++    logits = torch.randn(batch, vocab, generator=g) * 2.0
++    keys, _ = _keys(batch, 2)
++    positions = torch.arange(batch * steps, dtype=torch.int64).view(batch, steps) + 90
++    temperature = torch.tensor([1.0, 0.0, 0.6])
++    for step in range(steps):
++        got = CD.keyed_argmax(logits, temperature, keys, positions[:, step], 0.5)
++        draws = CD.keyed_gumbel(keys, positions[:, step].contiguous(), vocab)
++        want = CD.coupled_pick(logits, temperature, draws, scale=0.5)
++        assert torch.equal(got, want)
++
++
++def test_keyed_argmax_ties_go_to_the_lowest_id():
++    logits = torch.zeros(2, 3000)
++    logits[:, [5, 1500, 2999]] = 10.0
++    out = CD.keyed_argmax(logits, torch.zeros(2), *_keys(2, 3))
++    assert out.tolist() == [5, 5]
++
++
++def _greedy(vocab, rank, seed):
++    g = torch.Generator().manual_seed(seed)
++    weight = (torch.randn(vocab, rank, generator=g) * 0.05).to(torch.bfloat16)
++    embed = (torch.randn(vocab, rank, generator=g) * 0.5).to(torch.float16)
++    return MF.MarkovGreedy(weight, embed, steps=4), weight, embed
++
++
++def test_coupled_markov_tokens_match_eager_coupled_steps():
++    vocab, rank, batch, steps = 1000, 32, 3, 4
++    greedy, weight, embed = _greedy(vocab, rank, 0)
++    g = torch.Generator().manual_seed(1)
++    base = torch.randn(batch, steps, vocab, generator=g) * 2.0
++    prev = torch.tensor([3, vocab + 5, 77])  # out-of-range anchor clamps
++    temperature = torch.tensor([1.0, 0.8, 0.0])
++    keys, _ = _keys(batch, 4)
++    positions = torch.arange(batch * steps, dtype=torch.int64).view(batch, steps) + 11
++    got = MC.coupled_markov_tokens(
++        greedy, base, prev, temperature, keys, positions, 0.5
++    )
++    # eager reference: the drafter's unfused coupled loop
++    cur = prev.clamp(0, vocab - 1)
++    for step in range(steps):
++        rows = embed[cur]
++        bias = MF.markov_bias(greedy, rows)
++        step_logits = base[:, step] + bias
++        draws = CD.keyed_gumbel(keys, positions[:, step].contiguous(), vocab)
++        cur = CD.coupled_pick(step_logits, temperature, draws, scale=0.5)
++        assert torch.equal(got[:, step], cur), step
++    assert weight.dtype == torch.bfloat16
++
++
++def test_coupled_markov_greedy_row_matches_markov_greedy():
++    vocab, rank, steps = 1000, 32, 4
++    greedy, _, _ = _greedy(vocab, rank, 2)
++    g = torch.Generator().manual_seed(3)
++    base = torch.randn(1, steps, vocab, generator=g)
++    keys, _ = _keys(1, 5)
++    positions = torch.arange(steps, dtype=torch.int64).view(1, steps)
++    got = MC.coupled_markov_tokens(
++        greedy, base, torch.tensor([9]), torch.zeros(1), keys, positions, 0.5
++    )
++    want = greedy(base[0], torch.tensor([9]))
++    assert torch.equal(got[0], want)
++
++
++def test_trace_rows_writes_one_line_per_row(tmp_path):
++    g = torch.Generator().manual_seed(8)
++    logits = torch.randn(4, 500, generator=g)
++    keys, pos = _keys(4, 6)
++    temperature = torch.tensor([1.0, 0.0, 1.0, 1.0])
++    sampled = CD.keyed_argmax(logits, temperature, keys, pos)
++    prefix = str(tmp_path / "trace")
++    CD.trace_rows(logits, temperature, keys, pos, sampled, path=prefix)
++    (out,) = tmp_path.iterdir()
++    lines = [ln.split("\t") for ln in out.read_text().splitlines()]
++    assert len(lines) == 4 and all(len(c) == 11 for c in lines)
++    assert [c[3] for c in lines] == [str(p) for p in pos.tolist()]
++    assert all(c[10] == "1" and float(c[7]) >= 0 for c in lines)
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-q"]))
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..1107f20f04 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -461,6 +461,9 @@
+     VLLM_V41_COL_BLOCK: str = "256"
+     VLLM_V41_COL_PROJ: str = "0"
+     VLLM_V41_COL_W: str = "4"
++    VLLM_V41_COUPLED_DRAFT_TEMP: str = "0.5"
++    VLLM_V41_COUPLED_TRACE: str = ""
++    VLLM_V41_COUPLED_DRAFTS: str = "0"
+     VLLM_V41_COORD_DEBUG: str | None = None
+     VLLM_V41_DENSE_TM: str = "1"
+     VLLM_V41_DMA_DEBUG: str | None = None
+@@ -7247,6 +7250,46 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_COUPLED_DRAFT_TEMP": env_var(
++        lambda: os.getenv("VLLM_V41_COUPLED_DRAFT_TEMP", "0.5"),
++        description=(
++            "Experimental DS-V4.1 exact coupled drafts with keyed verification: "
++            "drafter temperature scale (> 0)."
++        ),
++        category="experimental",
++        declared_default="'0.5'",
++        effective_default="'0.5'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
++    "VLLM_V41_COUPLED_TRACE": env_var(
++        lambda: os.getenv("VLLM_V41_COUPLED_TRACE", ""),
++        description=(
++            "Debug for DS-V4.1 coupled drafts: path prefix of a per-process "
++            "TSV of every keyed verification row (position, winner, runner-up, "
++            "margin, logit bits); host syncs every step. Empty = off."
++        ),
++        category="experimental",
++        declared_default="''",
++        effective_default="''",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
++    "VLLM_V41_COUPLED_DRAFTS": env_var(
++        lambda: os.getenv("VLLM_V41_COUPLED_DRAFTS", "0"),
++        description=(
++            "Experimental DS-V4.1 exact coupled drafts with keyed verification: "
++            "1 = DSpark drafts share the target's keyed draws."
++        ),
++        category="experimental",
++        declared_default="'0'",
++        effective_default="'0'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
+     "VLLM_V41_COORD_DEBUG": env_var(
+         lambda: os.getenv("VLLM_V41_COORD_DEBUG"),
+         description=("DS-V4.1 SM70 runtime switch (developer)."),
+@@ -20278,6 +20321,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
+         "VLLM_V41_COL_B",
+         "VLLM_V41_COL_BLOCK",
+         "VLLM_V41_COL_PROJ",
++        "VLLM_V41_COUPLED_DRAFTS",
++        "VLLM_V41_COUPLED_DRAFT_TEMP",
++        "VLLM_V41_COUPLED_TRACE",
+         "VLLM_V41_COL_W",
+         "VLLM_V41_COORD_DEBUG",
+         "VLLM_V41_DENSE_TM",
+diff --git a/vllm/models/deepseek_v41/dspark.py b/vllm/models/deepseek_v41/dspark.py
+index da92c375f3..dfd2faf149 100644
+--- a/vllm/models/deepseek_v41/dspark.py
++++ b/vllm/models/deepseek_v41/dspark.py
+@@ -330,6 +330,19 @@ def greedy_draft_tokens(self, hidden_states, anchor):
+             return None
+         return self.greedy_graph(hidden_states, anchor)
+ 
++    def coupled_draft_tokens(
++        self, base_logits, prev, temperature, keys, positions, scale
++    ):
++        """[B, steps] coupled drafts from the fused keyed Markov kernels, or
++        None when the BF16 Markov head is not prepared."""
++        if self._markov is None or self._markov.vocab != base_logits.shape[-1]:
++            return None
++        from .markov_coupled import coupled_markov_tokens
++
++        return coupled_markov_tokens(
++            self._markov, base_logits, prev, temperature, keys, positions, scale
++        )
++
+     def markov_embed(self, token_ids):
+         # Under async scheduling a non-sampling step can carry an unfilled
+         # anchor (read from the persistent query buffer at a request boundary);
+diff --git a/vllm/models/deepseek_v41/markov_coupled.py b/vllm/models/deepseek_v41/markov_coupled.py
+new file mode 100644
+index 0000000000..e233dd078d
+--- /dev/null
++++ b/vllm/models/deepseek_v41/markov_coupled.py
+@@ -0,0 +1,151 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Coupled (keyed) DSpark Markov draft steps without [vocab] tensors.
++
++The sampled-draft twin of ``markov_fused.MarkovGreedy`` for any batch: per
++step, one ``_markov_keyed_block`` launch scores every (row, 128-token block)
++with the BF16 Markov bias summed in registers exactly as ``_markov_block``
++does, divides by the row's temperature x scale and adds the row's keyed
++Gumbel draw computed inline (``coupled_draw.gumbel``, the same draws as
++``coupled_draw.keyed_gumbel``); one ``_markov_keyed_reduce`` launch picks each
++row's token (lowest id on ties) and gathers its next Markov embedding row.
++Greedy rows (temperature 0) take the plain argmax of logits + bias.
++
++The drafter only proposes; verification keeps the output exact whatever
++these tokens are.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++from vllm.v1.spec_decode.coupled_draw import gumbel, row_seed
++
++from .markov_fused import ROWS
++
++
++@triton.jit
++def _markov_keyed_block(
++    weight,
++    embed_rows,
++    logits,
++    l_stride,
++    temperature,
++    scale,
++    keys,
++    positions,
++    p_stride,
++    best_val,
++    best_idx,
++    V: tl.constexpr,
++    K: tl.constexpr,
++    NB: tl.constexpr,
++    ROWS: tl.constexpr,
++):
++    pid, b = tl.program_id(0), tl.program_id(1)
++    v = pid * ROWS + tl.arange(0, ROWS)
++    k = tl.arange(0, K)
++    valid = v < V
++    raw = tl.load(weight + v[:, None] * K + k[None, :], valid[:, None], 0)
++    w = (raw.to(tl.int32) << 16).to(tl.float32, bitcast=True)
++    e = tl.load(embed_rows + b * K + k).to(tl.float32)
++    bias = tl.sum(w * e[None, :], 1)
++    x = tl.load(logits + b.to(tl.int64) * l_stride + v, valid, float("-inf")) + bias
++    t = tl.load(temperature + b)
++    if t > 0:
++        seed = row_seed(tl.load(keys + b), tl.load(positions + b * p_stride))
++        x = x / (t * scale) + gumbel(seed, v.to(tl.int64))
++    x = tl.where(valid, x, float("-inf"))
++    m = tl.max(x, 0)
++    tl.store(best_val + b * NB + pid, m)
++    tl.store(best_idx + b * NB + pid, tl.min(tl.where(x == m, v, 2147483647), 0))
++
++
++@triton.jit
++def _markov_keyed_reduce(
++    best_val,
++    best_idx,
++    embed,
++    embed_rows,
++    tokens,
++    t_stride,
++    V: tl.constexpr,
++    K: tl.constexpr,
++    NB: tl.constexpr,
++    PB: tl.constexpr,
++):
++    b = tl.program_id(0)
++    i = tl.arange(0, PB)
++    valid = i < NB
++    val = tl.load(best_val + b * NB + i, valid, float("-inf"))
++    idx = tl.load(best_idx + b * NB + i, valid, 2147483647)
++    m = tl.max(val, 0)
++    token = tl.min(tl.where(val == m, idx, 2147483647), 0)
++    tl.store(tokens + b * t_stride, token.to(tl.int64))
++    # next step's row, clamped like markov_embed (an all-NaN step reports 2**31-1)
++    row = tl.minimum(token, V - 1).to(tl.int64)
++    k = tl.arange(0, K)
++    tl.store(embed_rows + b * K + k, tl.load(embed + row * K + k))
++
++
++def coupled_markov_tokens(
++    greedy,
++    base_logits: torch.Tensor,
++    prev: torch.Tensor,
++    temperature: torch.Tensor,
++    keys: torch.Tensor,
++    positions: torch.Tensor,
++    scale: float,
++) -> torch.Tensor:
++    """[B, steps] int64 coupled drafts.
++
++    greedy: the model's ``MarkovGreedy`` (BF16 head as int16, FP16 embedding);
++    base_logits: [B, steps, vocab] draft logits; prev: [B] anchor tokens;
++    temperature: [B] (0 = greedy row); keys: [B] int64 stream keys;
++    positions: [B, steps] int64 output positions of the draft tokens.
++    """
++    batch, steps, vocab = base_logits.shape
++    device = base_logits.device
++    logits = base_logits.float().contiguous()
++    tokens = torch.empty((batch, steps), dtype=torch.int64, device=device)
++    if batch == 0:
++        return tokens
++    rows = torch.index_select(
++        greedy.embed, 0, prev.reshape(-1).long().clamp(0, greedy.vocab - 1)
++    ).contiguous()
++    nb = greedy.blocks
++    best_val = torch.empty((batch, nb), dtype=torch.float32, device=device)
++    best_idx = torch.empty((batch, nb), dtype=torch.int32, device=device)
++    temperature = temperature.to(torch.float32).contiguous()
++    for step in range(steps):
++        _markov_keyed_block[(nb, batch)](
++            greedy.weight,
++            rows,
++            logits[:, step],
++            logits.stride(0),
++            temperature,
++            float(scale),
++            keys,
++            positions[:, step],
++            positions.stride(0),
++            best_val,
++            best_idx,
++            V=vocab,
++            K=greedy.rank,
++            NB=nb,
++            ROWS=ROWS,
++            num_warps=4,
++        )
++        _markov_keyed_reduce[(batch,)](
++            best_val,
++            best_idx,
++            greedy.embed,
++            rows,
++            tokens[:, step],
++            tokens.stride(0),
++            V=vocab,
++            K=greedy.rank,
++            NB=nb,
++            PB=triton.next_power_of_2(nb),
++            num_warps=4,
++        )
++    return tokens
+diff --git a/vllm/v1/sample/rejection_sampler.py b/vllm/v1/sample/rejection_sampler.py
+index 81ee899ca2..6c0c46dad1 100644
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -165,6 +165,31 @@ def _token_matching_sampling_enabled(
+     )
+ 
+ 
++def _coupled_sampling_enabled(sampling_metadata: SamplingMetadata) -> bool:
++    """Keyed-draw verification covers temperature, top-k, top-p and min_p.
++
++    Seeded requests are fine (their key is the seed); anything that edits
++    logits per token or needs logprobs takes the regular path.
++    """
++    if sampling_metadata.max_num_logprobs is not None:
++        return False
++    if sampling_metadata.logprob_token_ids:
++        return False
++    if not sampling_metadata.no_penalties:
++        return False
++    if sampling_metadata.allowed_token_ids_mask is not None:
++        return False
++    if sampling_metadata.bad_words_token_ids:
++        return False
++    holder = sampling_metadata.thinking_budget_state_holder
++    if holder is not None and holder.has_tracked_requests():
++        return False
++    return all(
++        _combined_bonus_processor_safe(processor)
++        for processor in sampling_metadata.logitsprocs.all
++    )
++
++
+ def _combined_bonus_sampling_enabled(
+     sampling_metadata: SamplingMetadata,
+     needs_output_logprobs: bool,
+@@ -251,6 +276,13 @@ def __init__(
+             )
+         self.synthetic_mode = self.synthetic_conditional_rates is not None
+         self._last_target_candidate_ids: torch.Tensor | None = None
++        # V4.1 coupled drafts: per-request keys and per-logits-row output
++        # positions for the next forward(), set by the runner, consumed once.
++        self._coupled_rows: tuple[torch.Tensor, torch.Tensor] | None = None
++
++    def set_coupled_rows(self, keys: torch.Tensor, positions: torch.Tensor) -> None:
++        """keys: [num_reqs] int64 stream keys; positions: [num_rows] int64."""
++        self._coupled_rows = (keys, positions)
+ 
+     def _capture_dynamic_draft_candidates(
+         self,
+@@ -304,6 +336,17 @@ def forward(
+         """
+         assert metadata.max_spec_len <= MAX_SPEC_LEN
+         self._last_target_candidate_ids = None
++        coupled_rows, self._coupled_rows = self._coupled_rows, None
++        if (
++            coupled_rows is not None
++            and draft_probs is None
++            and not self.synthetic_mode
++            and not sampling_metadata.all_greedy
++            and _coupled_sampling_enabled(sampling_metadata)
++        ):
++            return self._sample_coupled(
++                metadata, logits, sampling_metadata, *coupled_rows
++            )
+ 
+         if (
+             draft_probs is None
+@@ -535,6 +578,40 @@ def _forward_combined_bonus(
+             logprobs_tensors=None,
+         )
+ 
++    def _sample_coupled(
++        self,
++        metadata: SpecDecodeMetadata,
++        logits: torch.Tensor,
++        sampling_metadata: SamplingMetadata,
++        keys: torch.Tensor,
++        positions: torch.Tensor,
++    ) -> SamplerOutput:
++        """Keyed-draw verification: every row takes its keyed target sample;
++        the longest matching draft prefix is accepted (exact)."""
++        from vllm.v1.spec_decode import coupled_draw
++
++        num_rows = logits.shape[0]
++        processed = apply_sampling_constraints(
++            logits.to(torch.float32),
++            metadata.cu_num_sampled_tokens,
++            sampling_metadata,
++            runtime=self._topk_runtime,
++        )
++        assert sampling_metadata.temperature is not None
++        temperature = expand_batch_to_tokens(
++            sampling_metadata.temperature,
++            metadata.cu_num_sampled_tokens,
++            num_rows,
++        )
++        keys = expand_batch_to_tokens(keys, metadata.cu_num_sampled_tokens, num_rows)
++        sampled = coupled_draw.keyed_argmax(processed, temperature, keys, positions)
++        if coupled_draw.TRACE:
++            coupled_draw.trace_rows(processed, temperature, keys, positions, sampled)
++        return SamplerOutput(
++            sampled_token_ids=token_match_sample(metadata, sampled),
++            logprobs_tensors=None,
++        )
++
+     def _sample_by_token_matching(
+         self,
+         metadata: SpecDecodeMetadata,
+diff --git a/vllm/v1/spec_decode/coupled_draw.py b/vllm/v1/spec_decode/coupled_draw.py
+new file mode 100644
+index 0000000000..da23b93006
+--- /dev/null
++++ b/vllm/v1/spec_decode/coupled_draw.py
+@@ -0,0 +1,309 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Coupled sampled drafts with keyed-draw verification (exact).
++
++A port of TensorFold's coupled drafts (Elevatormusic/TensorFold PR #25).
++Every sampled token at output position t of a request is
++
++    argmax(processed_target_logits + G(key, t))
++
++where G(key, t)[v] is a Gumbel draw that is a pure function of the request
++key, the position and the token id (a 32-bit integer hash, below). The
++drafter picks its token at t with the *same* draw on its own logits at
++temperature x DRAFT_TEMP_SCALE, so it agrees with the target far more often
++than an independent draft. Verification accepts the longest draft prefix
++that equals the target's keyed samples and emits the keyed sample at the
++first mismatch (token matching), so every emitted token is the target's own
++keyed sample: the output follows the target distribution exactly, whatever
++the drafts were. A seeded request is reproducible regardless of drafting.
++
++Exactness needs the draws to be independent across positions and tokens and
++independent of everything emitted before t; G depends only on (key, t, v).
++A position re-verified after a rejection reuses its draw, which is still
++unseen by any emitted token.
++
++Environment:
++  VLLM_V41_COUPLED_DRAFTS     1 = on; default 0 (off)
++  VLLM_V41_COUPLED_DRAFT_TEMP drafter temperature scale; default 0.5
++"""
++
++from __future__ import annotations
++
++import functools
++import hashlib
++import os
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++ENABLED = os.getenv("VLLM_V41_COUPLED_DRAFTS", "0") == "1"
++DRAFT_TEMP_SCALE = float(os.getenv("VLLM_V41_COUPLED_DRAFT_TEMP", "0.5"))
++if not DRAFT_TEMP_SCALE > 0.0:
++    raise ValueError("VLLM_V41_COUPLED_DRAFT_TEMP must be > 0")
++TRACE = os.getenv("VLLM_V41_COUPLED_TRACE", "")
++
++M32 = 0xFFFFFFFF
++_GOLDEN = 0x9E3779B9
++_SALT = 0x6A09E667
++
++
++def _mul32(x: torch.Tensor, c: int) -> torch.Tensor:
++    """(x * c) mod 2**32 for x in [0, 2**32) without int64 overflow."""
++    lo, hi = c & 0xFFFF, c >> 16
++    return (x * lo + (((x * hi) & 0xFFFF) << 16)) & M32
++
++
++def mix32(x: torch.Tensor) -> torch.Tensor:
++    """lowbias32 (Wellons): a 32-bit avalanche hash on int64 lanes."""
++    x = x ^ (x >> 16)
++    x = _mul32(x, 0x7FEB352D)
++    x = x ^ (x >> 15)
++    x = _mul32(x, 0x846CA68B)
++    return x ^ (x >> 16)
++
++
++def row_seeds(keys: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
++    """[R] 32-bit stream seeds for (key, output position) pairs."""
++    keys = keys.to(torch.int64)
++    hi = mix32(((keys >> 32) & M32) ^ _GOLDEN)
++    s = mix32((keys & M32) ^ hi)
++    return mix32(s ^ (positions.to(torch.int64) & M32))
++
++
++def keyed_gumbel(
++    keys: torch.Tensor, positions: torch.Tensor, vocab_size: int
++) -> torch.Tensor:
++    """[R, V] float32 Gumbel draws G(key_r, position_r)[v]."""
++    s = row_seeds(keys, positions).unsqueeze(1)
++    v = torch.arange(vocab_size, dtype=torch.int64, device=keys.device)
++    h = mix32(mix32(s ^ v) ^ ((s + _SALT) & M32))
++    # 23 bits: (k + 0.5) / 2**23 is exact in fp32 and strictly inside (0, 1).
++    u = ((h >> 9).to(torch.float32) + 0.5) * (1.0 / (1 << 23))
++    return -torch.log(-torch.log(u))
++
++
++def keyed_sample(
++    logits: torch.Tensor,
++    keys: torch.Tensor,
++    positions: torch.Tensor,
++    random_rows: torch.Tensor,
++) -> torch.Tensor:
++    """[R] keyed samples of processed (temperature-scaled, masked) logits.
++
++    Rows where `random_rows` is False take the plain argmax (greedy).
++    """
++    g = keyed_gumbel(keys, positions, logits.shape[-1])
++    g = torch.where(random_rows.unsqueeze(1), g, torch.zeros_like(g))
++    return (logits.to(torch.float32) + g).argmax(dim=-1)
++
++
++def coupled_pick(
++    logits: torch.Tensor,
++    temperature: torch.Tensor,
++    gumbel: torch.Tensor,
++    scale: float = DRAFT_TEMP_SCALE,
++) -> torch.Tensor:
++    """[R] draft tokens: argmax(logits / (T * scale) + G); greedy rows argmax.
++
++    `temperature` is per row, 0 for greedy rows (vLLM's encoding).
++    """
++    random_rows = temperature > 0
++    t = torch.where(random_rows, temperature * scale, torch.ones_like(temperature))
++    g = torch.where(random_rows.unsqueeze(1), gumbel, torch.zeros_like(gumbel))
++    return (logits.to(torch.float32) / t.unsqueeze(1) + g).argmax(dim=-1)
++
++
++# Fused kernels: the same draws as keyed_gumbel computed inline, so no [R, V]
++# noise tensor exists and a keyed argmax is two launches for any row count.
++# The hash runs on int64 lanes holding uint32 values; a wrapping int64
++# multiply keeps the low 32 bits exact, so the masked result equals _mul32.
++@triton.jit
++def _mix32(x):
++    x = x ^ (x >> 16)
++    x = (x * 0x7FEB352D) & 0xFFFFFFFF
++    x = x ^ (x >> 15)
++    x = (x * 0x846CA68B) & 0xFFFFFFFF
++    return x ^ (x >> 16)
++
++
++@triton.jit
++def row_seed(key, position):
++    """row_seeds for one (int64 key, int64 position)."""
++    hi = _mix32(((key >> 32) & 0xFFFFFFFF) ^ 0x9E3779B9)
++    s = _mix32((key & 0xFFFFFFFF) ^ hi)
++    return _mix32(s ^ (position & 0xFFFFFFFF))
++
++
++@triton.jit
++def gumbel(seed, v):
++    """keyed_gumbel values for one row seed at int64 token ids v."""
++    h = _mix32(_mix32(seed ^ v) ^ ((seed + 0x6A09E667) & 0xFFFFFFFF))
++    u = ((h >> 9).to(tl.float32) + 0.5) * (1.0 / 8388608.0)
++    return -tl.log(-tl.log(u))
++
++
++@triton.jit
++def _keyed_block(
++    logits,
++    l_stride,
++    temperature,
++    scale,
++    keys,
++    positions,
++    p_stride,
++    best_val,
++    best_idx,
++    V: tl.constexpr,
++    NB: tl.constexpr,
++    DIVIDE: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    pid, r = tl.program_id(0), tl.program_id(1)
++    v = pid * BLOCK + tl.arange(0, BLOCK)
++    valid = v < V
++    x = tl.load(logits + r.to(tl.int64) * l_stride + v, valid, float("-inf"))
++    x = x.to(tl.float32)
++    t = tl.load(temperature + r)
++    if t > 0:
++        if DIVIDE:
++            x = x / (t * scale)
++        seed = row_seed(tl.load(keys + r), tl.load(positions + r * p_stride))
++        x = x + gumbel(seed, v.to(tl.int64))
++    x = tl.where(valid, x, float("-inf"))
++    m = tl.max(x, 0)
++    tl.store(best_val + r * NB + pid, m)
++    tl.store(best_idx + r * NB + pid, tl.min(tl.where(x == m, v, 2147483647), 0))
++
++
++@triton.jit
++def _keyed_reduce(
++    best_val, best_idx, out, o_stride, NB: tl.constexpr, PB: tl.constexpr
++):
++    r = tl.program_id(0)
++    b = tl.arange(0, PB)
++    valid = b < NB
++    val = tl.load(best_val + r * NB + b, valid, float("-inf"))
++    idx = tl.load(best_idx + r * NB + b, valid, 2147483647)
++    m = tl.max(val, 0)
++    token = tl.min(tl.where(val == m, idx, 2147483647), 0)
++    tl.store(out + r * o_stride, token.to(tl.int64))
++
++
++KEYED_BLOCK = 1024
++
++
++def keyed_argmax(
++    logits: torch.Tensor,
++    temperature: torch.Tensor,
++    keys: torch.Tensor,
++    positions: torch.Tensor,
++    scale: float | None = None,
++) -> torch.Tensor:
++    """[R] int64 keyed picks in two launches, no host sync, graph safe.
++
++    Rows with temperature > 0 take argmax(x + G(key, position)), where x is
++    the row's logits divided by temperature * scale when `scale` is given
++    (drafter) and the logits as they are otherwise (sampler: already
++    temperature-scaled). Other rows take the plain argmax. Ties go to the
++    lowest token id, as torch.argmax. `positions` may be a strided [R] view.
++    """
++    rows, vocab = logits.shape
++    if logits.stride(1) != 1:
++        logits = logits.contiguous()
++    out = torch.empty(rows, dtype=torch.int64, device=logits.device)
++    if rows == 0:
++        return out
++    nb = triton.cdiv(vocab, KEYED_BLOCK)
++    best_val = torch.empty((rows, nb), dtype=torch.float32, device=logits.device)
++    best_idx = torch.empty((rows, nb), dtype=torch.int32, device=logits.device)
++    _keyed_block[(nb, rows)](
++        logits,
++        logits.stride(0),
++        temperature.to(torch.float32),
++        1.0 if scale is None else float(scale),
++        keys,
++        positions,
++        positions.stride(0),
++        best_val,
++        best_idx,
++        V=vocab,
++        NB=nb,
++        DIVIDE=scale is not None,
++        BLOCK=KEYED_BLOCK,
++        num_warps=4,
++    )
++    _keyed_reduce[(rows,)](
++        best_val, best_idx, out, 1, NB=nb, PB=triton.next_power_of_2(nb), num_warps=4
++    )
++    return out
++
++
++_TRACE_STEP = [0]
++
++
++def trace_rows(
++    processed: torch.Tensor,
++    temperature: torch.Tensor,
++    keys: torch.Tensor,
++    positions: torch.Tensor,
++    sampled: torch.Tensor,
++    path: str = TRACE,
++) -> None:
++    """Debug (VLLM_V41_COUPLED_TRACE): append one TSV line per keyed
++    verification row to ``<path>.<pid>.tsv`` (host sync; off by default).
++
++    Columns: step, row, key (low 16 bits), output position, sampled token,
++    winner and runner-up of logits + G, margin (winner - runner-up), the
++    processed logits of winner and runner-up as float hex (bit-exact across
++    runs), and whether the fused pick equals the torch winner. The emitted
++    token at a position is a function of (key, position, processed logits)
++    only, so two runs that differ there show a changed logit (hex columns)
++    or a near-tie margin.
++    """
++    noisy = (temperature > 0).unsqueeze(1)
++    g = keyed_gumbel(keys, positions, processed.shape[-1])
++    val = processed.to(torch.float32) + torch.where(noisy, g, torch.zeros_like(g))
++    top = val.topk(2, dim=-1)
++    win, run = top.indices[:, 0], top.indices[:, 1]
++    margin = top.values[:, 0] - top.values[:, 1]
++    lw = processed.to(torch.float32).gather(1, top.indices).cpu().tolist()
++    cols = zip(
++        (keys & 0xFFFF).tolist(),
++        positions.tolist(),
++        sampled.tolist(),
++        win.tolist(),
++        run.tolist(),
++        margin.tolist(),
++        lw,
++    )
++    step = _TRACE_STEP[0]
++    _TRACE_STEP[0] += 1
++    with open(f"{path}.{os.getpid()}.tsv", "a") as out:
++        for row, (key, pos, tok, w, r, m, (a, b)) in enumerate(cols):
++            out.write(
++                f"{step}\t{row}\t{key}\t{pos}\t{tok}\t{w}\t{r}\t{m:.6g}\t"
++                f"{float(a).hex()}\t{float(b).hex()}\t{int(tok == w)}\n"
++            )
++
++
++@functools.lru_cache(maxsize=8192)
++def request_key(seed: int | None, req_id: str, engine_seed: int) -> int:
++    """63-bit stream key: from the request seed when given (reproducible),
++    else from the engine seed and the request id (identical on every rank)."""
++    text = f"seed:{seed}" if seed is not None else f"req:{engine_seed}:{req_id}"
++    digest = hashlib.blake2b(text.encode(), digest_size=8).digest()
++    return int.from_bytes(digest, "little") & ((1 << 63) - 1)
++
++
++_KEYS: dict[str, torch.Tensor] = {}
++
++
++def keys_buffer(device: torch.device, size: int) -> torch.Tensor:
++    """The persistent per-batch-row key buffer shared by sampler and drafter."""
++    name = str(device)
++    buf = _KEYS.get(name)
++    if buf is None or buf.numel() < size:
++        buf = torch.zeros(size, dtype=torch.int64, device=device)
++        _KEYS[name] = buf
++    return buf
+diff --git a/vllm/v1/spec_decode/dspark.py b/vllm/v1/spec_decode/dspark.py
+index e12b5128d4..ac69116cd8 100644
+--- a/vllm/v1/spec_decode/dspark.py
++++ b/vllm/v1/spec_decode/dspark.py
+@@ -7,6 +7,7 @@
+ 
+ from vllm.config import VllmConfig
+ from vllm.v1.sample.metadata import SamplingMetadata
++from vllm.v1.spec_decode import coupled_draw
+ from vllm.v1.spec_decode.dflash import DFlashProposer
+ 
+ 
+@@ -98,6 +99,39 @@ def _select_verification_lengths(
+         )
+         return confident_prefix.sum(dim=1).clamp_max_(cap).to(torch.int32)
+ 
++    def _coupled_inputs(
++        self,
++        sampling_metadata: SamplingMetadata | None,
++        batch_size: int,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
++        """V4.1 coupled drafts: per-row (temperature, key, [B, K] positions).
++
++        Draft step s of row r is the token at query position
++        self.positions[r * K + s] + 1, the same output position the target
++        verifies it at; the key is the row's stream key (runner-filled).
++        None (regular draft sampling) when the knob is off or every row is
++        greedy.
++        """
++        if (
++            not coupled_draw.ENABLED
++            or sampling_metadata is None
++            or sampling_metadata.all_greedy
++            or sampling_metadata.temperature is None
++            or self._static_draft_vocab is not None
++            or getattr(self, "_enable_probabilistic_draft_probs", False)
++        ):
++            return None
++        k = self.num_speculative_tokens
++        temperature = sampling_metadata.temperature.to(torch.float32)
++        if temperature.shape[0] < batch_size:
++            pad = batch_size - temperature.shape[0]
++            temperature = torch.nn.functional.pad(temperature, (0, pad))
++        temperature = temperature[:batch_size].contiguous()
++        size = max(batch_size, self.max_batch_size)
++        keys = coupled_draw.keys_buffer(self.device, size)[:batch_size]
++        positions = (self.positions[: batch_size * k] + 1).view(batch_size, k)
++        return temperature, keys, positions
++
+     @override
+     def _sample_draft_tokens(
+         self,
+@@ -157,15 +191,39 @@ def _sample_draft_tokens(
+             [] if collect_confidence_logits else None
+         )
+         draft_probs: list[torch.Tensor] | None = None
+-        for step in range(self.num_speculative_tokens):
++        coupled = self._coupled_inputs(sampling_metadata, batch_size)
++        fused = None
++        if coupled is not None and markov_embeds is None:
++            fused_draft = getattr(self.model, "coupled_draft_tokens", None)
++            if fused_draft is not None:
++                fused = fused_draft(
++                    base_logits, prev, *coupled, coupled_draw.DRAFT_TEMP_SCALE
++                )
++        if fused is not None:
++            draft_tokens = [
++                self.model.map_draft_to_target(fused[:, step])
++                for step in range(self.num_speculative_tokens)
++            ]
++        for step in range(0 if fused is not None else self.num_speculative_tokens):
+             markov_embed = self.model.markov_embed(prev)
+             if markov_embeds is not None:
+                 markov_embeds.append(markov_embed)
+             step_logits = base_logits[:, step] + self.model.markov_bias(markov_embed)
+-            sampled, step_probs = self._sample_from_logits(
+-                step_logits,
+-                sampling_metadata,
+-            )
++            if coupled is not None:
++                temperature, keys, positions = coupled
++                sampled = coupled_draw.keyed_argmax(
++                    step_logits,
++                    temperature,
++                    keys,
++                    positions[:, step],
++                    coupled_draw.DRAFT_TEMP_SCALE,
++                )
++                step_probs = None
++            else:
++                sampled, step_probs = self._sample_from_logits(
++                    step_logits,
++                    sampling_metadata,
++                )
+             prev = self.model.map_draft_to_target(sampled)
+             draft_tokens.append(prev)
+             if step_probs is not None:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 3c8e61eb9e..3a6653273a 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1082,6 +1082,7 @@ def _non_greedy_rows_carry_drafts(
+ 
+ _V41_TRUNC_CUTOFF = int(envs.VLLM_V41_TRUNC_CUTOFF)
+ _V41_TRUNC = envs.VLLM_V41_TRUNC == "1"
++_COUPLED_DRAFTS = os.getenv("VLLM_V41_COUPLED_DRAFTS", "0") == "1"
+ 
+ 
+ class GPUModelRunner(
+@@ -7066,6 +7067,51 @@ def _commit_dynamic_draft_vocab_prefill_bootstrap(
+             self.dynamic_draft_vocab_prefill_topk,
+         )
+ 
++    def _fill_coupled_keys(self) -> None:
++        """V4.1 coupled drafts: this step's per-request stream keys, shared
++        with the drafter through coupled_draw.keys_buffer. Copied (pinned,
++        non-blocking: no stream sync) only when the batch's keys change."""
++        from vllm.v1.spec_decode import coupled_draw
++
++        num_reqs = self.input_batch.num_reqs
++        engine_seed = getattr(self.model_config, "seed", None) or 0
++        keys = []
++        for req_id in self.input_batch.req_ids[:num_reqs]:
++            params = self.requests[req_id].sampling_params
++            seed = None if params is None else params.seed
++            keys.append(coupled_draw.request_key(seed, req_id, engine_seed))
++        buffer = coupled_draw.keys_buffer(self.device, self.max_num_reqs)
++        # The buffer can be replaced (grown), so its address is part of the key.
++        state = (buffer.data_ptr(), keys)
++        if keys and state != getattr(self, "_coupled_keys_state", None):
++            staged = torch.tensor(keys, dtype=torch.int64).pin_memory()
++            buffer[:num_reqs].copy_(staged, non_blocking=True)
++            self._coupled_keys_state = state
++
++    def _set_coupled_rows(
++        self, metadata: SpecDecodeMetadata, logits: torch.Tensor
++    ) -> None:
++        """Per-logits-row output position (and per-request key) for keyed
++        verification.
++
++        Row i of `logits` is the token at self.positions[logits_indices[i]];
++        it predicts the next position. Skipped (regular rejection sampling)
++        when the rows do not follow the standard one-bonus-per-request layout.
++        """
++        from vllm.v1.spec_decode import coupled_draw
++
++        num_reqs = len(metadata.num_draft_tokens)
++        num_rows = sum(metadata.num_draft_tokens) + num_reqs
++        if (
++            logits.shape[0] != num_rows
++            or metadata.logits_indices.numel() != num_rows
++            or metadata.bonus_logits_indices.numel() != num_reqs
++        ):
++            return
++        buffer = coupled_draw.keys_buffer(self.device, self.max_num_reqs)
++        positions = self.positions[metadata.logits_indices.long()] + 1
++        self.rejection_sampler.set_coupled_rows(buffer[:num_reqs], positions)
++
+     def _sample(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -7076,6 +7122,8 @@ def _sample(
+     ) -> SamplerOutput:
+         # Sample the next token and get logprobs if needed.
+         sampling_metadata = self.input_batch.sampling_metadata
++        if _COUPLED_DRAFTS and not sampling_metadata.all_greedy:
++            self._fill_coupled_keys()
+         self._ddtree_accepted_rows_cpu_sidecar = None
+         self._ddtree_sampled_token_counts_cpu_sidecar = None
+         # Update output token ids with tokens sampled in last step
+@@ -7576,6 +7624,13 @@ def _sample(
+                 spec_decode_metadata.draft_token_ids = torch.where(
+                     index + 1 >= trunc, torch.full_like(drafts, -1), drafts
+                 )
++        if (
++            _COUPLED_DRAFTS
++            and draft_probs is None
++            and logits is not None
++            and not sampling_metadata.all_greedy
++        ):
++            self._set_coupled_rows(spec_decode_metadata, logits)
+         sampler_output = self.rejection_sampler(
+             spec_decode_metadata,
+             draft_probs,
