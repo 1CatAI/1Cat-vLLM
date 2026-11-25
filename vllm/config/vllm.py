@@ -710,7 +710,13 @@ class VllmConfig:
             self.speculative_config is not None
             and self.speculative_config.draft_token_map is not None
         )
+        is_mrv2_inkling2_dspark = self._is_inkling2_dspark()
         if use_v2_model_runner is not None:
+            if is_mrv2_inkling2_dspark and not use_v2_model_runner:
+                raise ValueError(
+                    "method='dspark' for Inkling2 is implemented only by Model "
+                    "Runner V2."
+                )
             if has_draft_vocab and not use_v2_model_runner:
                 raise ValueError("draft_token_map requires Model Runner V2.")
             if is_qwen4_exp and not use_v2_model_runner:
@@ -728,7 +734,7 @@ class VllmConfig:
         # The old V1 flat-DFlash route is intentionally removed. Force every
         # method='dflash' checkpoint through the MRV2 speculator and fail in
         # _validate_v2_model_runner if another configured feature is unsupported.
-        if is_mrv2_dflash or has_draft_vocab:
+        if is_mrv2_dflash or has_draft_vocab or is_mrv2_inkling2_dspark:
             return True
 
         # The model adapter qualifies its speculative metadata, graphs and
@@ -755,6 +761,14 @@ class VllmConfig:
             return False
 
         return True
+
+    def _is_inkling2_dspark(self) -> bool:
+        spec = self.speculative_config
+        if spec is None or spec.method != "dspark" or spec.draft_model_config is None:
+            return False
+        return getattr(spec.draft_model_config.hf_config, "model_type", None) == (
+            "inkling2_dspark"
+        )
 
     def _is_default_v2_model_runner_model(self) -> bool:
         model_config = self.model_config
@@ -2458,11 +2472,15 @@ class VllmConfig:
             # TODO: ngram / ngram_gpu are not supported by the v2 model runner yet
             if speculative_config.method in ("ngram", "ngram_gpu"):
                 unsupported.append("ngram/ngram_gpu speculative decoding")
-            elif speculative_config.method not in (
-                "eagle",
-                "eagle3",
-                "mtp",
-                "dflash",
+            elif (
+                speculative_config.method
+                not in (
+                    "eagle",
+                    "eagle3",
+                    "mtp",
+                    "dflash",
+                )
+                and not self._is_inkling2_dspark()
             ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
@@ -2470,6 +2488,7 @@ class VllmConfig:
             if (
                 speculative_config.parallel_drafting
                 and speculative_config.method != "dflash"
+                and not self._is_inkling2_dspark()
             ):
                 unsupported.append("parallel drafting for speculative decoding")
 

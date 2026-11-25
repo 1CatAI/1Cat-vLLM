@@ -38,6 +38,29 @@ class AsyncScheduler(Scheduler):
         )
         # req_id -> [ema_successes, ema_trials, cur_k]
         self._adaptive_mtp_state: dict[str, list[float]] = {}
+        # Inkling2 DSpark: draft width (verified tokens) by decode batch size.
+        self._dspark_widths = None
+        if (
+            self.use_v2_model_runner
+            and speculative_config is not None
+            and speculative_config.method == "dspark"
+            and getattr(draft_model_config.hf_config, "model_type", None)
+            == "inkling2_dspark"
+        ):
+            from vllm.v1.worker.gpu.spec_decode.dspark.widths import (
+                DSparkAdaptive,
+                DSparkWidths,
+            )
+
+            self._dspark_widths = DSparkWidths(self.num_spec_tokens)
+            # A lone decode request gets its width from its own acceptance.
+            self._dspark_adaptive = DSparkAdaptive(self.num_spec_tokens)
+            self._dspark_adaptive.widths = self._dspark_widths
+            self._dspark_widths.adaptive_obj = self._dspark_adaptive
+            logger.info(
+                "Inkling2 DSpark batch-aware draft widths (B=1,2,...): %s",
+                self._dspark_widths.table,
+            )
         if self._adaptive_mtp:
             logger.info(
                 "Adaptive MTP (EntMTP-Async) enabled: k in [%d, %d].",
@@ -51,6 +74,11 @@ class AsyncScheduler(Scheduler):
         num_draft_tokens: int,
         num_accepted_tokens: int,
     ) -> None:
+        if self._dspark_widths is not None:
+            self._dspark_adaptive.feedback(
+                req_id, num_draft_tokens, num_accepted_tokens
+            )
+            return
         if not self._adaptive_mtp or num_draft_tokens <= 0:
             return
         k_min = self._adaptive_mtp_min_k
@@ -104,6 +132,11 @@ class AsyncScheduler(Scheduler):
         state[2] = float(new_k)
 
     def _select_adaptive_batch_k(self, decode_req_ids: list[str]) -> int:
+        if self._dspark_widths is not None and decode_req_ids:
+            width = self._dspark_widths.width(len(decode_req_ids))
+            if len(decode_req_ids) == 1 and width > 0:
+                width = self._dspark_adaptive.width(decode_req_ids[0], width)
+            return width
         if not self._adaptive_mtp or not decode_req_ids:
             return self.num_spec_tokens
         if len(decode_req_ids) > 1:
@@ -114,6 +147,33 @@ class AsyncScheduler(Scheduler):
         if state is None:
             return self.num_spec_tokens
         return max(self._adaptive_mtp_min_k, min(self.num_spec_tokens, int(state[2])))
+
+    def schedule(self) -> SchedulerOutput:
+        if self._dspark_widths is not None:
+            self._uniform_dspark_drafts()
+        return super().schedule()
+
+    def _uniform_dspark_drafts(self) -> None:
+        """Trim the draft tokens of the running decode requests to one common
+        length: at most the width of this batch size, and no more than the
+        shortest request holds. A batch of equal query lengths replays a
+        captured target graph; mixed lengths (a request that drafted when the
+        batch was smaller) would run eagerly."""
+        decodes = [
+            r for r in self.running if r.spec_token_ids and not r.is_prefill_chunk
+        ]
+        if not decodes:
+            return
+        if len(decodes) < 2 and self._dspark_adaptive.enabled:
+            # A lone request keeps the width it was proposed with (adaptive).
+            return
+        width = min(
+            self._dspark_widths.width(len(decodes)),
+            min(len(r.spec_token_ids) for r in decodes),
+        )
+        for request in decodes:
+            if len(request.spec_token_ids) > width:
+                request.spec_token_ids = request.spec_token_ids[:width]
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
@@ -131,8 +191,10 @@ class AsyncScheduler(Scheduler):
             for req_id in scheduler_output.num_scheduled_tokens
             if not self.requests[req_id].is_prefill_chunk
         ]
+        if self._dspark_widths is not None:
+            self._dspark_adaptive.forget(self.requests)
         next_k = self._select_adaptive_batch_k(decode_req_ids)
-        if self._adaptive_mtp and decode_req_ids:
+        if (self._adaptive_mtp or self._dspark_widths is not None) and decode_req_ids:
             scheduler_output.next_spec_steps = next_k
         placeholders = (
             self._spec_token_placeholders

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -61,6 +62,10 @@ def _all_gather_existing_pynccl(input_, communicator, world_size, dim):
 # may read its input again after the call; an in-place reduction hands those
 # readers the summed tensor. Only callers that opt in (see envs.py) use it.
 _INPLACE_AR_MIN = int(envs.VLLM_INPLACE_AR_MIN)
+# VLLM_INKLING2_SM70_PREFILL_NCCL_AR_BYTES: all-reduces of at least this many bytes
+# (prefill chunks) go to NCCL instead of the custom 2-stage kernel; 0 keeps the
+# custom path.
+_PF_NCCL_AR_BYTES = int(os.environ.get("VLLM_INKLING2_SM70_PREFILL_NCCL_AR_BYTES", "0"))
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -549,6 +554,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm is not None
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
+            and not (0 < _PF_NCCL_AR_BYTES <= input_.numel() * input_.element_size())
         ):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None

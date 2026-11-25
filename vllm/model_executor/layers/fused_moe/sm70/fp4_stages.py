@@ -65,12 +65,19 @@ def execute_fp4(
         plan, buffers, x, route_ids, offsets, expert_ids, expert_count, topk_ids
     )
     if plan.w13.value not in FUSED_W13:
-        apply_swiglu(
-            buffers["intermediate"],
-            buffers["gate_up"],
-            codec.swiglu_limit,
-            interleaved=plan.interleaved,
-        )
+        if codec.activation is not None:
+            if plan.interleaved:
+                raise RuntimeError("A custom MoE activation needs [gate | up] halves.")
+            codec.activation(buffers["intermediate"], buffers["gate_up"])
+        else:
+            apply_swiglu(
+                buffers["intermediate"],
+                buffers["gate_up"],
+                codec.swiglu_limit,
+                interleaved=plan.interleaved,
+            )
+    elif codec.activation is not None:
+        raise RuntimeError("A custom MoE activation needs an unfused W13 stage.")
     codec.gemm_w2(
         plan, buffers, route_ids, offsets, expert_ids, expert_count, topk_weights
     )

@@ -31,6 +31,9 @@ class Fp4MoECodec:
     swiglu_limit: float | None = None
     bindings: Any = None
     raw_fast_qpn: bool = True
+    # Optional `fn(out [slots, I], gate_up [slots, 2I])` replacing the SiLU
+    # gate (unfused W13 routes only), e.g. Inkling2's softcapped SwiGLU.
+    activation: Any = None
 
     @property
     def operators(self):
