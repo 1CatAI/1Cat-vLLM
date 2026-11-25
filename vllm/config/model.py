@@ -770,8 +770,15 @@ class ModelConfig:
                     "disable the cache with --mm-processor-cache-gb 0."
                 )
 
-        # Multimodal GGUF models must use original repo for mm processing
-        if is_gguf(self.tokenizer) and self.is_multimodal_model:
+        # Multimodal GGUF models must use original repo for mm processing.
+        # This applies to every multimodal-capable architecture: with
+        # --language-model-only no multimodal processor runs, so the GGUF's
+        # own tokenizer suffices.
+        if (
+            is_gguf(self.tokenizer)
+            and self.multimodal_config is not None
+            and not self.multimodal_config.language_model_only
+        ):
             raise ValueError(
                 "Loading a multimodal GGUF model needs to use original "
                 "tokenizer. Please specify the unquantized hf model's "
@@ -1055,6 +1062,7 @@ class ModelConfig:
                 "awq_marlin",
                 "inc",
                 "moe_wna16",
+                "inkling2",
                 "modelopt",
                 "modelopt_fp4",
                 "modelopt_mxfp8",
