@@ -1326,6 +1326,65 @@ def test_no_spec_tokens_scheduled_for_prefill_chunks():
     assert len(output.scheduled_spec_decode_tokens[req.request_id]) == num_spec_tokens
 
 
+def test_pp_drafts_from_intermediate_prefill_chunk_are_dropped():
+    """Drafts proposed from an intermediate prompt chunk are dropped under PP.
+
+    With pipeline parallelism the final prompt chunk is scheduled before the
+    first chunk's output and drafts are applied, so ``request.is_prefill_chunk``
+    already describes the final chunk. Accepting the first chunk's drafts then
+    schedules draft tokens without the prompt's sampled token: the V1 runner
+    asserts ``num_scheduled_tokens >= draft_len + 1`` and Model Runner V2
+    replays a decode graph on inconsistent metadata (DeepSeek-V4.1 PP2, any
+    prompt longer than one prefill chunk).
+    """
+    num_spec_tokens = 3
+    scheduler = create_scheduler(
+        num_speculative_tokens=num_spec_tokens,
+        max_num_batched_tokens=50,
+        enable_chunked_prefill=True,
+        pipeline_parallel_size=2,
+    )
+    req = create_requests(num_requests=1, num_tokens=80)[0]
+    scheduler.add_request(req)
+    req_to_index = {req.request_id: 0}
+
+    def runner_output(sampled: list[int]) -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            req_ids=[req.request_id],
+            req_id_to_index=req_to_index,
+            sampled_token_ids=[sampled],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens[req.request_id] == 50
+    # PP: the final chunk is scheduled while the first one is still in flight.
+    second = scheduler.schedule()
+    assert second.num_scheduled_tokens[req.request_id] == 30
+    # The flag now describes the final chunk, so it cannot reject the drafts.
+    assert not req.is_prefill_chunk
+
+    scheduler.update_from_output(first, runner_output([]))
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([req.request_id], [[1, 2, 3]]), first
+    )
+    assert req.spec_token_ids == []
+    # Nothing to schedule for the request until the final chunk's token arrives.
+    waiting = scheduler.schedule()
+    assert req.request_id not in waiting.num_scheduled_tokens
+
+    scheduler.update_from_output(second, runner_output([42]))
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([req.request_id], [[1, 2, 3]]), second
+    )
+    assert req.spec_token_ids == [1, 2, 3]
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens[req.request_id] == 1 + num_spec_tokens
+    assert len(decode.scheduled_spec_decode_tokens[req.request_id]) == num_spec_tokens
+
+
 def test_scheduler_stats_waiting_queues():
     """Test that scheduler stats correctly report waiting and skipped_waiting queues."""
     # Create scheduler with limited capacity so we can have waiting requests
