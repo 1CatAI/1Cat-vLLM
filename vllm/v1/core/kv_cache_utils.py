@@ -636,9 +636,18 @@ def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
     # to 5.67 accepted tokens per round), and gained no first-token time.
     if speculative_config.use_dspark():
         return False
-    # KV connectors keep the legacy hashes.
-    if vllm_config.kv_transfer_config is not None:
-        return False
+    if transfer := vllm_config.kv_transfer_config:
+        if transfer.kv_connector is None:
+            return False
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        connector = KVConnectorFactory.get_connector_class(transfer)
+        if not connector.supports_lookahead_block_hashes(
+            transfer.kv_connector_extra_config
+        ):
+            return False
     return vllm_config.cache_config.enable_prefix_caching
 
 

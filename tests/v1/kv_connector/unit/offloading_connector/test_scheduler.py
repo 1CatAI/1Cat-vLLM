@@ -1033,6 +1033,74 @@ def test_mamba_boundary_store_uses_exact_source_not_positional_mirror():
     assert scheduler._block_id_to_pending_jobs == {99: {job_id}}
 
 
+def test_lookahead_prefix_lookup_uses_only_proven_full_pages():
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.config = scheduler.config._replace(use_lookahead_block_hashes=True)
+    scheduler._sliding_window_groups = (1,)
+    scheduler._lookup_groups = (0, 1)
+    scheduler._mamba_align_size = 16
+    scheduler._eagle_state_shift = None
+    scheduler.manager.lookup.return_value = True
+    req_status = scheduler._req_status["req"]
+    req_status.req.num_tokens = 32
+    # With a one-token lookahead, the exact second page has no hash yet.
+    assert scheduler._lookup(req_status) == 16
+    req_status.req.block_hashes.extend(BlockHash(f"h{i}".encode()) for i in range(4, 8))
+    req_status.req.num_tokens = 33
+    req_status.update_offload_keys()
+    assert scheduler._lookup(req_status) == 32
+
+
+def test_lookahead_store_waits_for_tail_hash_before_advancing():
+    scheduler = _make_exact_boundary_scheduler()
+    req_status = scheduler._req_status["req"]
+    req = req_status.req
+    req.num_tokens = 16
+    req.block_hashes.pop()
+    for group_state in req_status.group_states:
+        group_state.offload_keys.clear()
+    output = _empty_store_output(
+        scheduled_new_reqs=[SimpleNamespace(req_id="req", block_ids=None)],
+        num_scheduled_tokens={"req": 16},
+    )
+
+    assert scheduler._build_store_jobs(output) == {}
+    assert req_status.group_states[0].next_stored_block_idx == 0
+    scheduler.manager.prepare_store.assert_not_called()
+
+    req.block_hashes.append(BlockHash(b"h3"))
+    req.num_tokens = 17
+    req.num_computed_tokens = 16
+    output.num_scheduled_tokens["req"] = 0
+    [job] = scheduler._build_store_jobs(output).values()
+    src, _ = job.transfer_spec
+    assert src.block_ids.tolist() == [11]
+    assert req_status.group_states[0].next_stored_block_idx == 1
+
+
+def test_lookahead_boundary_store_rejects_replaced_source_hash():
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.config = scheduler.config._replace(use_lookahead_block_hashes=True)
+    req_status = scheduler._req_status["req"]
+    cached_key = req_status.group_states[1].offload_keys[0]
+    blocks = [SimpleNamespace(block_hash=None) for _ in range(100)]
+    scheduler.gpu_block_pool = SimpleNamespace(blocks=blocks)
+    output = _empty_store_output(
+        num_scheduled_tokens={"req": 16},
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+
+    assert scheduler._build_boundary_state_store_jobs(output) == {}
+    scheduler.manager.prepare_store.assert_not_called()
+
+    blocks[99].block_hash = b"h0h1h2old" + cached_key[-4:]
+    assert scheduler._build_boundary_state_store_jobs(output) == {}
+    scheduler.manager.prepare_store.assert_not_called()
+
+    blocks[99].block_hash = b"h0h1h2" + cached_key
+    assert len(scheduler._build_boundary_state_store_jobs(output)) == 1
+
+
 def test_normal_store_excludes_positional_mamba_align_source():
     scheduler = _make_exact_boundary_scheduler()
     output = _empty_store_output(
@@ -1719,7 +1787,11 @@ def _make_scratch_scheduler(*, full_attention_only=False, eagle=False):
     config.cache_config.hash_block_size = None
     config.kv_transfer_config.kv_connector_extra_config = {"offload_prompt_only": False}
     config.speculative_config = (
-        SimpleNamespace(use_eagle_kv_cache=lambda: True) if eagle else None
+        SimpleNamespace(
+            use_eagle_kv_cache=lambda: True, disable_lookahead_block_hashes=True
+        )
+        if eagle
+        else None
     )
     spec = MockOffloadingSpec(config, kv_config)
     scheduler = OffloadingConnectorScheduler(spec)

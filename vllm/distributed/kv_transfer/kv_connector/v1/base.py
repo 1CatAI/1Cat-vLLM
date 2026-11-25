@@ -604,6 +604,11 @@ class KVConnectorBase_V1(ABC):
         return None
 
     @classmethod
+    def supports_lookahead_block_hashes(cls, extra_config: dict[str, Any]) -> bool:
+        """Whether this connector can store and load lookahead-keyed blocks."""
+        return False
+
+    @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """
         Check if this connector requires PIECEWISE CUDA graph mode.

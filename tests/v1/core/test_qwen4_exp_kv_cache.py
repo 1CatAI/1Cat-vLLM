@@ -56,6 +56,7 @@ class _ModelConfig:
 def _vllm_config():
     return SimpleNamespace(
         model_config=_ModelConfig(),
+        speculative_config=None,
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1,
             decode_context_parallel_size=1,
