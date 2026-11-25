@@ -24,6 +24,10 @@ class DeepSeekV41ToolParser(DeepSeekV32ToolParser):
         return res
 
     def _convert_params_with_schema(self, function_name, param_dict):
+        # V4.1 does not unwrap wrapper params.
+        return self._coerce_params(function_name, param_dict)
+
+    def _coerce_params(self, function_name, param_dict):
         del function_name
         converted = {}
         for name, (value, string_attr) in param_dict.items():
