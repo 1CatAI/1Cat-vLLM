@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """`_apply_hf_processor_text_only` must not fail when the HF processor
 rejects placeholder tokens without multimodal items (transformers>=5)."""
 
@@ -30,7 +31,9 @@ def test_uses_hf_processor_when_it_accepts_text():
 
 
 def test_falls_back_to_tokenizer_when_hf_processor_rejects_placeholders():
-    err = ValueError("Found 1 <|image_pad|> tokens in the text but no images were passed.")
+    err = ValueError(
+        "Found 1 <|image_pad|> tokens in the text but no images were passed."
+    )
     proc, tokenizer = _fake_processor(err, encoded=(151652, 151655, 151653))
     ids = BaseMultiModalProcessor._apply_hf_processor_text_only(
         proc,
