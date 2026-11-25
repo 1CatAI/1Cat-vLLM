@@ -960,3 +960,83 @@ def test_fp8_qpn8_fused_gate_dispatches_without_intermediate(monkeypatch):
         ("dispatch", 8, workspace.data_ptr(), 8, 2, True, True),
         ("dispatch", 16, workspace.data_ptr(), 8, 2, True, True),
     ]
+
+
+@pytest.mark.parametrize(
+    ("capability", "fused_gated"), [((7, 0), True), ((7, 5), False)]
+)
+def test_block_qpn8_gate_up_fuses_the_gated_route_except_on_turing(
+    monkeypatch, capability, fused_gated
+):
+    # Turing serves gate_up_proj rows above M=8 through the tensor-core GEMM,
+    # which the fused gated route has no counterpart for; only Volta fuses.
+    from vllm.model_executor.kernels.linear.qpn import fp8_block
+    from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+        FP8ScaledMMLinearLayerConfig,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+        kFp8Static128BlockSym,
+    )
+    from vllm.platforms.interface import DeviceCapability
+
+    n, k = 256, 128
+    monkeypatch.setattr(
+        fp8_block.current_platform,
+        "get_device_capability",
+        lambda device_id=None: DeviceCapability(*capability),
+    )
+    monkeypatch.setattr(
+        torch.ops._C, "fp8_qpn8_gated_pair_sm70_out", object(), raising=False
+    )
+    monkeypatch.setattr(
+        fp8_block,
+        "_sm70_fp8_qpn8_config",
+        lambda k_dim, n_dim, gated: (8, 2, True),
+    )
+    monkeypatch.setattr(
+        fp8_block, "fp8_qpn8_occupancy_split_k", lambda k, n, split_k, device: split_k
+    )
+    monkeypatch.setattr(
+        fp8_block.QPN8Fp8BlockScaledMMLinearKernel,
+        "_keep_volta_turbomind_copy",
+        lambda self, device=None: False,
+    )
+    # The operator and device probes of can_implement need a GPU; only the
+    # preparation is under test.
+    monkeypatch.setattr(
+        fp8_block.QPN8Fp8BlockScaledMMLinearKernel,
+        "can_implement",
+        classmethod(lambda cls, config: (True, None)),
+    )
+    kernel = fp8_block.QPN8Fp8BlockScaledMMLinearKernel(
+        FP8ScaledMMLinearLayerConfig(
+            weight_quant_key=kFp8Static128BlockSym,
+            activation_quant_key=kFp8Dynamic128Sym,
+            weight_shape=(n, k),
+            input_dtype=torch.float16,
+            out_dtype=torch.float16,
+        )
+    )
+    kernel.policy.gated_silu = True
+    kernel.native_ops = SimpleNamespace(
+        fp8_qpn8_prepare_sm70=lambda weight, scales: (
+            torch.zeros((k, n), dtype=torch.uint8),
+            torch.zeros(1),
+        )
+    )
+    layer = torch.nn.Module()
+    layer.prefix = "model.layers.0.mlp.gate_up_proj"
+    layer.output_partition_sizes = [n // 2, n // 2]
+    layer.weight = torch.nn.Parameter(
+        torch.zeros((n, k), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale_inv = torch.nn.Parameter(
+        torch.ones(n // 128, k // 128), requires_grad=False
+    )
+
+    kernel.process_weights_after_loading(layer)
+
+    assert layer._qpn8_sm75_mma == (capability == (7, 5))
+    assert getattr(layer, "sm70_fp8_gated_silu", False) == fused_gated
+    assert hasattr(layer, "_qpn8_gated_cfg") == fused_gated

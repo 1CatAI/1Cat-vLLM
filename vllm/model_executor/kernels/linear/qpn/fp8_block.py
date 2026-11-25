@@ -749,8 +749,12 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             accumulator_chains,
             prefetch_codes,
         )
+        # Turing serves gate_up_proj rows above M=8 through the tensor-core
+        # GEMM; the fused gated route has no such path and would rebuild the
+        # dense weight for them.
         if (
-            self._is_sm70_gated_silu_layer(layer)
+            not layer._qpn8_sm75_mma
+            and self._is_sm70_gated_silu_layer(layer)
             and bool(self.policy.gated_silu)
             and n_dim % 256 == 0
             and k_dim % 128 == 0

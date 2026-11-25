@@ -422,8 +422,14 @@ def test_block_qpn8_fused_gated_silu_matches_reference(
     layer.output_partition_sizes = [1024, 1024]
     kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(2048, 1024))
     kernel.process_weights_after_loading(layer)
-    assert getattr(layer, "sm70_fp8_gated_silu", False)
     x = torch.randn(m, 1024, device="cuda", dtype=torch.float16) * 0.1
+    if torch.cuda.get_device_capability() == (7, 5):
+        # Turing serves gate_up_proj through the tensor-core GEMM; only Volta
+        # fuses the gated route.
+        assert not getattr(layer, "sm70_fp8_gated_silu", False)
+        assert kernel.apply_fused_silu_and_mul(layer, x) is None
+        return
+    assert getattr(layer, "sm70_fp8_gated_silu", False)
     y = kernel.apply_fused_silu_and_mul(layer, x)
     assert y is not None and y.shape == (m, 1024) and y.dtype == torch.float16
     if m:
