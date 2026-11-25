@@ -115,7 +115,12 @@ def _maybe_sm70_dense_forward(
 
     tm_weight = getattr(state, "_sm70_f16_tm_weight", None)
     k_ld = getattr(state, "_sm70_f16_k_ld", None)
-    if not torch.compiler.is_compiling() and tm_weight is not None and k_ld is not None:
+    if (
+        not torch.compiler.is_compiling()
+        and tm_weight is not None
+        and k_ld is not None
+        and tm_weight.shape[0] % 32 == 0
+    ):
         out = torch.empty(
             (x_2d.size(0), tm_weight.shape[0]),
             dtype=x_2d.dtype,
@@ -142,6 +147,8 @@ def prepare_dense(state, *, force_enable, input_parallel, suffix_allowed):
     if not input_parallel:
         return
     if not hasattr(torch.ops._C, "sm70_f16_prepare"):
+        return
+    if state.weight.shape[0] % 32 != 0:
         return
     if state.weight.dtype != torch.float16 or not state.weight.is_cuda:
         return
