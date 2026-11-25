@@ -8,6 +8,7 @@ from enum import Enum
 from functools import lru_cache, partial
 from typing import (
     TYPE_CHECKING,
+    Any,
     Generic,
     NamedTuple,
     Protocol,
@@ -1200,7 +1201,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             # processor would not update the prompt anyway, so plain
             # tokenization yields the same ids.
             tokenizer = self.info.get_tokenizer()
-            tok_kwargs = {
+            tok_kwargs: dict[str, Any] = {
                 k: v
                 for k, v in tokenization_kwargs.items()
                 if k in ("add_special_tokens", "truncation", "max_length")
