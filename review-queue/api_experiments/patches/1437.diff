@@ -1,0 +1,139 @@
+diff --git a/vllm/engine/protocol.py b/vllm/engine/protocol.py
+index 3f83734a5b..c5a467f4b6 100644
+--- a/vllm/engine/protocol.py
++++ b/vllm/engine/protocol.py
+@@ -79,8 +79,13 @@ def generate(
+         data_parallel_rank: int | None = None,
+         reasoning_ended: bool | None = None,
+         reasoning_parser_kwargs: dict[str, Any] | None = None,
++        keepalive: bool = False,
+     ) -> AsyncGenerator[RequestOutput, None]:
+-        """Generate outputs for a request."""
++        """Generate outputs for a request.
++
++        Set ``keepalive=True`` only from callers that know how to skip the
++        ``STREAM_KEEPALIVE`` sentinel; it makes long idle gaps emit one.
++        """
+         ...
+ 
+     @abstractmethod
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..bf8c19d9b3 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -238,7 +238,7 @@
+     VERBOSE: bool = False
+     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
+     VLLM_RPC_TIMEOUT: int = 10000  # ms
+-    VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
++    VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 600  # seconds
+     VLLM_MAX_N_SEQUENCES: int = 16384
+     VLLM_PLUGINS: list[str] | None = None
+     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
+@@ -3100,13 +3100,17 @@ def _resolve_rust_frontend_path() -> str | None:
+     ),
+     # Timeout in seconds for keeping HTTP connections alive in API server
+     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": env_var(
+-        lambda: int(os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")),
++        # Default raised from 5s to 600s: during long thinking or code
++        # generation an intermediary's 5s idle timeout drops the connection,
++        # which surfaces as a streaming 502 or a reset. 600s covers long
++        # sessions.
++        lambda: int(os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "600")),
+         description=(
+             "Timeout in seconds for keeping HTTP connections alive in API server"
+         ),
+         category="configuration",
+-        declared_default="5",
+-        effective_default="5",
++        declared_default="600",
++        effective_default="600",
+         automatic_conditions=(),
+         acceleration_paths=(),
+         user_visible=True,
+diff --git a/vllm/outputs.py b/vllm/outputs.py
+index 58a715c34b..b3864d7818 100644
+--- a/vllm/outputs.py
++++ b/vllm/outputs.py
+@@ -203,6 +203,22 @@ def __repr__(self) -> str:
+     finished=True,
+ )
+ 
++# Idle keep-alive sentinel.
++# During long thinking or long prefill the engine can go many seconds without
++# emitting a token, and intermediaries (proxies, load balancers) drop the SSE
++# connection on their idle timeout. AsyncLLM emits one of these every 15s of
++# idleness so the API layer can keep the stream alive.
++# Note `finished=False`: this is not an end-of-request marker, so consumers
++# must recognise and skip it.
++STREAM_KEEPALIVE = RequestOutput(
++    request_id="",
++    prompt=None,
++    prompt_token_ids=None,
++    prompt_logprobs=None,
++    outputs=[],
++    finished=False,
++)
++
+ _O = TypeVar("_O", default=PoolingOutput)
+ 
+ 
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 419e15163a..a23d70cf5b 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -25,7 +25,12 @@
+ from vllm.logger import init_logger
+ from vllm.lora.request import LoRARequest
+ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+-from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
++from vllm.outputs import (
++    STREAM_FINISHED,
++    STREAM_KEEPALIVE,
++    PoolingRequestOutput,
++    RequestOutput,
++)
+ from vllm.pooling_params import PoolingParams
+ from vllm.renderers import renderer_from_config
+ from vllm.renderers.inputs.preprocess import extract_prompt_components
+@@ -538,6 +543,7 @@ async def generate(
+         data_parallel_rank: int | None = None,
+         reasoning_ended: bool | None = None,
+         reasoning_parser_kwargs: dict[str, Any] | None = None,
++        keepalive: bool = False,
+     ) -> AsyncGenerator[RequestOutput, None]:
+         """
+         Main function called by the API server to kick off a request
+@@ -573,10 +579,31 @@ async def generate(
+             # The output_handler task pushes items into the queue.
+             # This task pulls from the queue and yields to caller.
+             finished = False
++            # Idle keep-alive: while the engine produces no token (long
++            # thinking / long prefill), emit a STREAM_KEEPALIVE sentinel every
++            # 15s so the API layer can keep the SSE stream alive instead of
++            # being cut off by an intermediary's idle timeout.
++            #
++            # The sentinel is visible to every consumer of this generator
++            # (chat/completion/responses/disagg/speech, 11 call sites), so it is
++            # opt-in: only callers that pass keepalive=True -- and therefore
++            # know how to skip it -- ever see it.
++            _KEEPALIVE_INTERVAL = 15.0
+             while not finished:
+                 # Note: drain queue without await if possible (avoids
+                 # task switching under load which helps performance).
+-                out = q.get_nowait() or await q.get()
++                out = q.get_nowait()
++                if out is None:
++                    if not keepalive:
++                        out = await q.get()
++                    else:
++                        try:
++                            out = await asyncio.wait_for(
++                                q.get(), timeout=_KEEPALIVE_INTERVAL
++                            )
++                        except asyncio.TimeoutError:
++                            yield STREAM_KEEPALIVE
++                            continue
+ 
+                 # Note: both OutputProcessor and EngineCore handle their
+                 # own request cleanup based on finished.

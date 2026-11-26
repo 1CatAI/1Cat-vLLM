@@ -1,0 +1,377 @@
+diff --git a/vllm/entrypoints/chat_utils.py b/vllm/entrypoints/chat_utils.py
+index f5131995d7..b13ab3924b 100644
+--- a/vllm/entrypoints/chat_utils.py
++++ b/vllm/entrypoints/chat_utils.py
+@@ -1309,13 +1309,58 @@ def _load_chat_template(
+ 
+ _cached_load_chat_template = lru_cache(_load_chat_template)
+ 
++# The most recently resolved chat template source, so
++# `POST /v1/internal/reload` can re-read it. Deliberately not an mtime stat per
++# request -- the template is re-read only when the endpoint is called, so the
++# request path pays nothing.
++_HOT_CHAT_TEMPLATE_SOURCE: str | None = None
++
+ 
+ def load_chat_template(
+     chat_template: Path | str | None,
+     *,
+     is_literal: bool = False,
+ ) -> str | None:
+-    return _cached_load_chat_template(chat_template, is_literal=is_literal)
++    global _HOT_CHAT_TEMPLATE_SOURCE
++    resolved = _cached_load_chat_template(chat_template, is_literal=is_literal)
++    # Record only file-backed sources: inline and built-in templates have no
++    # file to re-read.
++    if not is_literal and chat_template is not None:
++        try:
++            if isinstance(chat_template, Path) or (
++                isinstance(chat_template, str) and Path(chat_template).is_file()
++            ):
++                _HOT_CHAT_TEMPLATE_SOURCE = str(chat_template)
++        except (OSError, ValueError):
++            pass
++    return resolved
++
++
++def force_reload_chat_template() -> str | None:
++    """Re-read the chat template from disk for the hot-reload endpoint.
++
++    Returns the re-read template, or None when there is no file-backed source
++    (the caller then skips pushing it). A read failure keeps the last good
++    result and never raises, so a bad edit cannot take the server down.
++    """
++    source = _HOT_CHAT_TEMPLATE_SOURCE
++    if source is None:
++        return None
++    try:
++        with open(source, encoding="utf-8") as handle:
++            content = handle.read()
++    except OSError:
++        logger.exception("chat template hot-reload failed to read %s", source)
++        return None
++    # Drop the cache so ordinary requests pick up the new content too.
++    _cached_load_chat_template.cache_clear()
++    logger.warning(
++        "Chat template hot-reloaded from %s (%d bytes). "
++        "Note: an edited template invalidates the prompt prefix cache.",
++        source,
++        len(content),
++    )
++    return content
+ 
+ 
+ def _get_interleaved_text_prompt(
+diff --git a/vllm/entrypoints/serve/__init__.py b/vllm/entrypoints/serve/__init__.py
+index 93d459f115..408cf3278f 100644
+--- a/vllm/entrypoints/serve/__init__.py
++++ b/vllm/entrypoints/serve/__init__.py
+@@ -58,6 +58,14 @@ def register_vllm_serve_api_routers(app: FastAPI):
+ 
+     attach_tokenize_router(app)
+ 
++    # `POST /v1/internal/reload`: hot-reload tool parsers, serving classes and
++    # the chat template without an engine restart.
++    from vllm.entrypoints.serve.toolparser.api_router import (
++        attach_router as attach_toolparser_router,
++    )
++
++    attach_toolparser_router(app)
++
+     from .instrumentator import register_instrumentator_api_routers
+ 
+     register_instrumentator_api_routers(app)
+diff --git a/vllm/entrypoints/serve/toolparser/__init__.py b/vllm/entrypoints/serve/toolparser/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/vllm/entrypoints/serve/toolparser/api_router.py b/vllm/entrypoints/serve/toolparser/api_router.py
+new file mode 100644
+index 0000000000..175e9fd736
+--- /dev/null
++++ b/vllm/entrypoints/serve/toolparser/api_router.py
+@@ -0,0 +1,169 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Hot-reload endpoint for tool parsers and the chat template.
++
++``POST /v1/internal/reload`` applies, in one request:
++
++1. **Tool parsers** -- reloads the tool_parsers modules, refreshes the registry,
++   then pushes the new classes onto the live serving objects.
++2. **Chat template** -- re-reads the template source and pushes it onto the
++   live serving objects.
++
++Nothing extra happens on the request path: no mtime stat, no version compare.
++Everything takes effect here, once. Editing a parser or template then costs a
++single curl instead of an engine restart (minutes of model load).
++
++Intended for local development and verification. It is safe to leave the route
++registered in production -- with no source edits it is a no-op.
++"""
++
++from __future__ import annotations
++
++import importlib
++import logging
++
++from fastapi import APIRouter, Request
++from fastapi.responses import JSONResponse
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter()
++
++# Serving objects that cache a parser or a template.
++_HOLDERS = (
++    "openai_serving_chat",
++    "openai_serving_chat_batch",
++    "openai_serving_completion",
++    "openai_serving_responses",
++    "openai_serving_render",
++    "openai_serving_tokenization",
++)
++
++# Serving classes whose methods are patched onto the live instances.
++_SERVING_SOURCES = (
++    ("vllm.entrypoints.openai.chat_completion.serving", "OpenAIServingChat"),
++)
++
++
++def _refresh_tool_parser_holders(app) -> list[str]:
++    """Push freshly reloaded parser classes onto the live serving objects."""
++    from vllm.parser.parser_manager import ParserManager
++
++    done: list[str] = []
++    for name in _HOLDERS:
++        holder = getattr(app.state, name, None)
++        if holder is None:
++            continue
++        tool_parser_name = getattr(holder, "_tool_parser_name", None)
++        if tool_parser_name is None:
++            continue  # this object does not hold a tool parser
++        try:
++            holder.tool_parser = ParserManager.get_tool_parser(
++                tool_parser_name=tool_parser_name,
++                enable_auto_tools=getattr(holder, "enable_auto_tools", False),
++                model_name=getattr(holder.model_config, "model", None),
++            )
++            holder.parser_cls = ParserManager.get_parser(
++                tool_parser_name=tool_parser_name,
++                reasoning_parser_name=getattr(holder, "_reasoning_parser_name", None),
++                enable_auto_tools=getattr(holder, "enable_auto_tools", False),
++                model_name=getattr(holder.model_config, "model", None),
++            )
++            done.append(name)
++        except Exception:
++            logger.exception("reload: refreshing tool parser on %s failed", name)
++    return done
++
++
++def _refresh_serving_classes(app) -> list[str]:
++    """Copy reloaded methods onto the classes the live instances still use.
++
++    Serving objects are long-lived (``app.state``), and ``importlib.reload``
++    only produces **new** classes -- the instances stay bound to the old ones,
++    so editing a method has no effect. Rebuilding the instances is not an
++    option (they own the tokenizer, engine client and renderer), so copy the
++    new class's own attributes across. Method lookup goes through the class, so
++    the change takes effect immediately, and instance state is untouched.
++
++    Only the new class's *own* attributes are copied, never inherited base
++    behaviour.
++    """
++    by_name: dict[str, type] = {}
++    for module_name, class_name in _SERVING_SOURCES:
++        try:
++            module = importlib.reload(importlib.import_module(module_name))
++        except Exception:
++            try:
++                module = importlib.import_module(module_name)
++            except Exception:
++                continue
++        cls = getattr(module, class_name, None)
++        if cls is not None:
++            by_name[class_name] = cls
++
++    done: list[str] = []
++    for name in _HOLDERS:
++        holder = getattr(app.state, name, None)
++        if holder is None:
++            continue
++        old_cls = type(holder)
++        new_cls = by_name.get(old_cls.__name__)
++        if new_cls is None or old_cls is new_cls:
++            continue
++        patched = 0
++        for key, value in vars(new_cls).items():
++            if key.startswith("__"):
++                continue
++            try:
++                setattr(old_cls, key, value)
++                patched += 1
++            except Exception:
++                pass
++        if patched:
++            done.append(f"{name}:{old_cls.__name__}:{patched}")
++    return done
++
++
++def _refresh_chat_template_holders(app) -> int:
++    """Re-read the chat template and push it onto the live serving objects."""
++    try:
++        from vllm.entrypoints.chat_utils import force_reload_chat_template
++    except ImportError:
++        return 0
++
++    template = force_reload_chat_template()
++    if template is None:
++        return 0
++    count = 0
++    for name in _HOLDERS:
++        holder = getattr(app.state, name, None)
++        if holder is not None and hasattr(holder, "chat_template"):
++            holder.chat_template = template
++            count += 1
++    return count
++
++
++@router.post("/v1/internal/reload")
++async def reload_all(request: Request):
++    """Reload tool parsers, serving classes and the chat template."""
++    result: dict = {}
++
++    try:
++        from vllm.tool_parsers._hotreload import reload_now
++
++        result["tool_parser"] = reload_now(force=True)
++        result["tool_parser_holders"] = _refresh_tool_parser_holders(request.app)
++        result["serving_classes"] = _refresh_serving_classes(request.app)
++    except Exception as exc:
++        result["tool_parser_error"] = str(exc)
++
++    try:
++        result["chat_template_holders"] = _refresh_chat_template_holders(request.app)
++    except Exception as exc:
++        result["chat_template_error"] = str(exc)
++
++    return JSONResponse(result)
++
++
++def attach_router(app):
++    app.include_router(router)
+diff --git a/vllm/tool_parsers/_hotreload.py b/vllm/tool_parsers/_hotreload.py
+new file mode 100644
+index 0000000000..45368a3f1d
+--- /dev/null
++++ b/vllm/tool_parsers/_hotreload.py
+@@ -0,0 +1,110 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Hot-reload tool parser implementations without restarting the engine.
++
++Iterating on a tool parser normally means restarting the engine, because
++loading the model takes minutes. This module makes the edit -> test loop fast
++for deployments that serve from a mutable source tree.
++
++Design:
++
++- The HTTP endpoint ``POST /v1/internal/reload`` (see
++  ``entrypoints/serve/toolparser/api_router.py``) calls :func:`reload_now`,
++  which reloads the already-imported ``vllm.tool_parsers.*`` modules, refreshes
++  the ``ToolParserManager`` registry, and bumps a version counter.
++- The hot path costs one integer comparison: :func:`current_version` against a
++  cached value. Modules are never re-stat-ed and nothing is reloaded per
++  request.
++
++Limitations: only modules that are already imported get reloaded, and requests
++already in flight finish on the old classes.
++"""
++
++from __future__ import annotations
++
++import importlib
++import logging
++import sys
++import threading
++
++logger = logging.getLogger(__name__)
++
++# Reloaded before the parsers themselves: shared helpers that parsers import at
++# module scope, so reloading them first means the parsers below pick up the new
++# objects.
++_PREREQUISITE_MODULES = (
++    "vllm.tool_parsers.utils",
++    "vllm.tool_parsers.qwen_xml_tool_grammar",
++)
++
++_PARSER_PACKAGE = "vllm.tool_parsers."
++
++_VERSION = 0
++_LOCK = threading.Lock()
++
++
++def current_version() -> int:
++    """Current reload version. Compare against a cached value on the hot path."""
++    return _VERSION
++
++
++def _loaded_parser_modules() -> list[str]:
++    """Every already-imported ``vllm.tool_parsers.*`` module, prerequisites first."""
++    names = [
++        name
++        for name in sys.modules
++        if name.startswith(_PARSER_PACKAGE)
++        and name != _PARSER_PACKAGE
++        and not name.endswith("_hotreload")
++    ]
++    prereq = [n for n in _PREREQUISITE_MODULES if n in names]
++    rest = sorted(n for n in names if n not in prereq)
++    return prereq + rest
++
++
++def _refresh_registry() -> None:
++    """Point the lazy registry at the freshly reloaded class objects."""
++    try:
++        from vllm.tool_parsers import ToolParserManager
++
++        for name, entry in list(ToolParserManager.lazy_parsers.items()):
++            module_path, class_name = entry
++            module = sys.modules.get(module_path)
++            cls = getattr(module, class_name, None) if module is not None else None
++            if cls is not None:
++                ToolParserManager.tool_parsers[name] = cls
++    except Exception:
++        logger.exception("tool parser hot-reload registry refresh failed")
++
++
++def reload_now(force: bool = True) -> dict:
++    """Reload the tool parser modules and refresh the registry.
++
++    Args:
++        force: reload unconditionally. Kept as a parameter so callers can later
++            add an mtime-based skip without changing the signature.
++
++    Returns:
++        ``{"reloaded": [...], "version": <new version>}``
++    """
++    global _VERSION
++    reloaded: list[str] = []
++    with _LOCK:
++        for name in _loaded_parser_modules():
++            mod = sys.modules.get(name)
++            if mod is None:
++                continue
++            try:
++                importlib.reload(mod)
++                reloaded.append(name)
++            except Exception:
++                # Keep the old module rather than take the server down over a
++                # typo in the file being edited.
++                logger.exception("tool parser hot-reload failed for %s", name)
++        if reloaded:
++            _refresh_registry()
++            _VERSION += 1
++            logger.warning(
++                "tool parser hot-reloaded (v%d): %s", _VERSION, reloaded
++            )
++    return {"reloaded": reloaded, "version": _VERSION}

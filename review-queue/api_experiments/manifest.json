@@ -1,0 +1,87 @@
+{
+  "group": "api_experiments",
+  "title": "Serving API and alternative parser qualification queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1437,
+      "title": "feat(engine): emit an idle keep-alive sentinel during long gaps",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1437",
+      "head": "065705ab71474c9b7dae539f28e31a3dc084d97d",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "840ef653cde250f68bad2d5c077b82805d0c7c6970dfcce84f5412cd619e4db1",
+      "files": 4,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1438,
+      "title": "feat(startup): HEAD probe, startup log mirror and guarded cache reclamation",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1438",
+      "head": "50dd333b8c0b8a026b8a16416c5a67b2361ce870",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "2d4729c16c7cf12d3db8a2f4890e549bc88615ba90f391787cc7ff14f0e803ea",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1439,
+      "title": "feat(serve): add POST /v1/internal/reload for parser and template hot-reload",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1439",
+      "head": "6f16090081012e3a8aea4e1d5a4ac08fe2f3bd1f",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "3f21089061d37f9065e7a2f021f1f265300ae30e4f3fa157e8cd8ebf0f941417",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1440,
+      "title": "fix(anthropic): correct usage accounting, message framing and SSE tolerance",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1440",
+      "head": "ec3db4a8923aa1e559ca341f9e61afc32e4d4437",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "a2099be0ec2eaf743397c1e9c7bd870fa5d1dffdfcc00ac7b340137fe53ef1da",
+      "files": 4,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1443,
+      "title": "fix(chat): emit deferred tool calls at finish time",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1443",
+      "head": "ee1216fc8a67eeadcc4b27664ed07d16b8ecd5c6",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "7e602a405f87725ba03cc2ef6c56e94844691fb1dd082b4593ff360d337cbb1f",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1446,
+      "title": "feat(tools): alternative qwen3_coder / qwen3_xml parsers behind a switch",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1446",
+      "head": "17411f25a40b2b6927683475e4eb76ba62f47452",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "e801145d53add90cae4116196dff157d7ab2413d19677a36097eb09922f66b2e",
+      "files": 6,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 241,
+      "title": "feat(opt21-25): v1.3.0 重放源码集（NTK/MTP/并发/KV/工具调用/anthropic 增强）",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/241",
+      "head": "463406253a7cb57d320ef652288fb48fc2084b87",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "b8ffc3937b07a48aa22c6b37ee2199e4dbca6d2d84621d8e377434924bbc555e",
+      "files": 33,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "Keep service/reload/parser defaults unchanged pending API integration tests. #1446 supplies a large alternative parser with no test files in its diff and flips the default switch; do not promote it unqualified. #1439 hot reload and #1438 cache reclamation need concurrent-request and failure-path checks. #241 is a broad older replay, not a ready-to-merge patch stack.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}
