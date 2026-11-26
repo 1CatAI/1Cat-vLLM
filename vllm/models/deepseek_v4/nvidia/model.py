@@ -839,6 +839,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+        self.mhc_tensor_cores = vllm_config.kernel_config.use_triton_sm7x_tensor_cores()
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -932,6 +933,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_sinkhorn_iters,
                     norm_weight=attn_norm_weight,
                     norm_eps=attn_norm_eps,
+                    tensor_cores=self.mhc_tensor_cores,
                 )
         else:
             residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
@@ -951,6 +953,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 tile_n=1,
                 norm_weight=attn_norm_weight,
                 norm_eps=attn_norm_eps,
+                tensor_cores=self.mhc_tensor_cores,
             )
 
         # attn_norm is fused into mhc_pre_tilelang / mhc_fused_post_pre above.
@@ -975,6 +978,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             tile_n=1,
             norm_weight=ffn_norm_weight,
             norm_eps=ffn_norm_eps,
+            tensor_cores=self.mhc_tensor_cores,
         )
 
         x = self.ffn(x, input_ids)

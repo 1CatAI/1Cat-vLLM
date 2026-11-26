@@ -224,6 +224,13 @@ from vllm.model_executor.layers.attention.attention import (
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
+from vllm.model_executor.layers.attention.mla_kv_b_skinny import (
+    KV_B_SKINNY_MAX_ROWS,
+    KV_B_SKINNY_MIN_ROWS,
+    KvBTile,
+    kv_b_bmm_skinny,
+    kv_b_skinny_tile,
+)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -497,6 +504,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
 
         self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
+        # Decided once the weights sit on their card (process_weights_after_loading):
+        # the skinny kernel's tiles for W_UK_T and W_UV, or None for torch.bmm.
+        self.kv_b_skinny_tiles: tuple[KvBTile, KvBTile] | None = None
 
         # If kv_b_proj_weight is unquantized, quantize it to mxfp4 if supported
         self.is_aiter_triton_fp4_bmm_enabled = (
@@ -752,7 +762,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
+                self._kv_b_bmm(mqa_q_nope, self.W_UK_T, mqa_ql_nope, 0)
 
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
@@ -924,6 +934,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.W_UV = W_UV.transpose(0, 1)
             # Convert from (L, N, P) to (N, P, L)
             self.W_UK_T = W_UK.permute(1, 2, 0)
+            device_index = self.W_UK_T.device.index
+            if self._vllm_config.kernel_config.use_mla_kv_b_skinny(device_index):
+                # Tiles and shapes are settled at load time, not in a decode step.
+                capability = current_platform.get_device_capability(device_index)
+                assert capability is not None
+                self.kv_b_skinny_tiles = (
+                    kv_b_skinny_tile(self.W_UK_T, capability.to_int()),
+                    kv_b_skinny_tile(self.W_UV, capability.to_int()),
+                )
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
@@ -980,6 +999,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             model_version=model_version,
         )
 
+    def _kv_b_bmm(
+        self, x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, which: int
+    ) -> None:
+        """The per-head kv_b product ``out = x @ weight`` ([heads, rows, K]);
+        ``which`` is 0 for W_UK_T and 1 for W_UV."""
+        tiles = self.kv_b_skinny_tiles
+        if (
+            tiles is not None
+            and KV_B_SKINNY_MIN_ROWS <= x.shape[1] <= KV_B_SKINNY_MAX_ROWS
+        ):
+            kv_b_bmm_skinny(x, weight, out, tiles[which])
+        else:
+            torch.bmm(x, weight, out=out)
+
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
@@ -1002,7 +1035,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+            self._kv_b_bmm(x, self.W_UV, out.transpose(0, 1), 1)
 
 
 def unified_mla_kv_cache_update(

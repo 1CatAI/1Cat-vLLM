@@ -23,9 +23,13 @@
 
 #include "sm70_policy.h"
 #include "activation_pack_sm70.cuh"
+#include "fp8_qpn8_codes_sm70.cuh"
 #include "qpn_pair_sm70.cuh"
 
 namespace {
+
+using vllm::sm70::fp8x8_to_half2x4_fast;
+using vllm::sm70::qpn8_col_from_lane;
 
 __device__ __forceinline__ void fp8x8_to_half2x4(uint2 q, half2 out[4]) {
 #pragma unroll
@@ -39,27 +43,7 @@ __device__ __forceinline__ void fp8x8_to_half2x4(uint2 q, half2 out[4]) {
   }
 }
 
-__device__ __forceinline__ void fp8x8_to_half2x4_fast(uint2 q, half2 out[4]) {
-  constexpr unsigned kSign = 0x80008000u;
-  constexpr unsigned kExponentMantissa = 0x3f803f80u;
-  unsigned permuted[4];
-  permuted[0] = __byte_perm(q.x, q.y, 0x0400);
-  permuted[1] = __byte_perm(q.x, q.y, 0x0501);
-  permuted[2] = __byte_perm(q.x, q.y, 0x0602);
-  permuted[3] = __byte_perm(q.x, q.y, 0x0703);
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const unsigned value =
-        ((permuted[i] << 8) & kSign) | ((permuted[i] << 7) & kExponentMantissa);
-    out[i] = *reinterpret_cast<const half2*>(&value);
-  }
-}
-
 constexpr int kQpn8PrepareThreads = 256;
-
-__device__ __forceinline__ int qpn8_col_from_lane(int lane) {
-  return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
-}
 
 __device__ __forceinline__ int qpn8_lane_from_col(int col) {
   return (col & 3) | (((col >> 3) & 3) << 2) | (((col >> 2) & 1) << 4);

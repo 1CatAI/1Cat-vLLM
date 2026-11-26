@@ -57,9 +57,11 @@ def _dequant_gather_rows_kernel(
     out_ptr,
     cache_ptr,
     slots_ptr,
+    unused_ptr,
     num_cache_rows,
     cache_stride_block,
     slots_stride_t,
+    unused_stride_t,
     out_stride_t,
     out_col_offset,
     BLOCK_SIZE: tl.constexpr,
@@ -73,7 +75,9 @@ def _dequant_gather_rows_kernel(
     token = tl.program_id(0)
     col = tl.program_id(1)
     slot = tl.load(slots_ptr + token * slots_stride_t + col)
-    # An unused slot (-1) reads row 0; the caller zeroes what it gathered.
+    # An unused slot stores zeros instead of what its row holds: that may be
+    # unwritten cache, and its zero weight does not cancel a NaN in PV.
+    keep = tl.load(unused_ptr + token * unused_stride_t + out_col_offset + col) == 0
     safe = tl.where((slot >= 0) & (slot < num_cache_rows), slot, 0).to(tl.int64)
     block = cache_ptr + (safe // BLOCK_SIZE) * cache_stride_block
     pos = safe % BLOCK_SIZE
@@ -93,10 +97,12 @@ def _dequant_gather_rows_kernel(
         else:
             values = bits.to(tl.float8e4nv, bitcast=True).to(tl.float32)
         scale = tl.exp2(tl.load(scales + group).to(tl.float32) - 127.0)
-        tl.store(out_row + offsets, (values * scale).to(out_ptr.dtype.element_ty))
+        values = tl.where(keep, values * scale, 0.0)
+        tl.store(out_row + offsets, values.to(out_ptr.dtype.element_ty))
 
     rope_offsets = tl.arange(0, ROPE_DIM)
     rope = tl.load((data + NOPE_DIM).to(tl.pointer_type(tl.bfloat16)) + rope_offsets)
+    rope = tl.where(keep, rope.to(tl.float32), 0.0)
     tl.store(out_row + NOPE_DIM + rope_offsets, rope.to(out_ptr.dtype.element_ty))
 
 
@@ -105,9 +111,11 @@ def dequant_gather_rows(
     col_offset: int,
     cache: torch.Tensor,
     slots: torch.Tensor,
+    unused: torch.Tensor,
 ) -> None:
     """Fill keys[:, col_offset : col_offset + W] with the cache rows named by
-    slots [T, W]. cache is the packed [blocks, block_size, bytes] uint8 cache."""
+    slots [T, W], zeros where unused[:, col_offset + w] is set. cache is the
+    packed [blocks, block_size, bytes] uint8 cache."""
     assert cache.dtype == torch.uint8 and cache.ndim == 3
     assert cache.shape[2] == _TOKEN_DATA_BYTES + _TOKEN_SCALE_BYTES
     # Blocks may be padded (stride(0) larger than their bytes); inside a
@@ -115,6 +123,7 @@ def dequant_gather_rows(
     assert cache.stride(1) == cache.shape[2] and cache.stride(2) == 1
     assert keys.shape[2] == _HEAD_DIM and keys.is_contiguous()
     assert slots.dtype == torch.int32 and slots.stride(1) == 1
+    assert unused.dtype == torch.bool and unused.stride(1) == 1
     num_tokens, width = slots.shape
     if width == 0:
         return
@@ -122,9 +131,11 @@ def dequant_gather_rows(
         keys,
         cache,
         slots,
+        unused,
         cache.shape[0] * cache.shape[1],
         cache.stride(0),
         slots.stride(0),
+        unused.stride(0),
         keys.stride(0),
         col_offset,
         BLOCK_SIZE=cache.shape[1],
@@ -150,8 +161,7 @@ def sparse_decode_bmm_workspace_specs(
     return [
         ((num_tokens, width, head_dim), dtype),
         ((num_tokens, num_heads, width), torch.float32),
-        ((num_tokens, num_heads, width + 1), torch.float32),
-        ((num_tokens, num_heads, width + 1), torch.float32),
+        ((num_tokens, num_heads, width), dtype),
     ]
 
 
@@ -168,11 +178,10 @@ def sparse_attn_decode_bmm(
     output: torch.Tensor,
     keys: torch.Tensor,
     scores: torch.Tensor,
-    logits: torch.Tensor,
     probs: torch.Tensor,
 ) -> None:
     """q [T, H, D]; main/extra indices are global slot ids into their packed
-    caches (-1 = unused) with per-token lengths; attn_sink [H]. The four
+    caches (-1 = unused) with per-token lengths; attn_sink [H]. The three
     buffers come from the workspace specs and may be larger than needed."""
     num_tokens, num_heads, head_dim = q.shape
     main_slots = main_indices.reshape(num_tokens, -1)
@@ -188,22 +197,19 @@ def sparse_attn_decode_bmm(
 
     keys = _fit(keys, (num_tokens, width, head_dim))
     scores = _fit(scores, (num_tokens, num_heads, width))
-    logits = _fit(logits, (num_tokens, num_heads, width + 1))
-    probs = _fit(probs, (num_tokens, num_heads, width + 1))
+    probs = _fit(probs, (num_tokens, num_heads, width))
 
     columns = torch.arange(max(main_width, extra_width), device=q.device)[None, :]
     unused = torch.empty((num_tokens, width), dtype=torch.bool, device=q.device)
     unused[:, :main_width] = (main_slots < 0) | (
         columns[:, :main_width] >= main_lengths.reshape(-1, 1)
     )
-    dequant_gather_rows(keys, 0, main_cache, main_slots)
+    dequant_gather_rows(keys, 0, main_cache, main_slots, unused)
     if has_extra:
         assert extra_cache is not None and extra_lengths is not None
         unused[:, main_width:] = (extra_slots < 0) | (
             columns[:, :extra_width] >= extra_lengths.reshape(-1, 1)
         )
-        dequant_gather_rows(keys, main_width, extra_cache, extra_slots)
+        dequant_gather_rows(keys, main_width, extra_cache, extra_slots, unused)
 
-    attend_gathered_keys(
-        q, keys, unused, scale, attn_sink, output, scores, logits, probs
-    )
+    attend_gathered_keys(q, keys, unused, scale, attn_sink, output, scores, probs)
