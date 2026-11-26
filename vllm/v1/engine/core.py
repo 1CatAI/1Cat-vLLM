@@ -102,8 +102,236 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 _NO_DRAFTS = object()
 
 
+V41_EMPTY_AHEAD_KNOB = "VLLM_V41_PP_EMPTY_AHEAD"
+V41_ANSWER_NO_SLEEP_KNOB = "VLLM_V41_PP_ANSWER_NO_SLEEP"
+V41_LOOP_STATS_KNOB = "VLLM_V41_PP_LOOP_STATS"
+
+
+def v41_loop_switch(knob: str, value: str) -> bool:
+    """A switch of the engine core's loop under pipeline parallelism: 0 (the
+    default): the loop as it was; 1: on. Any other value refuses."""
+    if value not in ("0", "1"):
+        raise ValueError(f"{knob} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def v41_loop_stats_every(value: str) -> int:
+    """VLLM_V41_PP_LOOP_STATS: 0 (the default): off. N >= 1: one line per N
+    token-step answers that were followed by a step with tokens. Anything
+    else refuses."""
+    if not value.isdecimal():
+        raise ValueError(
+            f"{V41_LOOP_STATS_KNOB} must be 0 or a count of answers, got {value!r}"
+        )
+    return int(value)
+
+
+class V41LoopStats:
+    """What the loop does between a token step's answer and the next step
+    with tokens it submits, counted in the engine core with no profiler.
+
+    Events, in the loop's own order: "answer" (the answer of a step with
+    tokens was taken), then any of "empty" (an empty step was submitted),
+    "sleep" (the loop slept its millisecond), "take" (a blocking draft take),
+    then "tokens" (a step with tokens was submitted): that closes one round.
+    Every ``every`` rounds one line: how many rounds had no empty step in
+    between, the sleeps and takes in between, and the time from the answer
+    to the submission. With several requests a round is an answer and the
+    next token step of any request."""
+
+    def __init__(self, every: int) -> None:
+        self.every = every
+        self.open_at: float | None = None
+        self._reset()
+
+    def _reset(self) -> None:
+        self.rounds = self.ahead = self.sleeps = self.takes = 0
+        self.total = 0.0
+        self.low, self.high = float("inf"), 0.0
+        self.in_empty = self.in_sleep = self.in_take = 0
+
+    def event(self, event: str, now: float) -> None:
+        if event == "answer":
+            self.open_at = now
+            self.in_empty = self.in_sleep = self.in_take = 0
+            return
+        if event not in ("empty", "sleep", "take", "tokens"):
+            raise ValueError(f"unknown loop event {event!r}")
+        if self.open_at is None:
+            return
+        if event == "empty":
+            self.in_empty += 1
+        elif event == "sleep":
+            self.in_sleep += 1
+        elif event == "take":
+            self.in_take += 1
+        else:
+            spent = (now - self.open_at) * 1000.0
+            self.open_at = None
+            self.rounds += 1
+            self.ahead += self.in_empty == 0
+            self.sleeps += self.in_sleep
+            self.takes += self.in_take
+            self.total += spent
+            self.low, self.high = min(self.low, spent), max(self.high, spent)
+            if self.rounds >= self.every:
+                logger.info(
+                    "%s: %d answers each followed by a step with tokens: no "
+                    "empty step in between in %d of %d, sleeps in between %d, "
+                    "blocking draft takes in between %d; ms from the answer "
+                    "to that step's submission mean %.3f min %.3f max %.3f.",
+                    V41_LOOP_STATS_KNOB,
+                    self.rounds,
+                    self.ahead,
+                    self.rounds,
+                    self.sleeps,
+                    self.takes,
+                    self.total / self.rounds,
+                    self.low,
+                    self.high,
+                )
+                self._reset()
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
+
+    # VLLM_V41_PP_EMPTY_AHEAD, VLLM_V41_PP_ANSWER_NO_SLEEP and
+    # VLLM_V41_PP_LOOP_STATS (set in __init__ by _init_v41_loop_switches); the
+    # class defaults keep an engine built without __init__ on the loop as it
+    # was.
+    _v41_empty_ahead: bool = False
+    _v41_empty_ahead_seen: bool = False
+    _v41_answer_no_sleep: bool = False
+    _v41_answer_no_sleep_seen: bool = False
+    _v41_token_step_answered: bool = False
+    _v41_loop_stats: V41LoopStats | None = None
+
+    def _v41_loop_event(self, event: str) -> None:
+        """VLLM_V41_PP_LOOP_STATS: one of the loop's events between a token
+        step's answer and the next step with tokens (see V41LoopStats)."""
+        stats = self._v41_loop_stats
+        if stats is not None:
+            stats.event(event, time.perf_counter())
+
+    def _init_v41_loop_switches(self) -> None:
+        """Read the loop switches once the batch queue exists.
+
+        With Model Runner V2 under synchronous pipeline parallelism a
+        request's next step is the pp_size-th call after its last (the
+        scheduler's spacing rule: the stages before the last take the sampled
+        tokens from PPHandler's ring, which counts execute_model calls, empty
+        ones included). After a prompt read of one step the loop then needs
+        two iterations after each answer before the request's next step is
+        with the workers, the first stage idle meanwhile: it sleeps a
+        millisecond (the iteration that waited for the answer scheduled no
+        step with tokens), schedules the last empty spacing call, waits for
+        it, sleeps another millisecond, and only then schedules the request's
+        step. After a read of several steps the spacing calls are already out
+        before the answer and only the first sleep remains.
+
+        VLLM_V41_PP_EMPTY_AHEAD=1: every spacing call is submitted while the
+        request's step is in flight, so the first call after the answer is
+        the request's next step. The workers get the same calls in the same
+        order; only the time of submission changes. The loop takes an
+        ahead-submitted empty step as a step that ran (the same return as
+        after a token step), so no millisecond's sleep follows it either.
+        VLLM_V41_PP_ANSWER_NO_SLEEP=1: no millisecond's sleep after the
+        iteration that took a token step's answer (the next iteration has
+        work: it schedules). Every other iteration sleeps as before.
+        VLLM_V41_PP_LOOP_STATS=N: counts what lies between an answer and the
+        next step with tokens (V41LoopStats).
+
+        A server a switch cannot act on does not start: fewer than three
+        pipeline stages for EMPTY_AHEAD (a queue of two is full after one
+        empty call), its use with PP_MICRO / VLLM_V41_SKIP_EMPTY (they do
+        not run empty steps while results are pending), or data parallelism
+        (that loop runs a dummy batch after a step that did not execute, and
+        an ahead-submitted empty step returns as one that did); no batch
+        queue for the other two; async scheduling for both switches (another
+        loop discipline)."""
+        self._v41_empty_ahead = self._v41_empty_ahead_seen = False
+        self._v41_answer_no_sleep = self._v41_answer_no_sleep_seen = False
+        self._v41_token_step_answered = False
+        self._v41_loop_stats = None
+        ahead = v41_loop_switch(V41_EMPTY_AHEAD_KNOB, envs.VLLM_V41_PP_EMPTY_AHEAD)
+        no_sleep = v41_loop_switch(
+            V41_ANSWER_NO_SLEEP_KNOB, envs.VLLM_V41_PP_ANSWER_NO_SLEEP
+        )
+        stats_every = v41_loop_stats_every(envs.VLLM_V41_PP_LOOP_STATS)
+        if ahead and (self.batch_queue is None or self.batch_queue_size < 3):
+            raise ValueError(
+                f"{V41_EMPTY_AHEAD_KNOB}=1 needs three or more pipeline stages "
+                f"(the batch queue holds {self.batch_queue_size} step(s))"
+            )
+        if ahead and (self._v41_micro or _V41_SKIP_EMPTY):
+            raise ValueError(
+                f"{V41_EMPTY_AHEAD_KNOB}=1 does not combine with "
+                "VLLM_V41_PP_MICRO=1 or VLLM_V41_SKIP_EMPTY=1"
+            )
+        if ahead and self.vllm_config.parallel_config.data_parallel_size > 1:
+            raise ValueError(
+                f"{V41_EMPTY_AHEAD_KNOB}=1 does not run under data parallelism "
+                "(an ahead-submitted empty step returns as a step that ran; the "
+                "data-parallel loop would skip its dummy batch)"
+            )
+        if no_sleep and self.batch_queue is None:
+            raise ValueError(
+                f"{V41_ANSWER_NO_SLEEP_KNOB}=1 needs pipeline parallelism "
+                "(a batch queue)"
+            )
+        for knob, on in (
+            (V41_EMPTY_AHEAD_KNOB, ahead),
+            (V41_ANSWER_NO_SLEEP_KNOB, no_sleep),
+        ):
+            if on and self.async_scheduling:
+                raise ValueError(
+                    f"{knob}=1 needs sync scheduling (--no-async-scheduling)"
+                )
+        if stats_every and self.batch_queue is None:
+            raise ValueError(
+                f"{V41_LOOP_STATS_KNOB} needs pipeline parallelism (a batch queue)"
+            )
+        self._v41_empty_ahead = ahead
+        self._v41_answer_no_sleep = no_sleep
+        if stats_every:
+            self._v41_loop_stats = V41LoopStats(stats_every)
+            logger.info(
+                "%s=%d active (engine core, batch queue %d): one line per %d "
+                "token-step answers.",
+                V41_LOOP_STATS_KNOB,
+                stats_every,
+                self.batch_queue_size,
+                stats_every,
+            )
+        if ahead:
+            logger.info(
+                "%s=1 active (engine core, batch queue %d): an empty spacing "
+                "step is submitted while the request's step is in flight, not "
+                "after its answer.",
+                V41_EMPTY_AHEAD_KNOB,
+                self.batch_queue_size,
+            )
+        if no_sleep:
+            logger.info(
+                "%s=1 active (engine core, batch queue %d): no millisecond's "
+                "sleep after the loop iteration that took a token step's "
+                "answer.",
+                V41_ANSWER_NO_SLEEP_KNOB,
+                self.batch_queue_size,
+            )
+
+    def _v41_spacing_step_ahead(self, scheduler_output: SchedulerOutput) -> bool:
+        """VLLM_V41_PP_EMPTY_AHEAD: whether the empty step just queued lets
+        the loop schedule again instead of waiting for an answer: only when
+        the oldest queued step carries tokens (a request's step is in flight;
+        the caller adds that the queue has room and that step is unanswered).
+        Off, or for a step with tokens: False, the loop as it was."""
+        if not self._v41_empty_ahead or scheduler_output.total_num_scheduled_tokens:
+            return False
+        batch_queue = self.batch_queue
+        assert batch_queue is not None
+        return bool(batch_queue[-1][1].total_num_scheduled_tokens)
 
     def __init__(
         self,
@@ -246,6 +474,7 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+        self._init_v41_loop_switches()
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -641,6 +870,8 @@ class EngineCore:
         assert batch_queue is not None
         from vllm.v1 import v41_live, v41_trace
 
+        self._v41_token_step_answered = False
+
         if v41_trace.ENABLED:
             v41_trace.set_role("engine")
             v41_trace.mark("e_step", q=len(batch_queue))
@@ -708,6 +939,10 @@ class EngineCore:
                     trace_execute_submit_ms = (
                         time.perf_counter() - trace_execute_t0
                     ) * 1000.0
+            if self._v41_loop_stats is not None:
+                self._v41_loop_event(
+                    "tokens" if scheduler_output.total_num_scheduled_tokens else "empty"
+                )
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -739,12 +974,24 @@ class EngineCore:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
                 if (
-                    model_executed
+                    (model_executed or self._v41_spacing_step_ahead(scheduler_output))
                     and len(batch_queue) < depth
                     and not batch_queue[-1][0].done()
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
+                    if not model_executed and not self._v41_empty_ahead_seen:
+                        # Reached only with VLLM_V41_PP_EMPTY_AHEAD=1.
+                        self._v41_empty_ahead_seen = True
+                        logger.info(
+                            "%s: first return to the scheduler after an empty "
+                            "step with a request's step in flight (queue %d of "
+                            "%d): the next spacing step goes out before the "
+                            "answer.",
+                            V41_EMPTY_AHEAD_KNOB,
+                            len(batch_queue),
+                            depth,
+                        )
                     if trace_log:
                         logger.info(
                             "SM70 async cpu trace step=%d mode=enqueue_return "
@@ -789,6 +1036,12 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        # VLLM_V41_PP_ANSWER_NO_SLEEP reads this in _process_engine_step.
+        self._v41_token_step_answered = bool(
+            scheduler_output.total_num_scheduled_tokens
+        )
+        if self._v41_token_step_answered:
+            self._v41_loop_event("answer")
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -819,6 +1072,7 @@ class EngineCore:
                 # VLLM_V41_INLINE_DRAFTS: the last stage returned them inline.
                 draft_token_ids = model_output.v41_drafts
             else:
+                self._v41_loop_event("take")
                 draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
@@ -850,6 +1104,7 @@ class EngineCore:
             # we can compute the grammar bitmask for the deferred request.
             if self.use_spec_decode:
                 if self.async_scheduling or self._v41_micro:
+                    self._v41_loop_event("take")
                     draft_token_ids = self.model_executor.take_draft_token_ids()
                 else:
                     draft_token_ids = model_output.draft_token_ids
@@ -1636,7 +1891,19 @@ class EngineCoreProc(EngineCore):
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
         if not model_executed and self.scheduler.has_requests():
-            time.sleep(0.001)
+            if self._v41_answer_no_sleep and self._v41_token_step_answered:
+                # VLLM_V41_PP_ANSWER_NO_SLEEP: this iteration took the answer
+                # of a step with tokens; the next one has work (it schedules).
+                if not self._v41_answer_no_sleep_seen:
+                    self._v41_answer_no_sleep_seen = True
+                    logger.info(
+                        "%s: first loop iteration that took a token step's "
+                        "answer and did not sleep.",
+                        V41_ANSWER_NO_SLEEP_KNOB,
+                    )
+            else:
+                self._v41_loop_event("sleep")
+                time.sleep(0.001)
 
         return model_executed
 
