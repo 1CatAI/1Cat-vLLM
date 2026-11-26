@@ -23,9 +23,13 @@
 
 #include "sm70_policy.h"
 #include "activation_pack_sm70.cuh"
+#include "fp8_qpn8_codes_sm70.cuh"
 #include "qpn_pair_sm70.cuh"
 
 namespace {
+
+using vllm::sm70::fp8x8_to_half2x4_fast;
+using vllm::sm70::qpn8_col_from_lane;
 
 __device__ __forceinline__ void fp8x8_to_half2x4(uint2 q, half2 out[4]) {
 #pragma unroll
@@ -39,27 +43,7 @@ __device__ __forceinline__ void fp8x8_to_half2x4(uint2 q, half2 out[4]) {
   }
 }
 
-__device__ __forceinline__ void fp8x8_to_half2x4_fast(uint2 q, half2 out[4]) {
-  constexpr unsigned kSign = 0x80008000u;
-  constexpr unsigned kExponentMantissa = 0x3f803f80u;
-  unsigned permuted[4];
-  permuted[0] = __byte_perm(q.x, q.y, 0x0400);
-  permuted[1] = __byte_perm(q.x, q.y, 0x0501);
-  permuted[2] = __byte_perm(q.x, q.y, 0x0602);
-  permuted[3] = __byte_perm(q.x, q.y, 0x0703);
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const unsigned value =
-        ((permuted[i] << 8) & kSign) | ((permuted[i] << 7) & kExponentMantissa);
-    out[i] = *reinterpret_cast<const half2*>(&value);
-  }
-}
-
 constexpr int kQpn8PrepareThreads = 256;
-
-__device__ __forceinline__ int qpn8_col_from_lane(int lane) {
-  return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
-}
 
 __device__ __forceinline__ int qpn8_lane_from_col(int col) {
   return (col & 3) | (((col >> 3) & 3) << 2) | (((col >> 2) & 1) << 4);
@@ -214,12 +198,23 @@ __global__ void fp8_qpn8_sm70_kernel(
     half* __restrict__ z_output, const half* __restrict__ ba_weight,
     half* __restrict__ ba_output, half* __restrict__ b_output,
     half* __restrict__ a_output, int ba_n, int qkv_n, int n, int k, int m,
-    bool channel_scales) {
+    bool channel_scales, int input_stride, int output_stride) {
   static_assert(RowTiles == 1 || RowTiles == 2,
                 "QPN8 supports one or two 8-row tiles");
   static_assert(!M1Only || RowTiles == 1,
                 "QPN8 M=1 specialization uses one row tile");
   __shared__ float partials[SplitK][M1Only ? 32 : RowTiles * 256];
+
+  // Grouped launch (grid.y > 1, block scales only): batch element blockIdx.y
+  // owns its own [k, n] codes and [k / 128, n / 32] scales, reads columns
+  // [batch * k, (batch + 1) * k) of every input row and writes columns
+  // [batch * n, (batch + 1) * n) of every output row (DeepSeek-V4 wo_a). With
+  // grid.y == 1 the shifts are zero and the strides are k and n.
+  const int batch = blockIdx.y;
+  codes += static_cast<size_t>(batch) * n * k;
+  group_scales += static_cast<size_t>(batch) * (k >> 7) * (n >> 5);
+  input += static_cast<size_t>(batch) * k;
+  output += static_cast<size_t>(batch) * n;
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -311,7 +306,8 @@ __global__ void fp8_qpn8_sm70_kernel(
   }
   const half* single_input_row =
       (RowTiles == 1 && m > 0)
-          ? (input + static_cast<size_t>(row < m ? row : (m - 1)) * k)
+          ? (input +
+             static_cast<size_t>(row < m ? row : (m - 1)) * input_stride)
           : nullptr;
 
 #pragma unroll 4
@@ -364,7 +360,7 @@ __global__ void fp8_qpn8_sm70_kernel(
         const int input_row_idx = row_tile * 8 + row;
         if (input_row_idx < m) {
           const half* input_row =
-              input + static_cast<size_t>(input_row_idx) * k;
+              input + static_cast<size_t>(input_row_idx) * input_stride;
           input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
           input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
         }
@@ -455,7 +451,7 @@ __global__ void fp8_qpn8_sm70_kernel(
                      qkv_n] = __float2half(value);
           }
         } else {
-          output[static_cast<size_t>(output_row) * n + col] =
+          output[static_cast<size_t>(output_row) * output_stride + col] =
               __float2half(value);
         }
       }
@@ -463,15 +459,20 @@ __global__ void fp8_qpn8_sm70_kernel(
   }
 }
 
+// n and k are the sizes of one batch element; batch > 1 is a grouped launch
+// over input [m, batch * k] and output [m, batch * n].
 template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
           bool M1Only = false, int RowTiles = 1>
 void launch_fp8_qpn8_sm70(const uint8_t* codes, const half* group_scales,
                           const half* input, half* output, int n, int k, int m,
-                          bool channel_scales, cudaStream_t stream) {
+                          bool channel_scales, cudaStream_t stream,
+                          int batch = 1) {
   fp8_qpn8_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes, M1Only, false,
-                       false, RowTiles><<<(n / 32), (32 * SplitK), 0, stream>>>(
-      codes, group_scales, input, output, nullptr, nullptr, nullptr, nullptr,
-      nullptr, 0, n, n, k, m, channel_scales);
+                       false, RowTiles>
+      <<<dim3(n / 32, batch), (32 * SplitK), 0, stream>>>(
+          codes, group_scales, input, output, nullptr, nullptr, nullptr,
+          nullptr, nullptr, 0, n, n, k, m, channel_scales, batch * k,
+          batch * n);
 }
 
 struct Fp8PairReader {
@@ -823,7 +824,7 @@ void launch_fp8_qpn8_ba_split_sm70(const uint8_t* codes,
   fp8_qpn8_sm70_kernel<16, 2, true, false, true, true, true>
       <<<(n / 32 + (ba_n + 1) / 2), 512, 0, stream>>>(
           codes, group_scales, input, qkv_output, z_output, ba_weight, nullptr,
-          b_output, a_output, ba_n, qkv_n, n, k, 1, channel_scales);
+          b_output, a_output, ba_n, qkv_n, n, k, 1, channel_scales, k, n);
 }
 
 template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
@@ -1550,6 +1551,11 @@ void fp8_qpn8_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// Grouped mode (DeepSeek-V4 wo_a): codes [G, K, N], group_scales
+// [G, K / 128, N / 32], input [M, G * K], out [M, G * N], and the workspace
+// holds the whole dequantized weight, G * K * N elements laid out [G, K, N].
+// One batched product then computes out[:, g] = input[:, g] @ W_g like the
+// dense-weight bmm it replaces. Not combined with gated_silu.
 void fp8_qpn8_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
                                torch::Tensor input, torch::Tensor codes,
                                torch::Tensor group_scales, bool gated_silu) {
@@ -1563,13 +1569,33 @@ void fp8_qpn8_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   TORCH_CHECK(input.is_contiguous() && out.is_contiguous(),
               "fp8_qpn8_prefill_sm70_out: tensors must be contiguous");
 
+  const bool grouped = codes.dim() == 3;
+  TORCH_CHECK(!grouped || !gated_silu,
+              "fp8_qpn8_prefill_sm70_out: grouped mode has no gated SiLU");
+  const int64_t batch = grouped ? codes.size(0) : 1;
   const int64_t m = input.size(0);
-  const int64_t k = input.size(1);
-  const int64_t n = codes.size(1);
-  TORCH_CHECK(codes.dim() == 2 && codes.size(0) == k,
+  const int64_t k = codes.size(grouped ? 1 : 0);
+  const int64_t n = codes.size(grouped ? 2 : 1);
+  TORCH_CHECK(codes.dim() == (grouped ? 3 : 2) && input.size(1) == batch * k,
               "fp8_qpn8_prefill_sm70_out: code shape mismatch");
-  TORCH_CHECK(out.size(0) == m && out.size(1) == (gated_silu ? n / 2 : n),
-              "fp8_qpn8_prefill_sm70_out: output shape mismatch");
+  TORCH_CHECK(
+      out.size(0) == m && out.size(1) == (gated_silu ? n / 2 : batch * n),
+      "fp8_qpn8_prefill_sm70_out: output shape mismatch");
+
+  if (grouped) {
+    auto dense_weight =
+        torch::from_blob(reinterpret_cast<void*>(dense_weight_ptr),
+                         {batch, k, n}, input.options());
+    for (int64_t group = 0; group < batch; ++group) {
+      auto group_weight = dense_weight.select(0, group);
+      fp8_qpn8_dequantize_sm70_out(group_weight, codes.select(0, group),
+                                   group_scales.select(0, group));
+    }
+    auto out_by_group = out.view({m, batch, n}).transpose(0, 1);
+    at::bmm_out(out_by_group, input.view({m, batch, k}).transpose(0, 1),
+                dense_weight);
+    return;
+  }
 
   auto dense_weight = torch::from_blob(
       reinterpret_cast<void*>(dense_weight_ptr), {k, n}, input.options());
@@ -1589,6 +1615,11 @@ void fp8_qpn8_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// Grouped mode (DeepSeek-V4 wo_a): codes [G, K, N] (G stacked QPN8 packs),
+// group_scales [G, K / 128, N / 32] block scales, input [M, G * K] and out
+// [M, G * N]; one launch computes out[:, g * N:(g + 1) * N] =
+// input[:, g * K:(g + 1) * K] @ W_g^T for every g. M <= 8, block scales only.
+// Without a leading G the operator is the ordinary [K, N] GEMM.
 void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                             torch::Tensor codes, torch::Tensor group_scales,
                             int64_t split_k, int64_t accumulator_chains,
@@ -1603,8 +1634,11 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_gemm_sm70_out: codes must be uint8");
   TORCH_CHECK(group_scales.scalar_type() == torch::kFloat16,
               "fp8_qpn8_gemm_sm70_out: group scales must be float16");
-  TORCH_CHECK(input.dim() == 2 && out.dim() == 2 && group_scales.dim() == 2,
-              "fp8_qpn8_gemm_sm70_out: expected 2D tensors");
+  const bool grouped = codes.dim() == 3;
+  TORCH_CHECK(input.dim() == 2 && out.dim() == 2 &&
+                  group_scales.dim() == (grouped ? 3 : 2),
+              "fp8_qpn8_gemm_sm70_out: expected 2D input and output, and "
+              "scales with as many dims as the codes minus one");
   TORCH_CHECK(input.is_contiguous() && out.is_contiguous() &&
                   codes.is_contiguous() && group_scales.is_contiguous(),
               "fp8_qpn8_gemm_sm70_out: tensors must be contiguous");
@@ -1613,25 +1647,37 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                   input.get_device() == group_scales.get_device(),
               "fp8_qpn8_gemm_sm70_out: tensors must share one device");
 
+  const int64_t batch = grouped ? codes.size(0) : 1;
   const int64_t m = input.size(0);
-  const int64_t k = input.size(1);
-  const int64_t n = out.size(1);
+  TORCH_CHECK(
+      batch >= 1 && input.size(1) % batch == 0 && out.size(1) % batch == 0,
+      "fp8_qpn8_gemm_sm70_out: input and output widths must split "
+      "evenly over the groups");
+  // k and n are the sizes of one group.
+  const int64_t k = input.size(1) / batch;
+  const int64_t n = out.size(1) / batch;
   TORCH_CHECK(m >= 1 && m <= 40,
               "fp8_qpn8_gemm_sm70_out: M must be in [1, 40]");
   TORCH_CHECK(out.size(0) == m, "fp8_qpn8_gemm_sm70_out: output M mismatch");
   TORCH_CHECK(n > 0 && n % 32 == 0,
               "fp8_qpn8_gemm_sm70_out: N must be a positive multiple of 32");
-  const bool channel_scales =
-      group_scales.size(0) == 1 && group_scales.size(1) == n;
-  const bool block_scales =
-      group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32;
+  const int64_t scale_rows = group_scales.size(group_scales.dim() - 2);
+  const int64_t scale_cols = group_scales.size(group_scales.dim() - 1);
+  const bool channel_scales = !grouped && scale_rows == 1 && scale_cols == n;
+  const bool block_scales = scale_rows == k / 128 && scale_cols == n / 32 &&
+                            (!grouped || group_scales.size(0) == batch);
   TORCH_CHECK(channel_scales ? (k > 0 && k % 16 == 0) : (k > 0 && k % 128 == 0),
               "fp8_qpn8_gemm_sm70_out: channel scales require K%16=0; "
               "block scales require K%128=0");
-  TORCH_CHECK(codes.numel() == n * k,
+  TORCH_CHECK(codes.numel() == batch * n * k,
               "fp8_qpn8_gemm_sm70_out: packed code size mismatch");
+  TORCH_CHECK(!grouped || (codes.size(1) == k && codes.size(2) == n),
+              "fp8_qpn8_gemm_sm70_out: grouped codes must be [G, K, N]");
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_gemm_sm70_out: scale shape mismatch");
+  TORCH_CHECK(!grouped || (m <= 8 && block_scales),
+              "fp8_qpn8_gemm_sm70_out: grouped mode requires M<=8 and block "
+              "scales");
   TORCH_CHECK(m <= 8 || channel_scales,
               "fp8_qpn8_gemm_sm70_out: M=9..40 requires channel scales");
   TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 12 || split_k == 16 ||
@@ -1719,29 +1765,32 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
     if (split_k == 12) {
       launch_fp8_qpn8_sm70<12, 2, true, false, true>(
           code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),
-          static_cast<int>(k), 1, channel_scales, stream);
+          static_cast<int>(k), 1, channel_scales, stream,
+          static_cast<int>(batch));
     } else {
       launch_fp8_qpn8_sm70<16, 2, true, false, true>(
           code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),
-          static_cast<int>(k), 1, channel_scales, stream);
+          static_cast<int>(k), 1, channel_scales, stream,
+          static_cast<int>(batch));
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
 
-#define VLLM_LAUNCH_QPN8(SPLIT, NACC, FAST, PREFETCH)                        \
-  do {                                                                       \
-    if (m <= 8) {                                                            \
-      launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 1>(           \
-          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),   \
-          static_cast<int>(k), static_cast<int>(m), channel_scales, stream); \
-    } else if constexpr (SPLIT <= 16) {                                      \
-      launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 2>(           \
-          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),   \
-          static_cast<int>(k), static_cast<int>(m), true, stream);           \
-    } else {                                                                 \
-      TORCH_CHECK(false, "QPN8 M=9..16 does not support split_k ", SPLIT);   \
-    }                                                                        \
+#define VLLM_LAUNCH_QPN8(SPLIT, NACC, FAST, PREFETCH)                       \
+  do {                                                                      \
+    if (m <= 8) {                                                           \
+      launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 1>(          \
+          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),  \
+          static_cast<int>(k), static_cast<int>(m), channel_scales, stream, \
+          static_cast<int>(batch));                                         \
+    } else if constexpr (SPLIT <= 16) {                                     \
+      launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 2>(          \
+          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),  \
+          static_cast<int>(k), static_cast<int>(m), true, stream);          \
+    } else {                                                                \
+      TORCH_CHECK(false, "QPN8 M=9..16 does not support split_k ", SPLIT);  \
+    }                                                                       \
   } while (0)
 
   if (prefetch_codes) {
@@ -1979,8 +2028,8 @@ static void fp8_qpn8_dispatch_ba_split_sm70_impl(
             nullptr, reinterpret_cast<half*>(b_out.data_ptr<at::Half>()),
             reinterpret_cast<half*>(a_out.data_ptr<at::Half>()),
             static_cast<int>(ba_n), static_cast<int>(qkv_n),
-            static_cast<int>(n), static_cast<int>(k), static_cast<int>(m),
-            true);
+            static_cast<int>(n), static_cast<int>(k), static_cast<int>(m), true,
+            static_cast<int>(k), static_cast<int>(n));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }

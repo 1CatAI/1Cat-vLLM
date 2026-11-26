@@ -493,18 +493,11 @@ class Fp8LinearMethod(LinearMethodBase):
         ):
             return
 
-        if (
-            self.use_marlin
-            or (
-                not self.use_sm70_fp8_turbomind
-                and isinstance(
-                    getattr(self, "fp8_linear", None), QPN8Fp8BlockScaledMMLinearKernel
-                )
-            )
-        ) and getattr(layer, "is_bmm", False):
+        if self.use_marlin and getattr(layer, "is_bmm", False):
             # Marlin packs one [N, K] matrix and cannot serve the grouped
-            # matmul of an is_bmm layer (DeepSeek-V4 wo_a on Turing), so the
-            # weight is dequantized once here and applied per group in apply().
+            # matmul of an is_bmm layer, so the weight is dequantized once here
+            # and applied per group in apply(). The QPN8 kernel serves such
+            # layers itself (DeepSeek-V4 wo_a on Turing).
             assert self.block_quant, "is_bmm layers are block-quantized"
             weight, weight_scale_inv = process_fp8_weight_block_strategy(
                 layer.weight, layer.weight_scale_inv
@@ -514,14 +507,6 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             replace_parameter(layer, "weight", weight)
             layer.dequantized_bmm = True
-            if isinstance(
-                getattr(self, "fp8_linear", None), QPN8Fp8BlockScaledMMLinearKernel
-            ):
-                logger.info_once(
-                    "Block FP8 QPN8 unavailable: grouped BMM uses the "
-                    "existing dequantized grouped implementation."
-                )
-                del self.fp8_linear
             return
 
         if self.use_marlin:
