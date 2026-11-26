@@ -8,6 +8,7 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -117,6 +118,7 @@ def sparse_attn_indexer(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
     skip_k_cache_insert: bool,
+    triton_tensor_cores: bool,
     use_fp4_cache: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
@@ -255,6 +257,7 @@ def sparse_attn_indexer(
                     k_quant,
                     k_scale,
                     weights[chunk.token_start : chunk.token_end],
+                    triton_tensor_cores=triton_tensor_cores,
                 )
             elif current_platform.is_xpu():
                 if q_scale_slice is not None:
@@ -292,6 +295,10 @@ def sparse_attn_indexer(
                 logits.stride(1),
                 topk_tokens,
             )
+            # Free this chunk's logits before the next chunk allocates its own:
+            # the rebinding alone frees them only after the new ones exist, so
+            # sub-chunks under the logits budget would still peak at two.
+            del logits
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -378,6 +385,7 @@ def sparse_attn_indexer(
                 indexer_decode_cublas=get_forward_context()
                 .no_compile_layers[k_cache_prefix]
                 .sm70_sparse.indexer_decode_cublas,
+                triton_tensor_cores=triton_tensor_cores,
             )
         elif current_platform.is_xpu():
             if padded_q_scale is not None:
@@ -463,6 +471,7 @@ def sparse_attn_indexer_fake(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
+    triton_tensor_cores: bool,
     use_fp4_cache: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
@@ -513,6 +522,9 @@ class SparseAttnIndexer(CustomOp):
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
+        self.triton_tensor_cores = (
+            get_current_vllm_config().kernel_config.use_triton_sm7x_tensor_cores()
+        )
         self.use_fp4_cache = use_fp4_cache
         if (
             current_platform.is_cuda()
@@ -569,6 +581,7 @@ class SparseAttnIndexer(CustomOp):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
+            self.triton_tensor_cores,
             self.use_fp4_cache,
         )
 

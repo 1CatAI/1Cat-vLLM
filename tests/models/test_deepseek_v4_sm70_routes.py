@@ -152,8 +152,8 @@ def test_volta_and_turing_select_triton_sparse_impl(minor):
     platform = MagicMock()
     platform.is_rocm.return_value = False
     platform.is_cuda.return_value = True
-    platform.is_device_capability_family.side_effect = (
-        lambda family: capability.to_int() // 10 == family // 10
+    platform.is_device_capability_family.side_effect = lambda family: (
+        capability.to_int() // 10 == family // 10
     )
     with patch.object(attention, "current_platform", platform):
         assert attention._select_v4_sparse_impl() is DeepseekV4SM70SparseImpl
@@ -475,10 +475,12 @@ def test_sm70_sparse_bmm_decode_takes_graph_workspace_buffers():
     splitk.assert_not_called()
     paged.assert_not_called()
     bmm.assert_called_once()
-    keys, scores, logits, probs = bmm.call_args.args[-4:]
+    # The fused sink softmax reads FP32 scores and writes the probabilities;
+    # the sink needs no extra column.
+    keys, scores, probs = bmm.call_args.args[-3:]
     assert keys.shape == (6, 128, 512)
-    assert scores.shape == (6, 64, 128)
-    assert logits.shape == probs.shape == (6, 64, 129)
+    assert scores.shape == probs.shape == (6, 64, 128)
+    assert scores.dtype == torch.float32 and probs.dtype == torch.float16
 
 
 def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
@@ -486,6 +488,8 @@ def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
 
     layer = MagicMock()
     layer.max_num_batched_tokens = 2048
+    # A MagicMock attribute is truthy and would pick the tensor-core route.
+    layer.sparse_tensor_cores = False
     q = torch.empty((1, 64, 512), dtype=torch.float16)
     impl = sparse.DeepseekV4SM70SparseImpl
 
@@ -497,6 +501,42 @@ def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
     assert [shape for shape, _ in specs] == [
         (128, 640, 512),
         (128, 64, 640),
-        (128, 64, 641),
-        (128, 64, 641),
+        (128, 64, 640),
     ]
+    # The tensor-core matmuls read the selected rows through the indices, so
+    # no gathered keys, and one pass takes up to 1024 tokens.
+    from vllm.models.deepseek_v4.common.ops.sparse_prefill_bmm import tokens_per_pass
+
+    layer.sparse_tensor_cores = True
+    with patch.object(sparse, "_bmm_blocker", return_value=None):
+        specs = impl._prefill_bmm_workspace_specs(layer, q, 640)
+    per_pass = min(2048, tokens_per_pass(True))
+    assert [shape for shape, _ in specs] == [(per_pass, 64, 640), (per_pass, 64, 640)]
+
+
+@pytest.mark.parametrize(("max_num_seqs", "rows"), [(1, 1), (3, 3), (64, 8)])
+def test_sm70_sparse_eager_workspace_holds_one_row_per_sequence(max_num_seqs, rows):
+    from vllm.models.deepseek_v4.sm70 import sparse
+
+    layer = MagicMock()
+    layer.max_num_seqs = max_num_seqs
+    layer.max_model_len = 1048576
+    layer.max_num_batched_tokens = 1024
+    layer.compress_ratio = 4
+    layer.window_size = 128
+    layer.topk_indices_buffer = torch.empty((1, 512), dtype=torch.int32)
+    q = torch.empty((1, 64, 512), dtype=torch.float16)
+    output = torch.empty_like(q)
+    context = MagicMock(attn_metadata=None)
+
+    with (
+        patch.object(sparse, "get_forward_context", return_value=context),
+        patch.object(sparse, "current_workspace_manager") as manager,
+        patch.object(sparse, "_bmm_blocker", return_value="disabled by policy"),
+    ):
+        sparse.DeepseekV4SM70SparseImpl.forward_mqa(layer, q, q, q, output)
+
+    # One row of 1M context costs 257 MiB, and a chunk never holds more
+    # requests than the engine has sequences.
+    kv_spec = manager.return_value.get_simultaneous.call_args.args[0]
+    assert kv_spec == ((rows, 262144 + 128 + 1024, 512), torch.float16)

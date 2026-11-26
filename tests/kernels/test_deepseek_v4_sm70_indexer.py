@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from tests.kernels.utils import requires_tensor_core_triton
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.sm70_sparse import sparse_policy
 from vllm.models.deepseek_v4.sm70 import indexer as sm70_indexer
@@ -55,6 +56,27 @@ def _reference_index_logits(
     return torch.einsum("mhn,mh->mn", torch.relu(per_head), weights.float())
 
 
+def _reference_prefill_logits(
+    q: torch.Tensor, weights: torch.Tensor, values: torch.Tensor, scales: torch.Tensor
+) -> torch.Tensor:
+    """The prefill routes' arithmetic in fp64: per-head scores of the unscaled
+    keys rounded to fp16 (as the cuBLAS route stores them; the fused SM75
+    scorer and the Triton scorer keep FP32, well within the tolerance below),
+    then relu, head weights, head sum and the per-key scale.
+    """
+    per_head = torch.einsum("mhd,nd->mhn", q.double(), values.double())
+    per_head = per_head.float().half().double()
+    summed = torch.einsum("mhn,mh->mn", torch.relu(per_head), weights.double())
+    return summed * scales.double()
+
+
+def _assert_close_to_max(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Accumulation order only moves an fp16 rounding boundary now and then, so
+    the error is judged against the largest score, not element by element."""
+    error = (actual.double() - expected).abs().max() / expected.abs().max()
+    assert error < 1e-3, f"max |actual - expected| / max |expected| = {error:.2e}"
+
+
 def _reference_factored_logits(
     q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor
 ) -> torch.Tensor:
@@ -99,8 +121,17 @@ def _make_queries(rows: int, num_heads: int):
 
 
 @requires_sm70
-@pytest.mark.parametrize("use_cublas", [True, False])
-def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas):
+@pytest.mark.parametrize(
+    ("use_cublas", "triton_tensor_cores"),
+    [
+        (True, False),
+        (False, False),
+        pytest.param(True, True, marks=requires_tensor_core_triton),
+    ],
+)
+def test_prefill_matches_the_reference_scoring_function(
+    monkeypatch, use_cublas, triton_tensor_cores
+):
     torch.manual_seed(20260819)
     generator = torch.Generator().manual_seed(20260819)
     num_queries, num_heads, num_keys = 5, 8, 37
@@ -112,7 +143,11 @@ def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas)
     k = values * scales[:, None]
 
     actual = sm70_indexer_prefill_logits(
-        q, bits.view(torch.float8_e4m3fn), scales, weights
+        q,
+        bits.view(torch.float8_e4m3fn),
+        scales,
+        weights,
+        triton_tensor_cores=triton_tensor_cores,
     )
     expected = _reference_index_logits(q, weights, k)
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
@@ -121,6 +156,172 @@ def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas)
     # function, which is what broke long-context top-k selection.
     factored = _reference_factored_logits(q, weights, k)
     assert not torch.allclose(expected, factored, rtol=1e-2, atol=1e-2)
+
+
+@requires_sm70
+@pytest.mark.parametrize(
+    "triton_tensor_cores",
+    [False, pytest.param(True, marks=requires_tensor_core_triton)],
+)
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_prefill_model_head_counts_match_the_reference(
+    num_heads, weight_dtype, triton_tensor_cores
+):
+    """32 and 64 heads are the model head counts (16-head indexers pad to 32);
+    without tensor-core Triton, Turing takes the fused native scorer. 37
+    queries and 1100 keys leave a partial token group, a partial key tile and a
+    second key range.
+    """
+    torch.manual_seed(20261021)
+    generator = torch.Generator().manual_seed(20261021)
+    num_queries, num_keys = 37, 1100
+
+    q, weights = _make_queries(num_queries, num_heads)
+    weights = weights.to(weight_dtype)
+    bits, values = _random_fp8_keys(num_keys, generator)
+    scales = torch.linspace(0.5, 2.0, num_keys, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q,
+        bits.view(torch.float8_e4m3fn),
+        scales,
+        weights,
+        triton_tensor_cores=triton_tensor_cores,
+    )
+    _assert_close_to_max(actual, _reference_prefill_logits(q, weights, values, scales))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 5),
+    reason="requires a Turing GPU (SM75)",
+)
+def test_turing_prefill_takes_the_fused_scorer(monkeypatch):
+    def cublas_route(*args):
+        raise AssertionError("Turing must not stage scores through cuBLAS")
+
+    monkeypatch.setattr(sm70_indexer, "_prefill_logits_cublas", cublas_route)
+    generator = torch.Generator().manual_seed(20261021)
+    q, weights = _make_queries(512, 64)
+    bits, values = _random_fp8_keys(300, generator)
+    scales = torch.linspace(0.5, 2.0, 300, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights, triton_tensor_cores=False
+    )
+    _assert_close_to_max(actual, _reference_prefill_logits(q, weights, values, scales))
+
+
+@requires_tensor_core_triton
+@pytest.mark.parametrize("num_heads", [8, 32, 64])
+def test_tensor_core_triton_keeps_the_fused_turing_scorer(monkeypatch, num_heads):
+    """With tensor-core Triton the Triton kernel replaces the cuBLAS route; Turing
+    keeps its fused native scorer for 32 and 64 heads, the faster one there, and
+    takes the Triton kernel for other head counts. Eight heads need two tokens
+    per MMA; 1100 keys cross the per-program key range.
+    """
+
+    def forbidden(route):
+        def call(*args, **kwargs):
+            raise AssertionError(f"tensor-core Triton must not take {route} here")
+
+        return call
+
+    monkeypatch.setattr(
+        sm70_indexer, "_prefill_logits_cublas", forbidden("the cuBLAS route")
+    )
+    if torch.cuda.get_device_capability() == (7, 5) and num_heads in (32, 64):
+        monkeypatch.setattr(
+            sm70_indexer, "_prefill_scores_triton", forbidden("the Triton kernel")
+        )
+    else:
+        monkeypatch.setattr(
+            torch.ops._C,
+            "indexer_prefill_scores_sm75",
+            forbidden("the fused SM75 scorer"),
+            raising=False,
+        )
+    generator = torch.Generator().manual_seed(20261022)
+    q, weights = _make_queries(37, num_heads)
+    bits, values = _random_fp8_keys(1100, generator)
+    scales = torch.linspace(0.5, 2.0, 1100, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights, triton_tensor_cores=True
+    )
+    _assert_close_to_max(actual, _reference_prefill_logits(q, weights, values, scales))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 5),
+    reason="requires a Turing GPU (SM75)",
+)
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_turing_fused_scorer_survives_unscaled_key_magnitudes(monkeypatch, num_heads):
+    """The fused SM75 scorer multiplies by keys with their scale left out, so
+    e4m3 values reach 448 and one q . k passes fp16's 65504. Its products must
+    stay FP32: rounded to fp16 they became inf, and NaN where the mixed-sign
+    head weights summed +inf and -inf."""
+
+    def cublas_route(*args):
+        raise AssertionError("Turing must take its fused scorer here")
+
+    monkeypatch.setattr(sm70_indexer, "_prefill_logits_cublas", cublas_route)
+    torch.manual_seed(20261102)
+    generator = torch.Generator().manual_seed(20261102)
+    num_queries, num_keys = 3, 80
+    q, weights = _make_queries(num_queries, num_heads)
+    q[:, :2] = 2.0  # 128 * 2.0 * 448 = 114688 against the full-scale keys
+    weights[:, 0], weights[:, 1] = 1.0, -1.0
+    bits, values = _random_fp8_keys(num_keys, generator)
+    bits[: num_keys // 2] = 0x7E  # e4m3fn 448, the format's largest finite value
+    values[: num_keys // 2] = 448.0
+    scales = torch.full((num_keys,), 2.0**-8, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights, triton_tensor_cores=False
+    )
+    expected = _reference_index_logits(q, weights, values * scales[:, None])
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-2)
+
+
+@requires_sm70
+@pytest.mark.parametrize(
+    "triton_tensor_cores",
+    [False, pytest.param(True, marks=requires_tensor_core_triton)],
+)
+def test_prefill_triton_scores_survive_unscaled_key_magnitudes(
+    monkeypatch, triton_tensor_cores
+):
+    """The Triton scorer multiplies by keys with their scale left out, so e4m3
+    values reach 448 and one q . k passes fp16's 65504, as GLM-5.3's index
+    queries do. The product must stay FP32: rounded to fp16 it became inf, and
+    NaN where the mixed-sign head weights summed +inf and -inf. Eight heads
+    keep Turing off its fused native scorer."""
+    torch.manual_seed(20261102)
+    generator = torch.Generator().manual_seed(20261102)
+    num_queries, num_heads, num_keys = 3, 8, 16
+    monkeypatch.setattr(sparse_policy(), "indexer_prefill_cublas", False)
+
+    q, weights = _make_queries(num_queries, num_heads)
+    q[:, :2] = 2.0  # 128 * 2.0 * 448 = 114688 against the full-scale keys
+    weights[:, 0], weights[:, 1] = 1.0, -1.0
+    bits, values = _random_fp8_keys(num_keys, generator)
+    bits[: num_keys // 2] = 0x7E  # e4m3fn 448, the format's largest finite value
+    values[: num_keys // 2] = 448.0
+    scales = torch.full((num_keys,), 2.0**-8, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q,
+        bits.view(torch.float8_e4m3fn),
+        scales,
+        weights,
+        triton_tensor_cores=triton_tensor_cores,
+    )
+    expected = _reference_index_logits(q, weights, values * scales[:, None])
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-2)
 
 
 @requires_sm70
@@ -136,7 +337,7 @@ def test_prefill_relu_off_restores_the_factored_form(monkeypatch):
     scales = torch.linspace(0.5, 2.0, num_keys, device="cuda", dtype=torch.float32)
 
     actual = sm70_indexer_prefill_logits(
-        q, bits.view(torch.float8_e4m3fn), scales, weights
+        q, bits.view(torch.float8_e4m3fn), scales, weights, triton_tensor_cores=False
     )
     expected = _reference_factored_logits(q, weights, values * scales[:, None])
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
@@ -162,7 +363,7 @@ def test_prefill_cublas_scores_survive_unscaled_key_magnitudes(monkeypatch):
     scales = torch.full((num_keys,), 2.0**-8, device="cuda", dtype=torch.float32)
 
     actual = sm70_indexer_prefill_logits(
-        q, bits.view(torch.float8_e4m3fn), scales, weights
+        q, bits.view(torch.float8_e4m3fn), scales, weights, triton_tensor_cores=False
     )
     expected = _reference_index_logits(q, weights, values * scales[:, None])
     assert torch.isfinite(actual).all()
@@ -218,6 +419,7 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
         block_table,
         max_seq_len,
         indexer_decode_cublas=True,
+        triton_tensor_cores=False,
     )
 
     reference = _reference_index_logits if relu else _reference_factored_logits
@@ -243,15 +445,25 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
 # block-table row and one length per token. two_requests: the same, twice.
 @pytest.mark.parametrize("layout", ["native", "flattened", "two_requests"])
 @pytest.mark.parametrize("num_rows", [3, 8, 13])
-@pytest.mark.parametrize("graph_width", [2048, 8192])
+# fused: the tensor-core scorer on FP8 keys replaces the cuBLAS GEMM and epilogue.
+@pytest.mark.parametrize(
+    "fused", [False, pytest.param(True, marks=requires_tensor_core_triton)]
+)
+# The 20k shape crosses the 16k-key switch of the decode score tile
+# (_decode_score_tile) on Volta and Turing; live_seq_len is graph_width // 2 - 7
+# for the 2k and 8k shapes.
+@pytest.mark.parametrize(
+    "live_seq_len,graph_width",
+    [(1017, 2048), (4089, 8192), (16437, 20480)],
+    ids=["2k", "8k", "20k"],
+)
 @requires_sm70
 def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
-    monkeypatch, padded_blocks, layout, num_rows, graph_width
+    monkeypatch, padded_blocks, layout, num_rows, fused, live_seq_len, graph_width
 ):
     torch.manual_seed(20260824)
     generator = torch.Generator().manual_seed(20260824)
     num_heads = 64
-    live_seq_len = graph_width // 2 - 7
     blocks = (live_seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
 
     bits, _ = _random_fp8_keys(blocks * _BLOCK_SIZE, generator)
@@ -306,17 +518,25 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
         graph_width,
         table_rows_per_request,
         indexer_decode_cublas=True,
+        triton_tensor_cores=False,
     )
 
-    static_workspace = (
-        torch.empty((graph_width, _HEAD_DIM), dtype=torch.float16, device="cuda"),
-        torch.empty((graph_width,), dtype=torch.float32, device="cuda"),
-        torch.empty(
-            (num_rows * num_heads, graph_width),
-            dtype=torch.float32,
-            device="cuda",
-        ),
-    )
+    static_workspace: tuple[torch.Tensor, ...]
+    if fused:
+        static_workspace = (
+            torch.empty((graph_width, _HEAD_DIM), dtype=torch.uint8, device="cuda"),
+            torch.empty((graph_width,), dtype=torch.float32, device="cuda"),
+        )
+    else:
+        static_workspace = (
+            torch.empty((graph_width, _HEAD_DIM), dtype=torch.float16, device="cuda"),
+            torch.empty((graph_width,), dtype=torch.float32, device="cuda"),
+            torch.empty(
+                (num_rows * num_heads, graph_width),
+                dtype=torch.float32,
+                device="cuda",
+            ),
+        )
 
     workspace_requests = []
 
@@ -343,6 +563,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
             graph_width,
             table_rows_per_request,
             indexer_decode_cublas=True,
+            triton_tensor_cores=fused,
         )
 
     capture_stream = torch.cuda.Stream()
@@ -359,7 +580,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
         candidate = candidate_call()
     graph.replay()
     torch.accelerator.synchronize()
-    # Only the cuBLAS route asks for a workspace: this card took it.
+    # Only the cuBLAS and fused routes ask for a workspace: this card took one.
     assert workspace_requests
 
     for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
@@ -384,6 +605,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
         graph_width,
         table_rows_per_request,
         indexer_decode_cublas=True,
+        triton_tensor_cores=False,
     )
     graph.replay()
     torch.accelerator.synchronize()
@@ -424,6 +646,7 @@ def test_sm70_indexer_decode_valid_logits_do_not_depend_on_workspace_width() -> 
         block_table,
         max_seq_len=16,
         indexer_decode_cublas=True,
+        triton_tensor_cores=False,
     )
     wide = sm70_indexer_decode_logits(
         q,
@@ -433,6 +656,7 @@ def test_sm70_indexer_decode_valid_logits_do_not_depend_on_workspace_width() -> 
         block_table,
         max_seq_len=64,
         indexer_decode_cublas=True,
+        triton_tensor_cores=False,
     )
 
     assert narrow.shape == (num_queries, 16)
@@ -498,6 +722,7 @@ def test_decode_cublas_score_tiles_match_one_tile(monkeypatch):
             graph_width,
             rows,
             indexer_decode_cublas=True,
+            triton_tensor_cores=False,
         )
 
     single = decode()
