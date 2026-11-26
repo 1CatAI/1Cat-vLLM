@@ -22,9 +22,12 @@ bytes hold the 16 nibbles of the group's 16 k in the order
 Scales are one fp8-e4m3fn byte per ``(tile, group, lane)``.
 """
 
+import functools
+
 import torch
 
 from vllm._sm70.policy import register_policy_op
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -136,6 +139,16 @@ def _nvfp4_qpn2_dequant_kernel(
     tl.store(out_ptr + base_idx + 8, v1.to(tl.float16), mask=m3)
 
 
+@functools.cache
+def _groups_per_block(device_index: int) -> int:
+    # Swept with 8 warps at the Qwen3.8-27B TP2 shapes (2026-10-23): on Turing
+    # 64 groups hold 128 values per thread, past Triton's register budget
+    # there, and 16 run 2.2x faster (17408 x 5120: 1.090 -> 0.496 ms, 460
+    # GB/s); on Volta 64 stays the fastest (34816 x 5120: 1.83 ms vs 2.19 ms
+    # for 32 groups and 4 warps).
+    return 16 if current_platform.is_device_capability((7, 5), device_index) else 64
+
+
 def nvfp4_qpn2_dequant(
     codes: torch.Tensor,
     scales: torch.Tensor,
@@ -149,9 +162,7 @@ def nvfp4_qpn2_dequant(
     tiles = n // 32
     if out is None:
         out = torch.empty(n, k, dtype=torch.float16, device=codes.device)
-    # 64 groups per program with 8 warps was the fastest of the swept
-    # configurations on Volta (34816 x 5120: 1.83 ms vs 2.19 ms for 32 / 4).
-    groups_per_block = 64
+    groups_per_block = _groups_per_block(codes.device.index)
     grid = (tiles, triton.cdiv(groups, groups_per_block))
     codes32 = codes.view(torch.int32)
     # The scales are fp8-e4m3fn bytes; Triton on these devices reads them as

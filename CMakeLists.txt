@@ -445,6 +445,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_prefill_cutlass.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn2_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/skinny_moe_qpn_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/csf32_expand_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_fp16_gemv_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/bf16_weight_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_cublaslt_sm70.cpp"
@@ -476,6 +477,22 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
       CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+    # Turing runs this family through binary compatibility. Kernels built on
+    # the m16n8k8 MMA, which Volta lacks, ship sm_75 code even in a 7.0-only
+    # build; the dispatch reaches them only on SM75 devices.
+    set(VLLM_SM75_TURBOMIND_SRCS
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_mma_sm75.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/paged_prefill_attention_sm75.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/indexer_prefill_scores_sm75.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${VLLM_SM75_TURBOMIND_SRCS}"
+      CUDA_ARCHS "7.5")
+    list(APPEND VLLM_SM70_TURBOMIND_SRCS "${VLLM_SM75_TURBOMIND_SRCS}")
+    # The grouped skinny MoE runs m16n8k8 fragments on SM75; its sm_75 image
+    # comes next to the sm_70 one (the flags append).
+    set_gencode_flags_for_srcs(
+      SRCS "${VLLM_SM70_TURBOMIND_ROOT}/ops/skinny_moe_qpn_sm70.cu"
+      CUDA_ARCHS "7.5")
     set_source_files_properties(
       csrc/torch_bindings.cpp
       PROPERTIES COMPILE_DEFINITIONS ENABLE_SM70_TURBOMIND=1)

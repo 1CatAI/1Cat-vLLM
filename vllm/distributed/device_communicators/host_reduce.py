@@ -14,7 +14,12 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.config.kernel import HostReduceConfig
 from vllm.platforms import current_platform
 
-_OPS = ("host_reduce_open", "host_reduce_close", "host_reduce_out")
+_OPS = (
+    "host_reduce_open",
+    "host_reduce_close",
+    "host_reduce_out",
+    "host_reduce_copy_engine_out",
+)
 
 
 def _nccl_peer_access(group, device: torch.device) -> bool:
@@ -72,7 +77,10 @@ class HostReduceCommunicator:
         if reason is None:
             self._open()
         self.status.update(
-            enabled=reason is None, reason=reason, max_bytes=self.policy.max_bytes
+            enabled=reason is None,
+            reason=reason,
+            max_bytes=self.policy.max_bytes,
+            copy_engine_max_bytes=self.policy.copy_engine_max_bytes,
         )
         if cfg:
             cfg.kernel_config.collective_kernel_selections[name] = self.status
@@ -86,7 +94,10 @@ class HostReduceCommunicator:
         )
         with torch.accelerator.device_index(self.device.index):
             self.handle = torch.ops._C.host_reduce_open(
-                paths[0], self.rank, self.policy.max_bytes
+                paths[0],
+                self.rank,
+                self.policy.max_bytes,
+                self.policy.copy_engine_max_bytes,
             )
         dist.barrier(group=self.group)
         if self.rank == 0:
@@ -101,8 +112,14 @@ class HostReduceCommunicator:
         if tensor.device != self.device or not tensor.is_contiguous():
             return "requires_contiguous_local_cuda_input"
         nbytes = tensor.numel() * tensor.element_size()
-        if not 0 < nbytes <= self.policy.max_bytes or nbytes % 16:
+        largest = max(self.policy.max_bytes, self.policy.copy_engine_max_bytes)
+        if not 0 < nbytes <= largest or nbytes % 16:
             return "payload_outside_channel"
+        # The copy-engine mode orders its pieces from the host, so a graph
+        # cannot replay it; captured payloads of that size keep the next
+        # collective in the chain.
+        if nbytes > self.policy.max_bytes and torch.cuda.is_current_stream_capturing():
+            return "copy_engine_mode_not_capturable"
         if tensor.data_ptr() % 16:
             return "requires_16_byte_alignment"
         return None
@@ -111,7 +128,10 @@ class HostReduceCommunicator:
         if self.rejection_reason(tensor) is not None:
             return None
         output = torch.empty_like(tensor)
-        torch.ops._C.host_reduce_out(output, tensor, self.handle)
+        if tensor.numel() * tensor.element_size() <= self.policy.max_bytes:
+            torch.ops._C.host_reduce_out(output, tensor, self.handle)
+        else:
+            torch.ops._C.host_reduce_copy_engine_out(output, tensor, self.handle)
         return output
 
     def close(self) -> None:

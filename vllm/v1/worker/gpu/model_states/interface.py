@@ -105,6 +105,11 @@ class ModelState(ABC):
     ) -> None:
         return None
 
+    def align_ubatch_split(self, input_batch: InputBatch, split_token: int) -> int:
+        """Token index at which a batch splits into two micro-batches, moved
+        forward from ``split_token`` where per-request model state needs it."""
+        return split_token
+
     @abstractmethod
     def get_mm_embeddings(
         self,
@@ -134,5 +139,6 @@ class ModelState(ABC):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        ubatch_id: int = 0,
     ) -> dict[str, Any]:
         raise NotImplementedError
