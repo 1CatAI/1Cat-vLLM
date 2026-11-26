@@ -52,8 +52,9 @@ They are investigated separately, after the layout-independent parts.
    the same fp32 `[G, T, N]` K-group partials, so the in-order group sum, `select_experts`
    and the reference grouping are unchanged; only the summation order inside a 1024-wide
    group differs. Larger batches keep the tile kernel.
-2. **Decode attention and short convs:** fused prep (q/k/v/r with the K/V convs) and
-   grouped-query split-KV decode attention.
+2. **Decode attention and short convs:** first, SM70 launch configs for #1598's existing
+   prologue, short-conv and decode-attention kernels (done, below); new fused kernels
+   only if the remaining gap justifies them.
 3. **Experts:** after the layout question above is settled.
 
 Each step replaces a #1598 decode kernel only where it is measured faster at TP=1 and TP=2,
@@ -83,3 +84,51 @@ Numerics, measured by running the official checkpoint against #1598 with
 Kernel test `tests/models/inkling2/test_sm70_router_gemv.py`:
 - the partials match the tile kernel within fp32 rounding;
 - batches above 8 still take the tile kernel, bit for bit.
+
+### 2. Launch configs: prologue, short conv, decode attention
+
+Same kernels as #1598, with SM70 decode launch parameters chosen by sweeps (eager per-kernel
+profile at TP=1, ms per decode step):
+
+| Kernel | Change | Before | After |
+| --- | --- | --- | --- |
+| `_attn_prologue_kernel` | 8 warps for decode (no fused q/r tokens) | 16.8 µs | 9.6 µs |
+| `_sconv_kernel` | 128-channel decode tile | 9.5 µs | 5.7 µs |
+| `_rel_attention_kernel` | 32-key blocks for 16-row decode tiles | 1.66 ms | 0.91 ms |
+| `_rel_attention_kernel` at 7k context | same | 4.0 ms | 3.4 ms |
+
+Per-kernel figures are per launch for the prologue and short conv, and per step (48
+launches) for attention. Rejected in the attention sweep:
+- 2 warps: 4–8× slower;
+- 1 pipeline stage: no change;
+- fewer local splits: slower at 4k.
+
+Prefill launches and other architectures are unchanged.
+
+Q8 GGUF, TP=1, one V100, CUDA graphs, decode tok/s (short / 4k / 16k):
+
+| Stage | tok/s |
+| --- | --- |
+| #1598 | 44.2 / 41.4 / 38.4 |
+| + router GEMV | 51.3 / 47.7 / 43.7 |
+| + prologue and short-conv configs | 52.8 / 49.0 / 44.8 |
+| + 32-key decode attention blocks | 55.8 / 51.5 / 46.9 |
+
+That is +26 / +24 / +22 % over #1598. Greedy output matches the official checkpoint on all
+parity prompts at every stage.
+
+### Test fix: FP8 KV attention test read past its scale buffers
+
+`test_rel_attention_fp8_kv` (from #1598) failed intermittently in full-file runs:
+- 2 of 6 runs at the #1598 head, 1 of 6 on this branch before the fix;
+- non-finite output in the prefill case;
+- never when run alone.
+
+Cause: the test passed per-head `(H,)` q/r scales, while the fused clip reads
+per-element `(HQ, D)` / `(HQ, D_rel)` scales, as the model allocates them.
+compute-sanitizer memcheck reported 1879 invalid reads in `_l2_clip`, so results depended
+on whatever memory followed the 96-byte buffers.
+
+The test now uses full-shape scales with the same values, and `attention_prologue` asserts
+the shapes. The model path was already in bounds. After the fix, 4 of 4 full-file runs
+pass with identical numbers, and memcheck reports 0 errors.
