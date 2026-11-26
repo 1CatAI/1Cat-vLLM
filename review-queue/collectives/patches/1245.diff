@@ -1,0 +1,4229 @@
+diff --git a/MANIFEST.in b/MANIFEST.in
+index cc443d0161..c3eb284ff0 100644
+--- a/MANIFEST.in
++++ b/MANIFEST.in
+@@ -9,3 +9,5 @@ recursive-include cmake *
+ recursive-include csrc *
+ recursive-include flash_qla *.py *.cu LICENSE
+ recursive-include flash-attention-v100/kernel/h3 *.cu *.h *.md
++
++recursive-include vllm/distributed/device_communicators/topology_all_reduce *.cpp
+diff --git a/benchmarks/kernels/benchmark_topology_all_reduce.py b/benchmarks/kernels/benchmark_topology_all_reduce.py
+new file mode 100644
+index 0000000000..fa773a3825
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_topology_all_reduce.py
+@@ -0,0 +1,144 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Measure full-group and representative peer-link all-reduce crossovers.
++
++Run with torchrun on one node, one process per visible GPU. Results describe
++complete dependent graph calls, not isolated wire latency or model throughput.
++Use a fresh output directory for each run. The ordinary communicator retains
++its serving capture/registration lifecycle, including for pair comparisons.
++"""
++
++import argparse
++import json
++import socket
++from datetime import timedelta
++from pathlib import Path
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument(
++        "--sizes-kib", type=int, nargs="+", default=[1, 5, 10, 25, 40, 80]
++    )
++    parser.add_argument(
++        "--precisions", choices=("fp16", "fp32"), nargs="+", default=["fp16", "fp32"]
++    )
++    parser.add_argument("--budget", type=int, default=2048)
++    parser.add_argument("--shortlist", type=int, default=8)
++    parser.add_argument(
++        "--groups", choices=("full", "pairs"), nargs="+", default=["full", "pairs"]
++    )
++    args = parser.parse_args()
++    if any(size <= 0 for size in args.sizes_kib):
++        parser.error("Payload sizes must be positive KiB counts")
++
++    import torch
++    import torch.distributed as dist
++
++    from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
++    from vllm.distributed.device_communicators.topology_all_reduce import (
++        collective_tuner,
++        planner_probe,
++    )
++
++    torch.set_num_threads(1)
++    dist.init_process_group("gloo", timeout=timedelta(seconds=1800))
++    rank, world = dist.get_rank(), dist.get_world_size()
++    hosts = [None] * world
++    dist.all_gather_object(hosts, socket.gethostname())
++    if len(set(hosts)) != 1 or world != torch.accelerator.device_count():
++        raise ValueError("Use one process per visible GPU on a single node")
++    torch.accelerator.set_device_index(rank)
++    device = torch.device("cuda", rank)
++    visible = planner_probe.visible_devices()
++    topology = planner_probe.discover()
++    groups = [("full", list(range(world)))] if "full" in args.groups else []
++    representatives = {}
++    for a in range(world):
++        for b in range(a + 1, world):
++            label = topology.labels.get((visible[a], visible[b]))
++            if label and (visible[b], visible[a]) in topology.labels:
++                representatives.setdefault(label, [a, b])
++    if "pairs" in args.groups:
++        groups.extend(sorted(representatives.items()))
++    if rank == 0:
++        args.output.mkdir(parents=True, exist_ok=False)
++        (args.output / "manifest.json").write_text(
++            json.dumps(
++                dict(
++                    groups=groups,
++                    sizes_kib=args.sizes_kib,
++                    precisions=args.precisions,
++                    budget=args.budget,
++                    shortlist=args.shortlist,
++                    grids="automatic",
++                    torch=str(torch.__version__),
++                    cuda=torch.version.cuda,
++                ),
++                indent=2,
++            )
++            + "\n"
++        )
++    dist.barrier()
++    rows = []
++    try:
++        for label, members in groups:
++            group = dist.new_group(members, backend="gloo")
++            if rank in members:
++                backend = CudaCommunicator(
++                    group, device=device, unique_name="tp-benchmark"
++                )
++                try:
++                    for precision in args.precisions:
++                        for size in args.sizes_kib:
++                            cache = args.output / f"{label}-{precision}-{size}.json"
++                            for repeat in range(2):
++                                prepared = collective_tuner.prepare_best(
++                                    group,
++                                    device,
++                                    topology,
++                                    existing=backend,
++                                    payload_bytes=size * 1024,
++                                    precision=precision,
++                                    budget=args.budget,
++                                    shortlist=args.shortlist,
++                                    cache=cache,
++                                    context=dict(group=members, link=label),
++                                )
++                                try:
++                                    if (
++                                        prepared.channel is not None
++                                        and world > 1
++                                        and prepared.receipt["cache_hit"]
++                                        != bool(repeat)
++                                    ):
++                                        raise RuntimeError("Unexpected cache reuse")
++                                    rows.append(
++                                        dict(
++                                            group=label,
++                                            ranks=members,
++                                            precision=precision,
++                                            kib=size,
++                                            repeat=repeat,
++                                            receipt=prepared.receipt,
++                                        )
++                                    )
++                                finally:
++                                    prepared.close()
++                            (args.output / f"rank{rank}.json").write_text(
++                                json.dumps(rows, indent=2) + "\n"
++                            )
++                finally:
++                    backend.destroy()
++                    dist.destroy_process_group(group)
++            dist.barrier()
++            if rank == 0:
++                print(f"Completed {label}", flush=True)
++    finally:
++        dist.destroy_process_group()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/design/architecture/runtime_reference.md b/docs/design/architecture/runtime_reference.md
+index 874754bb6e..67ef576ad0 100644
+--- a/docs/design/architecture/runtime_reference.md
++++ b/docs/design/architecture/runtime_reference.md
+@@ -38,12 +38,13 @@ identify initialization/hash code; they do not evaluate its semantics.
+ | `vllm.config.gdn_state.GdnStateConfig` | kernel_config.gdn.state | resolve: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L39); graph_options: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L52) | [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L23) |
+ | `vllm.config.gdn_state.GdnStateTraceConfig` | observability_config.gdn_state | resolve: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L99); compile_ignored_aliases: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L142) | [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L59) |
+ | `vllm.config.kernel.IrOpPriorityConfig` | kernel_config.ir_op_priority | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L84) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L67) |
+-| `vllm.config.kernel.KernelConfig` | kernel_config | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L1095) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L632) |
++| `vllm.config.kernel.KernelConfig` | kernel_config | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L1115) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L647) |
+ | `vllm.config.kernel.Sm70AwqConfig` | kernel_config.sm70_awq | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L338); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L317) |
+ | `vllm.config.kernel.Sm70Fp8Config` | kernel_config.sm70_fp8 | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L433); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L369) |
+ | `vllm.config.kernel.Sm70GgufConfig` | kernel_config.sm70_gguf |  | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L498) |
+ | `vllm.config.kernel.Sm70NvFp4Config` | kernel_config.sm70_nvfp4 | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L277); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L236) |
+ | `vllm.config.kernel.Sm70RingConfig` | kernel_config.sm70_ring |  | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L621) |
++| `vllm.config.kernel.TopologyAllReduceConfig` | kernel_config.topology_all_reduce |  | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L632) |
+ | `vllm.config.kv_events.KVEventsConfig` | kv_events_config | __post_init__: [vllm/config/kv_events.py](../../../vllm/config/kv_events.py#L50) | [vllm/config/kv_events.py](../../../vllm/config/kv_events.py#L11) |
+ | `vllm.config.kv_transfer.KVTransferConfig` | kv_transfer_config | compute_hash: [vllm/config/kv_transfer.py](../../../vllm/config/kv_transfer.py#L75); __post_init__: [vllm/config/kv_transfer.py](../../../vllm/config/kv_transfer.py#L93) | [vllm/config/kv_transfer.py](../../../vllm/config/kv_transfer.py#L23) |
+ | `vllm.config.legacy_inputs.LegacyInputs` | kernel_config.sm70_awq.legacy, kernel_config.sm70_fp8.legacy, kernel_config.sm70_moe.awq.legacy, kernel_config.sm70_moe.fp8.legacy, kernel_config.sm70_moe.mxfp4.legacy, kernel_config.sm70_moe.nvfp4.legacy, kernel_config.sm70_nvfp4.legacy, scheduler_config.sm70_inputs | value: [vllm/config/legacy_inputs.py](../../../vllm/config/legacy_inputs.py#L39) | [vllm/config/legacy_inputs.py](../../../vllm/config/legacy_inputs.py#L15) |
+diff --git a/setup.py b/setup.py
+index 6144032ce6..365106d69d 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1453,6 +1453,7 @@ def _read_requirements(filename: str) -> list[str]:
+         "entrypoints/serve/instrumentator/static/*.js",
+         "entrypoints/serve/instrumentator/static/*.css",
+         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
++        "distributed/device_communicators/topology_all_reduce/*.cpp",
+         # DeepGEMM JIT include headers (vendored via cmake)
+         "third_party/deep_gemm/include/**/*.cuh",
+         "third_party/deep_gemm/include/**/*.h",
+diff --git a/tests/distributed/topology_all_reduce/__init__.py b/tests/distributed/topology_all_reduce/__init__.py
+new file mode 100644
+index 0000000000..11d4ddddbb
+--- /dev/null
++++ b/tests/distributed/topology_all_reduce/__init__.py
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from . import _package  # noqa: F401
+diff --git a/tests/distributed/topology_all_reduce/_package.py b/tests/distributed/topology_all_reduce/_package.py
+new file mode 100644
+index 0000000000..baf34c3f69
+--- /dev/null
++++ b/tests/distributed/topology_all_reduce/_package.py
+@@ -0,0 +1,22 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Load the CPU-only package without initializing vLLM's CUDA runtime."""
++
++import importlib.util
++import sys
++from pathlib import Path
++
++PACKAGE = (
++    Path(__file__).resolve().parents[3]
++    / "vllm/distributed/device_communicators/topology_all_reduce"
++)
++NAME = "_vllm_topology_all_reduce_tests"
++if NAME not in sys.modules:
++    spec = importlib.util.spec_from_file_location(
++        NAME, PACKAGE / "__init__.py", submodule_search_locations=[str(PACKAGE)]
++    )
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[NAME] = module
++    spec.loader.exec_module(module)
+diff --git a/tests/distributed/topology_all_reduce/test_collective_capture.py b/tests/distributed/topology_all_reduce/test_collective_capture.py
+new file mode 100644
+index 0000000000..601c18cc24
+--- /dev/null
++++ b/tests/distributed/topology_all_reduce/test_collective_capture.py
+@@ -0,0 +1,212 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Exercise the real qualification/timing loops with CPU graph stand-ins."""
++
++import unittest
++from contextlib import ExitStack, contextmanager
++from types import SimpleNamespace
++from typing import Any
++from unittest.mock import patch
++
++from _vllm_topology_all_reduce_tests.collective_setup import measure_channel
++from _vllm_topology_all_reduce_tests.collective_tuner import BoundBackend, Existing
++from _vllm_topology_all_reduce_tests.planned_collectives import PlannedChannel
++
++
++class CaptureTests(unittest.TestCase):
++    def exercise(self, timing, *, custom=True, world=3, corrupt=False, native=False):
++        import torch
++
++        events = []
++        active_graph = None
++        capturing = False
++        registered = False
++        gathered: list[torch.Tensor] = []
++        graph_outputs = []
++        tensor_gathers = 0
++        divisor = 16384 if timing else 1048576
++
++        @contextmanager
++        def capture():
++            nonlocal capturing, registered
++            capturing = True
++            events.append("enter")
++            yield
++            capturing = False
++            registered = True
++            events.append("register")
++
++        @contextmanager
++        def graph_context(graph):
++            nonlocal active_graph
++            if custom:
++                self.assertTrue(capturing)
++            active_graph = graph
++            events.append("cuda-enter")
++            yield
++            events.append("cuda-exit")
++            active_graph = None
++
++        class Graph:
++            def __init__(self):
++                self.operations = []
++
++            def replay(graph):
++                if custom:
++                    self.assertTrue(registered)
++                    self.assertFalse(capturing)
++                events.append("replay")
++                for i, (source, output) in enumerate(graph.operations):
++                    values = (
++                        [source + r / divisor for r in range(world)]
++                        if i == 0
++                        else [source] * world
++                    )
++                    result = values[0].clone()
++                    for value in values[1:]:
++                        result = result + value
++                    if corrupt and i == 1:
++                        result = result + 0.125
++                    output.copy_(result)
++
++        def all_reduce(source):
++            if active_graph is not None:
++                output = torch.empty_like(source)
++                active_graph.operations.append((source, output))
++                graph_outputs.append(output)
++                return output
++            result = gathered[0].clone()
++            for value in gathered[1:]:
++                result = result + value
++            return result
++
++        def gather(output, value, group):
++            nonlocal gathered, tensor_gathers
++            if isinstance(value, torch.Tensor):
++                tensor_gathers += 1
++                # Eager inputs differ by rank; replay outputs are identical.
++                values = (
++                    [value + r / divisor for r in range(world)]
++                    if not any(value is tensor for tensor in graph_outputs)
++                    else [value] * world
++                )
++                output[:] = values
++                gathered = values
++            else:
++                output[:] = [value] * world
++
++        empty = torch.empty
++
++        def allocate(*args, **kwargs):
++            if custom:
++                self.assertTrue(capturing)
++            events.append("allocate")
++            return empty(*args, **kwargs)
++
++        members = list(range(world))
++        plan = dict(
++            payload_bytes=64,
++            members=members,
++            devices=members,
++            precision="fp16",
++            values=[dict(children=None, dtype="fp16") for _ in members]
++            + [
++                dict(children=[0 if r == 1 else world + r - 2, r], dtype="fp16")
++                for r in range(1, world)
++            ],
++            outputs=[2 * world - 2] * world,
++            fingerprint="cpu-test",
++        )
++        backend = SimpleNamespace(
++            all_reduce=all_reduce,
++            ca_comm=SimpleNamespace(capture=capture) if custom else None,
++        )
++        with ExitStack() as stack:
++            for target, replacement in (
++                ("torch.distributed.get_rank", lambda group: 0),
++                ("torch.distributed.get_world_size", lambda group: world),
++                ("torch.distributed.all_gather_object", gather),
++                ("torch.distributed.barrier", lambda group: None),
++                ("torch.accelerator.synchronize", lambda device: None),
++                ("torch.cuda.CUDAGraph", Graph),
++                ("torch.cuda.graph", graph_context),
++                (
++                    "torch.cuda.Event",
++                    lambda **kw: SimpleNamespace(
++                        record=lambda: None, elapsed_time=lambda end: 1.0
++                    ),
++                ),
++                ("torch.empty", allocate),
++            ):
++                stack.enter_context(patch(target, replacement))
++            adapter: Any
++            if native:
++                adapter = PlannedChannel.__new__(PlannedChannel)
++                adapter.group, adapter.device, adapter.plan = (
++                    "cpu-group",
++                    torch.device("cpu"),
++                    plan,
++                )
++                adapter.native, adapter.rank, adapter.capacity = (
++                    True,
++                    0,
++                    plan["payload_bytes"],
++                )
++                adapter.all_reduce = all_reduce
++            else:
++                adapter = Existing(
++                    BoundBackend(backend), "cpu-group", torch.device("cpu"), plan
++                )
++            receipt = (
++                measure_channel(adapter, repeats=3, warmup=1)
++                if timing
++                else adapter.qualify(repeats=2)
++            )
++        if custom:
++            self.assertLess(events.index("enter"), events.index("allocate"))
++            self.assertLess(events.index("cuda-exit"), events.index("register"))
++            self.assertLess(events.index("register"), events.index("replay"))
++        self.assertFalse(torch.cuda.is_initialized())
++        receipt["tensor_gathers"] = tensor_gathers
++        return receipt
++
++    def test_timing_registers_graph_inputs_before_replay(self):
++        result = self.exercise(timing=True)
++        self.assertTrue(result["correct"])
++        self.assertEqual(len(result["samples_us"]), 3)
++
++    def test_qualification_uses_same_capture_lifecycle(self):
++        self.assertEqual(self.exercise(timing=False)["status"], "passed")
++
++    def test_nccl_only_backend_needs_no_custom_capture_context(self):
++        self.assertTrue(self.exercise(timing=True, custom=False)["correct"])
++
++    def test_corrupt_dependent_result_fails_both_loops(self):
++        for timing in (False, True):
++            for native in (False, True):
++                with (
++                    self.subTest(timing=timing, native=native),
++                    self.assertRaises(RuntimeError),
++                ):
++                    self.exercise(
++                        timing=timing, corrupt=True, native=native, custom=not native
++                    )
++
++    def test_generated_checks_do_not_gather_intermediate_tensors(self):
++        result = self.exercise(timing=False, custom=False, native=True)
++        self.assertEqual(result["status"], "passed")
++        self.assertEqual(
++            result["tensor_gathers"], 4
++        )  # Eager and initial graph inputs only.
++        result = self.exercise(timing=True, custom=False, native=True)
++        self.assertTrue(result["correct"])
++        self.assertEqual(result["tensor_gathers"], 0)
++
++    def test_large_group_probes_remain_finite(self):
++        self.assertEqual(self.exercise(timing=False, world=64)["status"], "passed")
++        self.assertTrue(self.exercise(timing=True, world=64)["correct"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/distributed/topology_all_reduce/test_collective_planner.py b/tests/distributed/topology_all_reduce/test_collective_planner.py
+new file mode 100644
+index 0000000000..5c68827324
+--- /dev/null
++++ b/tests/distributed/topology_all_reduce/test_collective_planner.py
+@@ -0,0 +1,185 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import copy
++import itertools
++import tempfile
++import time
++import unittest
++from pathlib import Path
++
++from _vllm_topology_all_reduce_tests.collective_planner import (
++    Topology,
++    load_selection,
++    save_selection,
++    select_measured,
++    simulate,
++    solve,
++    validate,
++)
++
++
++def graph(nodes, edges, labels=None):
++    return Topology(
++        list(nodes),
++        [
++            dict(
++                source=a,
++                dest=b,
++                transport=(labels or {}).get((a, b), "PIX"),
++                latency_us=1.0,
++                bytes_per_us=6000.0,
++            )
++            for a, b in edges
++        ],
++    )
++
++
++class PlannerTests(unittest.TestCase):
++    def test_local_and_arbitrary_sparse_sizes(self):
++        for n in (1, 2, 3, 4, 5, 8, 12):
++            nodes = [13 + i * 3 for i in range(n)]
++            edges = [
++                (a, b) for a, b in zip(nodes, nodes[1:]) for a, b in ((a, b), (b, a))
++            ]
++            topology = graph(nodes, edges)
++            result = solve(topology, nodes, budget=32)
++            self.assertEqual(result["status"], "shortlisted")
++            self.assertLessEqual(result["evaluations"], 32)
++            for entry in result["candidates"]:
++                self.assertTrue(validate(entry["plan"], topology))
++
++    def test_disconnected_and_unidirectional_fail_to_fallback(self):
++        for edges in ([], [(0, 1)]):
++            result = solve(graph([0, 1], edges), [0, 1], budget=32)
++            self.assertEqual(result["status"], "fallback-required")
++            self.assertFalse(result["candidates"])
++
++    def test_external_relay_has_no_input_contribution(self):
++        topology = graph(
++            ["left", "relay", "right"],
++            [
++                ("left", "relay"),
++                ("relay", "left"),
++                ("right", "relay"),
++                ("relay", "right"),
++            ],
++        )
++        result = solve(topology, ["left", "right"], helpers=["relay"], budget=32)
++        self.assertEqual(result["status"], "shortlisted")
++        for candidate in result["candidates"]:
++            p = candidate["plan"]
++            validate(p, topology)
++            helper = p["devices"].index("relay")
++            self.assertEqual(p["values"][helper]["mask"], 0)
++            self.assertEqual(p["values"][p["outputs"][0]]["mask"], 3)
++            for m in p["messages"]:
++                self.assertIn(
++                    (p["devices"][m["source"]], p["devices"][m["dest"]]),
++                    topology.labels,
++                )
++
++    def test_cache_requires_measured_finite_correct_receipt_and_exact_context(self):
++        topology = graph([0, 1], [(0, 1), (1, 0)])
++        result = solve(topology, [0, 1], budget=32)
++        receipt = select_measured(
++            result,
++            lambda p: dict(correct=True, samples_us=[3.0, 2.0, 4.0]),
++            context={"driver": "a", "concurrent_groups": [[0, 1]]},
++        )
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / "selection.json"
++            save_selection(path, result, receipt)
++            self.assertIsNotNone(load_selection(path, result, receipt["context"]))
++            self.assertIsNone(load_selection(path, result, {"driver": "b"}))
++            changed = solve(topology, [0, 1], payload_bytes=10240, budget=32)
++            self.assertIsNone(load_selection(path, changed, receipt["context"]))
++            changed = solve(topology, [1, 0], budget=32)
++            self.assertIsNone(load_selection(path, changed, receipt["context"]))
++        self.assertEqual(
++            select_measured(
++                result,
++                lambda p: dict(correct=False, samples_us=[1.0, 2.0, 3.0]),
++                context={},
++            )["status"],
++            "fallback-required",
++        )
++        with self.assertRaisesRegex(ValueError, "samples"):
++            select_measured(
++                result,
++                lambda p: dict(correct=True, samples_us=[1.0, 2.0, float("nan")]),
++                context={},
++            )
++
++    def test_current_graph_bounded_search_finds_balanced_delivery(self):
++        # Synthetic crossed topology: NVLink 4+2+2, PCIe 4+4.
++        islands = ((0, 1, 2, 3), (4, 5), (6, 7))
++        planes = ((0, 1, 4, 6), (2, 3, 5, 7))
++        labels = {
++            (a, b): ("NV2" if any(a in g and b in g for g in islands) else "PIX")
++            for a, b in itertools.permutations(range(8), 2)
++            if any(a in g and b in g for g in islands + planes)
++        }
++        topology = graph(range(8), labels, labels)
++        started = time.monotonic()
++        result = solve(topology, range(8), precision="fp16", budget=2048, shortlist=8)
++        self.assertLess(time.monotonic() - started, 10)
++        self.assertEqual(result["evaluations"], 2048)
++        balanced = [
++            e for e in result["candidates"] if e["plan"]["family"] == "island-delivery"
++        ]
++        self.assertTrue(balanced)
++        for entry in balanced:
++            p = entry["plan"]
++            payload = sum(
++                m["bytes"]
++                for m in p["messages"]
++                if not topology.labels[
++                    p["devices"][m["source"]], p["devices"][m["dest"]]
++                ].startswith("NV")
++            )
++            self.assertEqual(payload, 30720)
++        repeat = solve(topology, range(8), precision="fp16", budget=2048, shortlist=8)
++        self.assertEqual(result["candidates"], repeat["candidates"])
++        self.assertEqual(result["key"], repeat["key"])
++
++    def test_explicit_shared_resources_and_duplex(self):
++        resources = {"bus": dict(bytes_per_us=6000.0, lanes=1)}
++        topology = Topology(
++            [0, 1, 2, 3],
++            [
++                dict(
++                    source=a,
++                    dest=b,
++                    transport="PIX",
++                    latency_us=1.0,
++                    bytes_per_us=6000.0,
++                    resources=["bus"],
++                )
++                for a, b in itertools.permutations(range(4), 2)
++            ],
++            resources,
++        )
++        result = solve(topology, [0, 1, 2, 3], budget=32)
++        for entry in result["candidates"]:
++            trace = simulate(entry["plan"], topology, trace=True)["events"]
++            sends = [v for v in trace if v["op"] == "send"]
++            times = sorted(v["start_us"] for v in sends)
++            self.assertEqual(len(times), len(set(times)))
++
++    def test_invalid_profiles_and_duplicate_contributions_rejected(self):
++        with self.assertRaises(ValueError):
++            Topology(
++                [0, 1],
++                [dict(source=0, dest=1, latency_us=float("nan"), bytes_per_us=1)],
++            )
++        topology = graph([0, 1], [(0, 1), (1, 0)])
++        result = solve(topology, [0, 1], budget=32)
++        broken = copy.deepcopy(result["candidates"][0]["plan"])
++        broken["values"][-1]["mask"] = 1
++        with self.assertRaises(ValueError):
++            validate(broken, topology)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/distributed/topology_all_reduce/test_collective_startup.py b/tests/distributed/topology_all_reduce/test_collective_startup.py
+new file mode 100644
+index 0000000000..0b260357e3
+--- /dev/null
++++ b/tests/distributed/topology_all_reduce/test_collective_startup.py
+@@ -0,0 +1,195 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++
++"""Startup sizing follows model/speculation metadata instead of model names."""
++
++import unittest
++from types import SimpleNamespace
++
++from _vllm_topology_all_reduce_tests.startup import payloads
++
++
++def model(hidden):
++    return SimpleNamespace(get_hidden_size=lambda: hidden)
++
++
++class StartupTests(unittest.TestCase):
++    def test_target_only(self):
++        self.assertEqual(payloads(model(5120)), [10240])
++
++    def test_different_draft_width(self):
++        spec = SimpleNamespace(num_speculative_tokens=7, draft_model_config=model(4096))
++        self.assertEqual(payloads(model(5120), spec), [8192, 10240, 65536, 81920])
++
++    def test_mtp_and_shared_width_deduplication(self):
++        spec = SimpleNamespace(num_speculative_tokens=4, draft_model_config=model(2560))
++        self.assertEqual(payloads(model(2560), spec), [5120, 25600])
++
++    def test_native_packet_alignment(self):
++        with self.assertRaises(ValueError):
++            payloads(model(1537))
++
++
++class InstallTests(unittest.TestCase):
++    """Exercise startup wiring with a communicator, without a CUDA runtime."""
++
++    def run_install(self, *, world=2, remote=False, precision="fp16"):
++        import tempfile
++        from contextlib import ExitStack
++        from unittest.mock import Mock, patch
++
++        from _vllm_topology_all_reduce_tests import collective_tuner, startup
++
++        calls = []
++        comm = SimpleNamespace(
++            all_reduce=lambda x: ("existing", x.nbytes),
++            destroy=lambda: calls.append("destroy"),
++        )
++        old_reduce = comm.all_reduce
++        lifecycle = dict(cpu_alive=True)
++        tp = SimpleNamespace(
++            world_size=world,
++            rank_in_group=0,
++            ranks=list(range(world)),
++            device_communicator=comm,
++            cpu_group="cpu",
++        )
++
++        def destroy_group():
++            lifecycle["cpu_alive"] = False
++            comm.destroy()
++
++        tp.destroy = destroy_group
++
++        def gather(output, value, **kwargs):
++            output[:] = [value] * world
++            if remote and isinstance(value, str):
++                output[-1] = value + "-other-node"
++
++        dist = SimpleNamespace(all_gather_object=gather)
++        torch = SimpleNamespace(
++            float16="fp16",
++            distributed=dist,
++            accelerator=SimpleNamespace(synchronize=lambda device: None),
++        )
++        routes = []
++
++        def prepare(group, device, **kwargs):
++            self.assertIs(comm.all_reduce, old_reduce)
++            self.assertEqual(kwargs["precision"], precision)
++            self.assertTrue(str(kwargs["cache"]).endswith(f"-{precision}.json"))
++            width = kwargs["payload_bytes"]
++
++            def close_route():
++                self.assertTrue(lifecycle["cpu_alive"])
++                calls.append(width)
++
++            route = SimpleNamespace(
++                receipt=dict(winner="native", cache_hit=True),
++                all_reduce=lambda x: ("native", width),
++                close=close_route,
++            )
++            routes.append(route)
++            return route
++
++        worker = SimpleNamespace(
++            device="cuda:0",
++            vllm_config=SimpleNamespace(
++                kernel_config=SimpleNamespace(
++                    topology_all_reduce=SimpleNamespace(
++                        precision=precision, cache_dir="unused"
++                    )
++                ),
++                model_config=SimpleNamespace(
++                    model="synthetic", get_hidden_size=lambda: 5120
++                ),
++                speculative_config=SimpleNamespace(
++                    method="synthetic", num_speculative_tokens=7
++                ),
++                scheduler_config=SimpleNamespace(max_num_seqs=4),
++            ),
++        )
++        with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
++            worker.vllm_config.kernel_config.topology_all_reduce.cache_dir = folder
++            vllm = SimpleNamespace()
++            stack.enter_context(
++                patch.dict(
++                    "sys.modules",
++                    {
++                        "torch": torch,
++                        "torch.distributed": dist,
++                        "vllm": vllm,
++                        "vllm.distributed": SimpleNamespace(get_tp_group=lambda: tp),
++                        "vllm.logger": SimpleNamespace(init_logger=lambda name: Mock()),
++                    },
++                )
++            )
++            mock = stack.enter_context(
++                patch.object(collective_tuner, "prepare_best", side_effect=prepare)
++            )
++            result = startup.install(worker)
++            return tp, result, calls, mock.call_count
++
++    def test_local_and_multinode_leave_backend_unchanged(self):
++        for kwargs in (dict(world=1), dict(remote=True)):
++            tp, result, calls, count = self.run_install(**kwargs)
++            comm = tp.device_communicator
++            self.assertEqual(result, {})
++            self.assertEqual(count, 0)
++            self.assertEqual(
++                comm.all_reduce(SimpleNamespace(nbytes=10240))[0], "existing"
++            )
++            self.assertEqual(calls, [])
++
++    def test_freeze_exact_signatures_and_close_before_backend(self):
++        tp, result, calls, count = self.run_install()
++        comm = tp.device_communicator
++        self.assertEqual(sorted(result), [10240, 81920])
++        self.assertEqual(count, 2)
++        tensor = SimpleNamespace(
++            nbytes=10240, dtype="fp16", is_contiguous=lambda: True, data_ptr=lambda: 16
++        )
++        self.assertEqual(comm.all_reduce(tensor), ("native", 10240))
++        tensor.nbytes = 16384
++        self.assertEqual(comm.all_reduce(tensor)[0], "existing")
++        tensor.nbytes = 10240
++        tensor.dtype = "bf16"
++        self.assertEqual(comm.all_reduce(tensor)[0], "existing")
++        tensor.dtype = "fp16"
++        tensor.data_ptr = lambda: 2
++        self.assertEqual(comm.all_reduce(tensor)[0], "existing")
++        tp.destroy()
++        self.assertEqual(calls, [10240, 81920, "destroy"])
++
++    def test_explicit_fp32_reaches_tuner_and_uses_separate_cache(self):
++        tp, result, calls, count = self.run_install(precision="fp32")
++        self.assertEqual(count, 2)
++        self.assertEqual(sorted(result), [10240, 81920])
++        tp.destroy()
++        self.assertEqual(calls, [10240, 81920, "destroy"])
++
++    def test_worker_installs_before_compile_and_capture(self):
++        import ast
++        from pathlib import Path
++
++        root = Path(__file__).resolve().parents[3]
++        source = (root / "vllm/v1/worker/gpu_worker.py").read_text()
++        tree = ast.parse(source)
++        method = next(
++            n
++            for n in ast.walk(tree)
++            if isinstance(n, ast.FunctionDef) and n.name == "compile_or_warm_up_model"
++        )
++        text = ast.get_source_segment(source, method)
++        assert text is not None
++        self.assertIn("kernel_config.topology_all_reduce.enabled", text)
++        self.assertIn('"_topology_all_reduce_installed", False', text)
++        self.assertLess(text.index("startup.install(self)"), text.index("._dummy_run("))
++        self.assertLess(
++            text.index("startup.install(self)"), text.index(".capture_model(")
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/distributed/topology_all_reduce/test_collective_tuner.py b/tests/distributed/topology_all_reduce/test_collective_tuner.py
+new file mode 100644
+index 0000000000..d6411dc795
+--- /dev/null
++++ b/tests/distributed/topology_all_reduce/test_collective_tuner.py
+@@ -0,0 +1,183 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import unittest
++from contextlib import contextmanager
++from types import SimpleNamespace
++from typing import Any
++
++from _vllm_topology_all_reduce_tests.collective_setup import PreparedCollective
++from _vllm_topology_all_reduce_tests.collective_tuner import (
++    BoundBackend,
++    Existing,
++    choose,
++)
++from _vllm_topology_all_reduce_tests.planned_collectives import PlannedChannel
++
++
++class TunerTests(unittest.TestCase):
++    def test_fp32_policy_upcasts_existing_winner_and_fallback(self):
++        import torch
++
++        calls = []
++
++        def reduce(x):
++            calls.append(x.dtype)
++            return x * 2
++
++        backend = SimpleNamespace(all_reduce=reduce)
++        source = torch.tensor([0.125, -0.25], dtype=torch.float16)
++        original = source.clone()
++        bound = BoundBackend(backend, precision="fp32")
++        for route in (bound, PreparedCollective(None, {}, bound)):
++            output = route.all_reduce(source)
++            self.assertEqual(output.dtype, torch.float16)
++            self.assertTrue(torch.equal(output, original * 2))
++            self.assertTrue(torch.equal(source, original))
++        self.assertEqual(calls, [torch.float32, torch.float32])
++        BoundBackend(backend).all_reduce(source)
++        self.assertEqual(calls[-1], torch.float16)
++
++    def test_fp32_qualification_does_not_allow_half_accumulation_error(self):
++        import torch
++
++        adapter = Existing.__new__(Existing)
++        adapter.accumulation = "fp32"
++        values = [torch.tensor([v], dtype=torch.float16) for v in (1.0, 2**-12, -1.0)]
++        reference = torch.stack(values).double().sum(0).half()
++        self.assertTrue(adapter.result_matches(reference, reference, values))
++        self.assertFalse(
++            adapter.result_matches(
++                (values[0] + values[1]) + values[2], reference, values
++            )
++        )
++
++    def test_existing_capture_matches_serving_context(self):
++        events = []
++
++        @contextmanager
++        def capture():
++            events.append("enter")
++            yield
++            events.append("register")
++
++        backend = SimpleNamespace(
++            all_reduce=lambda x: x, ca_comm=SimpleNamespace(capture=capture)
++        )
++        adapter = Existing.__new__(Existing)
++        adapter.accumulation = "fp16"
++        adapter.backend = BoundBackend(backend)
++        with adapter.capture():
++            events.append("capture")
++        self.assertEqual(events, ["enter", "capture", "register"])
++        # NCCL-only communicators and standalone harnesses need no CA context.
++        for backend in (
++            SimpleNamespace(all_reduce=lambda x: x, ca_comm=None),
++            SimpleNamespace(all_reduce=lambda x: x),
++        ):
++            adapter.backend = BoundBackend(backend)
++            with adapter.capture():
++                pass
++        adapter.backend = SimpleNamespace()
++        with adapter.capture():
++            pass
++
++    def test_existing_accepts_half_rounding_with_three_or_more_ranks(self):
++        import torch
++
++        adapter = Existing.__new__(Existing)
++        adapter.accumulation = "fp16"
++        native = PlannedChannel.__new__(PlannedChannel)
++        for world in (3, 4, 8, 64):
++            generator = torch.Generator().manual_seed(723001)
++            values = [
++                (torch.randn(512, generator=generator) * 0.125).half()
++                for _ in range(world)
++            ]
++            reference = torch.stack(values).double().sum(0).half()
++            for order in (values, values[::-1], values[::2] + values[1::2]):
++                output = order[0].clone()
++                for value in order[1:]:
++                    output = output + value
++                self.assertFalse(torch.equal(output, reference))
++                self.assertTrue(adapter.result_matches(output, reference, values))
++                self.assertFalse(native.result_matches(output, reference, values))
++
++    def test_existing_tolerance_handles_cancellation_and_subnormals(self):
++        import torch
++
++        adapter = Existing.__new__(Existing)
++        adapter.accumulation = "fp16"
++        for raw in ((1.0, 2**-12, -1.0), (2**-24, -(2**-24), 2**-24)):
++            values = [torch.tensor([v], dtype=torch.float16) for v in raw]
++            output = (values[0] + values[1]) + values[2]
++            reference = torch.stack(values).double().sum(0).half()
++            self.assertTrue(adapter.result_matches(output, reference, values))
++
++    def test_existing_rejects_wrong_contributions_and_nonfinite_results(self):
++        import torch
++
++        adapter = Existing.__new__(Existing)
++        adapter.accumulation = "fp16"
++        values = [torch.full((16,), v, dtype=torch.float16) for v in (0.125, 0.25, 0.5)]
++        reference = torch.stack(values).double().sum(0).half()
++        for bad in (
++            reference - values[-1],
++            reference + values[0],
++            reference + 0.01,
++            torch.zeros_like(reference),
++            torch.full_like(reference, float("nan")),
++            torch.full_like(reference, float("inf")),
++        ):
++            self.assertFalse(adapter.result_matches(bad, reference, values))
++
++    def test_existing_tolerance_does_not_relax_native_signed_zero_check(self):
++        import torch
++
++        native = PlannedChannel.__new__(PlannedChannel)
++        zero = torch.zeros(16, dtype=torch.float16)
++        self.assertFalse(native.result_matches(-zero, zero, [zero, zero]))
++        self.assertTrue(native.result_matches(zero, zero, [zero, zero]))
++
++    def test_installing_wrapper_cannot_recurse_into_old_communicator(self):
++        class Communicator:
++            def all_reduce(self, x):
++                return x + 1
++
++        old: Any = Communicator()
++        bound = BoundBackend(old)
++        old.all_reduce = lambda x: bound.all_reduce(x) * 2
++        self.assertEqual(old.all_reduce(3), 8)
++
++    def test_only_clear_native_improvement_replaces_existing(self):
++        self.assertEqual(
++            choose(dict(native=[6.0, 6.1, 5.9], existing=[9.0, 8.9, 9.1])), "native"
++        )
++        self.assertEqual(
++            choose(dict(native=[9.0, 8.9, 9.1], existing=[6.0, 6.1, 5.9])), "existing"
++        )
++        self.assertEqual(
++            choose(dict(native=[5.99, 6.0, 5.98], existing=[6.0, 6.0, 6.0])), "existing"
++        )
++        self.assertEqual(
++            choose(dict(native=[5.99, 6.0, 5.98], existing=[6.0, 6.0, 6.0]), margin=0),
++            "native",
++        )
++
++    def test_medians_resist_one_fast_outlier_and_reject_bad_receipts(self):
++        self.assertEqual(
++            choose(dict(native=[1.0, 10.0, 10.0], existing=[6.0, 6.0, 6.0])), "existing"
++        )
++        for values in (
++            [1.0],
++            [1.0, 2.0, float("inf")],
++            [1.0, 2.0, float("nan")],
++            [1.0, 2.0, True],
++            [-1.0, 2.0, 3.0],
++        ):
++            with self.assertRaises(ValueError):
++                choose(dict(native=values, existing=[6.0, 6.0, 6.0]))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/distributed/topology_all_reduce/test_planned_codegen.py b/tests/distributed/topology_all_reduce/test_planned_codegen.py
+new file mode 100644
+index 0000000000..827cfb0de4
+--- /dev/null
++++ b/tests/distributed/topology_all_reduce/test_planned_codegen.py
+@@ -0,0 +1,121 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import copy
++import itertools
++import unittest
++
++from _vllm_topology_all_reduce_tests.collective_planner import Topology, solve
++from _vllm_topology_all_reduce_tests.planned_codegen import generate, layout
++
++
++class PlannedCodeTests(unittest.TestCase):
++    def test_default_uses_half_sums_and_half_partial_transfers(self):
++        topology = self.topology(3)
++        default = solve(topology, range(3), budget=32)
++        half = solve(topology, range(3), precision="fp16", budget=32)
++        wide = solve(topology, range(3), precision="fp32", budget=32)
++        self.assertEqual(default["key"], half["key"])
++        self.assertNotEqual(default["key"], wide["key"])
++        for candidate in default["candidates"]:
++            plan = candidate["plan"]
++            self.assertTrue(all(v["dtype"] == "fp16" for v in plan["values"]))
++            source = generate([plan], topology, 5120)
++            self.assertIn("=add_half(", source)
++            self.assertNotIn("=add_wide(", source)
++
++    def topology(self, n):
++        return Topology(
++            list(range(n)),
++            [
++                dict(
++                    source=a,
++                    dest=b,
++                    transport="NV2",
++                    latency_us=1.0,
++                    bytes_per_us=10000.0,
++                )
++                for a, b in itertools.permutations(range(n), 2)
++            ],
++        )
++
++    def test_fp16_and_fp32_packet_width_and_native_arithmetic(self):
++        topology = self.topology(3)
++        for precision in ("fp16", "fp32"):
++            plan = solve(topology, range(3), precision=precision, budget=32)[
++                "candidates"
++            ][0]["plan"]
++            source = generate([plan], topology, 5120)
++            self.assertEqual(source.count("__global__ void planned_"), 3)
++            self.assertIn("int count", source)
++            self.assertNotIn("i<320", source)
++            self.assertIn("add.rn.f16x2", source)
++            self.assertIn("__fadd_rn", source)
++            self.assertIn(
++                "add_wide(widen(", source
++            ) if precision == "fp32" else self.assertIn("=add_half(", source)
++            offsets, sizes = layout(plan, 5120)
++            for dest in range(3):
++                intervals = []
++                for i, m in enumerate(plan["messages"]):
++                    if m["dest"] != dest:
++                        continue
++                    length = (
++                        5120
++                        * (2 if plan["values"][m["value"]]["dtype"] == "fp32" else 1)
++                        * 2
++                    )
++                    intervals.append((offsets[i], offsets[i] + length))
++                    self.assertLessEqual(offsets[i] + length, sizes[dest])
++                intervals.sort()
++                self.assertTrue(
++                    all(a[1] <= b[0] for a, b in zip(intervals, intervals[1:]))
++                )
++
++    def test_relay_leaf_never_loads_or_writes_member_input_output(self):
++        topology = Topology(
++            [10, 20, 30],
++            [
++                dict(
++                    source=a,
++                    dest=b,
++                    transport="PIX",
++                    latency_us=1.0,
++                    bytes_per_us=6000.0,
++                )
++                for a, b in ((10, 20), (20, 10), (20, 30), (30, 20))
++            ],
++        )
++        plan = solve(topology, [10, 30], helpers=[20], budget=32)["candidates"][0][
++            "plan"
++        ]
++        source = generate([plan], topology, 5120)
++        rank = plan["devices"].index(20)
++        body = source.split(f"__global__ void planned_0_rank_{rank}(")[1].split(
++            "__global__ void"
++        )[0]
++        self.assertIn("make_uint4(0,0,0,0)", body)
++        self.assertNotIn("=x[i]", body)
++        self.assertNotIn("out[i]=", body)
++
++    def test_no_fixed_eight_gpu_assumption(self):
++        for n in (1, 2, 4, 9):
++            topology = self.topology(n)
++            plan = solve(topology, range(n), budget=32)["candidates"][0]["plan"]
++            source = generate([plan], topology, 10240)
++            self.assertIn(f"char* data[{n}]", source)
++            self.assertEqual(source.count("__global__ void planned_"), n)
++
++    def test_reject_invalid_capacity_and_unsupported_mapping(self):
++        topology = self.topology(2)
++        plan = solve(topology, [0, 1], budget=32)["candidates"][0]["plan"]
++        with self.assertRaises(ValueError):
++            generate([plan], topology, 5130)
++        broken = copy.deepcopy(plan)
++        broken["messages"][0]["dest"] = broken["messages"][0]["source"]
++        with self.assertRaises(ValueError):
++            generate([broken], topology, 5120)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/distributed/topology_all_reduce/test_planner_probe.py b/tests/distributed/topology_all_reduce/test_planner_probe.py
+new file mode 100644
+index 0000000000..a91e69210f
+--- /dev/null
++++ b/tests/distributed/topology_all_reduce/test_planner_probe.py
+@@ -0,0 +1,142 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from _vllm_topology_all_reduce_tests.planner_probe import (
++    from_text,
++    matrix,
++    refresh,
++    visible_devices,
++)
++
++
++def table(nodes, diagonal, off):
++    return (
++        "\t"
++        + "\t".join("GPU" + str(n) for n in nodes)
++        + "\n"
++        + "\n".join(
++            "GPU"
++            + str(a)
++            + "\t"
++            + "\t".join(diagonal if a == b else off for b in nodes)
++            for a in nodes
++        )
++    )
++
++
++class ProbeTests(unittest.TestCase):
++    def test_nonconsecutive_ids_and_more_than_eight_cards(self):
++        for nodes in ([0, 3, 11], list(range(12))):
++            topo = from_text(
++                table(nodes, "X", "NV2"),
++                table(nodes, "X", "OK"),
++                table(nodes, "X", "OK"),
++                hardware="uuids",
++            )
++            self.assertEqual(topo.nodes, nodes)
++            self.assertEqual(len(topo.labels), len(nodes) * (len(nodes) - 1))
++            self.assertEqual(topo.identity["hardware"], "uuids")
++
++    def test_single_gpu_header_with_cpu_affinity(self):
++        nodes, labels = matrix(" GPU7 CPU Affinity NUMA Affinity\nGPU7 X 0-31 0\n")
++        self.assertEqual(nodes, [7])
++        self.assertEqual(labels[7, 7], "X")
++        topo = from_text(" GPU7\nGPU7 X\n", " GPU7\nGPU7 X\n", " GPU7\nGPU7 X\n")
++        self.assertEqual(topo.nodes, [7])
++        self.assertFalse(topo.edges)
++
++    def test_negotiated_pcie_width_scales_estimate_and_invalidates_profile(self):
++        nodes = [0, 1]
++        args = (
++            table(nodes, "X", "PIX"),
++            table(nodes, "X", "OK"),
++            table(nodes, "X", "OK"),
++        )
++        slow = from_text(
++            *args,
++            hardware="0, GPU-a, bus0, driver, 3, 8\n1, GPU-b, bus1, driver, 3, 8\n",
++        )
++        fast = from_text(
++            *args,
++            hardware="0, GPU-a, bus0, driver, 4, 16\n1, GPU-b, bus1, driver, 4, 16\n",
++        )
++        self.assertAlmostEqual(
++            fast.links[0, 1]["bytes_per_us"] / slow.links[0, 1]["bytes_per_us"],
++            4.0,
++            places=6,
++        )
++        with patch(
++            "_vllm_topology_all_reduce_tests.planner_probe.discover", return_value=fast
++        ):
++            actual = refresh(slow)
++        self.assertEqual(actual.key, fast.key)
++
++    def test_unsupported_or_one_direction_only_not_invented(self):
++        topo = from_text(
++            table([0, 1], "X", "PIX"),
++            table([0, 1], "X", "OK"),
++            table([0, 1], "X", "NS"),
++        )
++        self.assertFalse(topo.labels)
++        with self.assertRaises(ValueError):
++            matrix(" GPU0 GPU1\nGPU0 X\nGPU1 OK X")
++
++    def test_rewiring_or_uuid_change_discards_old_profiles(self):
++        old = from_text(
++            table([0, 1], "X", "NV2"),
++            table([0, 1], "X", "OK"),
++            table([0, 1], "X", "OK"),
++            hardware="old",
++        )
++        old.edges[0]["latency_us"] = 99
++        old.links[0, 1]["latency_us"] = 99
++        for link, hardware in (("PIX", "old"), ("NV2", "new")):
++            new = from_text(
++                table([0, 1], "X", link),
++                table([0, 1], "X", "OK"),
++                table([0, 1], "X", "OK"),
++                hardware=hardware,
++            )
++            with patch(
++                "_vllm_topology_all_reduce_tests.planner_probe.discover",
++                return_value=new,
++            ):
++                actual = refresh(old)
++            self.assertNotEqual(actual.links[0, 1]["latency_us"], 99)
++        same = from_text(
++            table([0, 1], "X", "NV2"),
++            table([0, 1], "X", "OK"),
++            table([0, 1], "X", "OK"),
++            hardware="old",
++        )
++        with patch(
++            "_vllm_topology_all_reduce_tests.planner_probe.discover", return_value=same
++        ):
++            actual = refresh(old)
++        self.assertEqual(actual.links[0, 1]["latency_us"], 99)
++
++    def test_cuda_ordinal_mapping_uses_uuid_instead_of_environment_assumptions(self):
++        cuda = SimpleNamespace(
++            device_count=lambda: 2,
++            get_device_properties=lambda d: SimpleNamespace(
++                uuid=["GPU-bb", "GPU-aa"][d]
++            ),
++        )
++        with (
++            patch.dict(
++                "sys.modules", {"torch": SimpleNamespace(cuda=cuda, accelerator=cuda)}
++            ),
++            patch(
++                "_vllm_topology_all_reduce_tests.planner_probe.subprocess.check_output",
++                return_value="0, GPU-aa\n3, GPU-bb\n",
++            ),
++        ):
++            self.assertEqual(visible_devices(), [3, 0])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index a23eb0b9b0..b8df775e4e 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -628,10 +628,30 @@ class Sm70RingConfig:
+     """Largest calibrated input payload; larger messages retain NCCL."""
+ 
+ 
++@config
++class TopologyAllReduceConfig:
++    """Experimental measured single-node CUDA IPC all-reduce selection."""
++
++    enabled: bool = False
++    """Qualify and select routes before first model compilation and capture."""
++
++    precision: Literal["fp16", "fp32"] = "fp16"
++    """Use FP16 sums/transfers by default; opt into FP32 sums and partial
++    transfers for accuracy at higher latency. Input and output stay FP16."""
++
++    cache_dir: str | None = None
++    """Selection cache directory; None uses PyTorch's default extension root."""
++
++
+ @config
+ class KernelConfig:
+     """Configuration for kernel selection and warmup behavior."""
+ 
++    topology_all_reduce: TopologyAllReduceConfig = Field(
++        default_factory=TopologyAllReduceConfig
++    )
++    """Opt-in topology-aware peer reduction with startup measured selection."""
++
+     layer_execution: LayerExecutionPolicy = Field(default_factory=LayerExecutionPolicy)
+     """Per-engine execution decisions and initialization provenance."""
+ 
+@@ -1099,6 +1119,7 @@ def compute_hash(self) -> str:
+         Any future fields that don't affect compilation should be excluded.
+         """
+         ignored_factors = {
++            "topology_all_reduce",  # Include enabled math policy below, not cache path.
+             "enable_flashinfer_autotune",
+             "gdn",  # Hash only initialized computation policy below.
+             "sm70_marlin",  # Hash only when the provider is prepared.
+@@ -1161,6 +1182,10 @@ def compute_hash(self) -> str:
+         if not self.sm70_mxfp4.values:
+             ignored_factors.add("sm70_mxfp4")
+         factors = get_hash_factors(self, ignored_factors)
++        if self.topology_all_reduce.enabled:
++            factors["topology_all_reduce"] = dict(
++                enabled=True, precision=self.topology_all_reduce.precision
++            )
+         factors["layer_execution"] = self.layer_execution.compute_hash()
+         if self.sm70_sparse.active:
+             factors["sm70_sparse"] = self.sm70_sparse.compute_hash()
+diff --git a/vllm/distributed/device_communicators/topology_all_reduce/__init__.py b/vllm/distributed/device_communicators/topology_all_reduce/__init__.py
+new file mode 100644
+index 0000000000..5e004b020d
+--- /dev/null
++++ b/vllm/distributed/device_communicators/topology_all_reduce/__init__.py
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Experimental measured single-node CUDA IPC all-reduce planning."""
+diff --git a/vllm/distributed/device_communicators/topology_all_reduce/collective_planner.py b/vllm/distributed/device_communicators/topology_all_reduce/collective_planner.py
+new file mode 100644
+index 0000000000..2e69ebaad0
+--- /dev/null
++++ b/vllm/distributed/device_communicators/topology_all_reduce/collective_planner.py
+@@ -0,0 +1,922 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Bounded topology-independent collective planning, costing and measured selection.
++
++CPU only. Missing peer edges are never invented. A model shortlist is distinct
++from a measured winner; disconnected peer graphs explicitly require a fallback.
++"""
++
++import hashlib
++import heapq
++import itertools
++import json
++import math
++import random
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++from .plan import Plan
++
++SCHEMA = 1
++
++
++def fingerprint(value):
++    return hashlib.sha256(
++        json.dumps(
++            value, sort_keys=True, separators=(",", ":"), allow_nan=False
++        ).encode()
++    ).hexdigest()
++
++
++@dataclass
++class Topology:
++    nodes: list
++    edges: list
++    resources: dict = field(default_factory=dict)
++    identity: dict = field(default_factory=dict)
++
++    def __post_init__(self):
++        if not self.nodes or len(set(self.nodes)) != len(self.nodes):
++            raise ValueError("Distinct nodes required")
++        self.index = {node: i for i, node in enumerate(self.nodes)}
++        self.links: dict[tuple[Any, Any], dict[str, Any]] = {}
++        for edge in self.edges:
++            a, b = edge["source"], edge["dest"]
++            if (
++                a not in self.index
++                or b not in self.index
++                or a == b
++                or (a, b) in self.links
++            ):
++                raise ValueError("Invalid/duplicate edge")
++            if (
++                not math.isfinite(edge["latency_us"])
++                or edge["latency_us"] < 0
++                or not math.isfinite(edge["bytes_per_us"])
++                or edge["bytes_per_us"] <= 0
++            ):
++                raise ValueError("Invalid edge cost")
++            if any(r not in self.resources for r in edge.get("resources", [])):
++                raise ValueError("Unknown shared resource")
++            self.links[a, b] = edge
++        for resource in self.resources.values():
++            if (
++                not math.isfinite(resource["bytes_per_us"])
++                or resource["bytes_per_us"] <= 0
++                or not isinstance(resource.get("lanes", 1), int)
++                or resource.get("lanes", 1) < 1
++            ):
++                raise ValueError("Invalid resource")
++        # CUDA IPC mappings/signalling require supported edges both ways.
++        self.labels = {
++            (a, b): e.get("transport", "peer")
++            for (a, b), e in self.links.items()
++            if (b, a) in self.links
++        }
++
++    def export(self):
++        return dict(
++            nodes=self.nodes,
++            edges=self.edges,
++            resources=self.resources,
++            identity=self.identity,
++        )
++
++    @property
++    def key(self):
++        return fingerprint(self.export())
++
++
++def from_probe(record, profiles=None, identity=None):
++    """Convert driver-supported links; supplied measured profiles override estimates.
++
++    profiles is a list of directed edges with latency_us/bytes_per_us and optional
++    resource identifiers. Explicit resources can describe upstream bottlenecks.
++    Without profiles all costs are labelled estimates, never measurements.
++    """
++    from .planner_probe import matrix
++
++    nodes, labels = matrix(record["topology"])
++    positions = {node: i for i, node in enumerate(nodes)}
++    edges = []
++    resources: dict[str, dict[str, Any]] = {}
++    overrides = {(e["source"], e["dest"]): e for e in (profiles or {}).get("edges", [])}
++    resources.update((profiles or {}).get("resources", {}))
++    for (a, b), label in sorted(labels.items()):
++        if a == b or any(
++            record[k][positions[x]][positions[y]] != "OK"
++            for k in ("peer_read", "peer_write")
++            for x, y in ((a, b), (b, a))
++        ):
++            continue
++        if label.startswith("NV"):
++            bw = 11294.1176470588 * int(label[2:]) / 2
++            alpha = max(0.0, 2.050 - 5120 / bw) / 2
++            shared = []
++        else:
++            bw = 5783.13253012048
++            alpha = (3.392 - 5120 / bw) / 2
++            shared = [f"pcie-tx-{a}", f"pcie-rx-{b}"]
++            for name in shared:
++                resources.setdefault(name, dict(bytes_per_us=bw, lanes=1))
++        edge = dict(
++            source=a,
++            dest=b,
++            transport=label,
++            latency_us=alpha,
++            bytes_per_us=bw,
++            resources=shared,
++            measured=False,
++        )
++        edge.update(overrides.get((a, b), {}))
++        edges.append(edge)
++    return Topology(
++        nodes,
++        edges,
++        resources,
++        dict(
++            identity or {},
++            cost_origin="profiles" if profiles else "explicit-initial-estimates",
++        ),
++    )
++
++
++class DAG(Plan):
++    def __init__(self, topology, nodes, members, payload, precision, name, family):
++        super().__init__(nodes, topology.labels, name, family, payload)
++        self.members = list(members)
++        self.payload = payload
++        self.precision = precision
++        for rank, node in enumerate(nodes):
++            if node not in members:
++                self.values[rank]["mask"] = 0
++
++    def add(self, rank, left, right, dtype=None):
++        return super().add(rank, left, right, dtype or self.precision)
++
++    def sum(self, rank, values, dtype=None):
++        return super().sum(rank, values, dtype or self.precision)
++
++    def reduce_groups(self, groups, dtype=None):
++        return super().reduce_groups(groups, dtype or self.precision)
++
++    def wave(self, transfers):
++        before = len(self.messages)
++        super().wave(transfers)
++        for m in self.messages[before:]:
++            m["bytes"] = self.payload * (
++                2 if self.values[m["value"]]["dtype"] == "fp32" else 1
++            )
++
++    def finish(self):
++        goal = sum(
++            1 << r for r, node in enumerate(self.devices) if node in self.members
++        )
++        if len(set(self.current)) != 1 or any(
++            self.values[v]["mask"] != goal for v in self.current
++        ):
++            raise ValueError("Incomplete common expression")
++        self.outputs = self.current[:]
++        return self
++
++    def export(self):
++        return dict(
++            super().export(),
++            members=self.members,
++            payload_bytes=self.payload,
++            precision=self.precision,
++        )
++
++
++def validate(data, topology):
++    nodes = data["devices"]
++    members = data["members"]
++    n = len(nodes)
++    values = data["values"]
++    have = [{r} for r in range(n)]
++    if (
++        len(set(nodes)) != n
++        or not set(nodes) <= set(topology.nodes)
++        or not members
++        or len(set(members)) != len(members)
++        or not set(members) <= set(nodes)
++    ):
++        raise ValueError("Invalid membership")
++    if len(data["programs"]) != n or len(data["outputs"]) != n or len(values) < n:
++        raise ValueError("Rank count mismatch")
++    if (
++        data["precision"] not in ("fp16", "fp32")
++        or data["payload_bytes"] <= 0
++        or data["payload_bytes"] % 16
++    ):
++        raise ValueError("Invalid arithmetic/payload")
++    for i, v in enumerate(values):
++        if i < n:
++            if v != dict(
++                mask=1 << i if nodes[i] in members else 0, children=None, dtype="fp16"
++            ):
++                raise ValueError("Invalid input/helper")
++        else:
++            left, right = v["children"]
++            if (
++                not 0 <= left < i
++                or not 0 <= right < i
++                or not values[left]["mask"]
++                or not values[right]["mask"]
++                or values[left]["mask"] & values[right]["mask"]
++            ):
++                raise ValueError("Duplicate/invalid contribution")
++            if (
++                v["mask"] != values[left]["mask"] | values[right]["mask"]
++                or v["dtype"] != data["precision"]
++            ):
++                raise ValueError("Invalid subtotal")
++    sends = set()
++    recvs = set()
++    for rank, program in enumerate(data["programs"]):
++        for op in program:
++            kind = op["op"]
++            v = op["value"]
++            if not 0 <= v < len(values):
++                raise ValueError("Invalid value")
++            if kind == "add":
++                if (
++                    op["left"] not in have[rank]
++                    or op["right"] not in have[rank]
++                    or values[v]["children"] != [op["left"], op["right"]]
++                ):
++                    raise ValueError("Missing operands")
++                have[rank].add(v)
++            elif kind in ("send", "recv"):
++                mid = op["message"]
++                if not 0 <= mid < len(data["messages"]):
++                    raise ValueError("Invalid message")
++                m = data["messages"][mid]
++                s, d = m["source"], m["dest"]
++                if (
++                    not 0 <= s < n
++                    or not 0 <= d < n
++                    or (nodes[s], nodes[d]) not in topology.labels
++                ):
++                    raise ValueError("Unsupported peer mapping")
++                if m["value"] != v or m["bytes"] != data["payload_bytes"] * (
++                    2 if values[v]["dtype"] == "fp32" else 1
++                ):
++                    raise ValueError("Invalid message width")
++                if kind == "send":
++                    if (
++                        s != rank
++                        or d != op["dest"]
++                        or v not in have[rank]
++                        or mid in sends
++                    ):
++                        raise ValueError("Invalid send")
++                    sends.add(mid)
++                else:
++                    if d != rank or s != op["source"] or mid in recvs:
++                        raise ValueError("Invalid receive")
++                    recvs.add(mid)
++                    have[rank].add(v)
++            else:
++                raise ValueError("Unknown operation")
++        if data["outputs"][rank] not in have[rank]:
++            raise ValueError("Missing output")
++    if sends != recvs or len(sends) != len(data["messages"]):
++        raise ValueError("Unpaired message")
++    goal = sum(1 << r for r, node in enumerate(nodes) if node in members)
++    if len(set(data["outputs"])) != 1 or any(
++        values[v]["mask"] != goal for v in data["outputs"]
++    ):
++        raise ValueError("Inconsistent/incomplete output")
++    return True
++
++
++def simulate(data, topology, issue=0.02, receive=0.2, add=0.02, trace=False):
++    n = len(data["devices"])
++    positions = [0] * n
++    clocks = [0.0] * n
++    arrivals: dict[tuple[int, int], float] = {}
++    resources: dict[str, list[float]] = {}
++    events = []
++    while any(positions[r] < len(data["programs"][r]) for r in range(n)):
++        ready = []
++        for r in range(n):
++            if positions[r] == len(data["programs"][r]):
++                continue
++            op = data["programs"][r][positions[r]]
++            t = clocks[r]
++            if op["op"] == "recv":
++                if op["message"] not in arrivals:
++                    continue
++                t = max(t, arrivals[op["message"]])
++            ready.append((t, r))
++        if not ready:
++            raise ValueError("Deadlocked schedule")
++        t, r = min(ready)
++        op = data["programs"][r][positions[r]]
++        start = t
++        if op["op"] == "send":
++            m = data["messages"][op["message"]]
++            a, b = data["devices"][r], data["devices"][m["dest"]]
++            edge = topology.links[a, b]
++            needed = [
++                (
++                    f"link-{topology.index[a]}-{topology.index[b]}",
++                    dict(bytes_per_us=edge["bytes_per_us"], lanes=1),
++                )
++            ]
++            needed += [
++                (key, topology.resources[key]) for key in edge.get("resources", [])
++            ]
++            selected = []
++            for key, spec in needed:
++                lanes = resources.setdefault(key, [0.0] * spec.get("lanes", 1))
++                lane = min(range(len(lanes)), key=lanes.__getitem__)
++                start = max(start, lanes[lane])
++                selected.append((lanes, lane, m["bytes"] / spec["bytes_per_us"]))
++            service = max(v[2] for v in selected)
++            for lanes, lane, duration in selected:
++                lanes[lane] = start + duration
++            end = start + service + edge["latency_us"]
++            arrivals[op["message"]] = end
++            clocks[r] = t + issue
++        else:
++            end = t + (receive if op["op"] == "recv" else add)
++            clocks[r] = end
++        if trace:
++            events.append(
++                dict(
++                    rank=r,
++                    op=op["op"],
++                    message=op.get("message"),
++                    value=op["value"],
++                    start_us=start,
++                    end_us=end,
++                )
++            )
++        positions[r] += 1
++    return dict(us=max(clocks), rank_us=clocks, events=events if trace else None)
++
++
++def shortest_tree(topology, nodes, root, payload, jitter=None):
++    distance = [math.inf] * len(nodes)
++    distance[root] = 0
++    parents = [-1] * len(nodes)
++    queue = [(0.0, root)]
++    while queue:
++        cost, a = heapq.heappop(queue)
++        if cost != distance[a]:
++            continue
++        for b in range(len(nodes)):
++            if (nodes[a], nodes[b]) not in topology.labels:
++                continue
++            e = topology.links[nodes[a], nodes[b]]
++            reverse = topology.links[nodes[b], nodes[a]]
++            weight = (
++                e["latency_us"]
++                + reverse["latency_us"]
++                + payload / e["bytes_per_us"]
++                + payload / reverse["bytes_per_us"]
++            )
++            candidate = cost + weight * (
++                jitter.get((min(a, b), max(a, b)), 1.0) if jitter else 1.0
++            )
++            if candidate < distance[b]:
++                distance[b] = candidate
++                parents[b] = a
++                heapq.heappush(queue, (candidate, b))
++    if any(not math.isfinite(v) for v in distance):
++        raise ValueError("Disconnected peer graph")
++    return parents
++
++
++def tree(topology, nodes, members, payload, precision, root, parents):
++    p = DAG(topology, nodes, members, payload, precision, "routed-tree", "tree")
++    children: list[list[int]] = [[] for _ in nodes]
++    for r, parent in enumerate(parents):
++        if parent >= 0:
++            children[parent].append(r)
++    # Prune helper leaves, but retain every relay on a member-to-root path.
++    keep = set(nodes.index(v) for v in members)
++    for r in list(keep):
++        while parents[r] >= 0:
++            r = parents[r]
++            keep.add(r)
++    levels = [[root]]
++    while levels[-1]:
++        levels.append([c for r in levels[-1] for c in children[r] if c in keep])
++    current = [r if node in members else None for r, node in enumerate(nodes)]
++    for level in reversed(levels[1:-1]):
++        p.wave([(r, parents[r], current[r]) for r in level])
++        for parent in sorted({parents[r] for r in level}):
++            operands = ([current[parent]] if current[parent] is not None else []) + [
++                current[c] for c in children[parent] if c in keep
++            ]
++            current[parent] = p.sum(parent, operands)
++    full = current[root]
++    for level in levels[1:-1]:
++        p.wave([(parents[r], r, full) for r in level])
++    # Excluded helpers are omitted entirely from the resulting executable plan.
++    active = sorted(keep)
++    p.current = [full] * len(nodes)
++    p.outputs = p.current[:]
++    data = p.export()
++    if len(active) != len(nodes):
++        return None  # caller retries with the pruned node set
++    data["root"] = root
++    data["parents"] = parents
++    return data
++
++
++def fast_groups(topology, nodes):
++    """Greedy complete fast-link islands; chains never become fake cliques."""
++    remaining = set(range(len(nodes)))
++    groups = []
++    while remaining:
++        group = [min(remaining)]
++        remaining.remove(group[0])
++        for r in sorted(remaining):
++            if all(
++                topology.labels.get((nodes[r], nodes[s]), "").startswith("NV")
++                and topology.labels.get((nodes[s], nodes[r]), "").startswith("NV")
++                for s in group
++            ):
++                group.append(r)
++        remaining -= set(group)
++        groups.append(tuple(group))
++    return groups
++
++
++def island_plan(topology, nodes, members, payload, precision, groups, assignment):
++    p = DAG(
++        topology,
++        nodes,
++        members,
++        payload,
++        precision,
++        "balanced-islands",
++        "island-delivery",
++    )
++    p.reduce_groups(groups)
++    values = [p.current[g[0]] for g in groups]
++    p.wave([(s, d, values[g]) for g, s, d in assignment])
++    transfers = []
++    for group in groups:
++        for r in group:
++            for value in values:
++                if value not in p.have[r]:
++                    source = next(s for s in group if value in p.have[s])
++                    transfers.append((source, r, value))
++    p.wave(transfers)
++    for r in range(len(nodes)):
++        p.current[r] = p.sum(r, values)
++    return p.finish().export()
++
++
++def solve(
++    topology,
++    members,
++    *,
++    helpers=(),
++    payload_bytes=5120,
++    precision="fp16",
++    budget=4096,
++    shortlist=8,
++    seed=271828,
++):
++    """Deterministic bounded search, polynomial seeds + budgeted assignments.
++
++    Returns a ranked model shortlist, not an unmeasured optimality claim.
++    Native execution may impose a smaller hardware limit than this CPU solver.
++    """
++    start = time.monotonic()
++    members = list(members)
++    helpers = list(helpers)
++    if (
++        not members
++        or len(set(members + helpers)) != len(members) + len(helpers)
++        or not set(members + helpers) <= set(topology.nodes)
++    ):
++        raise ValueError("Invalid members/helpers")
++    if (
++        precision not in ("fp16", "fp32")
++        or payload_bytes <= 0
++        or payload_bytes % 16
++        or not 16 <= budget <= 100000
++        or not 1 <= shortlist <= 32
++    ):
++        raise ValueError("Invalid bounded planning request")
++    key = fingerprint(
++        dict(
++            schema=SCHEMA,
++            solver_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
++            topology=topology.export(),
++            members=members,
++            helpers=helpers,
++            payload_bytes=payload_bytes,
++            precision=precision,
++            budget=budget,
++            shortlist=shortlist,
++            seed=seed,
++        )
++    )
++    counts: dict[str, int] = {}
++    best: dict[str, list[dict[str, Any]]] = {}
++    seen = set()
++    attempts = 0
++    rng = random.Random(seed)
++
++    def consider(data):
++        nonlocal attempts
++        if data is None or attempts >= budget:
++            return
++        attempts += 1
++        family = data["family"]
++        counts[family] = counts.get(family, 0) + 1
++        signature = fingerprint(
++            {
++                k: data[k]
++                for k in (
++                    "devices",
++                    "members",
++                    "values",
++                    "programs",
++                    "messages",
++                    "outputs",
++                    "payload_bytes",
++                    "precision",
++                )
++            }
++        )
++        if signature in seen:
++            return
++        seen.add(signature)
++        validate(data, topology)
++        result = simulate(data, topology)
++        data["fingerprint"] = signature
++        entry = dict(predicted_us=result["us"], plan=data)
++        rows = best.setdefault(family, [])
++        rows.append(entry)
++        rows.sort(key=lambda v: (v["predicted_us"], v["plan"]["fingerprint"]))
++        del rows[shortlist:]
++
++    if len(members) == 1:
++        p = DAG(
++            topology, members, members, payload_bytes, precision, "local", "identity"
++        )
++        consider(p.finish().export())
++    else:
++        # Always keep a usable arbitrary connected-graph route, including relays.
++        for nodes in (members, members + helpers) if helpers else (members,):
++            for trial in range(min(16, len(nodes) + 8)):
++                jitter = (
++                    None
++                    if trial < len(nodes)
++                    else {
++                        tuple(sorted((a, b))): rng.uniform(0.55, 1.8)
++                        for a, b in itertools.combinations(range(len(nodes)), 2)
++                    }
++                )
++                root = trial % len(nodes)
++                try:
++                    parents = shortest_tree(
++                        topology,
++                        nodes,
++                        root,
++                        payload_bytes * (2 if precision == "fp32" else 1),
++                        jitter,
++                    )
++                except ValueError:
++                    break
++                keep = set(nodes.index(v) for v in members)
++                for r in list(keep):
++                    while parents[r] >= 0:
++                        r = parents[r]
++                        keep.add(r)
++                chosen = [nodes[r] for r in sorted(keep)]
++                if len(chosen) != len(nodes):
++                    chosen_root = chosen.index(nodes[root])
++                    parents = shortest_tree(
++                        topology, chosen, chosen_root, payload_bytes
++                    )
++                    root = chosen_root
++                consider(
++                    tree(
++                        topology,
++                        chosen,
++                        members,
++                        payload_bytes,
++                        precision,
++                        root,
++                        parents,
++                    )
++                )
++        nodes = members
++        n = len(nodes)
++        groups = fast_groups(topology, nodes)
++        if all((a, b) in topology.labels for a in nodes for b in nodes if a != b):
++            p = DAG(
++                topology,
++                nodes,
++                members,
++                payload_bytes,
++                precision,
++                "direct-clique",
++                "clique",
++            )
++            p.reduce_groups([tuple(range(n))])
++            consider(p.finish().export())
++        if n & (n - 1) == 0:
++            # Rank permutations give canonical doubling trees; independent
++            # random pairings could round the same shards differently by rank.
++            for trial in range(min(128, max(0, (budget - attempts) // 4))):
++                order = list(range(n))
++                if trial:
++                    rng.shuffle(order)
++                rounds = [
++                    [(order[i], order[i ^ bit]) for i in range(n) if i < (i ^ bit)]
++                    for bit in (1 << k for k in range(n.bit_length() - 1))
++                ]
++                if any(
++                    (nodes[a], nodes[b]) not in topology.labels
++                    for matching in rounds
++                    for a, b in matching
++                ):
++                    continue
++                p = DAG(
++                    topology,
++                    nodes,
++                    members,
++                    payload_bytes,
++                    precision,
++                    "recursive-doubling",
++                    "doubling",
++                )
++                for matching in rounds:
++                    old = p.current[:]
++                    p.wave(
++                        [
++                            (s, d, old[s])
++                            for a, b in matching
++                            for s, d in ((a, b), (b, a))
++                        ]
++                    )
++                    for a, b in matching:
++                        values = sorted(
++                            (old[a], old[b]), key=lambda v: p.values[v]["mask"]
++                        )
++                        p.current[a] = p.sum(a, values)
++                        p.current[b] = p.sum(b, values)
++                consider(p.finish().export())
++        # Fast-island delivery: Cartesian products are lazily bounded, never
++        # materialize an exponential assignment space. Random samples supplement
++        # a load-balanced beam when the complete product exceeds the budget.
++        if 1 < len(groups) <= min(8, n):
++            options: list[list[tuple[int, int, int]]] = []
++            for i, g in enumerate(groups):
++                for j, h in enumerate(groups):
++                    if i == j:
++                        continue
++                    choices = [
++                        (i, a, b)
++                        for a in g
++                        for b in h
++                        if (nodes[a], nodes[b]) in topology.labels
++                    ]
++                    if not choices:
++                        options = []
++                        break
++                    options.append(choices)
++                if not options:
++                    break
++            expected = len(groups) * (len(groups) - 1)
++            if len(options) == expected:
++                space = math.prod(len(v) for v in options)
++                limit = min(budget - attempts, max(64, budget // 2))
++                if space <= limit:
++                    assignments = itertools.product(*options)
++                else:
++                    # Rotate cheap / low-load endpoints, avoiding lexicographic
++                    # concentration on the first GPU of an island.
++                    def samples():
++                        for trial in range(limit):
++                            load = [0] * n
++                            assignment = []
++                            for choices in options:
++                                pick = min(
++                                    choices,
++                                    key=lambda v: (
++                                        load[v[1]]
++                                        + load[v[2]]
++                                        + rng.random() * (0.25 if trial == 0 else 2),
++                                        topology.links[nodes[v[1]], nodes[v[2]]][
++                                            "latency_us"
++                                        ],
++                                    ),
++                                )
++                                load[pick[1]] += 1
++                                load[pick[2]] += 1
++                                assignment.append(pick)
++                            yield assignment
++
++                    assignments = samples()
++                for assignment in assignments:
++                    consider(
++                        island_plan(
++                            topology,
++                            nodes,
++                            members,
++                            payload_bytes,
++                            precision,
++                            groups,
++                            assignment,
++                        )
++                    )
++        # Bounded hierarchy seeds from clique covers, including the PCIe planes.
++        if n <= 8:
++            from .plan import clique_partitions
++
++            covers = clique_partitions(nodes, topology.labels)
++            for first in covers:
++                if not 2 <= len(first) <= 4:
++                    continue
++                membership = {r: i for i, g in enumerate(first) for r in g}
++                for second in covers:
++                    if attempts >= budget:
++                        break
++                    if not all(
++                        len({membership[r] for r in g}) == len(first) for g in second
++                    ):
++                        continue
++                    p = DAG(
++                        topology,
++                        nodes,
++                        members,
++                        payload_bytes,
++                        precision,
++                        "clique-hierarchy",
++                        "hierarchy",
++                    )
++                    p.reduce_groups(first)
++                    p.reduce_groups(second)
++                    consider(p.finish().export())
++        # Refine independent local posting/polling order without changing sums.
++        from .plan import reorder_runs
++
++        beam = [e["plan"] for rows in best.values() for e in rows[:2]]
++        while beam and attempts < budget:
++            p = reorder_runs(rng.choice(beam), rng)
++            p["family"] = "instruction-order"
++            consider(p)
++            if attempts % 128 == 0:
++                beam = [e["plan"] for rows in best.values() for e in rows[:2]]
++    ranked = sorted(
++        (e for rows in best.values() for e in rows),
++        key=lambda e: (e["predicted_us"], e["plan"]["fingerprint"]),
++    )
++    selected = []
++    identities = set()
++    # Preserve family diversity for hardware qualification, then fill by score.
++    for entry in (
++        sorted((rows[0] for rows in best.values()), key=lambda e: e["predicted_us"])
++        + ranked
++    ):
++        if entry["plan"]["fingerprint"] in identities:
++            continue
++        selected.append(entry)
++        identities.add(entry["plan"]["fingerprint"])
++        if len(selected) == shortlist:
++            break
++    selected.sort(key=lambda e: (e["predicted_us"], e["plan"]["fingerprint"]))
++    return dict(
++        schema=SCHEMA,
++        key=key,
++        topology=topology.export(),
++        members=members,
++        helpers=helpers,
++        payload_bytes=payload_bytes,
++        precision=precision,
++        status="shortlisted" if selected else "fallback-required",
++        candidates=selected,
++        evaluations=attempts,
++        unique_plans=len(seen),
++        counts=counts,
++        elapsed_s=time.monotonic() - start,
++        selection="model-only",
++        optimality=(
++            "Best within a bounded candidate search; hardware qualification required"
++        ),
++    )
++
++
++def select_measured(result, measure, *, context):
++    """Callback must qualify every candidate and return real complete-call samples.
++
++    context should include UUIDs, driver/runtime/backend ABI, peer state and
++    concurrent group layout. The caller synchronizes group participants.
++    """
++    measurements = []
++    for candidate in result["candidates"]:
++        receipt = measure(candidate["plan"])
++        if receipt.get("correct") is not True:
++            continue
++        samples = receipt.get("samples_us", [])
++        if len(samples) < 3 or any(
++            isinstance(v, bool)
++            or not isinstance(v, (float, int))
++            or not math.isfinite(v)
++            or v <= 0
++            for v in samples
++        ):
++            raise ValueError("Invalid measured samples")
++        import statistics
++
++        measurements.append(
++            dict(
++                fingerprint=candidate["plan"]["fingerprint"],
++                median_us=statistics.median(samples),
++                receipt=receipt,
++            )
++        )
++    if not measurements:
++        return dict(
++            status="fallback-required", planner_key=result["key"], context=context
++        )
++    winner = min(measurements, key=lambda r: (r["median_us"], r["fingerprint"]))
++    return dict(
++        schema=SCHEMA,
++        status="measured",
++        planner_key=result["key"],
++        context=context,
++        measurements=measurements,
++        winner=winner["fingerprint"],
++        key=fingerprint(dict(planner_key=result["key"], context=context)),
++    )
++
++
++def save_selection(path, result, receipt):
++    """Atomic cache with an exact configuration identity, never a shape wildcard."""
++    import os
++    import tempfile
++
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if receipt.get("status") != "measured" or receipt["planner_key"] != result["key"]:
++        raise ValueError("Unqualified cache entry")
++    data = dict(result=result, receipt=receipt)
++    with tempfile.NamedTemporaryFile(
++        dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False
++    ) as file:
++        temporary = Path(file.name)
++    try:
++        temporary.write_text(json.dumps(data, sort_keys=True, allow_nan=False) + "\n")
++        os.replace(temporary, path)
++    finally:
++        temporary.unlink(missing_ok=True)
++
++
++def load_selection(path, result, context):
++    try:
++        data = json.loads(Path(path).read_text())
++    except (OSError, ValueError):
++        return None
++    if not isinstance(data, dict):
++        return None
++    receipt = data.get("receipt", {})
++    if not isinstance(receipt, dict):
++        return None
++    expected = fingerprint(dict(planner_key=result["key"], context=context))
++    if (
++        receipt.get("status") != "measured"
++        or receipt.get("key") != expected
++        or receipt.get("planner_key") != result["key"]
++    ):
++        return None
++    candidates = {v["plan"]["fingerprint"]: v["plan"] for v in result["candidates"]}
++    plan = candidates.get(receipt.get("winner"))
++    if plan is None:
++        return None
++    evidence = next(
++        (
++            v
++            for v in receipt.get("measurements", [])
++            if v.get("fingerprint") == receipt.get("winner")
++        ),
++        None,
++    )
++    if evidence is None or evidence.get("receipt", {}).get("correct") is not True:
++        return None
++    samples = evidence["receipt"].get("samples_us", [])
++    if len(samples) < 3 or any(
++        isinstance(v, bool)
++        or not isinstance(v, (float, int))
++        or not math.isfinite(v)
++        or v <= 0
++        for v in samples
++    ):
++        return None
++    validate(plan, Topology(**result["topology"]))
++    return dict(plan=plan, receipt=receipt)
+diff --git a/vllm/distributed/device_communicators/topology_all_reduce/collective_setup.py b/vllm/distributed/device_communicators/topology_all_reduce/collective_setup.py
+new file mode 100644
+index 0000000000..da6aa632c4
+--- /dev/null
++++ b/vllm/distributed/device_communicators/topology_all_reduce/collective_setup.py
+@@ -0,0 +1,387 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Setup-time plan qualification, whole-call tuning and exact-identity caching."""
++
++import hashlib
++import math
++import os
++import statistics
++from contextlib import nullcontext
++from pathlib import Path
++from typing import Any
++
++from .collective_planner import load_selection, save_selection, select_measured, solve
++from .planned_collectives import PlannedChannel, load_native
++
++
++def backend_identity():
++    import subprocess
++
++    import torch
++
++    root = Path(__file__).parent
++    return dict(
++        torch=torch.__version__,
++        cuda=torch.version.cuda,
++        hardware=subprocess.check_output(
++            [
++                "nvidia-smi",
++                "--query-gpu=index,uuid,pci.bus_id,driver_version,pcie.link.gen.current,pcie.link.width.current",
++                "--format=csv,noheader",
++            ],
++            text=True,
++            timeout=15,
++        ),
++        sources={
++            name: hashlib.sha256((root / name).read_bytes()).hexdigest()
++            for name in (
++                "collective_planner.py",
++                "plan.py",
++                "planner_probe.py",
++                "collective_setup.py",
++                "planned_collectives.py",
++                "planned_codegen.py",
++                "planned_reduce.cpp",
++            )
++        },
++        arch=os.environ.get("TORCH_CUDA_ARCH_LIST", "native"),
++    )
++
++
++def measure_channel(channel, *, repeats=9, warmup=3):
++    """One untimed ready call, then dependent complete calls, max rank per sample.
++
++    Separate local graphs avoid cross-device event fork/join. Every replay
++    changes exact inputs and checks the entire final result on every rank.
++    Caller can supply a different layout-coordinated measurement callback.
++    """
++    import torch
++    import torch.distributed as dist
++
++    if not 3 <= repeats <= 15 or not 1 <= warmup <= 5:
++        raise ValueError("Bounded timing counts required")
++    rank = dist.get_rank(channel.group)
++    world = dist.get_world_size(channel.group)
++    if world == 1:
++        return dict(correct=True, samples_us=[0.000001] * repeats, local=True)
++    chain = max(1, min(8, int(26 / max(1, math.log2(world))) - 1))
++    graph = torch.cuda.CUDAGraph()
++    start = torch.cuda.Event(enable_timing=True, external=True)
++    end = torch.cuda.Event(enable_timing=True, external=True)
++    # Allocate under the communicator's IPC allocator policy, then register
++    # captured graph buffers on context exit before the first replay.
++    with getattr(channel, "capture", nullcontext)():
++        x = torch.empty(
++            channel.capacity // 2, dtype=torch.float16, device=channel.device
++        )
++        with torch.cuda.graph(graph):
++            current = channel.all_reduce(x)
++            storage = [current]
++            start.record()
++            for _ in range(chain):
++                current = channel.all_reduce(current)
++                storage.append(current)
++            end.record()
++    samples: list[float] = []
++    hashes = []
++    for trial in range(warmup + repeats):
++        # Positive integer fractions give an exact common answer on every tree;
++        # rank-varying patterns detect missing or stale input contributions.
++        values = [
++            (
++                torch.arange(channel.capacity // 2, dtype=torch.int32) % 3
++                + r
++                + 1
++                + trial % 3
++            ).half()
++            / 16384
++            for r in range(world)
++        ]
++        x.copy_(values[rank])
++        for out in storage:
++            out.fill_(float("nan"))
++        torch.accelerator.synchronize(channel.device)
++        dist.barrier(group=channel.group)
++        graph.replay()
++        torch.accelerator.synchronize(channel.device)
++        # Validate every dependency. The existing backend propagates actual
++        # rank outputs to allow legal rounding; generated ranks share an exact
++        # reference and do not need additional CPU tensor collectives.
++        expected = values
++        passed = True
++        for out in storage:
++            by_node = dict(zip(channel.plan["members"], expected))
++            cache = [
++                by_node.get(node, torch.zeros_like(expected[0]))
++                for node in channel.plan["devices"]
++            ]
++            for value in channel.plan["values"][len(cache) :]:
++                left, right = value["children"]
++                total = cache[left].float() + cache[right].float()
++                cache.append(total if value["dtype"] == "fp32" else total.half())
++            ref = cache[channel.plan["outputs"][0]].half()
++            if not torch.isfinite(ref).all():
++                raise RuntimeError("Timing oracle overflow")
++            actual = out.cpu()
++            passed &= channel.result_matches(actual, ref, expected)
++            expected = channel.next_values(ref, actual)
++        states = [None] * world
++        dist.all_gather_object(states, passed, group=channel.group)
++        if not all(states):
++            raise RuntimeError("Measured dependent graph oracle failed")
++        local = start.elapsed_time(end) * 1000 / chain
++        times = [0.0] * world
++        dist.all_gather_object(times, local, group=channel.group)
++        if trial >= warmup:
++            samples.append(max(times))
++            hashes.append(
++                hashlib.sha256(
++                    current.cpu().view(torch.uint8).numpy().tobytes()
++                ).hexdigest()
++            )
++    return dict(
++        correct=True,
++        samples_us=samples,
++        chain=chain,
++        warmup=warmup,
++        output_sha256=hashes,
++        timing=(
++            "max-rank local external-event elapsed / dependent call count; "
++            "one untimed complete ready call; no baseline subtraction"
++        ),
++    )
++
++
++class PreparedCollective:
++    def __init__(self, channel, receipt, fallback=None):
++        self.channel, self.receipt, self.fallback = channel, receipt, fallback
++
++    def all_reduce(self, x):
++        if self.channel is not None and self.channel.accepts(x):
++            return self.channel.all_reduce(x)
++        if self.fallback is not None:
++            return self.fallback.all_reduce(x)
++        raise ValueError("No qualified peer route for this operation signature")
++
++    def close(self):
++        if self.channel is not None:
++            self.channel.close()
++
++
++def prepare(
++    group,
++    device,
++    topology=None,
++    *,
++    payload_bytes=5120,
++    precision="fp16",
++    helpers=(),
++    budget=2048,
++    shortlist=8,
++    grids=None,
++    cache=None,
++    context=None,
++    fallback=None,
++    measure=None,
++    verify_live=True,
++):
++    """All group members call before capture; returns an immutable measured route.
++
++    Graphs never invoke this function or rediscover a topology. For concurrent
++    layouts, context must describe those groups and measure can coordinate their
++    real joint workload. Default tuning measures this group alone. Existing
++    fallback is retained for disconnected graphs and unqualified signatures.
++    """
++    import torch
++    import torch.distributed as dist
++
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("Setup cannot run during CUDA graph capture")
++    from .planner_probe import refresh, visible_devices
++
++    if verify_live:
++        topology = refresh(topology)
++    if topology is None:
++        raise ValueError("A topology is required for offline setup")
++    if grids is None:
++        grids = tuple(
++            (t, min(32, max(1, (payload_bytes // 16 + t - 1) // t)))
++            for t in (64, 128, 256)
++        )
++    if (
++        not grids
++        or len(grids) > 9
++        or any(t not in (64, 128, 256) or not 1 <= b <= 32 for t, b in grids)
++    ):
++        raise ValueError("Bounded launch grid list required")
++    rank = dist.get_rank(group)
++    world = dist.get_world_size(group)
++    visible = visible_devices()
++    members = [None] * world
++    dist.all_gather_object(members, visible[device.index], group=group)
++    eligibility = [None] * world
++    dist.all_gather_object(
++        eligibility, set(members) | set(helpers) <= set(visible), group=group
++    )
++    if not all(eligibility):
++        return PreparedCollective(
++            None,
++            dict(
++                status="fallback-required",
++                reason=(
++                    "Selected members/helpers must be visible "
++                    "to every native participant"
++                ),
++            ),
++            fallback,
++        )
++    results: list[Any] = [None] * world
++    local = (
++        solve(
++            topology,
++            members,
++            helpers=helpers,
++            payload_bytes=payload_bytes,
++            precision=precision,
++            budget=budget,
++            shortlist=shortlist,
++        )
++        if rank == 0
++        else None
++    )
++    dist.all_gather_object(results, local, group=group)
++    result = results[0]
++    if not result["candidates"]:
++        return PreparedCollective(
++            None, dict(status="fallback-required", planner=result), fallback
++        )
++    if world == 1:
++        return PreparedCollective(
++            PlannedChannel(group, device, result["candidates"][0]["plan"], topology),
++            dict(status="local", planner_key=result["key"]),
++            fallback,
++        )
++    extra = dict(concurrent_groups=[members])
++    extra.update(context or {})
++    configuration = dict(
++        extra,
++        backend=backend_identity(),
++        grids=[list(v) for v in grids],
++        visible=visible,
++        device_names=[torch.cuda.get_device_name(visible.index(v)) for v in members],
++    )
++    loaded = load_selection(cache, result, configuration) if cache else None
++    # Cache is read by rank zero only for the decision, then shared. Different
++    # local filesystems must never cause different ranks to execute new routes.
++    choices: list[Any] = [None] * world
++    dist.all_gather_object(choices, loaded if rank == 0 else None, group=group)
++    loaded = choices[0]
++    if loaded:
++        grid = loaded["receipt"].get("launch", {})
++        if (grid.get("threads"), grid.get("blocks")) not in grids:
++            loaded = None
++    if loaded:
++        plans = [
++            entry["plan"]
++            for entry in result["candidates"]
++            if len(entry["plan"]["devices"]) == len(loaded["plan"]["devices"])
++        ]
++        candidate = next(
++            i
++            for i, p in enumerate(plans)
++            if p["fingerprint"] == loaded["plan"]["fingerprint"]
++        )
++        if rank == 0:
++            load_native(plans, topology, payload_bytes)
++        dist.barrier(group=group)
++        native = load_native(plans, topology, payload_bytes)
++        channel = PlannedChannel(
++            group,
++            device,
++            loaded["plan"],
++            topology,
++            threads=grid["threads"],
++            blocks=grid["blocks"],
++            native=native,
++            candidate=candidate,
++        )
++        channel.qualify()
++        return PreparedCollective(
++            channel, dict(loaded["receipt"], cache_hit=True), fallback
++        )
++    # One compilation per node count; a relay plan can have a different number
++    # of nodes. Static kernels retain independent plan-specific rank programs.
++    batches: dict[int, list[dict[str, Any]]] = {}
++    locations = {}
++    for entry in result["candidates"]:
++        p = entry["plan"]
++        batch = batches.setdefault(len(p["devices"]), [])
++        locations[p["fingerprint"]] = (len(p["devices"]), len(batch))
++        batch.append(p)
++    natives = {}
++    for n, plans in sorted(batches.items()):
++        if rank == 0:
++            load_native(plans, topology, payload_bytes)
++        dist.barrier(group=group)
++        natives[n] = load_native(plans, topology, payload_bytes)
++    channels = {}
++    timings = {}
++    measure = measure or measure_channel
++    try:
++        for entry in result["candidates"]:
++            plan = entry["plan"]
++            n, candidate = locations[plan["fingerprint"]]
++            options = []
++            for threads, blocks in grids:
++                channel = PlannedChannel(
++                    group,
++                    device,
++                    plan,
++                    topology,
++                    threads=threads,
++                    blocks=blocks,
++                    native=natives[n],
++                    candidate=candidate,
++                )
++                qualification = channel.qualify()
++                receipt = measure(channel)
++                if receipt.get("correct") is not True:
++                    channel.close()
++                    continue
++                options.append(
++                    (
++                        statistics.median(receipt["samples_us"]),
++                        threads,
++                        blocks,
++                        channel,
++                        dict(receipt, qualification=qualification),
++                    )
++                )
++            if not options:
++                continue
++            winner = min(options, key=lambda v: (v[0], v[1], v[2]))
++            for option in options:
++                if option is not winner:
++                    option[3].close()
++            channels[plan["fingerprint"]] = winner[3]
++            timings[plan["fingerprint"]] = dict(
++                winner[4], threads=winner[1], blocks=winner[2]
++            )
++        selected = select_measured(
++            result,
++            lambda p: timings.get(p["fingerprint"], dict(correct=False)),
++            context=configuration,
++        )
++        if selected["status"] != "measured":
++            return PreparedCollective(None, selected, fallback)
++        key = selected["winner"]
++        channel = channels.pop(key)
++        selected["launch"] = {k: timings[key][k] for k in ("threads", "blocks")}
++        if cache and rank == 0:
++            save_selection(cache, result, selected)
++        dist.barrier(group=group)
++        return PreparedCollective(channel, dict(selected, cache_hit=False), fallback)
++    finally:
++        for channel in channels.values():
++            channel.close()
+diff --git a/vllm/distributed/device_communicators/topology_all_reduce/collective_tuner.py b/vllm/distributed/device_communicators/topology_all_reduce/collective_tuner.py
+new file mode 100644
+index 0000000000..a810a7b82b
+--- /dev/null
++++ b/vllm/distributed/device_communicators/topology_all_reduce/collective_tuner.py
+@@ -0,0 +1,309 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Compare the measured generated route against an existing transport backend."""
++
++import copy
++import hashlib
++import inspect
++import json
++import math
++import os
++import statistics
++import tempfile
++from contextlib import nullcontext
++from pathlib import Path
++
++from .collective_planner import fingerprint
++from .collective_setup import (
++    PreparedCollective,
++    backend_identity,
++    measure_channel,
++    prepare,
++)
++from .planned_collectives import PlannedChannel
++
++
++def choose(samples, margin=0.01):
++    """Prefer the existing backend when the measured difference is within margin."""
++    if not 0 <= margin < 0.5 or not {"native", "existing"} <= set(samples):
++        raise ValueError("Two comparable backends required")
++    for values in samples.values():
++        if len(values) < 3 or any(
++            isinstance(v, bool)
++            or not isinstance(v, (float, int))
++            or not math.isfinite(v)
++            or v <= 0
++            for v in values
++        ):
++            raise ValueError("Invalid latency samples")
++    medians = {name: statistics.median(values) for name, values in samples.items()}
++    return (
++        "native"
++        if medians["native"] < medians["existing"] * (1 - margin)
++        else "existing"
++    )
++
++
++class Existing(PlannedChannel):
++    """Existing reduction qualified independently of its accumulation order."""
++
++    def __init__(self, backend, group, device, plan):
++        import torch.distributed as dist
++
++        self.backend, self.group, self.device = backend, group, device
++        self.plan = copy.deepcopy(plan)
++        self.capacity = plan["payload_bytes"]
++        self.native = True
++        self.rank = dist.get_rank(group)
++        self.accumulation = getattr(backend, "precision", "fp16")
++        # The plan supplies a reference tree, not the existing backend's
++        # accumulation order or intermediate precision.
++        for value in self.plan["values"]:
++            if value["children"] is not None:
++                value["dtype"] = "fp32"
++        self.plan["precision"] = "fp32"
++
++    def accepts(self, x):
++        import torch
++
++        return (
++            x.device == self.device
++            and x.dtype == torch.float16
++            and x.is_contiguous()
++            and x.nbytes == self.capacity
++        )
++
++    def all_reduce(self, x):
++        return self.backend.all_reduce(x)
++
++    def capture(self):
++        return getattr(self.backend, "capture", nullcontext)()
++
++    def result_matches(self, output, reference, values):
++        """Bound FP16 summation error, including cancellation and subnormals.
++
++        For n inputs, gamma_(n-1) * sum(abs(x)) bounds n-1 rounded additions.
++        Add final FP16 conversion error and n half-subnormal rounding errors.
++        FP64 sums of the supplied FP16 probes provide an independent reference.
++        A relative tolerance alone would incorrectly reject near-zero sums.
++        """
++        import torch
++
++        if output.shape != reference.shape or output.dtype != torch.float16:
++            return False
++        inputs = torch.stack(values).double()
++        exact = inputs.sum(0)
++        n = len(values)
++        unit = 2**-24 if self.accumulation == "fp32" else 2**-11
++        gamma = (n - 1) * unit / (1 - (n - 1) * unit)
++        bound = gamma * inputs.abs().sum(0) + 2**-11 * exact.abs() + n * 2**-25
++        return bool(
++            torch.isfinite(output).all()
++            and ((output.double() - exact).abs() <= bound).all()
++        )
++
++    def qualify(self, repeats=3):
++        return dict(
++            PlannedChannel.qualify(self, repeats),
++            precision=self.accumulation,
++            comparison="forward-error-bound against FP64 sum",
++        )
++
++    def next_values(self, reference, output):
++        import torch.distributed as dist
++
++        values = [None] * len(self.plan["members"])
++        dist.all_gather_object(values, output, group=self.group)
++        return values
++
++    def close(self):
++        pass  # The caller owns the existing backend.
++
++
++class BoundBackend:
++    """Snapshot the old method before installing a new communicator wrapper."""
++
++    def __init__(self, backend, precision="fp16"):
++        self.function = backend.all_reduce
++        self.precision = precision
++        ca = getattr(backend, "ca_comm", None)
++        # Match GroupCoordinator.graph_capture: registration happens when the
++        # outer context exits, after CUDA capture and before any replay.
++        self.capture = ca.capture if ca is not None else nullcontext
++
++    def all_reduce(self, x):
++        if self.precision == "fp32":
++            import torch
++
++            if x.dtype == torch.float16:
++                # The explicit policy must also hold if the existing backend
++                # wins or an unsupported signature takes the fallback route.
++                return self.function(x.float()).half()
++        return self.function(x)
++
++
++def prepare_best(
++    group,
++    device,
++    topology=None,
++    *,
++    existing=None,
++    cache=None,
++    margin=0.01,
++    measure=None,
++    context=None,
++    **options,
++):
++    """Tune generated candidates and retain the existing backend if it wins.
++
++    Existing backend must have out-of-place all_reduce(Tensor)->Tensor, like
++    1Cat's channels and vLLM PyNccl. Caller owns its lifetime. The default
++    measurement is per-group; a layout coordinator can provide measure(channel).
++    """
++    if existing is None:
++        return prepare(
++            group,
++            device,
++            topology,
++            cache=cache,
++            context=context,
++            measure=measure,
++            **options,
++        )
++    import torch
++    import torch.distributed as dist
++
++    try:
++        source = inspect.getsourcefile(type(existing))
++    except TypeError:
++        source = None
++    native = getattr(getattr(existing, "extension", None), "__file__", None)
++    external: dict[str, object] = dict(
++        type=type(existing).__module__ + "." + type(existing).__qualname__,
++        source=hashlib.sha256(Path(source).read_bytes()).hexdigest()
++        if source and Path(source).is_file()
++        else None,
++        native=hashlib.sha256(Path(native).read_bytes()).hexdigest()
++        if native and Path(native).is_file()
++        else None,
++    )
++    # vLLM's communicator delegates to native custom AR / NCCL wrappers.
++    # A rebuilt native library must invalidate the comparison receipt too.
++    import sys
++
++    runtime = sys.modules.get("vllm._C")
++    runtime_file = getattr(runtime, "__file__", None)
++    external["vllm_native"] = (
++        hashlib.sha256(Path(runtime_file).read_bytes()).hexdigest()
++        if runtime_file and Path(runtime_file).is_file()
++        else None
++    )
++    # A configured collective provider can be loaded separately from vllm._C.
++    external["loaded_libraries"] = sorted(
++        hashlib.sha256(Path(path).read_bytes()).hexdigest()
++        for path in torch.ops.loaded_libraries
++    )
++    existing = BoundBackend(existing, options.get("precision", "fp16"))
++    extra = dict(
++        context or {},
++        existing_backend=external,
++        tuner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
++        margin=margin,
++    )
++    # Native selection's own exact topology/shape/group/ABI cache remains the
++    # authority; this second receipt decides between it and the old backend.
++    native_cache = Path(str(cache) + ".native") if cache else None
++    prepared = prepare(
++        group,
++        device,
++        topology,
++        cache=native_cache,
++        context=extra,
++        measure=measure,
++        **options,
++    )
++    if prepared.channel is None:
++        return PreparedCollective(None, prepared.receipt, existing)
++    if len(prepared.channel.plan["members"]) == 1:
++        return prepared
++    adapter = Existing(existing, group, device, prepared.channel.plan)
++    identity = fingerprint(
++        dict(
++            native_receipt=prepared.receipt["key"],
++            backend=backend_identity(),
++            context=extra,
++        )
++    )
++    rank = dist.get_rank(group)
++    world = dist.get_world_size(group)
++    cached = None
++    if cache and rank == 0:
++        try:
++            data = json.loads(Path(cache).read_text())
++            if (
++                data.get("identity") == identity
++                and data.get("winner")
++                in (
++                    "native",
++                    "existing",
++                )
++                and (
++                    choose(
++                        {k: v["samples_us"] for k, v in data["measurements"].items()},
++                        margin,
++                    )
++                    == data["winner"]
++                )
++            ):
++                cached = data
++        except (OSError, ValueError, KeyError, TypeError, AttributeError):
++            pass
++    receipts = [None] * world
++    dist.all_gather_object(receipts, cached, group=group)
++    cached = receipts[0]
++    if cached:
++        if cached["winner"] == "existing":
++            adapter.qualify()
++            prepared.close()
++            return PreparedCollective(adapter, dict(cached, cache_hit=True), existing)
++        return PreparedCollective(
++            prepared.channel, dict(cached, cache_hit=True), existing
++        )
++    adapter.qualify()
++    measure = measure or measure_channel
++    # Both are remeasured together with the same boundary and inputs, rather
++    # than comparing a warm baseline with a historical native measurement.
++    measurements = dict(native=measure(prepared.channel), existing=measure(adapter))
++    if any(r.get("correct") is not True for r in measurements.values()):
++        prepared.close()
++        raise RuntimeError("Backend comparison failed qualification")
++    winner = choose({k: r["samples_us"] for k, r in measurements.items()}, margin)
++    receipt = dict(
++        status="measured",
++        identity=identity,
++        winner=winner,
++        measurements=measurements,
++        context=extra,
++        cache_hit=False,
++        native_selection=prepared.receipt,
++        margin=margin,
++    )
++    if cache and rank == 0:
++        path = Path(cache)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        with tempfile.NamedTemporaryFile(
++            dir=path.parent, prefix=path.name + ".", delete=False, mode="w"
++        ) as file:
++            temporary = Path(file.name)
++            json.dump(receipt, file, allow_nan=False)
++            file.write("\n")
++        try:
++            os.replace(temporary, path)
++        finally:
++            temporary.unlink(missing_ok=True)
++    dist.barrier(group=group)
++    if winner == "existing":
++        prepared.close()
++        return PreparedCollective(adapter, receipt, existing)
++    return PreparedCollective(prepared.channel, receipt, existing)
+diff --git a/vllm/distributed/device_communicators/topology_all_reduce/plan.py b/vllm/distributed/device_communicators/topology_all_reduce/plan.py
+new file mode 100644
+index 0000000000..456caa8968
+--- /dev/null
++++ b/vllm/distributed/device_communicators/topology_all_reduce/plan.py
+@@ -0,0 +1,206 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Contribution-tracking DAG construction and independent instruction ordering."""
++
++import hashlib
++import itertools
++import json
++from typing import Any
++
++
++class Plan:
++    def __init__(self, devices, labels, name, family, payload_bytes):
++        self.payload = payload_bytes
++        self.devices = tuple(devices)
++        self.labels = labels
++        self.name = name
++        self.family = family
++        self.values: list[dict[str, Any]] = [
++            dict(mask=1 << r, children=None, dtype="fp16") for r in range(len(devices))
++        ]
++        self.cache = {}
++        self.have = [{r} for r in range(len(devices))]
++        self.programs: list[list[dict[str, Any]]] = [[] for _ in devices]
++        self.messages = []
++        self.current = list(range(len(devices)))
++        self.outputs = None
++
++    def edge(self, a, b):
++        return a != b and (self.devices[a], self.devices[b]) in self.labels
++
++    def add(self, rank, left, right, dtype="fp16"):
++        if left not in self.have[rank] or right not in self.have[rank]:
++            raise ValueError("Missing local operand")
++        if self.values[left]["mask"] & self.values[right]["mask"]:
++            raise ValueError("Duplicate contribution")
++        key = left, right, dtype
++        if key not in self.cache:
++            self.cache[key] = len(self.values)
++            self.values.append(
++                dict(
++                    mask=self.values[left]["mask"] | self.values[right]["mask"],
++                    children=[left, right],
++                    dtype=dtype,
++                )
++            )
++        value = self.cache[key]
++        if value not in self.have[rank]:
++            self.programs[rank].append(
++                dict(op="add", value=value, left=left, right=right)
++            )
++            self.have[rank].add(value)
++        return value
++
++    def sum(self, rank, values, dtype="fp16"):
++        unique = list(dict.fromkeys(values))
++        value = unique[0]
++        for other in unique[1:]:
++            value = self.add(rank, value, other, dtype)
++        return value
++
++    def wave(self, transfers):
++        """Publish all independent sends before receiving; no phase barrier."""
++        pending = []
++        seen = set()
++        for source, dest, value in transfers:
++            if value in self.have[dest] or (dest, value) in seen:
++                continue
++            if not self.edge(source, dest) or value not in self.have[source]:
++                raise ValueError("Unavailable source or peer edge")
++            seen.add((dest, value))
++            message = len(self.messages)
++            size = self.payload * (2 if self.values[value]["dtype"] == "fp32" else 1)
++            self.messages.append(
++                dict(source=source, dest=dest, value=value, bytes=size)
++            )
++            self.programs[source].append(
++                dict(op="send", value=value, dest=dest, message=message)
++            )
++            pending.append((source, dest, value, message))
++        for source, dest, value, message in pending:
++            self.programs[dest].append(
++                dict(op="recv", value=value, source=source, message=message)
++            )
++            self.have[dest].add(value)
++
++    def reduce_groups(self, groups, dtype="fp16"):
++        transfers = []
++        results = {}
++        loads = [0] * len(self.devices)
++        for group in groups:
++            vals = sorted(
++                set(self.current[r] for r in group),
++                key=lambda v: self.values[v]["mask"],
++            )
++            mask = 0
++            for value in vals:
++                if mask & self.values[value]["mask"]:
++                    raise ValueError("Overlapping clique partials")
++                mask |= self.values[value]["mask"]
++            for dest in group:
++                for value in vals:
++                    if value in self.have[dest]:
++                        continue
++                    donors = [
++                        s for s in group if value in self.have[s] and self.edge(s, dest)
++                    ]
++                    if not donors:
++                        raise ValueError("Clique source cannot reach receiver")
++                    source = min(
++                        donors,
++                        key=lambda s: (
++                            loads[s],
++                            not self.labels[
++                                self.devices[s], self.devices[dest]
++                            ].startswith("NV"),
++                            s,
++                        ),
++                    )
++                    loads[source] += 1
++                    transfers.append((source, dest, value))
++            results[tuple(group)] = vals
++        self.wave(transfers)
++        for group, vals in results.items():
++            for rank in group:
++                self.current[rank] = self.sum(rank, vals, dtype)
++
++    def finish(self):
++        goal = (1 << len(self.devices)) - 1
++        if (
++            any(self.values[v]["mask"] != goal for v in self.current)
++            or len(set(self.current)) != 1
++        ):
++            raise ValueError("Outputs do not share one complete expression")
++        self.outputs = list(self.current)
++        return self
++
++    def export(self):
++        return dict(
++            name=self.name,
++            family=self.family,
++            devices=list(self.devices),
++            values=self.values,
++            programs=self.programs,
++            messages=self.messages,
++            outputs=self.outputs,
++            labels=[[a, b, label] for (a, b), label in sorted(self.labels.items())],
++            fingerprint=hashlib.sha256(
++                json.dumps(
++                    [self.programs, self.values, self.outputs], sort_keys=True
++                ).encode()
++            ).hexdigest(),
++        )
++
++
++def partitions(items):
++    if not items:
++        yield ()
++        return
++    first, *rest = items
++    for partition in partitions(rest):
++        yield ((first,),) + partition
++        for i, group in enumerate(partition):
++            yield partition[:i] + ((first,) + group,) + partition[i + 1 :]
++
++
++def clique_partitions(devices, labels):
++    def clique(group):
++        return all(
++            (devices[a], devices[b]) in labels and (devices[b], devices[a]) in labels
++            for a, b in itertools.combinations(group, 2)
++        )
++
++    return [
++        p
++        for p in partitions(tuple(range(len(devices))))
++        if all(clique(group) for group in p)
++    ]
++
++
++def reorder_runs(data, rng):
++    """Change issue/poll order within independent runs; preserve arithmetic."""
++    changed = dict(data)
++    changed["programs"] = [list(p) for p in data["programs"]]
++    options = []
++    for rank, program in enumerate(changed["programs"]):
++        begin = 0
++        while begin < len(program):
++            end = begin + 1
++            kind = program[begin]["op"]
++            while end < len(program) and program[end]["op"] == kind:
++                end += 1
++            if kind in ("send", "recv") and end - begin > 1:
++                options.append((rank, begin, end))
++            begin = end
++    if options:
++        rank, begin, end = rng.choice(options)
++        run = changed["programs"][rank][begin:end]
++        rng.shuffle(run)
++        changed["programs"][rank][begin:end] = run
++    changed["fingerprint"] = hashlib.sha256(
++        json.dumps(
++            [changed["programs"], changed["values"], changed["outputs"]], sort_keys=True
++        ).encode()
++    ).hexdigest()
++    return changed
+diff --git a/vllm/distributed/device_communicators/topology_all_reduce/planned_codegen.py b/vllm/distributed/device_communicators/topology_all_reduce/planned_codegen.py
+new file mode 100644
+index 0000000000..87d472d9b0
+--- /dev/null
++++ b/vllm/distributed/device_communicators/topology_all_reduce/planned_codegen.py
+@@ -0,0 +1,137 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++# Keep generated CUDA strings byte-identical to the qualified implementation.
++# ruff: noqa: E501
++
++"""Generate fixed-DAG CUDA peer kernels without fixed topology or message size."""
++
++from .collective_planner import validate
++
++
++def layout(plan, capacity):
++    offsets = []
++    sizes = [0] * len(plan["devices"])
++    for message in plan["messages"]:
++        dest = message["dest"]
++        offsets.append(sizes[dest])
++        sizes[dest] += (
++            2
++            * capacity
++            * (2 if plan["values"][message["value"]]["dtype"] == "fp32" else 1)
++        )
++    return offsets, [max(16, n) for n in sizes]
++
++
++HEADER = r"""
++#include <cuda_runtime.h>
++#include <cuda_fp16.h>
++#include <cstdint>
++#include <vector>
++struct Wide{float data[8];};
++__device__ __forceinline__ void store_packet(uint4 value,char* base,int i){
++ if(value.x==0xffffffff)value.x=0x7fc07fc0;if(value.y==0xffffffff)value.y=0x7fc07fc0;
++ if(value.z==0xffffffff)value.z=0x7fc07fc0;if(value.w==0xffffffff)value.w=0x7fc07fc0;
++ auto ptr=(uint4*)base+i;
++ asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};"::"l"(ptr),"r"(value.x),"r"(value.y),"r"(value.z),"r"(value.w):"memory");
++}
++__device__ __forceinline__ uint4 receive_packet(char* base,int i){
++ uint4 value;auto ptr=(uint4*)base+i;
++ do{asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];":"=r"(value.x),"=r"(value.y),"=r"(value.z),"=r"(value.w):"l"(ptr):"memory");}
++ while(value.x==0xffffffff||value.y==0xffffffff||value.z==0xffffffff||value.w==0xffffffff);
++ asm volatile("st.volatile.global.v4.u32 [%0], {%1,%1,%1,%1};"::"l"(ptr),"r"(0xffffffff):"memory");return value;
++}
++__device__ __forceinline__ uint4 add_half(uint4 a,uint4 b){
++ uint4 out;
++ #pragma unroll
++ for(int j=0;j<4;++j)asm volatile("add.rn.f16x2 %0,%1,%2;":"=r"(((uint32_t*)&out)[j]):"r"(((uint32_t*)&a)[j]),"r"(((uint32_t*)&b)[j]));
++ return out;
++}
++__device__ __forceinline__ Wide widen(uint4 a){
++ Wide out;
++ #pragma unroll
++ for(int j=0;j<4;++j){float2 f=__half22float2(((half2*)&a)[j]);out.data[2*j]=f.x;out.data[2*j+1]=f.y;}return out;
++}
++__device__ __forceinline__ Wide widen(Wide a){return a;}
++__device__ __forceinline__ Wide add_wide(Wide a,Wide b){
++ Wide out;
++ #pragma unroll
++ for(int j=0;j<8;++j)out.data[j]=__fadd_rn(a.data[j],b.data[j]);return out;
++}
++__device__ __forceinline__ uint4 narrow(Wide a){
++ uint4 out;
++ #pragma unroll
++ for(int j=0;j<4;++j)((half2*)&out)[j]=__floats2half2_rn(a.data[2*j],a.data[2*j+1]);return out;
++}
++__device__ __forceinline__ uint4 narrow(uint4 a){return a;}
++"""
++
++
++def generate(plans, topology, capacity):
++    if not plans or len(plans) > 32 or capacity <= 0 or capacity % 16:
++        raise ValueError("Invalid finite kernel batch")
++    n = len(plans[0]["devices"])
++    text = [HEADER, f"struct Boxes{{char* data[{n}];}};"]
++    dispatch = []
++    if any(len(p["devices"]) != n for p in plans):
++        raise ValueError("One node count per compiled batch")
++    for c, p in enumerate(plans):
++        validate(p, topology)
++        offsets, _ = layout(p, capacity)
++        for rank, program in enumerate(p["programs"]):
++            name = f"planned_{c}_rank_{rank}"
++            leaf = "x[i]" if p["values"][rank]["mask"] else "make_uint4(0,0,0,0)"
++            text.append(
++                f"__global__ void {name}(const uint4* x,uint4* out,Boxes boxes,int* flags,int count){{\nint b=blockIdx.x,epoch=flags[b]&1;\nfor(int i=b*blockDim.x+threadIdx.x;i<count;i+=gridDim.x*blockDim.x){{uint4 v{rank}={leaf};"
++            )
++            for op in program:
++                kind = op["op"]
++                v = op["value"]
++                wide = p["values"][v]["dtype"] == "fp32"
++                if kind == "add":
++                    expression = (
++                        f"add_wide(widen(v{op['left']}),widen(v{op['right']}))"
++                        if wide
++                        else f"add_half(v{op['left']},v{op['right']})"
++                    )
++                    text.append(f"{'Wide' if wide else 'uint4'} v{v}={expression};")
++                else:
++                    mid = op["message"]
++                    m = p["messages"][mid]
++                    width = 2 if wide else 1
++                    address = f"boxes.data[{m['dest']}]+{offsets[mid]}+epoch*{capacity * width}"
++                    if wide:
++                        if kind == "recv":
++                            text.append(f"Wide v{v};")
++                        for j in range(2):
++                            if kind == "send":
++                                # Canonicalize only a NaN word that collides with
++                                # readiness; finite numbers and infinities keep
++                                # their exact bits. Half transport has its own
++                                # safe two-half NaN representation in store_packet.
++                                text.append(
++                                    f"{{uint4 packet=((uint4*)&v{v})[{j}];uint32_t* words=(uint32_t*)&packet;for(int k=0;k<4;++k)if(words[k]==0xffffffff)words[k]=0x7fc00000;store_packet(packet,{address},2*i+{j});}}"
++                                )
++                            else:
++                                text.append(
++                                    f"((uint4*)&v{v})[{j}]=receive_packet({address},2*i+{j});"
++                                )
++                    elif kind == "send":
++                        text.append(f"store_packet(v{v},{address},i);")
++                    else:
++                        text.append(f"uint4 v{v}=receive_packet({address},i);")
++            if p["devices"][rank] in p["members"]:
++                text.append(f"out[i]=narrow(v{p['outputs'][rank]});")
++            text.append(
++                "}\n__syncthreads();if(threadIdx.x==0)((uint32_t*)flags)[b]+=1u;\n}"
++            )
++            dispatch.append(
++                f"if(candidate=={c}&&rank=={rank}){{{name}<<<blocks,threads,0,stream>>>(x,out,p,flags,count);return;}}"
++            )
++    text.append(f"""void planned_raw(const uint4* x,uint4* out,const std::vector<int64_t>& pointers,int* flags,int candidate,int rank,int threads,int blocks,int count,cudaStream_t stream){{
++ Boxes p;for(int i=0;i<{n};++i)p.data[i]=(char*)pointers[i];
++""")
++    text.extend(dispatch)
++    text.append('throw std::runtime_error("Unknown planned kernel");\n}')
++    # stdexcept is needed by the host dispatch only.
++    return "#include <stdexcept>\n" + "\n".join(text) + "\n"
+diff --git a/vllm/distributed/device_communicators/topology_all_reduce/planned_collectives.py b/vllm/distributed/device_communicators/topology_all_reduce/planned_collectives.py
+new file mode 100644
+index 0000000000..bd780ac300
+--- /dev/null
++++ b/vllm/distributed/device_communicators/topology_all_reduce/planned_collectives.py
+@@ -0,0 +1,346 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Explicit setup-time compiled DAG channels, including owned external relays."""
++
++import hashlib
++import os
++from contextlib import nullcontext
++from pathlib import Path
++from typing import Any
++
++from .collective_planner import validate
++from .planned_codegen import generate, layout
++
++
++def load_native(plans, topology, capacity):
++    import torch
++    from torch.utils.cpp_extension import get_default_build_root, load
++
++    source = generate(plans, topology, capacity)
++    cpp = Path(__file__).with_name("planned_reduce.cpp")
++    arch = os.environ.get("TORCH_CUDA_ARCH_LIST") or ";".join(
++        sorted(
++            {
++                f"{a}.{b}"
++                for a, b in (
++                    torch.cuda.get_device_capability(i)
++                    for i in range(torch.accelerator.device_count())
++                )
++            }
++        )
++    )
++    digest = hashlib.sha256(
++        source.encode() + cpp.read_bytes() + arch.encode()
++    ).hexdigest()
++    folder = Path(os.environ.get("TORCH_EXTENSIONS_DIR", get_default_build_root())) / (
++        "planned-" + digest[:20]
++    )
++    folder.mkdir(parents=True, exist_ok=True)
++    cu = folder / "planned.cu"
++    if not cu.exists() or cu.read_text() != source:
++        cu.write_text(source)
++    return load(
++        name="vllm_topology_planned_" + digest[:20],
++        sources=[str(cpp), str(cu)],
++        extra_cuda_cflags=["-O3", "-lineinfo"],
++        build_directory=str(folder),
++        verbose=False,
++    )
++
++
++class PlannedChannel:
++    """One exact input width and immutable configuration per graph-safe channel.
++
++    Build/qualify collectively before graph capture. CPU metadata uses the
++    supplied Gloo group; GPU payload uses only verified direct peer mappings.
++    Fixed launch geometry keeps two-epoch mailbox ownership consistent.
++    """
++
++    def __init__(
++        self,
++        group,
++        device,
++        plan,
++        topology,
++        *,
++        threads=64,
++        blocks=5,
++        visible=None,
++        native=None,
++        candidate=0,
++    ):
++        import torch
++        import torch.distributed as dist
++
++        validate(plan, topology)
++        if threads not in (64, 128, 256) or not 1 <= blocks <= 32:
++            raise ValueError("Invalid launch geometry")
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("Plan setup must precede capture")
++        self.group, self.device, self.plan, self.topology = (
++            group,
++            device,
++            plan,
++            topology,
++        )
++        self.threads, self.blocks = threads, blocks
++        self.capacity = plan["payload_bytes"]
++        self.allocated = {}
++        self.imported = []
++        self.engine: Any = None
++        if visible is None:
++            from .planner_probe import visible_devices
++
++            visible = visible_devices()
++        visible = list(visible)
++        members = [None] * dist.get_world_size(group)
++        dist.all_gather_object(members, visible[device.index], group=group)
++        if members != plan["members"]:
++            raise ValueError("Plan member order differs from communicator")
++        self.rank = dist.get_rank(group)
++        nodes = plan["devices"]
++        devices = [visible.index(d) for d in nodes]
++        if not set(nodes) <= set(visible):
++            raise ValueError("Relay is not visible")
++        if len(members) == 1 and len(nodes) == 1:
++            self.native: Any = None
++            return
++        # Native runtime limit is an explicit setup bound, not a topology rule.
++        if len(nodes) > 64:
++            raise ValueError("CUDA backend supports at most 64 nodes per compiled plan")
++        if native is None:
++            if self.rank == 0:
++                load_native([plan], topology, self.capacity)
++            dist.barrier(group=group)
++            native = load_native([plan], topology, self.capacity)
++        self.native = native
++        owners: list[Any] = [
++            members.index(node) if node in members else None for node in nodes
++        ]
++        loads = [0] * len(members)
++        for r, owner in enumerate(owners):
++            if owner is None:
++                owner = min(
++                    range(len(members)),
++                    key=lambda m: (
++                        (members[m], nodes[r]) not in topology.labels,
++                        loads[m],
++                        m,
++                    ),
++                )
++                owners[r] = owner
++                loads[owner] += 1
++        owned = [r for r, owner in enumerate(owners) if owner == self.rank]
++        adjacent = [{r} for r in range(len(nodes))]
++        for message in plan["messages"]:
++            a, b = message["source"], message["dest"]
++            adjacent[a].add(b)
++            adjacent[b].add(a)
++        for node in owned:
++            for peer in adjacent[node] - {node}:
++                if (
++                    nodes[node],
++                    nodes[peer],
++                ) not in topology.labels or not torch.cuda.can_device_access_peer(
++                    devices[node], devices[peer]
++                ):
++                    raise RuntimeError("Planned peer mapping unavailable")
++        _, sizes = layout(plan, self.capacity)
++        handles = {}
++        flags = []
++        for node in owned:
++            pointer, handle = native.allocate(devices[node], sizes[node])
++            self.allocated[node] = pointer
++            handles[node] = handle
++            flags.append(
++                torch.zeros(32, dtype=torch.int32, device=f"cuda:{devices[node]}")
++            )
++        exchanged: list[Any] = [None] * len(members)
++        dist.all_gather_object(exchanged, handles, group=group)
++        rows = []
++        for node in owned:
++            row = [0] * len(nodes)
++            for peer in sorted(adjacent[node]):
++                if owners[peer] == self.rank:
++                    row[peer] = self.allocated[peer]
++                    if peer != node:
++                        native.enable_peer(devices[node], devices[peer])
++                else:
++                    pointer = native.open_handle(
++                        devices[node], exchanged[owners[peer]][peer]
++                    )
++                    self.imported.append((devices[node], pointer))
++                    row[peer] = pointer
++            rows.append(row)
++        self.flags = flags
++        self.nodes_owned = owned
++        self.sizes = sizes
++        self.devices = devices
++        self.engine = native.Engine(
++            device.index,
++            owned,
++            devices,
++            rows,
++            flags,
++            candidate,
++            threads,
++            blocks,
++            self.capacity,
++        )
++        for node in owned:
++            torch.accelerator.synchronize(devices[node])
++        dist.barrier(group=group)
++
++    def accepts(self, x):
++        import torch
++
++        if self.native is None:
++            return x.device == self.device
++        return (
++            x.device == self.device
++            and x.dtype == torch.float16
++            and x.is_contiguous()
++            and x.nbytes == self.capacity
++            and x.data_ptr() % 16 == 0
++        )
++
++    def all_reduce(self, x):
++        import torch
++
++        if not self.accepts(x):
++            raise ValueError("Unqualified payload shape/dtype/layout")
++        if self.native is None:
++            return x
++        out = torch.empty_like(x)
++        self.engine.run(x, out)
++        return out
++
++    def result_matches(self, output, reference, values):
++        """Generated kernels must match their declared expression bitwise."""
++        import torch
++
++        return torch.equal(output.view(torch.int16), reference.view(torch.int16))
++
++    def next_values(self, reference, output):
++        # Every generated rank implements the same declared expression. A
++        # failed bitwise check fails qualification collectively, so no extra
++        # tensor collective is needed to propagate a successful reference.
++        return [reference] * len(self.plan["members"])
++
++    def qualify(self, repeats=3):
++        """Changed dense inputs, all-rank bitwise AST, poisoned chained graphs."""
++        import torch
++        import torch.distributed as dist
++
++        if self.native is None:
++            return dict(
++                status="passed", checks=0, precision=self.plan["precision"], local=True
++            )
++        checks = 0
++        examples = []
++
++        def expected(values):
++            cache = []
++            by_node = dict(zip(self.plan["members"], values))
++            for node in self.plan["devices"]:
++                cache.append(by_node.get(node, torch.zeros_like(values[0])))
++            for value in self.plan["values"][len(cache) :]:
++                a, b = value["children"]
++                v = cache[a].float() + cache[b].float()
++                cache.append(v if value["dtype"] == "fp32" else v.half())
++            return cache[self.plan["outputs"][0]].half()
++
++        for trial in range(repeats):
++            generator = torch.Generator().manual_seed(723001 + trial * 31 + self.rank)
++            original = (
++                torch.randn(self.capacity // 2, generator=generator) * 0.125
++            ).half()
++            values = [None] * dist.get_world_size(self.group)
++            dist.all_gather_object(values, original, group=self.group)
++            ref = expected(values)
++            x = original.to(self.device)
++            torch.accelerator.synchronize(self.device)
++            dist.barrier(group=self.group)
++            out = self.all_reduce(x)
++            torch.accelerator.synchronize(self.device)
++            passed = self.result_matches(out.cpu(), ref, values) and torch.equal(
++                x.cpu(), original
++            )
++            statuses = [None] * len(values)
++            dist.all_gather_object(statuses, passed, group=self.group)
++            if not all(statuses):
++                raise RuntimeError("Planned DAG dense AST qualification failed")
++            checks += 2
++            examples.append(
++                hashlib.sha256(
++                    out.cpu().view(torch.uint8).numpy().tobytes()
++                ).hexdigest()
++            )
++        # Replay changes the input after capture. Each intermediate dependent
++        # output is checked, with exact fractions chosen to avoid overflow.
++        graph = torch.cuda.CUDAGraph()
++        with getattr(self, "capture", nullcontext)():
++            source = torch.empty(
++                self.capacity // 2, dtype=torch.float16, device=self.device
++            )
++            with torch.cuda.graph(graph):
++                output = source
++                outputs = []
++                for _ in range(4):
++                    output = self.all_reduce(output)
++                    outputs.append(output)
++        for trial in range(repeats):
++            original = torch.full(
++                (self.capacity // 2,),
++                (self.rank + 1 + trial) / 1048576,
++                dtype=torch.float16,
++            )
++            values = [None] * dist.get_world_size(self.group)
++            dist.all_gather_object(values, original, group=self.group)
++            source.copy_(original)
++            for output in outputs:
++                output.fill_(float("nan"))
++            torch.accelerator.synchronize(self.device)
++            dist.barrier(group=self.group)
++            graph.replay()
++            torch.accelerator.synchronize(self.device)
++            passed = True
++            for output in outputs:
++                ref = expected(values)
++                actual = output.cpu()
++                passed &= self.result_matches(actual, ref, values)
++                values = self.next_values(ref, actual)
++                checks += 1
++            statuses = [None] * len(values)
++            dist.all_gather_object(statuses, passed, group=self.group)
++            if not all(statuses):
++                raise RuntimeError(
++                    "Planned DAG changed/poisoned dependent graph failed"
++                )
++        return dict(
++            status="passed",
++            checks=checks,
++            examples=examples,
++            precision=self.plan["precision"],
++            fingerprint=self.plan["fingerprint"],
++        )
++
++    def close(self):
++        if not self.allocated:
++            return
++        import torch
++        import torch.distributed as dist
++
++        for node in self.nodes_owned:
++            torch.accelerator.synchronize(self.devices[node])
++        dist.barrier(group=self.group)
++        assert self.native is not None
++        self.engine.close()
++        for device, pointer in self.imported:
++            self.native.release(device, pointer, True)
++        self.imported.clear()
++        dist.barrier(group=self.group)
++        for node, pointer in self.allocated.items():
++            self.native.release(self.devices[node], pointer, False)
++        self.allocated.clear()
+diff --git a/vllm/distributed/device_communicators/topology_all_reduce/planned_reduce.cpp b/vllm/distributed/device_communicators/topology_all_reduce/planned_reduce.cpp
+new file mode 100644
+index 0000000000..0bafe68eb2
+--- /dev/null
++++ b/vllm/distributed/device_communicators/topology_all_reduce/planned_reduce.cpp
+@@ -0,0 +1,173 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAException.h>
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++
++void planned_raw(const uint4*, uint4*, const std::vector<int64_t>&, int*, int,
++                 int, int, int, int, cudaStream_t);
++struct Scope {
++  int old;
++  explicit Scope(int d) {
++    C10_CUDA_CHECK(cudaGetDevice(&old));
++    C10_CUDA_CHECK(cudaSetDevice(d));
++  }
++  ~Scope() { cudaSetDevice(old); }
++};
++std::tuple<int64_t, pybind11::bytes> allocate(int device, int64_t bytes) {
++  TORCH_CHECK(bytes > 0 && bytes <= 1024LL * 1024 * 1024);
++  Scope scope(device);
++  void* ptr;
++  C10_CUDA_CHECK(cudaMalloc(&ptr, bytes));
++  C10_CUDA_CHECK(cudaMemset(ptr, 0xff, bytes));
++  cudaIpcMemHandle_t handle;
++  C10_CUDA_CHECK(cudaIpcGetMemHandle(&handle, ptr));
++  return {(int64_t)ptr, pybind11::bytes((char*)&handle, sizeof(handle))};
++}
++int64_t open_handle(int device, pybind11::bytes value) {
++  Scope scope(device);
++  std::string raw = value;
++  TORCH_CHECK(raw.size() == sizeof(cudaIpcMemHandle_t));
++  cudaIpcMemHandle_t handle;
++  memcpy(&handle, raw.data(), sizeof(handle));
++  void* ptr;
++  C10_CUDA_CHECK(
++      cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess));
++  return (int64_t)ptr;
++}
++void release(int device, int64_t ptr, bool imported) {
++  Scope scope(device);
++  if (imported)
++    C10_CUDA_CHECK(cudaIpcCloseMemHandle((void*)ptr));
++  else
++    C10_CUDA_CHECK(cudaFree((void*)ptr));
++}
++void enable_peer(int device, int target) {
++  Scope scope(device);
++  auto status = cudaDeviceEnablePeerAccess(target, 0);
++  if (status == cudaErrorPeerAccessAlreadyEnabled) {
++    cudaGetLastError();
++    return;
++  }
++  C10_CUDA_CHECK(status);
++}
++void reset(int device, int64_t ptr, int64_t bytes) {
++  Scope scope(device);
++  C10_CUDA_CHECK(cudaMemset((void*)ptr, 0xff, bytes));
++}
++
++class Engine {
++  int device, candidate, threads, blocks, capacity;
++  std::vector<int> owned, devices;
++  std::vector<std::vector<int64_t>> pointers;
++  std::vector<torch::Tensor> flags;
++  std::vector<cudaStream_t> streams;
++  std::vector<cudaEvent_t> done;
++  cudaEvent_t ready = nullptr;
++
++ public:
++  Engine(int device_, std::vector<int> owned_, std::vector<int> devices_,
++         std::vector<std::vector<int64_t>> pointers_,
++         std::vector<torch::Tensor> flags_, int candidate_, int threads_,
++         int blocks_, int capacity_)
++      : device(device_),
++        candidate(candidate_),
++        threads(threads_),
++        blocks(blocks_),
++        capacity(capacity_),
++        owned(owned_),
++        devices(devices_),
++        pointers(pointers_),
++        flags(flags_) {
++    TORCH_CHECK(!owned.empty() && owned.size() == pointers.size() &&
++                owned.size() == flags.size());
++    TORCH_CHECK((threads == 64 || threads == 128 || threads == 256) &&
++                blocks >= 1 && blocks <= 32 && capacity > 0 &&
++                capacity % 16 == 0);
++    Scope scope(device);
++    C10_CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
++    for (size_t i = 0; i < owned.size(); ++i) {
++      int node = owned[i];
++      TORCH_CHECK(node >= 0 && node < (int)devices.size() &&
++                  pointers[i].size() == devices.size());
++      TORCH_CHECK(flags[i].is_cuda() &&
++                  flags[i].get_device() == devices[node] &&
++                  flags[i].scalar_type() == at::kInt &&
++                  flags[i].is_contiguous() && flags[i].numel() >= blocks);
++      Scope other(devices[node]);
++      cudaStream_t stream = nullptr;
++      cudaEvent_t event = nullptr;
++      if (devices[node] != device) {
++        C10_CUDA_CHECK(
++            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++        C10_CUDA_CHECK(
++            cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
++      }
++      streams.push_back(stream);
++      done.push_back(event);
++    }
++  }
++  void run(torch::Tensor x, torch::Tensor out) {
++    TORCH_CHECK(x.is_cuda() && x.get_device() == device &&
++                out.device() == x.device() && x.scalar_type() == at::kHalf &&
++                out.scalar_type() == at::kHalf);
++    TORCH_CHECK(x.is_contiguous() && out.is_contiguous() &&
++                x.nbytes() == out.nbytes() && x.nbytes() > 0 &&
++                x.nbytes() <= capacity && x.nbytes() % 16 == 0);
++    TORCH_CHECK((uintptr_t)x.data_ptr() % 16 == 0 &&
++                (uintptr_t)out.data_ptr() % 16 == 0);
++    Scope scope(device);
++    auto main = c10::cuda::getCurrentCUDAStream(device).stream();
++    bool helpers = owned.size() > 1;
++    if (helpers) C10_CUDA_CHECK(cudaEventRecord(ready, main));
++    for (size_t i = 0; i < owned.size(); ++i) {
++      bool helper = devices[owned[i]] != device;
++      Scope other(devices[owned[i]]);
++      auto stream = helper ? streams[i] : main;
++      if (helper) C10_CUDA_CHECK(cudaStreamWaitEvent(stream, ready, 0));
++      planned_raw(helper ? nullptr : (const uint4*)x.data_ptr(),
++                  helper ? nullptr : (uint4*)out.data_ptr(), pointers[i],
++                  (int*)flags[i].data_ptr(), candidate, owned[i], threads,
++                  blocks, x.nbytes() / 16, stream);
++      C10_CUDA_KERNEL_LAUNCH_CHECK();
++      if (helper) C10_CUDA_CHECK(cudaEventRecord(done[i], stream));
++    }
++    if (helpers)
++      for (auto event : done)
++        if (event) C10_CUDA_CHECK(cudaStreamWaitEvent(main, event, 0));
++  }
++  void close() {
++    if (!ready) return;
++    Scope scope(device);
++    C10_CUDA_CHECK(cudaEventDestroy(ready));
++    ready = nullptr;
++    for (size_t i = 0; i < owned.size(); ++i)
++      if (streams[i]) {
++        Scope other(devices[owned[i]]);
++        C10_CUDA_CHECK(cudaStreamDestroy(streams[i]));
++        C10_CUDA_CHECK(cudaEventDestroy(done[i]));
++        streams[i] = nullptr;
++      }
++  }
++  ~Engine() {
++    try {
++      close();
++    } catch (...) {
++    }
++  }
++};
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++  m.def("allocate", &allocate);
++  m.def("open_handle", &open_handle);
++  m.def("release", &release);
++  m.def("enable_peer", &enable_peer);
++  m.def("reset", &reset);
++  pybind11::class_<Engine>(m, "Engine", pybind11::module_local())
++      .def(pybind11::init<int, std::vector<int>, std::vector<int>,
++                          std::vector<std::vector<int64_t>>,
++                          std::vector<torch::Tensor>, int, int, int, int>())
++      .def("run", &Engine::run)
++      .def("close", &Engine::close);
++}
+diff --git a/vllm/distributed/device_communicators/topology_all_reduce/planner_probe.py b/vllm/distributed/device_communicators/topology_all_reduce/planner_probe.py
+new file mode 100644
+index 0000000000..65da068528
+--- /dev/null
++++ b/vllm/distributed/device_communicators/topology_all_reduce/planner_probe.py
+@@ -0,0 +1,171 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Driver-only topology discovery for the general planner; no CUDA contexts."""
++
++import subprocess
++
++import regex as re
++
++from .collective_planner import Topology, from_probe
++
++
++def matrix(text):
++    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
++    rows = {}
++    header = None
++    for line in text.splitlines():
++        fields = line.split()
++        if not fields:
++            continue
++        gpu = [int(v[3:]) for v in fields if re.fullmatch(r"GPU\d+", v)]
++        if len(gpu) > 1 or len(gpu) == 1 and len(fields) == 1:
++            header = gpu
++            continue
++        if re.fullmatch(r"GPU\d+", fields[0]) and len(fields) > 1:
++            rows[int(fields[0][3:])] = fields[1:]
++    nodes = header or list(rows)
++    if not 1 <= len(nodes) <= 64 or set(nodes) != set(rows):
++        raise ValueError("Unknown/truncated physical GPU matrix")
++    if any(len(rows[node]) < len(nodes) for node in nodes):
++        raise ValueError("Truncated GPU row")
++    return nodes, {(a, b): rows[a][j] for a in nodes for j, b in enumerate(nodes)}
++
++
++def from_text(topology, read, write, hardware="", profiles=None):
++    nodes, labels = matrix(topology)
++    rnodes, reads = matrix(read)
++    wnodes, writes = matrix(write)
++    if nodes != rnodes or nodes != wnodes:
++        raise ValueError("Driver matrices disagree")
++    normalized = "\t" + "\t".join(f"GPU{i}" for i in range(len(nodes))) + "\n"
++    normalized += "\n".join(
++        "GPU" + str(i) + "\t" + "\t".join(labels[a, b] for b in nodes)
++        for i, a in enumerate(nodes)
++    )
++    record = dict(
++        topology=normalized,
++        peer_read=[[reads[a, b] for b in nodes] for a in nodes],
++        peer_write=[[writes[a, b] for b in nodes] for a in nodes],
++    )
++    converted = None
++    if profiles:
++        converted = dict(
++            profiles,
++            edges=[
++                dict(e, source=nodes.index(e["source"]), dest=nodes.index(e["dest"]))
++                for e in profiles.get("edges", [])
++                if e["source"] in nodes and e["dest"] in nodes
++            ],
++        )
++    base = from_probe(record, converted, identity=dict(hardware=hardware))
++    edges = [
++        dict(e, source=nodes[e["source"]], dest=nodes[e["dest"]]) for e in base.edges
++    ]
++    # Initial PCIe throughput follows negotiated generation/width, rather than
++    # carrying an x8 Gen3 estimate onto every other machine.
++    rates = {
++        1: 250.0,
++        2: 500.0,
++        3: 984.6153846,
++        4: 1969.230769,
++        5: 3938.461538,
++        6: 7562.5,
++    }
++    ports = {}
++    for line in hardware.splitlines():
++        fields = [v.strip() for v in line.split(",")]
++        try:
++            if len(fields) >= 6:
++                ports[int(fields[0])] = rates[int(fields[-2])] * int(fields[-1]) * 0.74
++        except (ValueError, KeyError):
++            continue
++    overrides = {(e["source"], e["dest"]): e for e in (profiles or {}).get("edges", [])}
++    for edge in edges:
++        a, b = edge["source"], edge["dest"]
++        if (
++            not edge["transport"].startswith("NV")
++            and a in ports
++            and b in ports
++            and "bytes_per_us" not in overrides.get((a, b), {})
++        ):
++            edge["bytes_per_us"] = min(ports[a], ports[b])
++    for i, node in enumerate(nodes):
++        for key in (f"pcie-tx-{i}", f"pcie-rx-{i}"):
++            if (
++                node in ports
++                and key in base.resources
++                and key not in (profiles or {}).get("resources", {})
++            ):
++                base.resources[key]["bytes_per_us"] = ports[node]
++    return Topology(
++        nodes,
++        edges,
++        base.resources,
++        dict(base.identity, driver_topology=topology, peer_read=read, peer_write=write),
++    )
++
++
++def discover(profiles=None):
++    def query(*args):
++        return subprocess.check_output(["nvidia-smi", *args], text=True, timeout=15)
++
++    return from_text(
++        query("topo", "-m"),
++        query("topo", "-p2p", "r"),
++        query("topo", "-p2p", "w"),
++        query(
++            "--query-gpu=index,uuid,pci.bus_id,driver_version,pcie.link.gen.current,pcie.link.width.current",
++            "--format=csv,noheader",
++        ),
++        profiles,
++    )
++
++
++def refresh(previous):
++    """Reprobe before using a cached decision; discard stale physical profiles."""
++    live = discover()
++    if previous is None:
++        return live
++    same_hardware = previous.identity.get("hardware") == live.identity["hardware"]
++    explicit_unbound = (
++        not previous.identity.get("hardware")
++        and previous.identity.get("cost_origin") != "explicit-initial-estimates"
++    )
++    if live.labels == previous.labels and (same_hardware or explicit_unbound):
++        # Preserve explicit current-link costs/capacity models, but incorporate
++        # fresh driver graph and hardware identity in the selection key.
++        identity = dict(previous.identity, **live.identity)
++        identity["cost_origin"] = previous.identity.get(
++            "cost_origin", live.identity["cost_origin"]
++        )
++        return Topology(live.nodes, previous.edges, previous.resources, identity)
++    return live
++
++
++def visible_devices():
++    """Map actual CUDA ordinals by UUID, including reordered UUID environments."""
++    import torch
++
++    raw = subprocess.check_output(
++        ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
++        text=True,
++        timeout=15,
++    )
++    by_uuid = {
++        uuid.strip().lower().removeprefix("gpu-"): int(index)
++        for index, uuid in (line.split(",", 1) for line in raw.splitlines())
++    }
++    result = []
++    for logical in range(torch.accelerator.device_count()):
++        uuid = (
++            str(torch.cuda.get_device_properties(logical).uuid)
++            .lower()
++            .removeprefix("gpu-")
++        )
++        if uuid not in by_uuid:
++            raise ValueError(
++                "CUDA UUID does not map to a physical GPU; MIG requires its own backend"
++            )
++        result.append(by_uuid[uuid])
++    return result
+diff --git a/vllm/distributed/device_communicators/topology_all_reduce/startup.py b/vllm/distributed/device_communicators/topology_all_reduce/startup.py
+new file mode 100644
+index 0000000000..7853d4afd6
+--- /dev/null
++++ b/vllm/distributed/device_communicators/topology_all_reduce/startup.py
+@@ -0,0 +1,136 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Collective setup before first model compilation and CUDA graph capture."""
++
++import hashlib
++import json
++import socket
++import time
++from pathlib import Path
++from typing import Any
++
++
++def payloads(model_config, speculative_config=None):
++    """Derive FP16 single-token and single-sequence verification/draft widths."""
++    widths = {2 * model_config.get_hidden_size()}
++    if speculative_config is not None:
++        rows = speculative_config.num_speculative_tokens + 1
++        widths.add(2 * model_config.get_hidden_size() * rows)
++        draft = getattr(speculative_config, "draft_model_config", None)
++        if draft is not None:
++            widths.add(2 * draft.get_hidden_size())
++            widths.add(2 * draft.get_hidden_size() * rows)
++    if any(w <= 0 or w % 16 for w in widths):
++        raise ValueError("Unsupported activation width")
++    return sorted(widths)
++
++
++def install(worker):
++    """All TP ranks call once; freeze qualified dispatch before model capture.
++
++    Only the current single-node TP group is measured. Other operation signatures
++    keep their existing backend. Do not call this from an already captured graph.
++    """
++    import torch
++    import torch.distributed as dist
++
++    from vllm.distributed import get_tp_group
++    from vllm.logger import init_logger
++
++    from .collective_tuner import BoundBackend, prepare_best
++
++    logger = init_logger(__name__)
++    tp: Any = get_tp_group()
++    comm: Any = tp.device_communicator
++    if tp.world_size == 1 or comm is None:
++        return {}
++    hosts = [None] * tp.world_size
++    dist.all_gather_object(hosts, socket.gethostname(), group=tp.cpu_group)
++    if len(set(hosts)) != 1:
++        logger.warning("Topology all-reduce requires a single-node TP group; skipped")
++        return {}
++    config = worker.vllm_config
++    # Derive exactly the same widths on every rank, even with heterogeneous
++    # draft/target hidden dimensions. No model names or physical GPU IDs here.
++    widths = payloads(config.model_config, config.speculative_config)
++    previous = BoundBackend(comm)
++    options = config.kernel_config.topology_all_reduce
++    precision = options.precision
++    if precision not in ("fp16", "fp32"):
++        raise ValueError("topology_all_reduce.precision must be fp16 or fp32")
++    if options.cache_dir is None:
++        from torch.utils.cpp_extension import get_default_build_root
++
++        cache = Path(get_default_build_root()) / "topology-selections"
++    else:
++        cache = Path(options.cache_dir)
++    context = dict(
++        model=config.model_config.model,
++        speculation=getattr(config.speculative_config, "method", None),
++        max_sequences=config.scheduler_config.max_num_seqs,
++        group_ranks=list(tp.ranks),
++    )
++    key = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()[:20]
++    started = time.monotonic()
++    routes = {}
++    receipts = []
++    for width in widths:
++        begin = time.monotonic()
++        route = prepare_best(
++            tp.cpu_group,
++            worker.device,
++            existing=comm,
++            payload_bytes=width,
++            precision=precision,
++            cache=cache / f"{key}-{width}-{precision}.json",
++            context=context,
++        )
++        torch.accelerator.synchronize(worker.device)
++        times = [0.0] * tp.world_size
++        dist.all_gather_object(times, time.monotonic() - begin, group=tp.cpu_group)
++        routes[width] = route
++        receipts.append(
++            dict(bytes=width, setup_seconds=max(times), selection=route.receipt)
++        )
++
++    def reduce(x):
++        route = routes.get(x.nbytes)
++        if (
++            route is not None
++            and x.dtype == torch.float16
++            and x.is_contiguous()
++            and x.data_ptr() % 16 == 0
++        ):
++            return route.all_reduce(x)
++        return previous.all_reduce(x)
++
++    # Capture the old bound method; never recurse through the patched method.
++    comm.all_reduce = reduce
++    # GroupCoordinator destroys its CPU group before its communicator. Close
++    # IPC channels while that group still exists for coordinated buffer release.
++    destroy = tp.destroy
++
++    def close():
++        try:
++            for route in routes.values():
++                route.close()
++        finally:
++            destroy()
++
++    tp.destroy = close
++    logger.info(
++        "Topology all-reduce rank=%d setup=%.3fs precision=%s widths=%s",
++        tp.rank_in_group,
++        time.monotonic() - started,
++        precision,
++        [
++            dict(
++                bytes=r["bytes"],
++                seconds=r["setup_seconds"],
++                winner=r["selection"].get("winner"),
++                cache_hit=r["selection"].get("cache_hit"),
++            )
++            for r in receipts
++        ],
++    )
++    return routes
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 275b2a6d51..1be0c96cd4 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -844,6 +844,16 @@ def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+ 
+     @instrument(span_name="Warmup (GPU)")
+     def compile_or_warm_up_model(self) -> CompilationTimes:
++        if self.vllm_config.kernel_config.topology_all_reduce.enabled and not getattr(
++            self, "_topology_all_reduce_installed", False
++        ):
++            from vllm.distributed.device_communicators.topology_all_reduce import (
++                startup,
++            )
++
++            self._topology_all_reduce_routes = startup.install(self)
++            self._topology_all_reduce_installed = True
++
+         warmup_sizes: list[int] = []
+ 
+         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:

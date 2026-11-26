@@ -1,0 +1,65 @@
+{
+  "group": "collectives",
+  "title": "Collectives, PP overlap and P2P protocol qualification queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1245,
+      "title": "[Perf][Distributed] Add topology-aware all-reduce selection and extend to any p2p",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1245",
+      "head": "205ac6f550a5870b7ac06dc9286ea1a16069559e",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "eedc2d1d7ab9bcc03ecbd281b355ad7883854556e0ae8378c0f0de9f5ad1b0c6",
+      "files": 24,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1216,
+      "title": "[Kernel] Two-rank FP16 all-reduce through pinned host memory for GPUs without P2P",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1216",
+      "head": "01f1c7d2bf6976e4be4e4955fb95ae537be6e821",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "ba98f5a29765e217cb1e0ee4551e0ac1f2299ed978751567fb19f03cba53b7d9",
+      "files": 7,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 963,
+      "title": "[Kernel] Extend captured SM70 TP4 push all-reduce through M64",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/963",
+      "head": "c0c25bd70ecd64f1af41ab1ac9a1cba5a567cc75",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "0ee143fd0ca6a16ee5922c9c1f8f5b4950f1e46c1ee6c5926f8ae5b71f95335b",
+      "files": 4,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1294,
+      "title": "[Perf][PP] Let an eager step's pipeline send overlap the next step",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1294",
+      "head": "4f369ab020081e9fc478f21d8b6b24e579eb671b",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "f8965eeff46e12f1a7ef69ef0c920cfc18bd958037449c38e48249eaf0839393",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1250,
+      "title": "修复 P2pNcclConnector 三个问题：tensor key 对不上、对端重启挂 listener、producer 断言崩溃",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1250",
+      "head": "c02f3edc29cf6a25b7fea10fee2de79fdbae683a",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "03730cf06866a1e959b5a4ef913c1afa44e2f41fd577675d0236eb0df5947553",
+      "files": 3,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "Need actual NVLink/P2P, non-P2P two-rank and supported topology coverage, CUDA Graph replay, concurrent buffers, timeouts and slow ranks. #1250 checks an unknown communicator after allocating a pool block; repair ordering and exercise producer/restart/listener protocol before promotion. #1294 send overlap requires lifetime and shutdown validation. Do not infer all-reduce wins from a single topology.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}

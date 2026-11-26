@@ -1,0 +1,201 @@
+diff --git a/csrc/custom_all_reduce.cuh b/csrc/custom_all_reduce.cuh
+index 0c213a6369..db5406b88f 100644
+--- a/csrc/custom_all_reduce.cuh
++++ b/csrc/custom_all_reduce.cuh
+@@ -94,7 +94,9 @@ constexpr size_t kSm70Tp4PushAllreduceM16Bytes =
+     16 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
+ constexpr size_t kSm70Tp4PushAllreduceM32Bytes =
+     32 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
+-constexpr size_t kSm70Tp4PushAllreduceMaxBytes = kSm70Tp4PushAllreduceM32Bytes;
++constexpr size_t kSm70Tp4PushAllreduceM64Bytes =
++    64 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
++constexpr size_t kSm70Tp4PushAllreduceMaxBytes = kSm70Tp4PushAllreduceM64Bytes;
+ constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
+ constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
+ constexpr size_t kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes =
+@@ -200,7 +202,10 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
+   if (bytes == kSm70Tp4PushAllreduceM8Bytes ||
+       (concurrency != nullptr && std::strcmp(concurrency, "1") == 0 &&
+        (bytes == kSm70Tp4PushAllreduceM16Bytes ||
+-        bytes == kSm70Tp4PushAllreduceM32Bytes))) {
++        bytes == kSm70Tp4PushAllreduceM32Bytes ||
++        (bytes > kSm70Tp4PushAllreduceM32Bytes &&
++         bytes <= kSm70Tp4PushAllreduceM64Bytes &&
++         bytes % (kSm70GemmaRmsNormHiddenSize * sizeof(half)) == 0)))) {
+     return kSm70Tp4PushAllreduceBlocks;
+   }
+   if (bytes == kSm70Tp4PushAllreduce8KiBBytes) {
+@@ -239,6 +244,14 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
+              : 0;
+ }
+ 
++inline int sm70_tp4_push_allreduce_threads(size_t bytes) {
++  // Preserve the qualified smaller-message geometry. Larger captured decode
++  // messages reuse the same two-epoch protocol with fewer packs per thread.
++  return bytes > kSm70Tp4PushAllreduceM32Bytes
++             ? 2 * kSm70Tp4PushAllreduceThreads
++             : kSm70Tp4PushAllreduceThreads;
++}
++
+ inline int sm70_gemma_rms_norm_threads() {
+   const char* raw = std::getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS");
+   if (raw == nullptr) return kSm70GemmaRmsNormThreads;
+@@ -2209,8 +2222,8 @@ class CustomAllreduce {
+         const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes, true);
+         if (push_blocks > 0) {
+           sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
+-              <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
+-                  sm70_tp4_push_buffers_, input, output, rank_, size);
++              <<<push_blocks, sm70_tp4_push_allreduce_threads(bytes), 0,
++                 stream>>>(sm70_tp4_push_buffers_, input, output, rank_, size);
+           return;
+         }
+       }
+diff --git a/docs/design/sm70_tp4_large_verify_allreduce.md b/docs/design/sm70_tp4_large_verify_allreduce.md
+new file mode 100644
+index 0000000000..0bae7263c9
+--- /dev/null
++++ b/docs/design/sm70_tp4_large_verify_allreduce.md
+@@ -0,0 +1,27 @@
++# SM70 TP4 all-reduce for larger verification batches
++
++Captured FP16 verification batches with a hidden size of 5120 now reuse the
++existing SM70 TP4 push all-reduce through 64 rows (640 KiB). Admission still
++requires four fully interconnected SM70 devices and an initialized IPC push
++buffer. Eager calls, other dtypes, and unsupported message sizes retain their
++existing implementations. No new runtime option is required.
++
++Messages above 32 rows use 256 threads per CTA, with the existing 80-CTA grid
++and two-epoch protocol. Smaller-message launch geometry and accumulation order
++are unchanged. The maximum persistent IPC allocation grows by approximately
++2.5 MiB per rank; account for this allocation when sizing a nearly full device.
++
++## Validation
++
++`tests/distributed/test_sm70_large_push_all_reduce.py` compares captured chains
++against the original dispatch, including partial verification batches,
++alternating message lengths, repeated graph replay, rank skew, cancellation,
++unsupported dtypes, and output guards.
++
++A preliminary cold-L2 graph microbenchmark on four fully interconnected
++V100-SXM2-16GB devices at a 300 W power limit measured a 64-row collective at
++58.98 us with the previous two-stage path and 20.16 us with push. The benchmark
++used 16 collectives per replay, 60 replays, 128 MiB L2 eviction, and an untimed
++GPU collective before the timing events to align the ranks. Outputs were
++bitwise identical. These are operator measurements, not model speed claims;
++complete verification-round measurements are required before promotion.
+diff --git a/tests/distributed/test_sm70_large_push_all_reduce.py b/tests/distributed/test_sm70_large_push_all_reduce.py
+new file mode 100644
+index 0000000000..18d0bd7aa4
+--- /dev/null
++++ b/tests/distributed/test_sm70_large_push_all_reduce.py
+@@ -0,0 +1,95 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import os
++from datetime import timedelta
++
++import pytest
++import torch
++import torch.distributed as dist
++import torch.multiprocessing as mp
++
++
++def _check_large_push(rank: int, rendezvous: str) -> None:
++    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
++
++    torch.accelerator.set_device_index(rank)
++    torch.set_num_threads(1)
++    dist.init_process_group(
++        "gloo",
++        rank=rank,
++        world_size=4,
++        init_method=rendezvous,
++        timeout=timedelta(seconds=180),
++    )
++    communicator = CustomAllreduce(dist.group.WORLD, rank, max_size=1024 * 1024)
++    assert not communicator.disabled and communicator.fully_connected
++    try:
++        # Include partial batches and alternating packet lengths: the same
++        # persistent two-epoch buffer must not retain a previous graph's tail.
++        shapes = [(rows, 5120) for rows in (8, 16, 32, 33, 40, 48, 56, 64, 65)]
++        for dtype in (torch.float16, torch.bfloat16, torch.float32):
++            inputs = [
++                torch.empty(shape, dtype=dtype, device="cuda") for shape in shapes
++            ]
++            graphs, outputs, guards = [], [], []
++            for enabled in (False, True):
++                os.environ["VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY"] = str(
++                    int(enabled)
++                )
++                storage = [
++                    torch.full((x.numel() + 16,), 123.0, dtype=dtype, device="cuda")
++                    for x in inputs
++                ]
++                out = [y[8:-8].view_as(x) for x, y in zip(inputs, storage)]
++                graph = torch.cuda.CUDAGraph()
++                torch.accelerator.synchronize()
++                dist.barrier()
++                with communicator.capture(), torch.cuda.graph(graph):
++                    for _ in range(4):
++                        for x, y in zip(inputs, out):
++                            communicator.all_reduce(x, out=y, registered=True)
++                graphs.append(graph)
++                outputs.append(out)
++                guards.append(storage)
++            for cycle in range(12):
++                torch.manual_seed(317 + rank + 11 * cycle)
++                for x in inputs:
++                    if cycle == 5:
++                        x.fill_((65504.0, 0.0001, -65504.0, 0.03125)[rank])
++                        x.flatten()[1::2].mul_(-1)
++                    else:
++                        x.normal_().mul_(0.03 * (cycle + 1))
++                dist.barrier()
++                for graph in graphs:
++                    if rank == cycle % 4:
++                        torch.cuda._sleep(10000)
++                    graph.replay()
++                torch.accelerator.synchronize()
++                for actual, expected in zip(outputs[1], outputs[0]):
++                    assert torch.equal(
++                        actual.view(torch.uint8), expected.view(torch.uint8)
++                    )
++                for group in guards:
++                    for storage in group:
++                        assert bool(torch.all(storage[:8] == 123))
++                        assert bool(torch.all(storage[-8:] == 123))
++    finally:
++        communicator.close()
++        dist.destroy_process_group()
++
++
++def test_large_push_preserves_order_tail_and_graph_replay(tmp_path, monkeypatch):
++    if torch.accelerator.device_count() != 4 or torch.cuda.get_device_capability() != (
++        7,
++        0,
++    ):
++        pytest.skip("requires an isolated NVLink-connected group of four V100 GPUs")
++    monkeypatch.setenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1")
++    for name in (
++        "VLLM_CUSTOM_ALLREDUCE_ALGO",
++        "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES",
++    ):
++        monkeypatch.delenv(name, raising=False)
++    rendezvous = (tmp_path / "large-push-rendezvous").as_uri()
++    mp.spawn(_check_large_push, args=(rendezvous,), nprocs=4, join=True)
+diff --git a/vllm/distributed/device_communicators/custom_all_reduce.py b/vllm/distributed/device_communicators/custom_all_reduce.py
+index eb9dde5972..7e6ec84ac5 100644
+--- a/vllm/distributed/device_communicators/custom_all_reduce.py
++++ b/vllm/distributed/device_communicators/custom_all_reduce.py
+@@ -359,7 +359,8 @@ def __init__(
+             )
+             logger.info(
+                 "SM70 TP4 SGLang-style push all-reduce enabled for the "
+-                "FP16 80-KiB verifier, 8-KiB decode, and 5-KiB Qwen4Exp "
++                "FP16 verifier messages through 640 KiB, 8-KiB decode, "
++                "and 5-KiB Qwen4Exp "
+                 "payloads; batch payloads are %s, 5-KiB sum2 is %s, "
+                 "and opt-in 25-KiB MTP4 is %s.",
+                 qwen38_batch_status,
