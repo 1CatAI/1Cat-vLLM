@@ -27,7 +27,7 @@ import torch
 from vllm.models.inkling2.nvidia.ops.norm import qr_clip_rel_tokens, rsqrt
 from vllm.triton_utils import tl, triton
 
-from . import use_pdl
+from . import is_sm70, use_pdl
 from .e4m3 import cast_store, e4m3_arg
 from .pdl import gdc_launch_dependents, gdc_wait
 
@@ -423,7 +423,9 @@ def short_conv(
     # Prefill tiles skip the cache reads they never need.
     prefill = num_tokens > 256
     if num_tokens <= 8:
-        block_t, block_c = 1, 1024
+        # Decode: 128-channel tiles spread the convolution over the SMs (1024-wide
+        # tiles leave 3 programs for 2304 channels; V100: 9.5 -> 5.7 us a call).
+        block_t, block_c = 1, 128 if is_sm70() else 1024
     else:
         block_t, block_c = (4, 256) if prefill else (2, 512)
     block_c = min(triton.next_power_of_2(channels), block_c)
@@ -982,7 +984,9 @@ def attention_prologue(
         BLOCK_E=block_e,
         QR_TOKENS=triton.cdiv(block_t, num_heads),
         FUSE_QR=not qr_tokens,
-        num_warps=4,
+        # The fused decode launch is latency bound on SM70: 8 warps per program
+        # (V100: 16.8 -> 9.6 us a call).
+        num_warps=8 if is_sm70() and not qr_tokens else 4,
         enable_fp_fusion=False,
         launch_pdl=use_pdl(),
     )
