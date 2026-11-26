@@ -35,7 +35,7 @@ from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from .device import DeviceConfig
 from .ec_transfer import ECTransferConfig
-from .kernel import KernelConfig
+from .kernel import KernelConfig, check_adaptive_verify_scheduling
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
@@ -1408,6 +1408,9 @@ class VllmConfig:
         logger.info_once(
             "Asynchronous scheduling is %s.",
             "enabled" if self.scheduler_config.async_scheduling else "disabled",
+        )
+        check_adaptive_verify_scheduling(
+            self.kernel_config, self.scheduler_config.async_scheduling
         )
         if envs.VLLM_ENABLE_MAMBA_PREFIX_ASYNC:
             logger.warning_once(

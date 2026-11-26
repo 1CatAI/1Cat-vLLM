@@ -82,6 +82,8 @@ def test_spec_decode_stops_scheduling_drafts_at_drafter_context_limit(
     scheduler._spec_token_placeholders = (-1,) * num_speculative_tokens
     scheduler._drafter_max_model_len = 32
     scheduler.use_v2_model_runner = False
+    scheduler._verify_controller = None
+    scheduler._dspark_widths = None
     request = SimpleNamespace(
         is_prefill_chunk=False,
         use_structured_output=False,

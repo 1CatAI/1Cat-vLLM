@@ -11,6 +11,7 @@ import torch
 from vllm.config import AttentionConfig
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.config.execution_policy import GraphPolicy
+from vllm.config.kernel import AdaptiveVerifyConfig, KernelConfig
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.ops.sm70_e4m3_long import BUILTIN_MAX_CONTEXT
 from vllm.v1.worker.gpu import cudagraph_utils as cg
@@ -148,6 +149,14 @@ def test_tail_capture_and_dispatch_from_real_initialization(
     monkeypatch.setenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", str(int(enabled)))
     monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0")
     monkeypatch.delenv("VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", raising=False)
+    # This test covers the legacy tail option only. Adaptive MTP depth
+    # ("auto": on for k >= 5 on a real SM70 device, which the capability patch
+    # below does not reach) adds its own tails and has its own test; pin it
+    # off so the result does not depend on the GPU of the host.
+    monkeypatch.setattr(
+        "vllm.config.speculative_sampling.resolve_sampling_policy",
+        lambda _config: SimpleNamespace(adaptive_mtp="off", adaptive_mtp_min_k=None),
+    )
     monkeypatch.setattr(cg.current_platform, "is_cuda", lambda: True)
     # The gate asks the worker's own device; answer for it only.
     monkeypatch.setattr(
@@ -169,6 +178,7 @@ def test_tail_capture_and_dispatch_from_real_initialization(
     compilation.runtime.resolve()
     config = SimpleNamespace(
         attention_config=AttentionConfig(),
+        kernel_config=KernelConfig(),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
         model_config=SimpleNamespace(max_model_len=BUILTIN_MAX_CONTEXT),
         compilation_config=compilation,
@@ -195,6 +205,117 @@ def test_tail_capture_and_dispatch_from_real_initialization(
         # verifier graph independently of these q1..q7 tail descriptors.
         assert manager.dispatch(2, 2 * q, q).cg_mode == CUDAGraphMode.NONE
     assert manager.dispatch(1, 8, 8).cg_mode == CUDAGraphMode.FULL
+
+
+def _adaptive_verify_manager(
+    monkeypatch,
+    decode_query_len,
+    manager_cls,
+    method="dflash",
+    enabled=True,
+    **verify,
+):
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "0")
+    monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0")
+    monkeypatch.setattr(cg.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        cg.current_platform,
+        "get_device_capability",
+        lambda device_id=0: DeviceCapability(7, 5),
+    )
+    monkeypatch.setattr(cg.torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(cg.current_platform, "get_global_graph_pool", lambda: None)
+    monkeypatch.setattr(
+        cg,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    compilation = CompilationConfig(
+        cudagraph_capture_sizes=[decode_query_len], max_cudagraph_capture_size=32
+    )
+    compilation.runtime.resolve()
+    config = SimpleNamespace(
+        attention_config=AttentionConfig(),
+        kernel_config=KernelConfig(
+            adaptive_verify=AdaptiveVerifyConfig(
+                enabled=enabled, verify_cost_ratio=0.119, **verify
+            )
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        model_config=SimpleNamespace(max_model_len=BUILTIN_MAX_CONTEXT),
+        compilation_config=compilation,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, tensor_parallel_size=1, pipeline_parallel_size=5
+        ),
+        speculative_config=SimpleNamespace(
+            method=method,
+            num_speculative_tokens=decode_query_len - 1,
+            ngram_assist=False,
+        ),
+    )
+    config.attention_config.flash_v100.options.resolve()
+    manager = manager_cls(
+        config, torch.device("cpu"), CUDAGraphMode.FULL_DECODE_ONLY, decode_query_len
+    )
+    manager._graphs_captured = True
+    return manager
+
+
+def test_adaptive_mtp_keeps_its_single_request_tails(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.config.speculative_sampling.resolve_sampling_policy",
+        lambda _config: SimpleNamespace(adaptive_mtp="on", adaptive_mtp_min_k=None),
+    )
+    manager = _adaptive_verify_manager(
+        monkeypatch, 8, ModelCudaGraphManager, method="mtp", enabled=False
+    )
+
+    assert manager.decode_query_lens == (8, 7, 6, 5, 4, 3)
+    for query_len in range(3, 9):
+        assert manager.dispatch(1, query_len, query_len).cg_mode == CUDAGraphMode.FULL
+    assert manager.dispatch(1, 2, 2).cg_mode == CUDAGraphMode.NONE
+    assert manager.dispatch(2, 2 * 3, 3).cg_mode == CUDAGraphMode.NONE
+
+
+@pytest.mark.parametrize("decode_query_len", [5, 8])
+def test_adaptive_verify_captures_every_single_request_tail(
+    monkeypatch, decode_query_len
+):
+    manager = _adaptive_verify_manager(
+        monkeypatch, decode_query_len, ModelCudaGraphManager, min_tokens=2
+    )
+
+    # 1 + n rows for n = min_tokens..k_max, without the legacy tail option.
+    assert manager.tail_query_lens == tuple(range(decode_query_len - 1, 2, -1))
+    assert not manager._sm70_dflash2_tail_graphs
+    for query_len in range(3, decode_query_len + 1):
+        desc = manager.dispatch(1, query_len, query_len)
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert desc.num_tokens == desc.uniform_token_count == query_len
+    # Below the shortest verify length, and for batches, nothing is captured.
+    assert manager.dispatch(1, 2, 2).cg_mode == CUDAGraphMode.NONE
+    assert manager.dispatch(2, 2 * 3, 3).cg_mode == CUDAGraphMode.NONE
+
+
+def test_adaptive_verify_tails_stay_off_for_short_blocks_and_sequence_parallel(
+    monkeypatch,
+):
+    # Blocks of fewer than three drafts get no tails, as for adaptive MTP.
+    short = _adaptive_verify_manager(monkeypatch, 3, ModelCudaGraphManager)
+    assert short.tail_query_lens == ()
+    assert short.decode_query_lens == (3,)
+    # Sequence parallelism captures no tail shapes at all.
+    manager = _adaptive_verify_manager(monkeypatch, 8, ModelCudaGraphManager)
+    assert manager.tail_query_lens == tuple(range(7, 1, -1))
+    manager.vllm_config.compilation_config.pass_config.enable_sp = True
+    assert cg.tail_query_lens(manager.vllm_config, 8, True) == ()
+
+
+def test_adaptive_verify_drafter_manager_keeps_its_block_width(monkeypatch):
+    manager = _adaptive_verify_manager(monkeypatch, 8, cg.CudaGraphManager)
+
+    assert manager.tail_query_lens == ()
+    assert manager.decode_query_lens == (8,)
 
 
 @pytest.mark.parametrize("native_capacity", [1, 16, 32])
@@ -251,6 +372,7 @@ def test_batch_long_graph_capture_requires_native_capability(
     )
     config = SimpleNamespace(
         attention_config=AttentionConfig(),
+        kernel_config=KernelConfig(),
         scheduler_config=SimpleNamespace(max_num_seqs=32),
         model_config=SimpleNamespace(
             max_model_len=131072,

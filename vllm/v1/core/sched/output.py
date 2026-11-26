@@ -298,8 +298,10 @@ class SchedulerOutput:
     # flight (the worker reads their previous round from per-request tables).
     v41_ahead_req_ids: set[str] | None = None
 
-    # Adaptive MTP (EntMTP): number of speculative draft steps to generate for
-    # the next decode step (None uses the configured num_speculative_tokens).
+    # Adaptive verify length: draft tokens the next decode step verifies.
+    # Speculators with a multi-step decode draft only that many; block
+    # drafters keep their block. None uses the configured
+    # num_speculative_tokens.
     next_spec_steps: int | None = None
 
     @classmethod
