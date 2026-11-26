@@ -14,7 +14,6 @@ import torch
 
 from tests.quantization.utils import is_quant_method_supported
 from vllm.config.model import ModelConfig
-from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
@@ -110,7 +109,10 @@ def test_modelopt_nvfp4_leaves_excluded_parallel_lm_head_unquantized():
 
     method = config.get_quant_method(_mock_lm_head(), prefix="lm_head")
 
-    assert isinstance(method, UnquantizedLinearMethod)
+    # None: the head keeps its own UnquantizedEmbeddingMethod, as with
+    # compressed-tensors. The linear method's weight preparation reads the
+    # per-layer policies only LinearBase captures.
+    assert method is None
 
 
 def test_modelopt_mixed_precision_quantizes_parallel_lm_head():
@@ -516,3 +518,73 @@ def test_modelopt_mixed_precision_builds_w4a16_sibling_config():
     assert config.nvfp4_config.LinearMethodCls is m.ModelOptNvFp4LinearMethod
     assert config.w4a16_nvfp4_config.quant_method == "W4A16_NVFP4"
     assert config.w4a16_nvfp4_config.LinearMethodCls is m.ModelOptNvFp4W4A16LinearMethod
+
+
+def _mixed_mxfp8_config() -> ModelOptMixedPrecisionConfig:
+    return ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "kv_cache_quant_algo": None,
+                "exclude_modules": [],
+                "quantized_layers": {
+                    "model.layers.0.o_proj": {"quant_algo": "MXFP8"},
+                    "model.layers.0.mlp.gate_proj": {"quant_algo": "MXFP8"},
+                    "model.layers.0.mlp.up_proj": {"quant_algo": "MXFP8"},
+                    "lm_head": {"quant_algo": "MXFP8"},
+                },
+            }
+        }
+    )
+
+
+def test_modelopt_mixed_precision_dispatches_mxfp8_linear():
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization import modelopt as m
+
+    config = _mixed_mxfp8_config()
+    config.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
+    with patch.object(m, "init_mxfp8_linear_kernel"):
+        o_proj = config.get_quant_method(
+            MagicMock(spec=LinearBase), "model.layers.0.o_proj"
+        )
+        gate_up = config.get_quant_method(
+            MagicMock(spec=LinearBase), "model.layers.0.mlp.gate_up_proj"
+        )
+
+    assert isinstance(o_proj, m.ModelOptMxFp8LinearMethod)
+    assert isinstance(gate_up, m.ModelOptMxFp8LinearMethod)
+
+
+def test_modelopt_mixed_precision_leaves_the_mxfp8_lm_head_to_the_loader():
+    # The head keeps its UnquantizedEmbeddingMethod; the model loader
+    # dequantizes its weight pair.
+    config = _mixed_mxfp8_config()
+
+    assert config.get_quant_method(_mock_lm_head(), prefix="lm_head") is None
+
+
+def test_modelopt_mixed_precision_builds_the_mxfp8_config_only_when_named():
+    assert _mixed_mxfp8_config().mxfp8_config is not None
+    assert (
+        _mixed_precision_config(
+            {"model.layers.0.a": {"quant_algo": "NVFP4"}}
+        ).mxfp8_config
+        is None
+    )
+
+
+def test_modelopt_mixed_precision_reports_which_modules_are_quantized():
+    config = _mixed_mxfp8_config()
+    config.packed_modules_mapping = {"in_proj_qkv": ["q_proj", "k_proj", "v_proj"]}
+    config.quantized_layers = {
+        "model.layers.0.q_proj": {"quant_algo": "MXFP8"},
+        "model.layers.0.k_proj": {"quant_algo": "MXFP8"},
+        "model.layers.0.v_proj": {"quant_algo": "MXFP8"},
+    }
+
+    assert config.is_quantized("model.layers.0.in_proj_qkv")
+    assert config.is_quantized("model.layers.0.q_proj")
+    assert not config.is_quantized("model.layers.0.in_proj_bfg_a")
+    assert not config.is_quantized("model.layers.1.in_proj_qkv")

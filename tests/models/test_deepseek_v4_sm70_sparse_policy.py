@@ -27,6 +27,7 @@ def test_prefill_bmm_follows_the_layer_policy_without_config_context(prefill_bmm
     layer = SimpleNamespace(
         max_num_batched_tokens=2048,
         sm70_sparse=Sm70SparseConfig(prefill_bmm=prefill_bmm),
+        sparse_tensor_cores=False,
     )
     q = torch.empty((1, 64, 512), dtype=torch.float16)
     with (
