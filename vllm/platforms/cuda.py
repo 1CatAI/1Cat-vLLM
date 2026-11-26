@@ -152,7 +152,9 @@ def _get_backend_priorities_cached(
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
-            if device_capability.major == 7 and device_capability.minor in (0, 2):
+            if device_capability.major == 7:
+                # Compute capabilities 7.0 and 7.5 share the FP16 sparse-MLA
+                # kernels.
                 backends.insert(0, AttentionBackendEnum.GLM5_SM70_SPARSE)
             return backends
     else:

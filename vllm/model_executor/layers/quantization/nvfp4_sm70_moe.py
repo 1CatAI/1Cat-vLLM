@@ -715,6 +715,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         self.quant_config = quant_config
         self.use_a16 = True
         self.use_global_sf = False
+        # The TurboMind experts read uncompressed block scales; only the
+        # skinny experts serve csf_32x2_v1 scales.
+        self.csf_scales = False
         validate_nvfp4_sm70_moe_contract(moe_config)
 
     @property

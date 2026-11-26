@@ -425,12 +425,14 @@ def test_sm70_exact_kda_projection_dispatch(monkeypatch, enabled, num_tokens):
         torch.ops._C, "sm70_glm53_fp16_gemv_out", lambda *a: None, raising=False
     )
     layer = SimpleNamespace(
+        split_qkv=False,
         _use_sm70_exact_kda_gemv=enabled,
         in_proj_qkvbfg_a=Projection(),
         _exact_gemv_ops=Exact(),
         prefix="test",
     )
     hidden = torch.empty((num_tokens, 4096), dtype=torch.float16, device="meta")
+    # forward starts with _project_inputs, which owns the projection choice.
     with pytest.raises(StopAfterProjection):
-        kda_module.Glm5NextLinearAttention.forward(layer, hidden, None)
+        kda_module.Glm5NextLinearAttention._project_inputs(layer, hidden)
     assert calls == ["exact" if enabled and num_tokens == 1 else "standard"]

@@ -46,10 +46,13 @@ def test_preserves_unquantized_controls(
     if mode == "excluded":
         config.exclude_modules = ["model.proj"]
     prefix = "model.absent" if mode == "missing" else "model.proj"
-    assert isinstance(
-        config.get_quant_method(MagicMock(spec=layer_type), prefix),
-        UnquantizedLinearMethod,
-    )
+    method = config.get_quant_method(MagicMock(spec=layer_type), prefix)
+    if layer_type is ParallelLMHead:
+        # An LM head keeps its own UnquantizedEmbeddingMethod: the linear
+        # method's weight preparation expects LinearBase's per-layer policies.
+        assert method is None
+    else:
+        assert isinstance(method, UnquantizedLinearMethod)
 
 
 @pytest.mark.parametrize("layer_type", [LinearBase, ParallelLMHead])
