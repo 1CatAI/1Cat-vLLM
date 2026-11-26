@@ -4,11 +4,18 @@ Follow-up to `docs/design/inkling2_gguf_sm70.md`. Per decode step on one V100 (e
 time, one sequence), #1598's model takes 23.5 ms and a standalone single-card port 14.4 ms
 on the same weights. The profile attributes the gap to three components:
 
-| component | #1598 | standalone | gap | needs a different weight layout? |
-| --- | --- | --- | --- | --- |
-| routed experts and routing | ~8.2 ms | ~4.7 ms | ~3.5 ms | yes (see below) |
-| loop controllers | ~3.2 ms | ~0.8 ms | ~2.4 ms | no (FP16 weights) |
-| attention and short convs | ~3.6 ms | ~1.4 ms | ~2.2 ms | no (FP16 weights) |
+| component | #1598 kernels | #1598 | standalone | gap | layout-dependent? |
+| --- | --- | --- | --- | --- | --- |
+| router: logits and top-k | `_k_group_kernel` (2.77 ms), `_select_kernel` (0.54 ms) | 3.31 ms | 0.65 ms | **2.66 ms** | no |
+| expert GEMMs and permutation | TurboMind NVFP4 stage, FP16 GEMV (layers 20–23), sort / permute / unpermute | ~7.7 ms | ~4.0 ms | **~3.7 ms** | yes |
+| attention and short convs | `_rel_attention`, `_attn_prologue`, `_rel_decode_combine`, `_sconv` | ~3.6 ms | ~1.4 ms | **~2.2 ms** | no |
+| loop controllers | `_pair_rms_norm`, `_blend_rms_norm`, two small batched matmuls | ~0.6 ms + matmuls | ~0.8 ms | ≈ 0 | no |
+
+**Correction.** An earlier version of this profile (also in
+`docs/design/inkling2_gguf_sm70.md`) attributed `_k_group_kernel` to the loop
+controllers. It is the router: `select_experts` computes the `[128, 2304]` router logits
+as K-group partials (`k_group_partials`). On SM70 that kernel pads one decode row to a
+16-row mma tile, about 58 µs per call, for 48 calls per step.
 
 ## Routed experts: what reuse is possible
 
@@ -41,7 +48,10 @@ They are investigated separately, after the layout-independent parts.
 
 ## Order of work
 
-1. **Loop controllers:** fused down and apply kernels over the existing FP16 weights.
+1. **Router:** an SM70 GEMV branch in `k_group_partials` for up to 8 rows. It produces
+   the same fp32 `[G, T, N]` K-group partials, so the in-order group sum, `select_experts`
+   and the reference grouping are unchanged; only the summation order inside a 1024-wide
+   group differs. Larger batches keep the tile kernel.
 2. **Decode attention and short convs:** fused prep (q/k/v/r with the K/V convs) and
    grouped-query split-KV decode attention.
 3. **Experts:** after the layout question above is settled.
@@ -49,3 +59,27 @@ They are investigated separately, after the layout-independent parts.
 Each step replaces a #1598 decode kernel only where it is measured faster at TP=1 and TP=2,
 behind #1598's existing call sites, with tests against #1598's current kernels as the
 reference.
+
+## Results
+
+### 1. Router GEMV
+
+`k_group_partials` takes an SM70 GEMV path for at most 8 rows. Q8 GGUF, TP=1, one V100,
+CUDA graphs:
+
+| decode tok/s (short / 4k / 16k) | before | after | change |
+| --- | --- | --- | --- |
+| this branch | 44.2 / 41.4 / 38.4 | 51.3 / 47.7 / 43.7 | +16 / +15 / +14 % |
+
+Prefill is unchanged (~772 tok/s at 16k).
+
+Numerics, measured by running the official checkpoint against #1598 with
+`tools/inkling2/gguf_parity.py` (6 prompts, 24 tokens):
+- greedy tokens are identical;
+- chosen-token log-probs differ by 0.001 on average, 0.058 at most;
+- the largest top-5 differences are on improbable alternatives (p 6e-7 → 4e-6 and
+  8e-5 → 7e-4), consistent with rare routing near-ties resolving differently.
+
+Kernel test `tests/models/inkling2/test_sm70_router_gemv.py`:
+- the partials match the tile kernel within fp32 rounding;
+- batches above 8 still take the tile kernel, bit for bit.

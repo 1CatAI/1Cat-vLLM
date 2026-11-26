@@ -16,13 +16,17 @@ except ImportError:
         return False
 
 
-from . import use_pdl, use_sm100_kernels
+from . import is_sm70, use_pdl, use_sm100_kernels
 from .gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
 from .pdl import gdc_launch_dependents, gdc_wait
 
 # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
 # bandwidth (cuBLAS is up to 2x slower); larger batches use cuBLAS.
 LOW_M_MAX_TOKENS = 32
+# Decode-size row counts take the SM70 GEMV for split-K partials: the mma
+# tile kernel pads each row to a 16-row tile (the Inkling2 router logits,
+# [128, 2304], took ~58 us per call on V100 that way).
+SM70_GEMV_MAX_TOKENS = 8
 
 
 def linear(
@@ -207,6 +211,38 @@ def _k_group_tma_kernel(
 TMA_MIN_TOKENS = 2048
 
 
+@triton.jit
+def _k_group_gemv_kernel(
+    X,
+    W,
+    Out,
+    T,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    # fp32 partial of one 1024-wide K group for BN output columns of one row:
+    # the same [G, T, N] partials as the tile kernel, as a GEMV.
+    pid_n = tl.program_id(0)
+    t = tl.program_id(1).to(tl.int64)
+    g = tl.program_id(2)
+    cols = pid_n * BN + tl.arange(0, BN)
+    col_mask = cols < N
+    acc = tl.zeros([BN], dtype=tl.float32)
+    for kk in range(0, 1024, BK):
+        k = g * 1024 + kk + tl.arange(0, BK)
+        k_mask = k < K
+        xv = tl.load(X + t * K + k, mask=k_mask, other=0.0).to(tl.float32)
+        wv = tl.load(
+            W + cols[:, None].to(tl.int64) * K + k[None, :],
+            mask=col_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(wv * xv[None, :], axis=1)
+    tl.store(Out + (g * T + t) * N + cols, acc, mask=col_mask)
+
+
 def k_group_partials(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -247,9 +283,15 @@ def k_group_partials(
             launch_pdl=True,
         )
         return out
+    groups = triton.cdiv(hidden, 1024)
+    if is_sm70() and 0 < tokens <= SM70_GEMV_MAX_TOKENS and groups > 1:
+        out = torch.empty((groups, tokens, n), dtype=torch.float32, device=x.device)
+        _k_group_gemv_kernel[(triton.cdiv(n, 8), tokens, groups)](
+            x, weight, out, tokens, n, hidden, 8, 256, num_warps=4
+        )
+        return out
     block_m = 16 if tokens <= 128 else 64
     block_n = 32 if tokens <= 16 else 64 if tokens <= 256 else 128
-    groups = triton.cdiv(hidden, 1024)
     split = groups > 1 and tokens < 4096
     num_warps = 4 if block_n <= 64 else 8
     num_stages = 4 if not split else 3 if block_n <= 64 else 2
