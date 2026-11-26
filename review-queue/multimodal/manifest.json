@@ -1,0 +1,32 @@
+{
+  "group": "multimodal",
+  "title": "Multimodal and MRV2 pipeline qualification queue",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1415,
+      "title": "[Bugfix][Multimodal] Backport vllm-project/vllm#56576, #59565, #59126: broken-EXIF image hashing, GLM-5.3-Flash image budget and vision rope table",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1415",
+      "head": "a43f9b0448fcc24b99c09b5f985265daa155259d",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "1207099dadc55e3d77aea58fe512b99c6bbffbb01a26a181036d0ed64afdb9bf",
+      "files": 6,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1365,
+      "title": "[Multimodal][MRV2] Port three upstream fixes for multimodal models under pipeline parallelism",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1365",
+      "head": "af22bbe21c1b0f6d205193519922c327230cdee6",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "22740b606918db9462d57a86cec3fb6adfac6617a67936ca6e8c8947666901b4",
+      "files": 10,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "Image hashing broken-EXIF cases can be unit-tested, but GLM vision position/image budgets and MRV2 pipeline transfer need the relevant vision checkpoints plus PP layout. Preserve all source and qualify multimodal positions, cache identity and prompt/output behavior before integration.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}
