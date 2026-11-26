@@ -104,6 +104,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "cutlass_scaled_mm_supports_block_fp8(int cuda_device_capability) -> "
       "bool");
 
+  // Check if cutlass scaled_mm has a compiled INT8 kernel for a capability
+  ops.def(
+      "cutlass_scaled_mm_supports_int8(int cuda_device_capability) -> bool");
+
   // CUTLASS nvfp4 block scaled GEMM
   ops.def(
       "cutlass_scaled_fp4_mm(Tensor! out, Tensor a, Tensor b,"
@@ -641,6 +645,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
            TORCH_BOX(&cutlass_group_gemm_supported));
   ops.impl("cutlass_scaled_mm_supports_block_fp8",
            TORCH_BOX(&cutlass_scaled_mm_supports_block_fp8));
+  ops.impl("cutlass_scaled_mm_supports_int8",
+           TORCH_BOX(&cutlass_scaled_mm_supports_int8));
   ops.impl("cutlass_scaled_mm_supports_fp4",
            TORCH_BOX(&cutlass_scaled_mm_supports_fp4));
 #endif

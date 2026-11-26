@@ -15,6 +15,7 @@ import torch
 from vllm.model_executor.kernels.linear import (
     AiterInt8ScaledMMLinearKernel,
     CPUInt8ScaledMMLinearKernel,
+    CutlassInt8ScaledMMLinearKernel,
     Int8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
     ScaledMMLinearKernel,
@@ -127,3 +128,43 @@ def test_register_oot_linear_kernel(platform_mock):
     assert isinstance(kernel, OOTInt8ScaledMMLinearKernel), (
         "init_int8_linear_kernel should return an instance of the registered kernel"
     )
+
+
+@pytest.mark.parametrize(
+    ("op", "supported", "reason"),
+    [
+        (lambda capability: capability == 75, True, None),
+        (
+            lambda capability: False,
+            False,
+            "this build has no CUTLASS INT8 GEMM for compute capability 75.",
+        ),
+    ],
+)
+def test_cutlass_int8_follows_the_build_query(monkeypatch, op, supported, reason):
+    """CUTLASS INT8 is admitted exactly where the build query answers yes."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.kernels.linear.scaled_mm import cutlass
+
+    monkeypatch.setattr(cutlass.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(ops, "cutlass_scaled_mm_supports_int8", op)
+
+    assert CutlassInt8ScaledMMLinearKernel.is_supported(75) == (supported, reason)
+    # Without a capability the selection is left to the caller, as before.
+    assert CutlassInt8ScaledMMLinearKernel.is_supported(None) == (True, None)
+
+
+def test_cutlass_int8_is_rejected_by_a_library_without_the_query(monkeypatch):
+    """A native library older than the query answers no instead of raising."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.kernels.linear.scaled_mm import cutlass
+
+    def missing_op(capability: int) -> bool:
+        raise AttributeError("'_OpNamespace' '_C' object has no attribute")
+
+    monkeypatch.setattr(cutlass.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(ops, "cutlass_scaled_mm_supports_int8", missing_op)
+
+    supported, reason = CutlassInt8ScaledMMLinearKernel.is_supported(75)
+    assert not supported
+    assert reason is not None and "no CUTLASS INT8 GEMM" in reason

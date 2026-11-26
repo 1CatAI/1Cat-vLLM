@@ -53,6 +53,9 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     cutlass_fp4_supported,
 )
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    cutlass_int8_supported,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
@@ -94,18 +97,11 @@ def cutlass_int8_gemm_build():
     """Skip when this build has no CUTLASS INT8 GEMM kernel for the device.
 
     The op is always registered, but a build without the SM75+ CUTLASS kernels
-    (an SM70-only build) rejects every call with "No compiled
-    cutlass_scaled_mm". vLLM has no build query for the INT8 kernels (unlike
-    cutlass_scaled_mm_supports_fp8), so the op itself is asked, at test time
-    and not at collection, to keep CUDA out of the collecting process.
+    (an SM70-only build) rejects every call. The build query is asked at test
+    time and not at collection, to keep CUDA out of the collecting process.
     """
-    a = torch.zeros(16, 16, dtype=torch.int8, device="cuda")
-    scale = torch.ones(1, 1, dtype=torch.float32, device="cuda")
-    try:
-        ops.cutlass_scaled_mm(a, a.t(), scale, scale, torch.float16)
-    except RuntimeError as error:
-        if "No compiled cutlass_scaled_mm" not in str(error):
-            raise
+    capability = current_platform.get_device_capability()
+    if capability is None or not cutlass_int8_supported(capability.to_int()):
         pytest.skip("The build has no compiled CUTLASS INT8 GEMM for this GPU.")
 
 

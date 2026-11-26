@@ -30,6 +30,7 @@ void per_token_group_quant_int8(const torch::stable::Tensor& input,
 
 bool cutlass_scaled_mm_supports_fp8(int64_t cuda_device_capability);
 bool cutlass_scaled_mm_supports_block_fp8(int64_t cuda_device_capability);
+bool cutlass_scaled_mm_supports_int8(int64_t cuda_device_capability);
 bool cutlass_group_gemm_supported(int64_t cuda_device_capability);
 
 void cutlass_scaled_mm(torch::stable::Tensor& out,

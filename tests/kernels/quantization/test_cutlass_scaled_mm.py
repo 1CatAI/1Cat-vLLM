@@ -633,6 +633,40 @@ def test_cutlass_support_opcheck():
     opcheck(torch.ops._C.cutlass_scaled_mm_supports_fp8, (capability,))
 
 
+def test_cutlass_int8_support_opcheck():
+    opcheck(torch.ops._C.cutlass_scaled_mm_supports_int8, (capability,))
+
+
+def test_cutlass_int8_support_matches_dispatch():
+    """The INT8 build query answers exactly when an INT8 call finds a kernel.
+
+    The kernel selection relies on it, so it must agree with the dispatch of
+    cutlass_scaled_mm on this GPU, whichever kernels the build contains.
+    """
+    a = torch.zeros(16, 16, dtype=torch.int8, device="cuda")
+    scale = torch.ones(1, 1, dtype=torch.float32, device="cuda")
+    try:
+        ops.cutlass_scaled_mm(a, a.t(), scale, scale, torch.float16)
+    except RuntimeError as error:
+        # The SM100 and SM120 dispatchers are compiled but have no INT8 kernel.
+        if not any(
+            message in str(error)
+            for message in ("No compiled cutlass_scaled_mm", "Int8 not supported")
+        ):
+            raise
+        compiled = False
+    else:
+        compiled = True
+    assert ops.cutlass_scaled_mm_supports_int8(capability) is compiled
+
+    from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+        CutlassInt8ScaledMMLinearKernel,
+    )
+
+    supported, reason = CutlassInt8ScaledMMLinearKernel.is_supported(capability)
+    assert supported is compiled, reason
+
+
 @pytest.mark.parametrize("num_experts", [8, 64])
 @pytest.mark.parametrize("per_act_token", [True, False])
 @pytest.mark.parametrize("per_out_ch", [True, False])
