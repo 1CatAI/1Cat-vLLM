@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -121,6 +122,13 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+from vllm.v1.worker.gpu.pp_pack import (
+    PackedHandoverBuffers,
+    PackedHandoverLayout,
+    handover_inputs,
+    pp_pack_enabled,
+    verify_handover_layouts,
+)
 from vllm.v1.worker.gpu.pp_utils import PPHandler, scatter_draft_tokens
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
@@ -500,6 +508,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.eplb.maybe_start_async_loop(eplb_models_added)
 
+        self.pp_pack_recv: PackedHandoverBuffers | None = None
         if not self.is_first_pp_rank:
             # For non-first PP ranks, create intermediate tensors sized
             # for the max capture size so they can be sliced per batch.
@@ -510,6 +519,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dtype=self.model_config.dtype,
                 device=self.device,
             )
+            if pp_pack_enabled(self.vllm_config):
+                self.pp_pack_recv = PackedHandoverBuffers(
+                    PackedHandoverLayout.from_tensors(
+                        self.intermediate_tensors.tensors
+                    ),
+                    self.device,
+                )
 
         get_offloader().post_init()
 
@@ -984,7 +1000,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 has_lora=self.lora_config is not None,
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                pp_pack_recv=self.pp_pack_recv,
             )
+            if pp_pack_enabled(self.vllm_config):
+                verify_handover_layouts(
+                    get_pp_group(),
+                    self.pp_pack_recv,
+                    self.cudagraph_manager.pp_pack_send,
+                )
             if self.speculator is not None:
                 # Target warmup leaves eager allocator blocks outside its graph
                 # pool. Release them before allocating the draft's separate
@@ -1563,7 +1586,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
-        intermediate_tensors: IntermediateTensors | None = None,
+        intermediate_tensors: IntermediateTensors
+        | Callable[[BatchExecutionDescriptor], IntermediateTensors]
+        | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
@@ -1631,6 +1656,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
+
+        if callable(intermediate_tensors):
+            # The packed handover depends on the descriptor, so the worker
+            # posts the receive only now; the host preparation below overlaps it.
+            intermediate_tensors = intermediate_tensors(batch_desc)
 
         early_model_inputs: dict[str, Any] | None = None
         ple_prepared = False
@@ -1762,14 +1792,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare the intermediate tensors.
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
-            n = input_batch.num_tokens_after_padding
-            model_inputs["intermediate_tensors"] = IntermediateTensors(
-                {
-                    k: v[:n].copy_(intermediate_tensors.tensors[k][:n])
-                    for k, v in self.intermediate_tensors.tensors.items()
-                }
+            graph_inputs = handover_inputs(
+                batch_desc, self.intermediate_tensors, self.pp_pack_recv
             )
-            del intermediate_tensors
+            received = intermediate_tensors.tensors
+            for k, v in graph_inputs.items():
+                # A packed receive already landed in the graph's input buffer.
+                if received[k].data_ptr() != v.data_ptr():
+                    v.copy_(received[k][: v.shape[0]])
+            model_inputs["intermediate_tensors"] = IntermediateTensors(graph_inputs)
+            del intermediate_tensors, received
 
         # Profile only real MTP verification steps. Prefill, non-spec decode,
         # warmup, and ordinary production runs keep the event path disabled.

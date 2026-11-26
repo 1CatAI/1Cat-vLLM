@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+import functools
 import gc
 import os
 import time
@@ -75,6 +76,13 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.gpu.pp_pack import (
+    PACKED_KEY,
+    PackedHandoverBuffers,
+    PackedIntermediateTensors,
+    packs_handover,
+    pp_pack_enabled,
+)
 from vllm.v1.worker.utils import (
     configure_attention_workspace,
     is_residual_scattered_for_sp,
@@ -90,6 +98,7 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -284,6 +293,9 @@ class Worker(WorkerBase):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # Checked here, where the V1 and the V2 runner both pass, so a setting
+        # the handover cannot honour fails at startup on either.
+        self._pp_pack_handover = pp_pack_enabled(vllm_config)
         self._ple_offload_worker_handle: Any | None = None
         self._ple_offload_spawn_config: VllmConfig | None = None
         if ple_policy(self.vllm_config).hybrid and not (
@@ -1776,6 +1788,57 @@ class Worker(WorkerBase):
             )
         return tensor_dict
 
+    @property
+    def _pp_pack_recv(self) -> PackedHandoverBuffers | None:
+        if not self._pp_pack_handover:
+            return None
+        return self.model_runner.pp_pack_recv  # type: ignore[attr-defined]
+
+    def _irecv_pp_handover(
+        self,
+        batch_desc: "BatchExecutionDescriptor",
+        num_tokens: int,
+        all_gather_tensors: dict[str, bool],
+    ) -> AsyncIntermediateTensors:
+        """Post the receive of this step's stage input (MRV2 packed handover).
+
+        Fixed-shape decode and verify steps arrive as one message that lands in
+        the block the graph for ``batch_desc`` reads; the sender chooses by the
+        same descriptor. Every other step keeps the per-tensor transfer.
+        """
+        if not packs_handover(batch_desc):
+            return self._irecv_per_tensor_handover(num_tokens, all_gather_tensors)
+        assert self._pp_pack_recv is not None
+        block = self._pp_pack_recv.block(batch_desc.num_tokens)
+        handles = get_pp_group().irecv_tensor_dict_static({PACKED_KEY: block.flat})
+        return AsyncIntermediateTensors(block.tensors, comm_handles=handles)
+
+    def _irecv_per_tensor_handover(
+        self, num_scheduled_tokens: int, all_gather_tensors: dict[str, bool]
+    ) -> AsyncIntermediateTensors:
+        comm_postprocess: list[Callable[[], None]]
+        tensor_dict = self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
+        rank0 = self._rank0_pp_recv(num_scheduled_tokens)
+        if rank0 is not None:
+            tensor_dict, comm_handles, comm_postprocess = rank0
+        elif tensor_dict is not None:
+            comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
+            comm_postprocess = []
+            logger.info_once("Default SM70 metadata-free PP hidden transfer enabled.")
+        else:
+            tensor_dict, comm_handles, comm_postprocess = (
+                get_pp_group().irecv_tensor_dict(
+                    all_gather_group=get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
+                )
+            )
+        assert tensor_dict is not None
+        return AsyncIntermediateTensors(
+            tensor_dict,
+            comm_handles=comm_handles,
+            comm_postprocess=comm_postprocess,
+        )
+
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
@@ -1795,7 +1858,9 @@ class Worker(WorkerBase):
         elif not self._pp_send_overlaps_next_step:
             self._wait_pp_sends()
 
-        intermediate_tensors = None
+        intermediate_tensors: (
+            IntermediateTensors | Callable[..., IntermediateTensors] | None
+        ) = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and _DELAY_FILE:
             _injected_delay(get_pp_group().rank_in_group)
@@ -1839,30 +1904,19 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
-            comm_postprocess: list[Callable[[], None]]
-            tensor_dict = self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
-            rank0 = self._rank0_pp_recv(num_scheduled_tokens)
-            if rank0 is not None:
-                tensor_dict, comm_handles, comm_postprocess = rank0
-            elif tensor_dict is not None:
-                comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
-                comm_postprocess = []
-                logger.info_once(
-                    "Default SM70 metadata-free PP hidden transfer enabled."
+            if self._pp_pack_recv is not None:
+                # The runner calls this with its batch descriptor after its own
+                # dispatch (the packed path depends on it); the host work of
+                # the step overlaps the receive.
+                intermediate_tensors = functools.partial(
+                    self._irecv_pp_handover,
+                    num_tokens=num_scheduled_tokens,
+                    all_gather_tensors=all_gather_tensors,
                 )
             else:
-                tensor_dict, comm_handles, comm_postprocess = (
-                    get_pp_group().irecv_tensor_dict(
-                        all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
-                    )
+                intermediate_tensors = self._irecv_per_tensor_handover(
+                    num_scheduled_tokens, all_gather_tensors
                 )
-            assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
-            )
 
         if _STEP_TIMING:
             host_start = time.perf_counter()
@@ -1909,6 +1963,14 @@ class Worker(WorkerBase):
         )
 
         self._wait_pp_sends()
+        if isinstance(output, PackedIntermediateTensors):
+            # One message from the graph's own output block. Graph-sized, so
+            # the next forward waits for it like for the other graph sends.
+            self._pp_send_overlaps_next_step = False
+            self._pp_send_work = get_pp_group().isend_tensor_dict_static(
+                {PACKED_KEY: output.packed}
+            )
+            return None
         static_transfer = self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens)
         # VLLM_V41_PP_RANK0 sends manage their own copies (PP_SEND_DEFER).
         self._pp_send_overlaps_next_step = not _PP_RANK0 and self._pp_send_overlaps(

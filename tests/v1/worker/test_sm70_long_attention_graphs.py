@@ -11,6 +11,7 @@ import torch
 from vllm.config import AttentionConfig
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.config.execution_policy import GraphPolicy
+from vllm.config.kernel import KernelConfig
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.ops.sm70_e4m3_long import BUILTIN_MAX_CONTEXT
 from vllm.v1.worker.gpu import cudagraph_utils as cg
@@ -169,6 +170,7 @@ def test_tail_capture_and_dispatch_from_real_initialization(
     compilation.runtime.resolve()
     config = SimpleNamespace(
         attention_config=AttentionConfig(),
+        kernel_config=KernelConfig(),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
         model_config=SimpleNamespace(max_model_len=BUILTIN_MAX_CONTEXT),
         compilation_config=compilation,
@@ -251,6 +253,7 @@ def test_batch_long_graph_capture_requires_native_capability(
     )
     config = SimpleNamespace(
         attention_config=AttentionConfig(),
+        kernel_config=KernelConfig(),
         scheduler_config=SimpleNamespace(max_num_seqs=32),
         model_config=SimpleNamespace(
             max_model_len=131072,
