@@ -1,0 +1,191 @@
+diff --git a/tests/v1/core/test_mixed_prefill_budget.py b/tests/v1/core/test_mixed_prefill_budget.py
+index 2174205f4b..124c8f92fe 100644
+--- a/tests/v1/core/test_mixed_prefill_budget.py
++++ b/tests/v1/core/test_mixed_prefill_budget.py
+@@ -27,6 +27,32 @@ def test_budget_adapts_to_gpu_cost_and_ignores_short_boundaries():
+     assert 2400 <= budget.tokens <= 2512
+ 
+ 
++def test_floor_holds_on_slow_steps_and_growth_starts_from_it():
++    budget = MixedPrefillBudget(8192, 250, min_tokens=1632)
++    assert budget.tokens == budget.budget == 1632
++    for _ in range(5):
++        # 1632 tokens take 700 ms: the target alone would shrink the budget.
++        budget.update(MixedPrefillTiming(1632, 16, 1632, 700))
++    assert budget.tokens == budget.budget == 1632
++    for _ in range(3):
++        n = budget.budget
++        budget.update(MixedPrefillTiming(n, 16, n, n * 0.05))
++    assert budget.budget > 1632
++
++
++def test_budget_rounds_to_state_blocks_without_stalling_growth():
++    budget = MixedPrefillBudget(8192, 1000, block_size=1632)
++    assert budget.budget == 512  # Below one block the budget is not rounded.
++    seen = []
++    for _ in range(20):
++        n = budget.budget
++        budget.update(MixedPrefillTiming(n, 16, n, n * 0.1))
++        seen.append(budget.budget)
++    assert seen == sorted(seen)
++    assert all(b < 1632 or b % 1632 == 0 for b in seen)
++    assert budget.budget == 8160
++
++
+ @pytest.mark.parametrize("elapsed", [0, -1, float("nan"), float("inf")])
+ def test_invalid_timing_does_not_change_budget(elapsed):
+     budget = MixedPrefillBudget(8192, 250)
+@@ -146,3 +172,16 @@ def test_adaptive_threshold_floor_does_not_override_mixed_latency_budget():
+     assert output.num_scheduled_tokens[resident.request_id] > 0
+     assert output.num_scheduled_tokens[incoming.request_id] == 512
+     assert output.mixed_prefill_tokens == 512
++
++
++def test_mixed_step_uses_the_budget_floor():
++    scheduler = create_scheduler(max_num_batched_tokens=1024)
++    scheduler.mixed_prefill_enabled = True
++    scheduler.mixed_prefill_budget = MixedPrefillBudget(1024, 250, min_tokens=768)
++    resident = _resident(scheduler)
++    long = create_requests(num_requests=1, num_tokens=1536, req_ids=["long"])[0]
++    scheduler.add_request(long)
++    step = scheduler.schedule()
++    assert step.num_scheduled_tokens[resident.request_id] == 1
++    assert step.num_scheduled_tokens["long"] == 768
++    assert step.mixed_prefill_budget == 768
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index c124432b33..e089d2f7a3 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -95,6 +95,12 @@ class SchedulerConfig:
+     The prefill token budget adapts to completed GPU measurements. Pure prefill
+     keeps the normal token budget. Zero disables latency control."""
+ 
++    mixed_prefill_min_tokens: int = Field(default=0, ge=0)
++    """Lower bound on the adaptive mixed-prefill token budget. Zero keeps the
++    purely adaptive budget. Under Mamba align mode the budget is rounded down to
++    whole recurrent-state blocks once it covers one, so use a multiple of the
++    state block size."""
++
+     enable_chunked_prefill: bool = True
+     """If True, prefill requests can be chunked based
+     on the remaining `max_num_batched_tokens`.
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 6c9e36c9c8..95b6ccddbd 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -557,6 +557,7 @@ class EngineArgs:
+     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
+     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
+     mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
++    mixed_prefill_min_tokens: int = SchedulerConfig.mixed_prefill_min_tokens
+     long_prefill_token_threshold_adaptive: bool = (
+         SchedulerConfig.long_prefill_token_threshold_adaptive
+     )
+@@ -1440,6 +1441,10 @@ def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+             "--mixed-prefill-step-latency-ms",
+             **scheduler_kwargs["mixed_prefill_step_latency_ms"],
+         )
++        scheduler_group.add_argument(
++            "--mixed-prefill-min-tokens",
++            **scheduler_kwargs["mixed_prefill_min_tokens"],
++        )
+         # are no longer supported.
+         scheduler_group.add_argument(
+             "--scheduling-policy", **scheduler_kwargs["policy"]
+@@ -2298,6 +2303,7 @@ def create_engine_config(
+             max_long_partial_prefills=self.max_long_partial_prefills,
+             long_prefill_token_threshold=self.long_prefill_token_threshold,
+             mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
++            mixed_prefill_min_tokens=self.mixed_prefill_min_tokens,
+             long_prefill_token_threshold_adaptive=(
+                 self.long_prefill_token_threshold_adaptive
+             ),
+diff --git a/vllm/v1/core/sched/mixed_prefill.py b/vllm/v1/core/sched/mixed_prefill.py
+index 704ed9547a..30fb2bb20e 100644
+--- a/vllm/v1/core/sched/mixed_prefill.py
++++ b/vllm/v1/core/sched/mixed_prefill.py
+@@ -15,12 +15,34 @@ class MixedPrefillBudget:
+     not a hard deadline: even a decode-only step can exceed the target.
+     """
+ 
+-    def __init__(self, max_tokens: int, target_ms: float) -> None:
++    def __init__(
++        self,
++        max_tokens: int,
++        target_ms: float,
++        min_tokens: int = 0,
++        block_size: int | None = None,
++    ) -> None:
+         self.max_tokens = max_tokens
+         self.target_ms = target_ms
+-        self.tokens = min(512, max_tokens)
++        self.min_tokens = min(min_tokens, max_tokens)
++        # Recurrent-state block size in Mamba align mode, set by the scheduler.
++        self.block_size = block_size
++        self.tokens = max(min(512, max_tokens), self.min_tokens)
+         self.ms_per_token: float | None = None
+ 
++    @property
++    def budget(self) -> int:
++        """Prefill tokens a mixed step may schedule.
++
++        The learned budget, rounded down to whole state blocks once it covers
++        one, and never below ``min_tokens``. The controller keeps the unrounded
++        value so that rounding does not stop it from growing.
++        """
++        tokens = self.tokens
++        if self.block_size and tokens >= self.block_size:
++            tokens = tokens // self.block_size * self.block_size
++        return max(tokens, self.min_tokens)
++
+     def update(self, sample: MixedPrefillTiming | None) -> None:
+         if (
+             sample is None
+@@ -45,5 +67,6 @@ def update(self, sample: MixedPrefillTiming | None) -> None:
+         quantum = min(16, self.max_tokens)
+         self.tokens = max(
+             quantum,
++            self.min_tokens,
+             min(self.max_tokens, int(desired) // quantum * quantum),
+         )
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index cb068af846..1f3ccce943 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -126,6 +126,7 @@ def __init__(
+         self.mixed_prefill_budget = MixedPrefillBudget(
+             self.max_num_scheduled_tokens,
+             self.scheduler_config.mixed_prefill_step_latency_ms,
++            self.scheduler_config.mixed_prefill_min_tokens,
+         )
+         self.mixed_prefill_enabled = current_platform.device_type == "cuda"
+         self.enable_kv_cache_events = (
+@@ -313,6 +314,10 @@ def __init__(
+         self.mamba_state_block_size = (
+             next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
+         )
++        if self.need_mamba_block_aligned_split:
++            # A mixed chunk that ends off the state-block grid splits the next
++            # block across steps; keep the latency budget on whole blocks.
++            self.mixed_prefill_budget.block_size = self.mamba_state_block_size
+         # Sparse admission only retains replay/shared-prefix and periodic
+         # boundaries. Materializing discarded states must not split the whole
+         # model's prefill into one-state-block forwards. Mixed alignments still
+@@ -598,7 +603,7 @@ def limit_prefill(req_id: str, tokens: int) -> int:
+                 0,
+                 min(
+                     tokens,
+-                    self.mixed_prefill_budget.tokens - used,
++                    self.mixed_prefill_budget.budget - used,
+                     token_budget - reserve,
+                 ),
+             )
+@@ -1301,7 +1306,7 @@ def limit_prefill(req_id: str, tokens: int) -> int:
+                 else 0
+             ),
+             mixed_prefill_budget=(
+-                self.mixed_prefill_budget.tokens if control_mixed_prefill else 0
++                self.mixed_prefill_budget.budget if control_mixed_prefill else 0
+             ),
+             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
