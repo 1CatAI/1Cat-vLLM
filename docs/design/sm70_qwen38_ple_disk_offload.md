@@ -32,8 +32,10 @@ minor/major fault counts. It is intended for diagnosis rather than production.
 
 - The PLE worker constructs the logical embedding on `meta`; it does not
   allocate the 47.684-GiB anonymous parameter.
-- The loader accepts only checkpoint-native FP8 CPU tensors whose addresses
-  belong to real file mappings. Eager copies and missing shards fail closed.
+- The loader retains checkpoint-native CPU tensors whose addresses belong to
+  real file mappings. Eager copies and missing shards fail closed. The qualified
+  FP8 path is unchanged; the BF16 extension and its qualification limits are
+  described below.
 - All 128 tensors are retained after loading. The small global scale is copied
   so it does not depend on a transient loader mapping.
 - `MADV_RANDOM` prevents Linux mmap read-around from pulling almost the entire
@@ -44,6 +46,60 @@ minor/major fault counts. It is intended for diagnosis rather than production.
 - Disk mode without `VLLM_PLE_CPU_OFFLOAD=1` is rejected before model loading.
 
 The feature changes no default. The normal CPU-resident PLE path is untouched.
+
+### BF16 checkpoint rows (FP16 output)
+
+Unquantized BF16 PLE shards can use whole-table CPU disk offload with FP16
+model output. The logical table stays on `meta`; the owner retains the original
+file mappings. Each 160-element row occupies 320 bytes. The existing native
+gather and fast lane copy those bytes, including through the bounded row cache.
+They neither allocate a resident table nor quantize BF16 to FP8.
+
+GPU placeholders discover the storage dtype from checkpoint shards without
+copying the table. All consumers register the same BF16 result layout; the CPU
+owner checks it against its loaded storage before accepting result buffers.
+Only the selected rows are transported as uint8 pairs. The consumer reconstructs
+FP32 bits and rounds to FP16 in a small Triton operation, so SM70 compilation
+does not require native BF16 instructions. Existing PLE projections receive
+ordinary FP16 tensors. Mixed shard dtypes, incompatible geometry and FP8 scales
+on a BF16 table are rejected. BF16 cascade placement and non-FP16 output are not
+admitted by this extension.
+
+The storage/cast contract is exact relative to standard BF16-to-FP16 conversion
+for non-NaN outputs, including signed zero, subnormals and overflow; NaN payload
+bits are not part of the contract. The owning tests are
+`tests/models/qwen4_exp/test_bf16_disk_ple.py`,
+`tests/kernels/ple/test_bf16_result.py` and the 320-byte cases in
+`tests/v1/worker/test_ple_fast_lane.py`. They cover mmap ownership, shard/page
+boundaries, output padding, consumer agreement, repeated requests and all 65,536
+BF16 encodings. CPU interpreter execution and offline SM70 compilation are
+separate evidence from CUDA execution.
+
+V100 conversion and graph replay passed the exhaustive encoding test; compiled
+result tests passed with 0, 1, 4 and 17 token rows. An installed development wheel
+served `orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4` on four V100-SXM2-32GB
+GPUs with TP4, FP16 model/KV tensors and MTP disabled. The 128 BF16 shards retain
+95.368 GiB of file-backed storage; 384 sampled rows matched independent file
+reads. Functional checks passed for text, thinking, tool calls with follow-up,
+images, four concurrent short requests and retrieval at 110,096 and 220,096
+prompt tokens. The configured 262,144-token boundary and sustained-load behavior
+were not tested. These observations do not qualify four full-length requests.
+
+This serving evidence was collected on base `2d05ba9d8` plus the BF16 extension
+and existing local GEMM workspace, TP compile synchronization and PLE connector
+timeout fixes. It is not an isolated end-to-end result for the BF16 patch alone.
+The development wheel was `1.5.4.dev141+g2d05ba9d8.bf16ple1.cu129`, SHA256
+`9cb378af4a542523e896ae3a5b11fc4c9a80e2706c852f40b0aa73d2d15bec49`.
+
+Paired full-model quality and throughput remain unqualified. The intended model
+comparison is the same BF16 checkpoint with resident CPU PLE versus disk PLE,
+FP16 computation, TP4 and no MTP. Establish numerical tolerances from repeated
+baseline runs before the candidate comparison, then check task/format adherence,
+natural termination and recurrent/long-context behavior. BF16 rows also require
+twice the storage and transport bytes of FP8 rows, fewer cached rows for a fixed
+byte budget, and a consumer-side output allocation and conversion launch. The
+FP8 measurements below do not establish BF16 throughput or broader context and
+concurrency qualification.
 
 The shard discovery/reload coverage in upstream vLLM
 [#54129](https://github.com/vllm-project/vllm/pull/54129) is broader. This SM70

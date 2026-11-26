@@ -1142,6 +1142,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         super().__init__()
         self.layer_name = layer_name
         self.embedding_dim = embedding_dim
+        self._offload_embedding_dim = embedding_dim
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
         self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
@@ -1275,14 +1276,19 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
         elif self._file_backed_shards:
             if quant_method is None:
-                raise NotImplementedError(
-                    "Qwen4Exp PLE file-backed shards require FP8 checkpoint storage"
-                )
+                if self._cascade or params_dtype != torch.float16:
+                    raise NotImplementedError(
+                        "BF16 PLE file-backed storage requires whole-table CPU "
+                        "disk offload with FP16 model output"
+                    )
+                self._bf16_result = True
             with torch.device("meta"):
                 self.ngram_embedding = VocabParallelEmbedding(
                     padded_vocab_size,
                     self.head_dim,
-                    params_dtype=params_dtype,
+                    params_dtype=(
+                        torch.bfloat16 if quant_method is None else params_dtype
+                    ),
                     padding_size=divisor,
                     prefix=embedding_prefix,
                     quant_method=quant_method,
@@ -1758,9 +1764,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         """
         if any(shard is None for shard in self._disk_shards):
             raise RuntimeError("PLE disk lookup started before every shard was loaded")
+        row_bytes = self.head_dim * self.ngram_embedding.weight.element_size()
         if self._disk_row_kernel is not None:
             rows = torch.empty(
-                (flat_ids.size, self.head_dim), dtype=torch.uint8, device="cpu"
+                (flat_ids.size, row_bytes), dtype=torch.uint8, device="cpu"
             )
             self._disk_row_kernel.apply(torch.from_numpy(flat_ids), rows)
             if self._release_disk_pages:
@@ -1783,8 +1790,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     f"[{min_id}, {max_id}] for "
                     f"{self.ngram_embedding.org_vocab_size} rows"
                 )
-            rows = np.empty((flat_ids.size, self.head_dim), dtype=np.uint8)
-            row_bytes = self.head_dim
+            rows = np.empty((flat_ids.size, row_bytes), dtype=np.uint8)
             rows_ptr = rows.ctypes.data
             touched_shards: set[int] = set()
             for output_row, row_id in enumerate(flat_ids.tolist()):
@@ -1812,7 +1818,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         split_positions = np.searchsorted(sorted_ids, boundaries).tolist()
         starts = [0, *split_positions]
         ends = [*split_positions, sorted_ids.size]
-        sorted_output = np.empty((sorted_ids.size, self.head_dim), dtype=np.uint8)
+        sorted_output = np.empty((sorted_ids.size, row_bytes), dtype=np.uint8)
 
         tasks = [
             (shard_index, start, end)
@@ -1842,9 +1848,17 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         ngram_ids: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        """Gather mapped FP8 shard rows in logical-ID order (whole table)."""
+        """Gather checkpoint bytes in logical-ID order (whole table)."""
         if output.dtype not in (torch.uint8, torch.float8_e4m3fn):
-            raise RuntimeError("PLE disk lookup currently requires FP8 output")
+            raise RuntimeError("PLE disk lookup requires raw byte output")
+        row_bytes = self.head_dim * self.ngram_embedding.weight.element_size()
+        output_bytes = output.view(torch.uint8)
+        if (
+            output.device.type != "cpu"
+            or not output.is_contiguous()
+            or output_bytes.numel() != ngram_ids.numel() * row_bytes
+        ):
+            raise ValueError("PLE disk lookup output byte geometry mismatch")
         profile = envs.VLLM_PLE_DISK_OFFLOAD_PROFILE
         if profile:
             faults_before = resource.getrusage(resource.RUSAGE_SELF)
@@ -1853,7 +1867,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if flat_ids.size == 0:
             return
         if self._disk_row_kernel is not None:
-            self._disk_row_kernel.apply(ngram_ids, output.view(torch.uint8))
+            self._disk_row_kernel.apply(ngram_ids, output_bytes)
             if self._release_disk_pages:
                 for index in np.unique(flat_ids // self._disk_shard_size):
                     shard = self._disk_shards[int(index)]
@@ -1861,7 +1875,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     self._release_mapped_pages(shard)
         else:
             rows = self._gather_mapped_rows(flat_ids)
-            output.view(torch.uint8).reshape(-1, self.head_dim).numpy()[:] = rows
+            output_bytes.reshape(-1, row_bytes).numpy()[:] = rows
         if profile:
             faults_after = resource.getrusage(resource.RUSAGE_SELF)
             logger.info(
@@ -1908,6 +1922,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             getattr(self, "_sm70_hcx_diagnostics", False),
         )
         if output_buffer is not None:
+            if getattr(self, "_bf16_result", False):
+                output = output_buffer[:num_tokens]
+                self._disk_embedding_lookup(ngram_ids, output)
+                return output
             if getattr(self, "_packed_result_layout", None) is not None:
                 reader = self.ngram_embedding._cpu_reader
                 if reader is None or not is_offload_process():
@@ -1955,7 +1973,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
-        """Transport quantized lookup results as opaque E4M3FN bytes."""
+        """Transport checkpoint-native FP8/BF16 rows as opaque bytes."""
+        if getattr(self, "_bf16_result", False):
+            return torch.uint8
         if getattr(self, "_packed_result_layout", None) is not None:
             return torch.uint8
         embedding = getattr(self, "ngram_embedding", None)
@@ -1972,13 +1992,33 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         return default_dtype
 
     def get_offload_output_dim(self, default_dim: int) -> int:
+        if getattr(self, "_bf16_result", False):
+            return 2 * default_dim
         layout = getattr(self, "_packed_result_layout", None)
         return layout["packed_width"] if layout is not None else default_dim
 
     def offload_result_layout(self):
+        if getattr(self, "_bf16_result", False):
+            return {
+                "format": "bf16",
+                "embedding_dim": self._offload_embedding_dim,
+                "output_dtype": "float16",
+            }
         return getattr(self, "_packed_result_layout", None)
 
     def bind_offload_result_layout(self, layout):
+        if layout is not None and layout.get("format") == "bf16":
+            if (
+                not getattr(self, "_bf16_result", False)
+                or not self._disk_offload
+                or self._cascade
+                or self.ngram_embedding.weight.dtype != torch.bfloat16
+                or layout != self.offload_result_layout()
+            ):
+                raise ValueError("CPU BF16 PLE storage disagrees with result layout")
+            return
+        if getattr(self, "_bf16_result", False):
+            raise ValueError("BF16 PLE requires a matching BF16 result layout")
         if layout is None:
             self._packed_result_layout = None
             return
@@ -2002,6 +2042,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def wait_offloaded_output(
         self, hidden_states: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
+        if getattr(self, "_bf16_result", False):
+            import vllm.model_executor.kernels.ple.bf16_result  # noqa: F401
+
+            packet = super().wait_offloaded_output(hidden_states, num_tokens)
+            return torch.ops.vllm.ple_decode_bf16_result(packet)
         layout = getattr(self, "_packed_result_layout", None)
         if layout is None:
             return super().wait_offloaded_output(hidden_states, num_tokens)
@@ -2048,7 +2093,20 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             and not is_offload_process()
         ):
             retained: set[str] = set()
+            shard_dtype = getattr(self, "_offload_shard_dtype", None)
             for name, loaded_weight in weights:
+                if name.startswith(PLE_SHARD_PREFIX) and name.endswith(".weight"):
+                    if shard_dtype is not None and shard_dtype != loaded_weight.dtype:
+                        raise ValueError("PLE checkpoint shards have mixed dtypes")
+                    shard_dtype = loaded_weight.dtype
+                    self._offload_shard_dtype = shard_dtype
+                    if ple_policy().disk and shard_dtype == torch.bfloat16:
+                        if self._offload_model_dtype != torch.float16:
+                            raise NotImplementedError(
+                                "BF16 disk PLE requires FP16 model output"
+                            )
+                        self._bf16_result = True
+                    continue
                 if name != "ngram_embedding.weight_scale":
                     continue
                 # Match the resident FP8 embedding contract: its global scale
@@ -2065,6 +2123,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     persistent=False,
                 )
                 retained.add(name)
+            if getattr(self, "_bf16_result", False) and hasattr(
+                self, "_offload_weight_scale"
+            ):
+                raise ValueError("BF16 PLE checkpoint must not contain an FP8 scale")
             return retained
 
         persistent_buffers = {
@@ -2118,6 +2180,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         f"{tuple(loaded_weight.shape)}"
                     )
                 if file_backed:
+                    if not loaded_weight.is_contiguous():
+                        raise ValueError("PLE disk shards must be contiguous")
                     if loaded_weight.dtype != embedding.weight.dtype:
                         raise ValueError(
                             "PLE disk shard dtype mismatch: expected "
@@ -2148,6 +2212,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 loaded.add("ngram_embedding.weight")
                 continue
             if file_backed and name == "ngram_embedding.weight_scale":
+                if getattr(self, "_bf16_result", False):
+                    raise ValueError(
+                        "BF16 PLE checkpoint must not contain an FP8 scale"
+                    )
                 self._disk_weight_scale = loaded_weight.clone()
                 loaded.add(name)
                 continue
@@ -2173,7 +2241,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 pointers=self._disk_shard_pointers,
                 shard_size=self._disk_shard_size,
                 num_rows=self.ngram_embedding.org_vocab_size,
-                row_bytes=self.head_dim,
+                row_bytes=self.head_dim * self.ngram_embedding.weight.element_size(),
                 file_backed=bool(self._disk_mapped_paths),
                 enabled=self._disk_row_gather,
                 cache_bytes=getattr(self._kernel_config, "ple_row_cache_mib", 0) << 20,
@@ -2260,6 +2328,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # workers, so preserve the model-dtype scale contract explicitly for
         # its checkpoint-only load path.
         self.ple_embedding._offload_model_dtype = model_config.dtype
+        self.ple_embedding._offload_embedding_dim = int(config.ple_embed_dim)
         from vllm.model_executor.kernels.ple.gguf_packed_result import (
             packed_result_layout,
         )
