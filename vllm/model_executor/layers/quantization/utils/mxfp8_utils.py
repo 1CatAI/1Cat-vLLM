@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable, Iterable, Iterator
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -181,3 +183,103 @@ def xpu_mxfp8_quantize(
     x: torch.Tensor, dtype: torch.dtype | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.ops.vllm.xpu_mxfp8_quantize(x, dtype)
+
+
+def dequantize_mxfp8_weight_pairs(
+    weights: Iterable[tuple],
+    out_dtype: torch.dtype = torch.bfloat16,
+    keep_quantized: Callable[[str], bool] | None = None,
+) -> Iterator[tuple]:
+    """Yield checkpoint tensors with every MXFP8 weight dequantized.
+
+    An MXFP8 pair is an fp8-e4m3 ``<module>.weight`` and a uint8 E8M0
+    ``<module>.weight_scale`` of shape [N, K/32]; it becomes one
+    ``<module>.weight`` in ``out_dtype``. Other fp8 weights, e.g. block FP8
+    with float32 scales, pass through unchanged, so a model can keep those
+    quantized, and every other tensor passes through too. Items keep any extra
+    fields after (name, tensor). For hardware without MXFP8 kernels (before
+    SM80).
+
+    ``keep_quantized(module)`` names the modules the model holds as MXFP8: all
+    their tensors pass through unchanged, in stream order.
+
+    Every scale is handed on directly after its weight, whatever order the
+    shards store them in: model loaders pair the two inside one
+    ``load_weights`` call, and a split stream (``AutoWeightsLoader`` calls a
+    module once per run of its prefix) would otherwise part them. Apply it to
+    the whole stream, before any split.
+    """
+    pending_weights: dict[str, tuple] = {}
+    pending_scales: dict[str, tuple] = {}
+    # Modules whose unquantized weight already went by: a later scale of
+    # theirs has nothing to wait for.
+    passed: set[str] = set()
+    for item in weights:
+        name, tensor = item[0], item[1]
+        if name.endswith(".weight"):
+            module = name.removesuffix(".weight")
+            if keep_quantized is not None and keep_quantized(module):
+                yield item
+                continue
+            scale = pending_scales.pop(module, None)
+            if tensor.dtype != MXFP8_VALUE_DTYPE:
+                passed.add(module)
+                yield item
+                if scale is not None:
+                    yield scale
+            elif scale is None:
+                pending_weights[module] = item
+            elif scale[1].dtype == MXFP8_SCALE_DTYPE:
+                yield _dequantized_pair(item, scale[1], out_dtype)
+            else:
+                yield item
+                yield scale
+            continue
+        module = _scale_module(name, tensor)
+        if (
+            module is None
+            or module in passed
+            or (keep_quantized is not None and keep_quantized(module))
+        ):
+            yield item
+            continue
+        weight = pending_weights.pop(module, None)
+        if weight is None:
+            pending_scales[module] = item
+        elif tensor.dtype == MXFP8_SCALE_DTYPE:
+            yield _dequantized_pair(weight, tensor, out_dtype)
+        else:
+            yield weight
+            yield item
+    if pending_scales:
+        raise ValueError(
+            f"Weight scales without their weights: {sorted(pending_scales)[:4]}"
+        )
+    yield from pending_weights.values()
+
+
+def _scale_module(name: str, tensor: torch.Tensor) -> str | None:
+    """The module of a scale that belongs next to its weight: an MXFP8 E8M0
+    scale or a float32 (block or per-tensor) FP8 scale. NVFP4's E4M3 block
+    scales and every other tensor are not held."""
+    if tensor.dtype not in (MXFP8_SCALE_DTYPE, torch.float32):
+        return None
+    for suffix in (".weight_scale", ".weight_scale_inv"):
+        if name.endswith(suffix):
+            return name.removesuffix(suffix)
+    return None
+
+
+def _dequantized_pair(weight_item: tuple, scale: torch.Tensor, out_dtype) -> tuple:
+    name, weight = weight_item[0], weight_item[1]
+    if (
+        weight.dim() != 2
+        or scale.dim() != 2
+        or scale.shape[0] != weight.shape[0]
+        or scale.shape[1] * MXFP8_BLOCK_SIZE != weight.shape[1]
+    ):
+        raise ValueError(
+            f"MXFP8 {name}: weight {tuple(weight.shape)} and scale "
+            f"{tuple(scale.shape)} do not form 1x{MXFP8_BLOCK_SIZE} blocks"
+        )
+    return (name, dequant_mxfp8_to_bf16(weight, scale).to(out_dtype), *weight_item[2:])

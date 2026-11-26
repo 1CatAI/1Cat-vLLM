@@ -4,7 +4,10 @@ from collections.abc import Callable
 
 import torch
 
-from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+from vllm.model_executor.kernels.linear import (
+    Mxfp8LinearLayerConfig,
+    init_mxfp8_linear_kernel,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
@@ -34,9 +37,6 @@ class CompressedTensorsW8A8Mxfp8(CompressedTensorsScheme):
     - Activations dynamically quantized to MXFP8 during inference
     """
 
-    def __init__(self):
-        self.kernel = init_mxfp8_linear_kernel()
-
     @classmethod
     def get_min_capability(cls) -> int:
         return 75
@@ -51,6 +51,11 @@ class CompressedTensorsW8A8Mxfp8(CompressedTensorsScheme):
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
+        self.kernel = init_mxfp8_linear_kernel(
+            Mxfp8LinearLayerConfig(
+                (output_size_per_partition, input_size_per_partition)
+            )
+        )
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition

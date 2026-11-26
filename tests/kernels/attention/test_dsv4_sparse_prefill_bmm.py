@@ -5,11 +5,13 @@
 import pytest
 import torch
 
+from tests.kernels.utils import requires_tensor_core_triton
 from vllm.models.deepseek_v4.common.ops import (
     sparse_attn_prefill_bmm,
+    sparse_attn_prefill_tensor_cores,
     sparse_prefill_bmm_workspace_specs,
 )
-from vllm.models.deepseek_v4.common.ops.sparse_prefill_bmm import MAX_TOKENS_PER_PASS
+from vllm.models.deepseek_v4.common.ops.sparse_prefill_bmm import tokens_per_pass
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -17,6 +19,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 HEAD_DIM = 512
+# The BLAS route and the tensor-core route that reads the selected rows itself.
+ROUTES = [False, pytest.param(True, marks=requires_tensor_core_triton)]
+
+
+def _prefill(tensor_cores: bool):
+    return sparse_attn_prefill_tensor_cores if tensor_cores else sparse_attn_prefill_bmm
 
 
 def _reference(q, kv, indices, lengths, scale, attn_sink) -> torch.Tensor:
@@ -36,9 +44,10 @@ def _reference(q, kv, indices, lengths, scale, attn_sink) -> torch.Tensor:
 @pytest.mark.parametrize("num_heads", [8, 64])
 @pytest.mark.parametrize("width", [128, 640])
 @pytest.mark.parametrize("stale_tail", [False, True])
+@pytest.mark.parametrize("tensor_cores", ROUTES)
 @torch.inference_mode()
 def test_sparse_attn_prefill_bmm_matches_reference(
-    num_tokens: int, num_heads: int, width: int, stale_tail: bool
+    num_tokens: int, num_heads: int, width: int, stale_tail: bool, tensor_cores: bool
 ):
     torch.manual_seed(0)
     num_kv = 900
@@ -70,21 +79,68 @@ def test_sparse_attn_prefill_bmm_matches_reference(
     buffers = [
         torch.full(shape, float("nan"), dtype=dtype, device="cuda")
         for shape, dtype in sparse_prefill_bmm_workspace_specs(
-            num_tokens + 9, num_heads, HEAD_DIM, width + 128, torch.float16
+            num_tokens + 9,
+            num_heads,
+            HEAD_DIM,
+            width + 128,
+            torch.float16,
+            tensor_cores=tensor_cores,
         )
     ]
     output = torch.empty_like(q)
-    sparse_attn_prefill_bmm(q, kv, indices, lengths, scale, attn_sink, output, *buffers)
+    _prefill(tensor_cores)(q, kv, indices, lengths, scale, attn_sink, output, *buffers)
 
     expected = _reference(q, kv, indices, lengths, scale, attn_sink)
     assert torch.isfinite(output).all()
     assert not output[1].any()  # no keys: the sink takes all the weight
-    assert buffers[0].shape[0] == min(num_tokens + 9, MAX_TOKENS_PER_PASS)
+    assert buffers[0].shape[0] == min(num_tokens + 9, tokens_per_pass(tensor_cores))
+    # The tensor-core route reads the selected rows itself: no gathered keys.
+    assert len(buffers) == (2 if tensor_cores else 3)
     torch.testing.assert_close(output.double(), expected, atol=1e-3, rtol=1e-3)
 
 
+@requires_tensor_core_triton
 @torch.inference_mode()
-def test_prefill_retains_fp32_scores_before_softmax():
+def test_tensor_core_route_spans_several_passes():
+    # Two full passes of the tensor-core route and a partial one match the BLAS
+    # route, which the reference test above covers.
+    torch.manual_seed(1)
+    device = torch.device("cuda")
+    num_tokens = 2 * tokens_per_pass(True) + 3
+    num_heads, width, num_kv = 64, 640, 900
+    q = torch.randn((num_tokens, num_heads, HEAD_DIM), device=device).half()
+    kv = (0.3 * torch.randn((num_kv, HEAD_DIM), device=device)).half()
+    indices = torch.randint(
+        0, num_kv, (num_tokens, width), dtype=torch.int32, device=device
+    )
+    lengths = torch.randint(
+        1, width + 1, (num_tokens,), dtype=torch.int32, device=device
+    )
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    outputs = []
+    for tensor_cores in (False, True):
+        buffers = [
+            torch.empty(shape, dtype=dtype, device=device)
+            for shape, dtype in sparse_prefill_bmm_workspace_specs(
+                num_tokens,
+                num_heads,
+                HEAD_DIM,
+                width,
+                torch.float16,
+                tensor_cores=tensor_cores,
+            )
+        ]
+        output = torch.empty_like(q)
+        _prefill(tensor_cores)(
+            q, kv, indices, lengths, HEAD_DIM**-0.5, attn_sink, output, *buffers
+        )
+        outputs.append(output)
+    torch.testing.assert_close(outputs[1], outputs[0], atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("tensor_cores", ROUTES)
+@torch.inference_mode()
+def test_prefill_retains_fp32_scores_before_softmax(tensor_cores: bool):
     # Finite FP16 inputs can produce scaled QK scores beyond FP16 range. The
     # existing attention softmax consumes FP32 scores and returns finite values.
     q = torch.full((1, 8, HEAD_DIM), 64.0, device="cuda", dtype=torch.float16)
@@ -95,13 +151,13 @@ def test_prefill_retains_fp32_scores_before_softmax():
     buffers = [
         torch.empty(shape, device="cuda", dtype=dtype)
         for shape, dtype in sparse_prefill_bmm_workspace_specs(
-            1, 8, HEAD_DIM, 2, q.dtype
+            1, 8, HEAD_DIM, 2, q.dtype, tensor_cores=tensor_cores
         )
     ]
     output = torch.empty_like(q)
-    sparse_attn_prefill_bmm(
+    _prefill(tensor_cores)(
         q, kv, indices, lengths, HEAD_DIM**-0.5, sink, output, *buffers
     )
-    assert buffers[1].dtype == torch.float32
+    assert buffers[-2].dtype == torch.float32
     assert torch.isfinite(output).all()
     assert torch.equal(output, torch.full_like(output, 64.0))
