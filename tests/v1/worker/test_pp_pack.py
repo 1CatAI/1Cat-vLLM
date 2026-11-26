@@ -158,22 +158,65 @@ def _config(**overrides):
         pipeline_parallel_size=5, tensor_parallel_size=1, data_parallel_size=1
     )
     parallel.update(overrides.pop("parallel", {}))
+    use_v2_model_runner = overrides.pop("use_v2_model_runner", True)
     return SimpleNamespace(
         kernel_config=KernelConfig(**overrides),
         parallel_config=SimpleNamespace(**parallel),
+        use_v2_model_runner=use_v2_model_runner,
     )
 
 
-def test_admission_is_a_kernel_config_field_and_needs_pure_pp() -> None:
+def test_admission_is_a_kernel_config_field_and_needs_pure_pp(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_V41_PP_RANK0", "0")
     assert not KernelConfig().pp_pack_handover
     assert pp_pack_enabled(_config(pp_pack_handover=True))
     assert not pp_pack_enabled(_config())
-    for parallel in (
-        {"pipeline_parallel_size": 1},
-        {"tensor_parallel_size": 2},
-        {"data_parallel_size": 2},
-    ):
-        assert not pp_pack_enabled(_config(pp_pack_handover=True, parallel=parallel))
+    # Off, nothing is checked: the field is the only switch.
+    assert not pp_pack_enabled(
+        _config(parallel={"tensor_parallel_size": 2}, use_v2_model_runner=False)
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "pp_rank0", "reason"),
+    [
+        ({"parallel": {"pipeline_parallel_size": 1}}, "0", "pipeline parallelism"),
+        ({"parallel": {"tensor_parallel_size": 2}}, "0", "tensor parallel size 1"),
+        ({"parallel": {"data_parallel_size": 2}}, "0", "data parallel size 1"),
+        ({"use_v2_model_runner": False}, "0", "the V2 model runner"),
+        ({}, "1", "VLLM_V41_PP_RANK0 unset"),
+    ],
+)
+def test_a_setting_the_handover_cannot_honour_is_rejected(
+    monkeypatch, overrides, pp_rank0, reason
+) -> None:
+    monkeypatch.setenv("VLLM_V41_PP_RANK0", pp_rank0)
+    with pytest.raises(ValueError, match=f"pp_pack_handover requires {reason}"):
+        pp_pack_enabled(_config(pp_pack_handover=True, **overrides))
+
+
+def test_worker_construction_rejects_a_setting_it_cannot_honour() -> None:
+    """The check runs when the Worker is built, before any device or model."""
+    from vllm.config import VllmConfig
+
+    config = VllmConfig(kernel_config=KernelConfig(pp_pack_handover=True))
+    with pytest.raises(ValueError, match="requires pipeline parallelism"):
+        Worker(
+            vllm_config=config,
+            local_rank=0,
+            rank=0,
+            distributed_init_method="env://",
+        )
+
+
+def test_worker_receive_pool_follows_the_admission() -> None:
+    pool = _buffers()
+    worker = Worker.__new__(Worker)
+    worker.model_runner = SimpleNamespace(pp_pack_recv=pool)
+    worker._pp_pack_handover = False
+    assert worker._pp_pack_recv is None
+    worker._pp_pack_handover = True
+    assert worker._pp_pack_recv is pool
 
 
 def test_graph_manager_returns_the_send_block_for_packed_steps() -> None:

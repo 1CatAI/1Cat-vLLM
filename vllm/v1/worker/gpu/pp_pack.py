@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
@@ -44,19 +45,27 @@ def _is_capturing(device: torch.device) -> bool:
 
 
 def pp_pack_enabled(vllm_config: VllmConfig) -> bool:
-    """Admission for the packed handover.
+    """Admission for the packed handover; a setting it cannot honour is an error.
 
     The packed block is sent whole, so tensor-parallel slicing of the
     transfer (``all_gather_group``) is not modelled; data-parallel padding can
-    change a stage's descriptor independently of its neighbour.
+    change a stage's descriptor independently of its neighbour. Only the MRV2
+    runner captures into the blocks, and VLLM_V41_PP_RANK0 has its own
+    metadata-free transfer of the same boundary.
     """
+    if not vllm_config.kernel_config.pp_pack_handover:
+        return False
     parallel = vllm_config.parallel_config
-    return (
-        vllm_config.kernel_config.pp_pack_handover
-        and parallel.pipeline_parallel_size > 1
-        and parallel.tensor_parallel_size == 1
-        and parallel.data_parallel_size == 1
-    )
+    for unsupported, reason in (
+        (parallel.pipeline_parallel_size <= 1, "pipeline parallelism"),
+        (parallel.tensor_parallel_size != 1, "tensor parallel size 1"),
+        (parallel.data_parallel_size != 1, "data parallel size 1"),
+        (not vllm_config.use_v2_model_runner, "the V2 model runner"),
+        (envs.VLLM_V41_PP_RANK0 == "1", "VLLM_V41_PP_RANK0 unset"),
+    ):
+        if unsupported:
+            raise ValueError(f"kernel_config.pp_pack_handover requires {reason}")
+    return True
 
 
 def packs_handover(desc: "BatchExecutionDescriptor") -> bool:

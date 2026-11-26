@@ -811,10 +811,12 @@ class KernelConfig:
     pp_pack_handover: bool = False
     """Send the intermediate tensors of a pipeline stage boundary as one NCCL
     message on fixed-shape decode and verify steps (FULL uniform-decode CUDA
-    graphs; MRV2 runner, TP1, no data parallelism). The sender's graph writes
-    into one packed block and the receiver's graph reads from the block it
-    receives into, so the per-tensor sends, the step metadata and the receiver
-    copies disappear. Other steps keep the per-tensor transfer."""
+    graphs). The sender's graph writes into one packed block and the
+    receiver's graph reads from the block it receives into, so the per-tensor
+    sends, the step metadata and the receiver copies disappear. Other steps
+    keep the per-tensor transfer. Requires pipeline parallelism, tensor and
+    data parallel size 1, the V2 model runner and VLLM_V41_PP_RANK0 unset;
+    otherwise the Worker raises ValueError at startup."""
 
     sm70_packed_topk_gather: bool = True
     """Gather SM70 TP2/TP4 compact candidates in one lossless message."""

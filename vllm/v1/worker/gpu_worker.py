@@ -81,6 +81,7 @@ from vllm.v1.worker.gpu.pp_pack import (
     PackedHandoverBuffers,
     PackedIntermediateTensors,
     packs_handover,
+    pp_pack_enabled,
 )
 from vllm.v1.worker.utils import (
     configure_attention_workspace,
@@ -292,6 +293,9 @@ class Worker(WorkerBase):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # Checked here, where the V1 and the V2 runner both pass, so a setting
+        # the handover cannot honour fails at startup on either.
+        self._pp_pack_handover = pp_pack_enabled(vllm_config)
         self._ple_offload_worker_handle: Any | None = None
         self._ple_offload_spawn_config: VllmConfig | None = None
         if ple_policy(self.vllm_config).hybrid and not (
@@ -1786,7 +1790,7 @@ class Worker(WorkerBase):
 
     @property
     def _pp_pack_recv(self) -> PackedHandoverBuffers | None:
-        if not self.use_v2_model_runner:
+        if not self._pp_pack_handover:
             return None
         return self.model_runner.pp_pack_recv  # type: ignore[attr-defined]
 
@@ -1802,11 +1806,6 @@ class Worker(WorkerBase):
         the block the graph for ``batch_desc`` reads; the sender chooses by the
         same descriptor. Every other step keeps the per-tensor transfer.
         """
-        if _PP_RANK0:
-            raise RuntimeError(
-                "kernel_config.pp_pack_handover cannot be combined with "
-                "VLLM_V41_PP_RANK0"
-            )
         if not packs_handover(batch_desc):
             return self._irecv_per_tensor_handover(num_tokens, all_gather_tensors)
         assert self._pp_pack_recv is not None
