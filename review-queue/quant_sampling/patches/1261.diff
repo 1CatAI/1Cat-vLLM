@@ -1,0 +1,74 @@
+diff --git a/vllm/lora/layers/logits_processor.py b/vllm/lora/layers/logits_processor.py
+index 237a61eac..60a8e7022 100644
+--- a/vllm/lora/layers/logits_processor.py
++++ b/vllm/lora/layers/logits_processor.py
+@@ -189,6 +189,22 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
+         logits = logits[:, : self.base_layer.vocab_size]
+         return logits
+ 
++    def _apply_logits_transforms(
++        self, logits: torch.Tensor | None
++    ) -> torch.Tensor | None:
++        return self.base_layer._apply_logits_transforms(logits)
++
++    # Sparse target paths project with the base lm_head only; the model runner
++    # uses them only for batches without an active LoRA request.
++    def get_topk_tokens_and_logits(self, *args, **kwargs):
++        return self.base_layer.get_topk_tokens_and_logits(*args, **kwargs)
++
++    def get_topk_tokens_and_logits_with_fallback(self, *args, **kwargs):
++        return self.base_layer.get_topk_tokens_and_logits_with_fallback(*args, **kwargs)
++
++    def get_compact_target_probe_with_fallback(self, *args, **kwargs):
++        return self.base_layer.get_compact_target_probe_with_fallback(*args, **kwargs)
++
+     def forward(self, *args, **kwargs):
+         return type(self.base_layer).forward(self, *args, **kwargs)
+ 
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index a2b314f4d..c0d4b3a84 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -985,6 +985,8 @@ class Qwen3_5ForCausalLMBase(
+         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+         "in_proj_ba": ["in_proj_b", "in_proj_a"],
+     }
++    # Maps PEFT lm_head LoRA targets onto vLLM embedding wrappers.
++    embedding_modules = {"lm_head": "output_embeddings"}
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         config = vllm_config.model_config.hf_text_config
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 2dd1256d7..5075cdbce 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1331,7 +1331,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         sample_hidden_states = hidden_states[input_batch.logits_indices]
+         sampler_output = None
+         cached_logits = None
+-        if input_batch.num_draft_tokens > 0:
++        # The sparse target path projects with the base lm_head, so batches
++        # with an active LoRA request use dense LoRA-aware logits instead.
++        if input_batch.num_draft_tokens > 0 and not (
++            self.lora_config is not None
++            and self.lora_state.lora_ids[input_batch.idx_mapping_np].any()
++        ):
+             assert self.rejection_sampler is not None
+             assert self.speculator is not None
+             sparse_result = self.speculator.try_sample_target(
+@@ -1559,7 +1564,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     input_batch.idx_mapping_np,
+                     input_batch.num_scheduled_tokens,
+                 )
+-                self._set_active_loras(*lora_inputs)
++                # Logits have 1 + num_draft rows per request under spec decode;
++                # map each logits row (not each request) to its LoRA.
++                prompt_mapping, token_mapping, active_loras = lora_inputs
++                if input_batch.num_draft_tokens > 0:
++                    prompt_mapping = tuple(
++                        np.repeat(prompt_mapping, np.diff(input_batch.cu_num_logits_np))
++                    )
++                self._set_active_loras(prompt_mapping, token_mapping, active_loras)
+         else:
+             # No actual tokens to run. A dummy run for DP or memory profiling.
+             input_batch = InputBatch.make_dummy(

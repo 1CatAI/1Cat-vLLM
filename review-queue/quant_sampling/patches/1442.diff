@@ -1,0 +1,968 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314aa..0bc63fd490 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -785,6 +785,11 @@
+     VLLM_SPEC_DUMP_ALIGNMENT_LIMIT: int = 3
+     VLLM_SPEC_DUMP_ALIGNMENT_STEPS: str | None = None
+     VLLM_DEBUG_MTP_LOAD: bool = False
++    VLLM_DECODE_STEP_PROFILE: bool = False
++    VLLM_DECODE_STEP_PROFILE_EVERY: int = 20
++    VLLM_DECODE_STEP_PROFILE_WARMUP: int = 5
++    VLLM_DECODE_STEP_PROFILE_PHASE: str = "decode"
++    VLLM_DECODE_STEP_PROFILE_RANK: int = -1
+     VLLM_DEBUG_MTP_LOAD_VERBOSE: bool = False
+     VLLM_DFLASH_PROFILE: bool = False
+     VLLM_DFLASH_PROFILE_LOG_INTERVAL: int = 32
+@@ -11825,6 +11830,60 @@ def _resolve_rust_frontend_path() -> str | None:
+         acceleration_paths=(),
+         user_visible=True,
+     ),
++    "VLLM_DECODE_STEP_PROFILE": env_var(
++        lambda: bool(int(os.getenv("VLLM_DECODE_STEP_PROFILE", "0"))),
++        description=(
++            "vLLM: split each decode round into per-segment timings and report "
++            "both CPU and GPU timelines. Diagnostic only; off by default."
++        ),
++        category="debug",
++        declared_default="False",
++        effective_default="False",
++        automatic_conditions=(),
++        user_visible=True,
++    ),
++    "VLLM_DECODE_STEP_PROFILE_EVERY": env_var(
++        lambda: int(os.getenv("VLLM_DECODE_STEP_PROFILE_EVERY", "20")),
++        description="vLLM: sample and print the decode step profile every N steps.",
++        category="debug",
++        declared_default="20",
++        effective_default="20",
++        automatic_conditions=(),
++        user_visible=True,
++    ),
++    "VLLM_DECODE_STEP_PROFILE_WARMUP": env_var(
++        lambda: int(os.getenv("VLLM_DECODE_STEP_PROFILE_WARMUP", "5")),
++        description="vLLM: skip the first N steps before profiling decode steps.",
++        category="debug",
++        declared_default="5",
++        effective_default="5",
++        automatic_conditions=(),
++        user_visible=True,
++    ),
++    "VLLM_DECODE_STEP_PROFILE_PHASE": env_var(
++        lambda: os.getenv("VLLM_DECODE_STEP_PROFILE_PHASE", "decode").lower(),
++        description=(
++            "vLLM: which steps to profile -- 'all', 'decode' (default) or "
++            "'prefill'."
++        ),
++        category="debug",
++        declared_default="decode",
++        effective_default="decode",
++        automatic_conditions=(),
++        user_visible=True,
++    ),
++    "VLLM_DECODE_STEP_PROFILE_RANK": env_var(
++        lambda: int(os.getenv("VLLM_DECODE_STEP_PROFILE_RANK", "-1")),
++        description=(
++            "vLLM: print the decode step profile only on this TP rank. -1 "
++            "(default) prints on every rank."
++        ),
++        category="debug",
++        declared_default="-1",
++        effective_default="-1",
++        automatic_conditions=(),
++        user_visible=True,
++    ),
+     "VLLM_DEBUG_MTP_LOAD": env_var(
+         lambda: bool(int(os.getenv("VLLM_DEBUG_MTP_LOAD", "0"))),
+         description=(
+@@ -20265,6 +20324,11 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
+     hash everything else. This keeps the cache key aligned across workers."""
+ 
+     ignored_factors: set[str] = {
++        "VLLM_DECODE_STEP_PROFILE",
++        "VLLM_DECODE_STEP_PROFILE_EVERY",
++        "VLLM_DECODE_STEP_PROFILE_WARMUP",
++        "VLLM_DECODE_STEP_PROFILE_PHASE",
++        "VLLM_DECODE_STEP_PROFILE_RANK",
+         "VLLM_INPLACE_AR_MIN",
+         "VLLM_PYNCCL_ALLGATHER",
+         "VLLM_V41_ATTN_TIMING",
+diff --git a/vllm/v1/worker/gpu/decode_step_profile.py b/vllm/v1/worker/gpu/decode_step_profile.py
+new file mode 100644
+index 0000000000..0092f75762
+--- /dev/null
++++ b/vllm/v1/worker/gpu/decode_step_profile.py
+@@ -0,0 +1,278 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-decode-step profiling of segment timings (**diagnostic, off by default**).
++
++Splits one decode round (execute_model + sample_tokens) into per-segment
++timings, reporting two timelines: the CPU side (dispatch and preparation) and
++the GPU side (actual device work).
++
++This module **does not change inference behaviour**: when disabled every entry
++point returns on its first line, and the `gpu()` context manager degrades to a
++nullcontext.
++
++Enable with:
++    VLLM_DECODE_STEP_PROFILE=1
++
++Optional:
++    VLLM_DECODE_STEP_PROFILE_EVERY=<n>    sample and print once every n steps (default 20)
++    VLLM_DECODE_STEP_PROFILE_WARMUP=<n>   skip the first n steps (default 5)
++    VLLM_DECODE_STEP_PROFILE_PHASE=decode sample pure-decode steps only (default
++                                          decode; one of all/decode/prefill)
++    VLLM_DECODE_STEP_PROFILE_RANK=<n>     print on that rank only (default: all)
++
++How the timings are taken:
++  * CPU segments use ``time.perf_counter()``: wall-clock from the previous
++    marker to this one.
++  * GPU segments use ``torch.cuda.Event``: real device time for that segment on
++    the **main stream**. ``elapsed_time`` is only valid once both ends have
++    completed; this runner guarantees that in ``AsyncOutput.get_output()``
++    (copy_stream.wait_stream(main_stream) + synchronize), so no extra
++    synchronize is needed and the measurement does not perturb the run.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import time
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return int(os.getenv(name, str(default)))
++    except ValueError:
++        return default
++
++
++def _rank_tag() -> str:
++    try:
++        from vllm.distributed.parallel_state import (
++            get_tensor_model_parallel_rank,
++        )
++
++        tp = get_tensor_model_parallel_rank()
++    except Exception:
++        tp = -1
++    try:
++        return f"tp{tp}/dev{torch.cuda.current_device()}"
++    except Exception:
++        return f"tp{tp}"
++
++
++class DecodeStepProfiler:
++    """Accumulate per-step CPU/GPU segment timings; print one line every ``every`` steps."""
++
++    def __init__(self, tag: str = "decode") -> None:
++        self.tag = tag
++        self.enabled = os.getenv("VLLM_DECODE_STEP_PROFILE", "0") == "1"
++        self.every = max(1, _env_int("VLLM_DECODE_STEP_PROFILE_EVERY", 20))
++        self.warmup = max(0, _env_int("VLLM_DECODE_STEP_PROFILE_WARMUP", 5))
++        self.phase = os.getenv("VLLM_DECODE_STEP_PROFILE_PHASE", "decode").lower()
++        _rank = _env_int("VLLM_DECODE_STEP_PROFILE_RANK", -1)
++        self.rank_tag = _rank_tag()
++        self.silent = _rank >= 0 and not self.rank_tag.startswith(f"tp{_rank}/")
++
++        self.step = 0
++        self.sampling = False
++        self.is_decode = False
++        self.num_reqs = 0
++        self.num_toks = 0
++        self._t0 = 0.0
++        self._tprev = 0.0
++        self._cpu: dict[str, float] = {}
++        self._gpu_ev: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
++        # Accumulated across the execute_model and sample_tokens RPCs.
++        self._carry_cpu: dict[str, float] = {}
++        self._carry_gpu: dict[str, tuple] = {}
++        self._step_started = False
++        if self.enabled and not self.silent:
++            logger.info(
++                "DECODE_STEP_PROFILE enabled tag=%s rank=%s every=%d warmup=%d "
++                "phase=%s",
++                self.tag,
++                self.rank_tag,
++                self.every,
++                self.warmup,
++                self.phase,
++            )
++
++    # ------------------------------------------------------------ step lifecycle
++
++    def _want(self) -> bool:
++        return (
++            self.phase == "all"
++            or (self.phase == "decode" and self.is_decode)
++            or (self.phase == "prefill" and not self.is_decode)
++        )
++
++    def begin_step(self, num_reqs: int = 0, num_toks: int = 0) -> None:
++        """Called at the execute_model entry point.
++
++        Phase can only be estimated here: a decode step under speculative
++        decoding schedules ``num_reqs * (1 + draft tokens)`` tokens, far below
++        chunked prefill's 4096 budget, so a loose ratio is used first and then
++        corrected by :meth:`set_decode` from ``input_batch``'s authoritative
++        ``is_prefilling``. The loose first pass exists so the early segments
++        are not lost.
++        """
++        if not self.enabled:
++            return
++        self.step += 1
++        self.num_reqs = num_reqs
++        self.num_toks = num_toks
++        self.is_decode = num_reqs > 0 and num_toks <= num_reqs * 16
++        self.sampling = (
++            self._want()
++            and self.step > self.warmup
++            and self.step % self.every == 0
++        )
++        if not self.sampling:
++            return
++        now = time.perf_counter()
++        self._t0 = now
++        self._tprev = now
++        self._cpu = {}
++        self._gpu_ev = {}
++        self._step_started = True
++
++    def set_decode(self, is_decode: bool) -> None:
++        """Correct the phase decision from ``input_batch.is_prefilling``."""
++        if not self.sampling:
++            return
++        self.is_decode = is_decode
++        if not self._want():
++            self.sampling = False
++
++    def begin_sample(self) -> None:
++        """Called at the sample_tokens entry point; restarts continuous timing across RPCs."""
++        if not self.sampling:
++            return
++        self._tprev = time.perf_counter()
++
++    def end_step(self, extra: str = "") -> None:
++        """Called before sample_tokens returns, when all GPU events have completed."""
++        if not self.sampling:
++            return
++        now = time.perf_counter()
++        self._cpu["tail"] = self._cpu.get("tail", 0.0) + (now - self._tprev) * 1000.0
++
++        # 合并 execute 阶段结转的分段
++        cpu = dict(self._carry_cpu)
++        for k, v in self._cpu.items():
++            cpu[k] = cpu.get(k, 0.0) + v
++        gpu_ev = dict(self._carry_gpu)
++        gpu_ev.update(self._gpu_ev)
++
++        gpu: dict[str, float] = {}
++        for name, (s, e) in gpu_ev.items():
++            try:
++                # Draft-propose events are recorded after AsyncOutput's
++                # copy_event, so get_output()'s synchronize does not cover
++                # them; synchronize each (a no-op once finished).
++                e.synchronize()
++                gpu[name] = s.elapsed_time(e)
++            except Exception:
++                gpu[name] = float("nan")
++
++        cpu_total = sum(cpu.values())
++        gpu_total = sum(v for v in gpu.values() if v == v)
++        parts = " ".join(
++            f"{k}={v:.3f}" for k, v in sorted(cpu.items(), key=lambda x: -x[1])
++        )
++        gparts = " ".join(
++            f"{k}={v:.3f}" for k, v in sorted(gpu.items(), key=lambda x: -x[1])
++        )
++        if not self.silent:
++            logger.info(
++                "DECODE_STEP_PROFILE[%s] step=%d rank=%s decode=%s "
++                "reqs=%d toks=%d "
++                "cpu_total_ms=%.3f gpu_total_ms=%.3f | CPU %s | GPU %s%s",
++                self.tag,
++                self.step,
++                self.rank_tag,
++                self.is_decode,
++                self.num_reqs,
++                self.num_toks,
++                cpu_total,
++                gpu_total,
++                parts,
++                gparts,
++                f" | {extra}" if extra else "",
++            )
++
++        self.sampling = False
++        self._step_started = False
++        self._carry_cpu = {}
++        self._carry_gpu = {}
++
++    def carry_over(self) -> None:
++        """Called before execute_model returns: move this segment to carry for end_step to merge."""
++        if not self.sampling:
++            return
++        self._carry_cpu = dict(self._cpu)
++        self._carry_gpu = dict(self._gpu_ev)
++        self._cpu = {}
++        self._gpu_ev = {}
++
++    # ------------------------------------------------------------------- CPU 标记
++
++    def cpu(self, name: str) -> None:
++        """Record wall-clock from the previous marker to now under ``name``."""
++        if not self.sampling:
++            return
++        now = time.perf_counter()
++        self._cpu[name] = self._cpu.get(name, 0.0) + (now - self._tprev) * 1000.0
++        self._tprev = now
++
++    # ------------------------------------------------------------------- GPU 标记
++
++    def gpu_begin(self, name: str) -> None:
++        """Start GPU timing (for segments that need to wrap an if/else)."""
++        if not self.sampling:
++            return
++        start = torch.cuda.Event(enable_timing=True)
++        start.record()
++        self._gpu_ev[name] = (start, start)
++
++    def gpu_end(self, name: str) -> None:
++        if not self.sampling:
++            return
++        entry = self._gpu_ev.get(name)
++        if entry is None:
++            return
++        end = torch.cuda.Event(enable_timing=True)
++        end.record()
++        self._gpu_ev[name] = (entry[0], end)
++
++    @contextlib.contextmanager
++    def gpu(self, name: str):
++        """测量该段在 main stream 上的设备时间（同名多段合并为总跨度）。"""
++        if not self.sampling:
++            yield
++            return
++        start = torch.cuda.Event(enable_timing=True)
++        start.record()
++        try:
++            yield
++        finally:
++            end = torch.cuda.Event(enable_timing=True)
++            end.record()
++            s_prev, _ = self._gpu_ev.get(name, (None, None))
++            self._gpu_ev[name] = (s_prev or start, end)
++
++
++# One per model runner instance, created by GPUModelRunner.__init__.
++_profiler: DecodeStepProfiler | None = None
++
++
++def get_profiler(tag: str = "decode") -> DecodeStepProfiler:
++    global _profiler
++    if _profiler is None:
++        _profiler = DecodeStepProfiler(tag)
++    return _profiler
+diff --git a/vllm/v1/worker/gpu/sample/states.py b/vllm/v1/worker/gpu/sample/states.py
+index c50fa3f09c..094e7ffb63 100644
+--- a/vllm/v1/worker/gpu/sample/states.py
++++ b/vllm/v1/worker/gpu/sample/states.py
+@@ -32,11 +32,48 @@ def __init__(self, max_num_reqs: int, vocab_size: int):
+         self.top_k.copy_to_uva()
+         self.top_p.np.fill(1.0)
+         self.top_p.copy_to_uva()
++        # Temperature is the SAME kind of hazard: UvaBackedTensor zero-inits,
++        # and 0.0 is not a valid temperature -- `logits / temperature` becomes
++        # inf and the distribution collapses to a point mass on the argmax.
++        # Only live request slots are ever written by add_request, but the
++        # graph kernels index this table by request slot, so a stale/rounded
++        # slot must not read 0. Default to the 1.0 "no scaling" value.
++        self.temperature.np.fill(1.0)
++        self.temperature.copy_to_uva()
+ 
+         self.num_logprobs = np.empty(self.max_num_reqs, dtype=np.int32)
+         # -1 means no logprobs are requested.
+         self.num_logprobs.fill(NO_LOGPROBS)
+ 
++        # [2026-11-08] Graph-stable mirrors of the sampling parameters.
++        # `UvaBackedTensor.copy_to_uva()` returns a buffer from a round-robin
++        # pool (buffer_utils._DEFAULT_MAX_CONCURRENCY=2), so `.gpu` is a
++        # DIFFERENT address after every `apply_staged_writes()`. Any CUDA graph
++        # captured against `self.<field>.gpu` keeps reading the buffer it saw
++        # at capture time, i.e. stale parameters. A wrong temperature flattens
++        # the distribution and decodes fall onto vocabulary-edge tokens:
++        # outputs repeat one fragment forever at T>=0.5, while T==0 looks
++        # healthy because greedy never reads the value. That asymmetry is the
++        # fingerprint of this bug.
++        # These mirrors have fixed addresses and are refreshed with the pool.
++        device = self.temperature.gpu.device
++        self.temperature_stable = torch.empty(
++            max_num_reqs, dtype=torch.float32, device=device
++        )
++        self.top_p_stable = torch.empty(max_num_reqs, dtype=torch.float32, device=device)
++        self.min_p_stable = torch.empty(max_num_reqs, dtype=torch.float32, device=device)
++        self.top_k_stable = torch.empty(max_num_reqs, dtype=torch.int32, device=device)
++        self.seeds_stable = torch.empty(max_num_reqs, dtype=torch.int64, device=device)
++        self._refresh_stable()
++
++    def _refresh_stable(self) -> None:
++        """Copy the live UVA tensors into the graph-stable mirrors."""
++        self.temperature_stable.copy_(self.temperature.gpu)
++        self.top_p_stable.copy_(self.top_p.gpu)
++        self.min_p_stable.copy_(self.min_p.gpu)
++        self.top_k_stable.copy_(self.top_k.gpu)
++        self.seeds_stable.copy_(self.seeds.gpu)
++
+     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
+         self.temperature.np[req_idx] = sampling_params.temperature
+         self.top_p.np[req_idx] = sampling_params.top_p
+@@ -65,6 +102,19 @@ def apply_staged_writes(self) -> None:
+         self.top_k.copy_to_uva()
+         self.min_p.copy_to_uva()
+         self.seeds.copy_to_uva()
++        # Keep the graph-stable mirrors in lockstep with the rotating pool.
++        self._refresh_stable()
++
++    # [2026-11-08] The skip-branches below are CPU control flow, therefore
++    # TRACE CONSTANTS for torch.cuda.graph: whichever branch is taken while
++    # capturing is the only one baked into the graph, forever. DFlash2's
++    # sampler graph captures `_dense()` during warm-up, when every request
++    # still holds the default params (temperature 1.0, top_p 1.0, min_p 0).
++    # The capture therefore baked in "skip", and every later replay sampled
++    # an unprocessed (untempered) distribution: T==0 looked healthy because
++    # greedy never wants temperature, while T>=0.5 degenerated into repeating
++    # one fragment. Force the kernels into the graph instead.
++    capture_mode = False
+ 
+     def apply_temperature(
+         self,
+@@ -73,11 +123,11 @@ def apply_temperature(
+         idx_mapping_np: np.ndarray,
+     ) -> None:
+         temp_np = self.temperature.np[idx_mapping_np]
+-        if np.all((temp_np == 0.0) | (temp_np == 1.0)):
++        if not self.capture_mode and np.all((temp_np == 0.0) | (temp_np == 1.0)):
+             # No request requires temperature. Skip the kernel launch.
+             return
+ 
+-        apply_temperature(logits, expanded_idx_mapping, self.temperature.gpu)
++        apply_temperature(logits, expanded_idx_mapping, self.temperature_stable)
+ 
+     def apply_min_p(
+         self,
+@@ -85,10 +135,10 @@ def apply_min_p(
+         expanded_idx_mapping: torch.Tensor,
+         idx_mapping_np: np.ndarray,
+     ) -> None:
+-        if np.all(self.min_p.np[idx_mapping_np] == 0.0):
++        if not self.capture_mode and np.all(self.min_p.np[idx_mapping_np] == 0.0):
+             # No request uses min_p. Skip the kernel launch.
+             return
+-        apply_min_p(logits, expanded_idx_mapping, self.min_p.gpu)
++        apply_min_p(logits, expanded_idx_mapping, self.min_p_stable)
+ 
+     def apply_top_k_top_p(
+         self,
+@@ -98,11 +148,13 @@ def apply_top_k_top_p(
+     ) -> torch.Tensor:
+         do_top_k = np.any(self.top_k.np[idx_mapping_np] != self.vocab_size)
+         do_top_p = np.any(self.top_p.np[idx_mapping_np] != 1.0)
+-        if not (do_top_k or do_top_p):
++        if self.capture_mode:
++            do_top_k = do_top_p = True
++        elif not (do_top_k or do_top_p):
+             return logits
+ 
+-        top_k = self.top_k.gpu[expanded_idx_mapping] if do_top_k else None
+-        top_p = self.top_p.gpu[expanded_idx_mapping] if do_top_p else None
++        top_k = self.top_k_stable[expanded_idx_mapping] if do_top_k else None
++        top_p = self.top_p_stable[expanded_idx_mapping] if do_top_p else None
+         return apply_top_k_top_p(logits, top_k, top_p, runtime=self._topk_runtime)
+ 
+     def max_num_logprobs(self, idx_mapping_np: np.ndarray) -> int:
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/sampler_graph.py b/vllm/v1/worker/gpu/spec_decode/dflash2/sampler_graph.py
+index 853fcadece..c35eed14de 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash2/sampler_graph.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/sampler_graph.py
+@@ -127,7 +127,9 @@ def _copy_dense_slot(
+ 
+ def _capture_headroom(device: torch.device) -> bool:
+     free, _ = torch.cuda.mem_get_info(device)
+-    idle = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
++    idle = torch.accelerator.memory_reserved(device) - (
++        torch.accelerator.memory_allocated(device)
++    )
+     return free + idle >= CAPTURE_HEADROOM_BYTES
+ 
+ 
+@@ -143,8 +145,10 @@ def _all_ranks_support(status: int) -> bool:
+ 
+ 
+ class _RejectionGraph:
+-    def __init__(self, model, speculator, rejection, hidden, batch, sparse):
++    def __init__(self, model, speculator, rejection, hidden, batch, sparse, penalties):
+         self.requests = batch.num_reqs
++        # Penalties are a trace constant: graphs without them launch no kernel.
++        self.penalties = penalties
+         rows = self.requests * ROWS_PER_REQUEST
+         self.hidden = torch.empty_like(hidden)
+         self.inputs = torch.empty_like(batch.input_ids[:rows])
+@@ -183,6 +187,34 @@ def __init__(self, model, speculator, rejection, hidden, batch, sparse):
+             (self.requests, ROWS_PER_REQUEST), dtype=torch.int64
+         )
+         self.count = self.inputs.new_empty(self.requests, dtype=torch.int32)
++        # Sampling parameters live in UVA-backed tensors whose pool rotates
++        # round-robin on every apply_staged_writes(), so states.temperature.gpu
++        # is a DIFFERENT address each request. A captured graph freezes the
++        # pointer it saw, which then reads a stale slot and corrupts sampling
++        # (observed: temperature-dependent filler-token degeneration — outputs
++        # repeat a fragment forever at T>=0.5 while T==0 looks healthy, because
++        # greedy never reads the temperature value).
++        # Keep private storage and refresh it in prepare(), same as positions.
++        # ⚠️ Size must be the FULL state table (max_num_reqs), NOT self.requests.
++        # The kernels index these with `self.mapping` = batch.idx_mapping, which
++        # holds GLOBAL request-slot ids (0..max_num_reqs-1), not local 0..N-1.
++        # Sizing to self.requests made the lookup read out of bounds whenever a
++        # request lived in a high slot, which flipped `flags` inconsistently
++        # across TP ranks and deadlocked graph dispatch under concurrency
++        # (symptom: `No available shared memory broadcast block found`).
++        # `empty_like` leaves these as uninitialised device memory, and capture
++        # runs BEFORE the first real prepare(). `flags` is derived from these
++        # tensors during capture, so garbage here produced a garbage branch
++        # decision that differed across TP ranks (deadlock). Seed them with the
++        # neutral values (temperature 1.0 / top_p 1.0) so capture always sees a
++        # well-defined state.
++        states = rejection.sampler.sampling_states
++        self.temperature = torch.empty_like(states.temperature.gpu)
++        self.top_p = torch.empty_like(states.top_p.gpu)
++        self.seeds = torch.empty_like(states.seeds.gpu)
++        self.temperature.fill_(1.0)
++        self.top_p.fill_(1.0)
++        self.seeds.zero_()
+         self.counters = self.inputs.new_zeros(2, dtype=torch.int64)
+         self.request_id = None
+         self.prefix = torch.cuda.CUDAGraph(keep_graph=True)
+@@ -221,12 +253,27 @@ def prepare(self, hidden, batch, sparse):
+             triton.next_power_of_2(ids.shape[1] * ids.shape[2]),
+             num_warps=1,
+         )
++        # Refresh the private sampling parameters from the rotating UVA pool.
++        # These are the live pointers the graph reads, so they must be updated
++        # on every round even though the graph itself is captured once.
++        # Whole-table copy: the kernels index with global slot ids (see the
++        # sizing note in __init__), so a per-request gather is not enough.
++        # `cu_num_logits` drives every row index inside the kernels, and the
++        # capture-time clone is only valid while the batch shape is identical.
++        # Refresh it every round so a changed batch cannot leave the kernels
++        # walking rows outside the candidate buffers (symptom: target_keep
++        # ended up all-false and the decode repeated one token forever).
++        self.cu.copy_(batch.cu_num_logits[: self.requests + 1])
++        states = self.rejection.sampler.sampling_states
++        self.temperature.copy_(states.temperature.gpu)
++        self.top_p.copy_(states.top_p.gpu)
++        self.seeds.copy_(states.seeds.gpu)
+         # Dense proposals are accessed indirectly inside a conditional body.
+         # Record their consumer stream for replaced/eager tensor lifetimes.
+         self.speculator.draft_logits.record_stream(torch.cuda.current_stream())
+ 
+     def _probe(self):
+-        from .sparse_rejection import _compact_target_reference_flags
++        from .sparse_rejection import _compact_target_reference_flags, _penalize_probe
+ 
+         probe = getattr(
+             self.model,
+@@ -236,13 +283,65 @@ def _probe(self):
+         self.ids, self.values, self.fallback = probe(self.hidden, 64)
+         if self.fallback is None:
+             return False
+-        states = self.rejection.sampler.sampling_states
++        sampler = self.rejection.sampler
++        states = sampler.sampling_states
++        floors = None
++        if self.penalties:
++            floors = _penalize_probe(
++                self.values,
++                self.ids,
++                sampler.penalties_state,
++                self.expanded,
++                self.inputs,
++                self.local,
++            )
+         self.values, self.ids = sort_topk_with_vocab_ties(
+             self.values, self.ids, vocab_size=states.vocab_size, descending=True
+         )
++        # NOTE(2026-11-08): `states.*.gpu` are UVA pointers that rotate on every
++        # apply_staged_writes(), so a captured graph that reads them keeps
++        # reading the buffer it saw at capture time -- i.e. stale parameters.
++        # The private buffers are refreshed in prepare() right before every
++        # replay, so they carry the current round's values. Use them here too.
++        # (The earlier deadlock from doing this came from `empty_like` leaving
++        # the private buffers uninitialised during capture; they are now seeded
++        # with the neutral values in __init__.)
++        # Use the private buffers (refreshed in prepare() every round), never
++        # states.*.gpu -- those are UVA round-robin pool pointers, and the graph
++        # freezes the address it saw at capture time, so a replay would read
++        # stale parameters.
+         self.flags = _compact_target_reference_flags(
+-            self.values, states.temperature.gpu, states.top_p.gpu, self.expanded
++            self.values, self.temperature, self.top_p, self.expanded, floors
+         )
++        # The compact (top-64 sparse) branch emits a constant token when T > 0,
++        # i.e. it repeats. Confirmed by elimination:
++        #   - inputs are correct (SGTEMP buf == src; SGVAL sees 64/64 finite
++        #     candidates; SGRES residuals reproduce)
++        #   - forcing temperature 1.0 still repeats -> not temperature
++        #   - always rejecting the draft still repeats -> not draft acceptance
++        #   - fp64 gumbel, position keys and injecting pos noise all fail to fix it
++        #   - in-kernel diagnostics report target_keep all-false (that reading is
++        #     itself unreliable -- see the defect register)
++        # It is independent of the environment: clearing every VLLM_* env
++        # variable (all default to on) and using e4m3 draft KV still repeats at
++        # T=0.7, so the compact branch itself is at fault (#1409).
++        #
++        # It is also independent of concurrency -- the earlier "2/4/8 concurrent
++        # is fine" observation was an artefact of coding (HTML/SVG) prompts whose
++        # strong structural constraints mask the degeneration. Measured with the
++        # official env set, e4m3 draft KV and adaptive compact dispatch:
++        #   1 request  + short prompt -> repeats (3/3 runs, "Redis####...")
++        #   2 concurrent + short prompt -> repeats
++        #   4 concurrent + short prompt -> repeats
++        #   2/4/8 concurrent + coding prompt -> fine
++        # Any concurrency level repeats on free-form text.
++        #
++        # Cost of staying on the reference branch: compact is 6.3%/4.1%/1.0%
++        # faster at 2/4/8 concurrency, but that is not a gain worth repeating
++        # output for. The reference branch lives in the same graph, passes 4/4
++        # at 4-way concurrency, and produces correct output; full-vocab
++        # rejection costs throughput, roughly 432 -> 277 tok/s.
++        self.flags.fill_(True)
+         return True
+ 
+     def _dense(self):
+@@ -278,8 +377,8 @@ def _dense(self):
+             self.mapping,
+             self.expanded,
+             self.local,
+-            states.temperature.gpu,
+-            states.seeds.gpu,
++            self.temperature,
++            self.seeds,
+             self.rejection.num_speculative_steps,
+             use_fp64=sampler.use_fp64_gumbel,
+         )
+@@ -299,9 +398,9 @@ def _compact(self):
+             self.cu,
+             self.positions,
+             self.mapping,
+-            states.temperature.gpu,
+-            states.top_p.gpu,
+-            states.seeds.gpu,
++            self.temperature,
++            self.top_p,
++            self.seeds,
+             self.rejection.num_speculative_steps,
+             use_fp64=sampler.use_fp64_gumbel,
+             target_top_k=20,
+@@ -312,6 +411,19 @@ def _compact(self):
+     def capture(self):
+         # Sampling is stateless in seed/position. Warmup writes only the private
+         # outputs and does not advance request state or proposal random streams.
++        # `capture_mode` forces the parametric kernels (temperature/top-k/top-p/
++        # min-p) into the graph: their skip-branches read host numpy values and
++        # would otherwise be folded to "skip" for the lifetime of the graph,
++        # because warm-up still carries the default sampling params.
++        states = self.rejection.sampler.sampling_states
++        previous_capture_mode = states.capture_mode
++        states.capture_mode = True
++        try:
++            return self._capture()
++        finally:
++            states.capture_mode = previous_capture_mode
++
++    def _capture(self):
+         with graph_capture(device=self.hidden.device):
+             if not _all_ranks_support(0 if self._probe() else 801):
+                 return False
+@@ -393,6 +505,7 @@ def try_graph_rejection(
+         return None
+     states = rejection.sampler.sampling_states
+     idx = batch.idx_mapping_np
++    penalties = bool(np.any(rejection.sampler.penalties_state.use_penalty[idx]))
+     # CPU dispatch choices are trace constants; numeric parameters and request
+     # slots remain live GPU inputs. Private input storage makes cache decisions
+     # independent of the allocator and the target graph's output lifetime.
+@@ -410,6 +523,7 @@ def try_graph_rejection(
+         bool(np.any(states.temperature.np[idx] != 1.0)),
+         bool(np.any(states.top_p.np[idx] != 1.0)),
+         rejection.sampler.use_fp64_gumbel,
++        penalties,
+         tuple((t.dtype, tuple(t.shape), tuple(t.stride())) for t in tensors),
+     )
+     graphs = getattr(rejection, "_sm70_dflash2_rejection_graphs", None)
+@@ -422,7 +536,9 @@ def try_graph_rejection(
+         if not _all_ranks_support(0 if _capture_headroom(hidden.device) else 801):
+             graphs[key] = None
+             return None
+-        candidate = _RejectionGraph(model, speculator, rejection, hidden, batch, sparse)
++        candidate = _RejectionGraph(
++            model, speculator, rejection, hidden, batch, sparse, penalties
++        )
+         graphs[key] = candidate if candidate.capture() else None
+     graph = graphs[key]
+     if graph is None:
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection.py b/vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection.py
+index fd199b1d76..a90b5d83f3 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection.py
+@@ -41,6 +41,111 @@
+ _TARGET_PROBE_K = 64
+ 
+ 
++@triton.jit
++def _penalize_probe_kernel(
++    values,
++    ids,
++    floors,
++    row_stride: tl.constexpr,
++    expanded_idx_mapping,
++    token_ids,
++    expanded_local_pos,
++    repetition_penalty,
++    frequency_penalty,
++    presence_penalty,
++    prompt_bin_mask,
++    prompt_bin_mask_stride,
++    output_bin_counts,
++    output_bin_counts_stride,
++    width: tl.constexpr,
++    block: tl.constexpr,
++):
++    # The same arithmetic as _penalties_kernel, on the probe's candidates only.
++    row = tl.program_id(0)
++    col = tl.arange(0, block)
++    mask = col < width
++    logits = tl.load(values + row * row_stride + col, mask, float("inf"))
++    # Every token outside the probe ranks at or below its smallest logit before
++    # penalties, and these penalties never raise a logit.
++    tl.store(floors + row, tl.min(logits, 0))
++
++    request = tl.load(expanded_idx_mapping + row)
++    rep_penalty = tl.load(repetition_penalty + request)
++    freq_penalty = tl.load(frequency_penalty + request)
++    pres_penalty = tl.load(presence_penalty + request)
++    use_rep_penalty = rep_penalty != 1.0
++    if not (use_rep_penalty or freq_penalty != 0.0 or pres_penalty != 0.0):
++        return
++
++    tokens = tl.load(ids + row * row_stride + col, mask, 0)
++    counts = tl.load(
++        output_bin_counts + request * output_bin_counts_stride + tokens, mask, 0
++    )
++    # Earlier rows of this request verify draft tokens that count as output.
++    pos = tl.load(expanded_local_pos + row)
++    start = row - pos
++    for prev_pos in tl.range(pos):
++        prev_token = tl.load(token_ids + start + prev_pos + 1)
++        counts = counts + (tokens == prev_token).to(tl.int32)
++    output_mask = counts > 0
++
++    if use_rep_penalty:
++        packed = tl.load(
++            prompt_bin_mask + request * prompt_bin_mask_stride + tokens // 32, mask, 0
++        )
++        in_prompt = ((packed >> (tokens % 32)) & 1).to(tl.int1)
++        scale = tl.where(in_prompt | output_mask, rep_penalty, 1.0)
++        logits *= tl.where(logits > 0, 1.0 / scale, scale)
++    logits -= freq_penalty * counts
++    logits -= pres_penalty * output_mask
++    tl.store(values + row * row_stride + col, logits, mask)
++
++
++def _penalize_probe(
++    values: torch.Tensor,
++    ids: torch.Tensor,
++    penalties_state: Any,
++    expanded_idx_mapping: torch.Tensor,
++    token_ids: torch.Tensor,
++    expanded_local_pos: torch.Tensor,
++) -> torch.Tensor:
++    """Penalize probe logits in place and return each row's pre-penalty floor.
++
++    The caller re-sorts the probe and passes the floor to the cutoff guard.
++    """
++    rows, width = values.shape
++    floors = torch.empty(rows, device=values.device, dtype=torch.float32)
++    _penalize_probe_kernel[(rows,)](
++        values,
++        ids,
++        floors,
++        values.stride(0),
++        expanded_idx_mapping,
++        token_ids,
++        expanded_local_pos,
++        penalties_state.repetition_penalty.gpu,
++        penalties_state.frequency_penalty.gpu,
++        penalties_state.presence_penalty.gpu,
++        penalties_state.prompt_bin_mask,
++        penalties_state.prompt_bin_mask.stride(0),
++        penalties_state.output_bin_counts,
++        penalties_state.output_bin_counts.stride(0),
++        width,
++        triton.next_power_of_2(width),
++        num_warps=1,
++    )
++    return floors
++
++
++def _monotone_penalties(penalties_state: Any, idx: np.ndarray) -> bool:
++    """Whether every request's penalties can only lower logits."""
++    return bool(
++        np.all(penalties_state.repetition_penalty.np[idx] >= 1.0)
++        and np.all(penalties_state.frequency_penalty.np[idx] >= 0.0)
++        and np.all(penalties_state.presence_penalty.np[idx] >= 0.0)
++    )
++
++
+ @triton.jit
+ def _compact_target_reference_rows_kernel(
+     probe,
+@@ -48,10 +153,12 @@ def _compact_target_reference_rows_kernel(
+     top_ps,
+     row_to_request,
+     reference_rows,
++    floors,
+     row_stride: tl.constexpr,
+     width: tl.constexpr,
+     top_k: tl.constexpr,
+     block: tl.constexpr,
++    has_floor: tl.constexpr,
+ ):
+     row = tl.program_id(0)
+     col = tl.arange(0, block)
+@@ -61,7 +168,11 @@ def _compact_target_reference_rows_kernel(
+     values = tl.load(probe + row * row_stride + col, col < width, -float("inf"))
+     first = tl.load(probe + row * row_stride) / temperature
+     cutoff = tl.load(probe + row * row_stride + top_k - 1) / temperature
+-    last = tl.load(probe + row * row_stride + width - 1) / temperature
++    if has_floor:
++        # Penalized probes: unprobed tokens may reach the pre-penalty floor.
++        last = tl.load(floors + row) / temperature
++    else:
++        last = tl.load(probe + row * row_stride + width - 1) / temperature
+     logits = values / temperature
+     keep = (col < width) & (logits >= cutoff)
+     logits = tl.where(keep, logits, -float("inf"))
+@@ -92,6 +203,7 @@ def _compact_target_reference_flags(
+     temperatures: torch.Tensor,
+     top_ps: torch.Tensor,
+     row_to_request: torch.Tensor,
++    floors: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Compute graph-capturable fallback flags with the request-slot map."""
+     rows, width = probe.shape
+@@ -102,10 +214,12 @@ def _compact_target_reference_flags(
+         top_ps,
+         row_to_request,
+         result,
++        probe if floors is None else floors,
+         probe.stride(0),
+         width,
+         _TARGET_TOP_K,
+         triton.next_power_of_2(width),
++        floors is not None,
+         num_warps=1,
+     )
+     return result
+@@ -116,10 +230,13 @@ def _compact_target_reference_rows_gpu(
+     temperatures: torch.Tensor,
+     top_ps: torch.Tensor,
+     row_to_request: torch.Tensor,
++    floors: torch.Tensor | None = None,
+ ) -> np.ndarray:
+     """Copy only fallback decisions, preserving the request-slot parameter map."""
+     return (
+-        _compact_target_reference_flags(probe, temperatures, top_ps, row_to_request)
++        _compact_target_reference_flags(
++            probe, temperatures, top_ps, row_to_request, floors
++        )
+         .cpu()
+         .numpy()
+     )
+@@ -355,8 +472,15 @@ def _maybe_dump_selector_alignment(
+ def _supports_sparse_sampling_contract(
+     rejection_sampler: RejectionSampler,
+     input_batch: InputBatch,
++    *,
++    allow_penalties: bool = False,
+ ) -> bool:
+-    """Whether compact logits preserve every requested sampling transform."""
++    """Whether compact logits preserve every requested sampling transform.
++
++    With allow_penalties, the caller penalizes its wide probe and guards the
++    cutoff with the pre-penalty floor, which needs that probe: at least two
++    logit rows over a large vocabulary.
++    """
+     if rejection_sampler.rejection_sample_method != "standard":
+         return False
+     # Every request must be in the uniform decode verifier phase. The compact
+@@ -379,7 +503,13 @@ def _supports_sparse_sampling_contract(
+     if np.any(states.min_p.np[idx] != 0.0):
+         return False
+ 
+-    if np.any(sampler.penalties_state.use_penalty[idx]):
++    penalties = sampler.penalties_state
++    if np.any(penalties.use_penalty[idx]) and not (
++        allow_penalties
++        and int(input_batch.cu_num_logits_np[-1]) >= 2
++        and getattr(states, "vocab_size", 0) >= 32768
++        and _monotone_penalties(penalties, idx)
++    ):
+         return False
+     if np.any(sampler.logit_bias_state.use_logit_bias[idx]):
+         return False
+@@ -417,7 +547,9 @@ def try_dflash2_sparse_target_rejection(
+         return None
+     if not hasattr(model, "get_topk_tokens_and_logits"):
+         return None
+-    if not _supports_sparse_sampling_contract(rejection_sampler, input_batch):
++    if not _supports_sparse_sampling_contract(
++        rejection_sampler, input_batch, allow_penalties=True
++    ):
+         return None
+ 
+     sparse_draft_logits = speculator.get_sparse_draft_logits()
+@@ -462,6 +594,18 @@ def try_dflash2_sparse_target_rejection(
+         target_topk_ids, target_topk_logits = model.get_topk_tokens_and_logits(
+             sample_hidden_states, probe_k
+         )
++    floors = None
++    penalties = rejection_sampler.sampler.penalties_state
++    if np.any(penalties.use_penalty[idx]):
++        # The contract admits penalties only on this wide, tie-retaining probe.
++        floors = _penalize_probe(
++            target_topk_logits,
++            target_topk_ids,
++            penalties,
++            input_batch.expanded_idx_mapping,
++            input_batch.input_ids[input_batch.logits_indices],
++            input_batch.expanded_local_pos,
++        )
+     if retain_ties:
+         target_topk_logits, target_topk_ids = sort_topk_with_vocab_ties(
+             target_topk_logits,
+@@ -477,6 +621,7 @@ def try_dflash2_sparse_target_rejection(
+             states.temperature.gpu,
+             states.top_p.gpu,
+             input_batch.expanded_idx_mapping,
++            floors,
+         )
+     else:
+         num_logits = np.diff(input_batch.cu_num_logits_np)

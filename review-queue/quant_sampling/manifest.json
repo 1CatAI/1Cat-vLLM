@@ -1,0 +1,32 @@
+{
+  "group": "quant_sampling",
+  "title": "Repair QPN2 dispatch and graph sampling state",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1441,
+      "title": "fix(sm70): align QPN2 row window with the C++ mirror, tolerate non-Linear layers",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1441",
+      "head": "135f815612e2fdccb31689cba57f46bb57200716",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "f259ea00d783d3d6a1e19bce6ccded21b26d54282b6489f5cb58420e5e998982",
+      "files": 4,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1442,
+      "title": "fix(dflash2): keep sampling parameters out of the rotating UVA pool",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1442",
+      "head": "de0cafa591a329e8452a33e72fcf7394578bac0d",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "c0ded8809cf095a6ed8e260b5aa74cd74d0b9f947dc32810043dbea663a2a221",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "A corrected source candidate fixes the32-row native versus128-row Python dispatch mismatch by legal row chunks, binds lm_head execution policy once, and snapshots live UVA sampling parameters inside the DFlash2 graph only. Test native row thresholds, dynamic compile/CUDA Graph replay, rotating live request slots/seeds and precision/acceptance. #1261 LoRA sparse-target/mapping integration remains unapplied until its own qualification.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}
