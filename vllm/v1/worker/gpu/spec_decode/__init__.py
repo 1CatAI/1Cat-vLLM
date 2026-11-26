@@ -30,9 +30,16 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
 
         return DFlashSpeculator(vllm_config, device)
     if speculative_config.method == "dspark":
-        from vllm.v1.worker.gpu.spec_decode.dspark import Inkling2DSparkSpeculator
+        from vllm.v1.worker.gpu.spec_decode.dspark import (
+            DSparkSpeculator,
+            Inkling2DSparkSpeculator,
+        )
 
-        return Inkling2DSparkSpeculator(vllm_config, device)
+        # The Inkling2 drafter has its own speculator; every other DSpark
+        # drafter is a plain parallel block drafter.
+        if vllm_config._is_inkling2_dspark():
+            return Inkling2DSparkSpeculator(vllm_config, device)
+        return DSparkSpeculator(vllm_config, device)
     if speculative_config.use_eagle():
         from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
