@@ -1,0 +1,109 @@
+{
+  "group": "core_fixes",
+  "title": "Repair scheduler, cache, loader and pipeline ownership",
+  "kind": "unapplied proposal archive; not a runtime qualification",
+  "originals": [
+    {
+      "number": 1408,
+      "title": "[Bugfix][Core] Backport vllm-project/vllm#66048, #45224, #44490, #54436, #51694, #47911, #52142: resample race, shm reader stalls, new_block_ids leak, PP broadcast, MM block hashing, compile cache",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1408",
+      "head": "3affd3e9df3a5221d4a5416822780e9e1162c786",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "cff75c71de97d6ec89fd5928500d439b72720e3f0590abfa193c947f6b8ca701",
+      "files": 17,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1371,
+      "title": "[Bugfix][V1][PP] Preserve synchronous speculative step ownership",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1371",
+      "head": "0bd5c7954cc585fa30bd41fbe2c6483e79057c00",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "3c263c54ee3c0bbd6d5584109363e4905b2daeed38c0ca6bdd2a43fdc187b66b",
+      "files": 9,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1276,
+      "title": "[Core][Spec Decode] Lookahead block hashes for EAGLE/MTP prefix hits (backport of vllm#61589)",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1276",
+      "head": "bd3b78bcd4b11981dd45fbb968e9f55ffd5833e3",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "56c06cda58597c70eccfd19cbac6d43a5a33189003acc7d8e141b672ffd686ce",
+      "files": 14,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1225,
+      "title": "[Bugfix][MRv2] Bound prompt logprobs memory with small chunks and request limits",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1225",
+      "head": "f9d1134a6413c49a9d4ab1890ee42ef3b9add80a",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "1190b0ebbae938363f3a76e19c5834b36efa154b4dc15c86e5cc605e7af5fcdb",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1362,
+      "title": "[Bugfix][Loader] Skip the embedding, final norm, LM head and encoder towers a pipeline stage does not hold",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1362",
+      "head": "924bd588cdba31ee878512334afb903671a40c94",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "a793d7a3b193279487cf7c8e7aa01cb7bd2d929c4bfb86db89d86b1f22d7bff2",
+      "files": 4,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1319,
+      "title": "vllm: Skip the load-time split scope with expandable segments",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1319",
+      "head": "8b7fb496a4e812f38a2ed7235a56937a92ceb662",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "2155b5873f8592af26766ad4a19e3055c373e6ef9cf95187750409a18a187bd3",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1320,
+      "title": "sm70: Defer QPN4 scratch for eager profiled engines",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1320",
+      "head": "9efdccd897c4a2192b42176c10928b117dbff659",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "c1bb5ad0bc9582f20f8a174a8b387fb6782c123ef140b6bf2f3515d0e86659ee",
+      "files": 8,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1300,
+      "title": "[Bugfix][SM70] Accept the weights argument in ExpertCache.resolve so the GGUF expert cache can boot",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1300",
+      "head": "7b3ffb8711168c6cf855c5329e6469bd169b827f",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "6d067840a6fa3c3c1eb0a7ed07c2079503d6ff406939049c0d73b9cef4afbea5",
+      "files": 5,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    },
+    {
+      "number": 1161,
+      "title": "[Bugfix][SM70] Serialize set-valued policy fields in the acceleration report",
+      "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1161",
+      "head": "a66fcda49f1133b54dbbe8d14daf38e2a6731da4",
+      "source_status": "not accepted; retained for qualification",
+      "patch_sha256": "3c8fe6cbe4a3224c946e6edb4b8c896996d54d4b8fb24b42a5297e53866a65a9",
+      "files": 2,
+      "discussion_complete": true,
+      "superseded_ancestor": false
+    }
+  ],
+  "validation_gaps": "A corrected source candidate is being tested on54633 for broadcast timeouts, KV lookahead hashes, PP step ownership, prompt-logprobs memory, loader/direct-I/O and provider lifecycle. #1373 and #1250 are excluded and tracked in their feature/protocol groups. Generated architecture references and main CI must pass; prefix-cache and PP model-level checks remain admission gates where needed.",
+  "closure_authorization": "Owner requested qualified merges and consolidation of related unqualified work into a few drafts, retaining all source and records before closing superseded entries.",
+  "source_retention": "Publication commit parents/ancestors retain every exact original head and full source tree; original branches are not deleted. Patches and complete discussion snapshots are also retained here."
+}

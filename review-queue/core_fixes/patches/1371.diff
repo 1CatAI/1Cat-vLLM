@@ -1,0 +1,690 @@
+diff --git a/tests/v1/core/test_pp_spec_decode_inflight.py b/tests/v1/core/test_pp_spec_decode_inflight.py
+new file mode 100644
+index 0000000000..0d92f55c1a
+--- /dev/null
++++ b/tests/v1/core/test_pp_spec_decode_inflight.py
+@@ -0,0 +1,45 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Real scheduler acceptance for multiple synchronous PP speculative requests."""
++
++import pytest
++
++from tests.v1.core.utils import create_requests, create_scheduler
++from vllm.config import DeviceConfig
++from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
++
++
++@pytest.mark.parametrize("num_requests", [1, 2, 3])
++def test_inflight_verify_does_not_schedule_negative_token_count(
++    monkeypatch, num_requests
++):
++    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
++    scheduler = create_scheduler(
++        pipeline_parallel_size=2,
++        device_config=DeviceConfig(device="cpu"),
++        num_speculative_tokens=3,
++    )
++    requests = create_requests(num_requests=num_requests, num_tokens=37, max_tokens=200)
++    for request in requests:
++        scheduler.add_request(request)
++    for round_id in range(5):
++        scheduled = scheduler.schedule()
++        ids = list(scheduled.num_scheduled_tokens)
++        assert ids == [r.request_id for r in requests]
++        in_flight = scheduler.schedule()
++        assert in_flight.total_num_scheduled_tokens == 0
++        sampled = [
++            list(scheduled.scheduled_spec_decode_tokens.get(req, []))[: round_id % 4]
++            + [1000 + round_id]
++            for req in ids
++        ]
++        scheduler.update_from_output(
++            scheduled,
++            ModelRunnerOutput(
++                req_ids=ids,
++                req_id_to_index={r: i for i, r in enumerate(ids)},
++                sampled_token_ids=sampled,
++            ),
++        )
++        scheduler.update_draft_token_ids(
++            DraftTokenIds(ids, [[10, 20, 30] for _ in ids])
++        )
+diff --git a/tests/v1/core/utils.py b/tests/v1/core/utils.py
+index e565c221d1..9592ff6ab5 100644
+--- a/tests/v1/core/utils.py
++++ b/tests/v1/core/utils.py
+@@ -6,6 +6,7 @@
+ from tests.v1.kv_connector.unit.utils import MockKVConfig
+ from vllm.config import (
+     CacheConfig,
++    DeviceConfig,
+     ECTransferConfig,
+     KVTransferConfig,
+     ModelConfig,
+@@ -60,6 +61,7 @@ def create_scheduler(
+     use_ec_connector: bool = False,
+     ec_role: str | None = None,
+     kv_cache_spec: KVCacheSpec | None = None,
++    device_config: DeviceConfig | None = None,
+ ) -> Scheduler | AsyncScheduler:
+     """Create scheduler under test.
+ 
+@@ -143,6 +145,7 @@ def create_scheduler(
+     )
+ 
+     vllm_config = VllmConfig(
++        device_config=device_config or DeviceConfig(),
+         scheduler_config=scheduler_config,
+         model_config=model_config,
+         cache_config=cache_config,
+diff --git a/tests/v1/engine/test_pp_spec_decode_cadence.py b/tests/v1/engine/test_pp_spec_decode_cadence.py
+new file mode 100644
+index 0000000000..080ceef9ef
+--- /dev/null
++++ b/tests/v1/engine/test_pp_spec_decode_cadence.py
+@@ -0,0 +1,216 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Batch-queue draft cadence of the real EngineCore.step_with_batch_queue.
++
++Only the engine loop is real. The scheduler and executor are scripted: the
++executor's futures stay in flight until the engine blocks on them, and
++the shared latest-draft RPC raises if the queue tries to use it. Expected values
++come from the cadence itself: every token-bearing step's drafts must reach the
++scheduler after that step's update_from_output and before the next schedule.
++"""
++
++import queue
++from collections import deque
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.v1.engine.core import EngineCore
++from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
++
++
++class _InFlight:
++    def __init__(self, value):
++        self.value = value
++
++    def done(self):
++        return False
++
++    def result(self):
++        return self.value
++
++
++class _Scheduler:
++    def __init__(self, plan, log):
++        self.plan = deque(plan)
++        self.log = log
++        self.step = 0
++
++    def has_requests(self):
++        return True
++
++    def schedule(self):
++        reqs = self.plan.popleft() if self.plan else ()
++        self.step += 1
++        self.log.append(("schedule", self.step, tuple(reqs)))
++        return SimpleNamespace(
++            step=self.step,
++            reqs=tuple(reqs),
++            total_num_scheduled_tokens=6 * len(reqs),
++            pending_structured_output_tokens=False,
++            has_structured_output_requests=False,
++            scheduled_spec_decode_tokens={},
++        )
++
++    def get_grammar_bitmask(self, scheduler_output):
++        return None
++
++    def update_from_output(self, scheduler_output, model_output):
++        self.log.append(("update", scheduler_output.step, scheduler_output.reqs))
++        return {}
++
++    def update_draft_token_ids(self, drafts):
++        self.log.append(("drafts", drafts.step, tuple(drafts.req_ids)))
++
++    def make_stats(self):
++        return None
++
++
++class _Executor:
++    def __init__(self, attach):
++        self.attach = attach
++        self.pending = None
++
++    @staticmethod
++    def _drafts(scheduler_output):
++        drafts = DraftTokenIds(
++            list(scheduler_output.reqs), [[-1] * 5 for _ in scheduler_output.reqs]
++        )
++        drafts.step = scheduler_output.step
++        return drafts
++
++    def execute_model(self, scheduler_output, non_block=True):
++        if not scheduler_output.total_num_scheduled_tokens:
++            return _InFlight(ModelRunnerOutput(req_ids=[], req_id_to_index={}))
++        self.pending = scheduler_output
++        return _InFlight(None)
++
++    def sample_tokens(self, grammar_output, non_block=True):
++        drafts = self._drafts(self.pending) if self.attach else None
++        return _InFlight(
++            ModelRunnerOutput(
++                req_ids=list(self.pending.reqs),
++                req_id_to_index={req: i for i, req in enumerate(self.pending.reqs)},
++                draft_token_ids=drafts,
++            )
++        )
++
++    def take_draft_token_ids(self):
++        raise AssertionError(
++            "queued steps must never read the shared latest-draft slot"
++        )
++
++
++def _run(plan, *, synchronous, attach):
++    log = []
++    engine = EngineCore.__new__(EngineCore)
++    engine.vllm_config = SimpleNamespace(
++        observability_config=SimpleNamespace(
++            runtime_trace=SimpleNamespace(async_cpu=False, async_every=1),
++            enable_logging_iteration_details=False,
++        )
++    )
++    engine._sm70_async_cpu_trace_step = 0
++    engine.batch_queue = deque()
++    engine.batch_queue_size = 2
++    engine.scheduler = _Scheduler(plan, log)
++    engine.model_executor = _Executor(attach)
++    engine.is_ec_consumer = True
++    engine.is_pooling_model = False
++    engine.use_spec_decode = True
++    engine.async_scheduling = not synchronous
++    engine.aborts_queue = queue.Queue()
++    for _ in range(len(plan)):
++        engine.step_with_batch_queue()
++    return log
++
++
++def _late_or_missing(log):
++    """Token-bearing updates whose own drafts did not arrive before the next
++    schedule, or that received another step's drafts."""
++    bad = []
++    for i, event in enumerate(log):
++        if event[0] != "update" or not event[2]:
++            continue
++        end = next(
++            (j for j in range(i + 1, len(log)) if log[j][0] == "schedule"), len(log)
++        )
++        drafts = [e for e in log[i + 1 : end] if e[0] == "drafts"]
++        if not drafts or any(e[1] != event[1] for e in drafts):
++            bad.append(event)
++    return bad
++
++
++PLANS = {
++    "two_interleaved": [("r1",), ("r2",)] * 20,
++    "three_two_groups": [("r1", "r2"), ("r3",)] * 20,
++    "one_left": [("r1",), ()] * 20,
++}
++
++
++@pytest.mark.parametrize("name", sorted(PLANS))
++def test_synchronous_drafts_follow_their_own_step(name):
++    log = _run(PLANS[name], synchronous=True, attach=True)
++    assert [e for e in log if e[0] == "update" and e[2]]
++    assert _late_or_missing(log) == []
++
++
++def test_single_request_attaches_drafts_every_token_step():
++    log = _run(PLANS["one_left"], synchronous=True, attach=True)
++    assert [e for e in log if e[0] == "update" and e[2]]
++    assert _late_or_missing(log) == []
++
++
++def test_synchronous_step_without_attached_drafts_refuses():
++    with pytest.raises(RuntimeError, match="PP synchronous speculative decoding"):
++        _run(PLANS["two_interleaved"], synchronous=True, attach=False)
++
++
++def test_async_queue_does_not_require_host_drafts():
++    log = _run(PLANS["two_interleaved"], synchronous=False, attach=False)
++    assert [e for e in log if e[0] == "update"]
++    assert not [e for e in log if e[0] == "drafts"]
++
++
++def test_output_snapshot_survives_serialization_and_later_worker_mutation():
++    import pickle
++
++    drafts = DraftTokenIds(["a"], [[10, 20]])
++    first = ModelRunnerOutput(req_ids=["a"], req_id_to_index={"a": 0})
++    first.set_draft_token_ids(drafts)
++    drafts.req_ids[0] = "b"
++    drafts.draft_token_ids[0][0] = 99
++    restored = pickle.loads(pickle.dumps(first))
++    assert restored.draft_token_ids.req_ids == ["a"]
++    assert restored.draft_token_ids.draft_token_ids == [[10, 20]]
++
++
++def test_output_refuses_missing_worker_drafts():
++    output = ModelRunnerOutput(req_ids=["a"], req_id_to_index={"a": 0})
++    with pytest.raises(RuntimeError, match="PP synchronous speculative decoding"):
++        output.set_draft_token_ids(None)
++
++
++@pytest.mark.parametrize("queued", [False, True])
++def test_post_step_only_takes_drafts_without_a_queue(queued):
++    drafts = DraftTokenIds(["a"], [[7]])
++    calls = []
++
++    def take():
++        calls.append("take")
++        return drafts
++
++    engine = EngineCore.__new__(EngineCore)
++    engine.async_scheduling = False
++    engine.use_spec_decode = True
++    engine.batch_queue = deque() if queued else None
++    engine.model_executor = SimpleNamespace(take_draft_token_ids=take)
++    engine.scheduler = SimpleNamespace(
++        update_draft_token_ids=lambda value: calls.append(value)
++    )
++    engine.post_step(True)
++    assert calls == ([] if queued else ["take", drafts])
++
++
++def test_empty_sync_steps_do_not_require_proposals():
++    log = _run([()] * 6, synchronous=True, attach=False)
++    assert not [e for e in log if e[0] == "drafts"]
+diff --git a/tests/v1/worker/test_pp_spec_decode_history.py b/tests/v1/worker/test_pp_spec_decode_history.py
+new file mode 100644
+index 0000000000..d142583696
+--- /dev/null
++++ b/tests/v1/worker/test_pp_spec_decode_history.py
+@@ -0,0 +1,156 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU unit test of non-last-stage accepted-token reconstruction."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.v1.worker.gpu_model_runner import GPUModelRunner
++
++
++@pytest.mark.parametrize("accepted", [0, 1, 2, 3])
++def test_each_request_gets_its_own_accepted_prefix_and_bonus(accepted):
++    runner = SimpleNamespace(
++        input_batch=SimpleNamespace(spec_token_ids=[[10, 20, 30], [40, 50, 60]])
++    )
++    for row, req_id in enumerate(["a", "b"]):
++        result = GPUModelRunner._pp_prepend_accepted_drafts(
++            runner,
++            req_id,
++            SimpleNamespace(num_tokens=100),
++            row,
++            100 + accepted,
++            [90 + row],
++            {},
++        )
++        expected = [[10, 20, 30], [40, 50, 60]][row][:accepted] + [90 + row]
++        assert result == expected
++
++
++def test_supplied_short_history_refuses_even_with_held_drafts():
++    runner = SimpleNamespace(input_batch=SimpleNamespace(spec_token_ids=[[10, 20, 30]]))
++    with pytest.raises(RuntimeError, match="full token history is shorter"):
++        GPUModelRunner._pp_prepend_accepted_drafts(
++            runner, "a", SimpleNamespace(num_tokens=100), 0, 102, [90], {"a": [1] * 101}
++        )
++
++
++def test_full_history_owns_tokens_for_resumed_request():
++    runner = SimpleNamespace(input_batch=SimpleNamespace(spec_token_ids=[[10, 20, 30]]))
++    assert GPUModelRunner._pp_prepend_accepted_drafts(
++        runner,
++        "a",
++        SimpleNamespace(num_tokens=100),
++        None,
++        102,
++        [90],
++        {"a": list(range(103))},
++    ) == [100, 101, 90]
++
++
++def test_missing_history_and_missing_held_prefix_refuse():
++    runner = SimpleNamespace(input_batch=SimpleNamespace(spec_token_ids=[[]]))
++    with pytest.raises(RuntimeError, match="accepted draft token"):
++        GPUModelRunner._pp_prepend_accepted_drafts(
++            runner,
++            "a",
++            SimpleNamespace(num_tokens=100),
++            None,
++            102,
++            [90],
++            {},
++        )
++
++
++@pytest.mark.parametrize("num_requests", [2, 3])
++def test_real_runner_keeps_each_requests_accepted_history(monkeypatch, num_requests):
++    import torch
++
++    import vllm.v1.worker.gpu_model_runner as runner_module
++    from tests.v1.core.utils import create_requests, create_scheduler
++    from vllm.config import DeviceConfig
++    from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
++    from vllm.v1.worker.gpu_input_batch import InputBatch
++
++    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
++    monkeypatch.setattr(
++        runner_module,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=False),
++    )
++    scheduler = create_scheduler(
++        pipeline_parallel_size=2,
++        num_speculative_tokens=3,
++        device_config=DeviceConfig(device="cpu"),
++        max_model_len=512,
++        block_size=16,
++    )
++    runner = object.__new__(GPUModelRunner)
++    runner.pp_keep_batch = False
++    runner._pp_keep_batch_kept_logged = False
++    runner.device = torch.device("cpu")
++    runner.input_batch = InputBatch(
++        max_num_reqs=4,
++        max_model_len=512,
++        max_num_batched_tokens=512,
++        device=runner.device,
++        pin_memory=False,
++        vocab_size=50272,
++        block_sizes=[16],
++        kernel_block_sizes=[16],
++        num_spec_tokens=3,
++    )
++    runner.requests = {}
++    runner.num_prompt_logprobs = {}
++    runner.encoder_cache = {}
++    runner.late_interaction_runner = runner_module.LateInteractionRunner()
++    runner._dynamic_draft_vocab_prefill_bootstrap = (
++        runner_module.DynamicDraftVocabPrefillBootstrapState()
++    )
++    runner.speculative_config = None
++    runner.use_async_spec_decode = False
++    runner.sync_spec_decode_accept_counts = False
++    runner.use_async_scheduling = False
++    runner.is_pooling_model = False
++    runner.uses_mrope = False
++    runner.uses_xdrope_dim = 0
++    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
++    requests = create_requests(
++        num_requests=num_requests, num_tokens=37, max_tokens=200, block_size=16
++    )
++    for request in requests:
++        scheduler.add_request(request)
++    for round_id in range(6):
++        scheduled = scheduler.schedule()
++        runner._update_states(scheduled)
++        ids = list(scheduled.num_scheduled_tokens)
++        for request in requests:
++            row = runner.input_batch.req_id_to_index[request.request_id]
++            count = int(runner.input_batch.num_tokens_no_spec[row])
++            assert runner.input_batch.token_ids_cpu[row, :count].tolist() == list(
++                request.all_token_ids
++            )
++            assert runner.requests[request.request_id].output_token_ids == list(
++                request.output_token_ids
++            )
++        empty = scheduler.schedule()
++        assert empty.total_num_scheduled_tokens == 0
++        runner._update_states(empty)
++        sampled = [
++            list(scheduled.scheduled_spec_decode_tokens.get(req, []))[: round_id % 4]
++            + [1000 + round_id * 10 + i]
++            for i, req in enumerate(ids)
++        ]
++        scheduler.update_from_output(
++            scheduled,
++            ModelRunnerOutput(
++                req_ids=ids,
++                req_id_to_index={req: i for i, req in enumerate(ids)},
++                sampled_token_ids=sampled,
++            ),
++        )
++        scheduler.update_draft_token_ids(
++            DraftTokenIds(
++                ids, [[200 + i * 10 + j for j in range(3)] for i in range(len(ids))]
++            )
++        )
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index f7e6c59e09..9314a16540 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -712,6 +712,17 @@ def limit_prefill(req_id: str, tokens: int) -> int:
+                 + request.num_output_placeholders
+                 - request.num_computed_tokens
+             )
++            if (
++                num_new_tokens < 0
++                and self.use_pp
++                and not self.scheduler_config.async_scheduling
++            ):
++                # PP>1 without async scheduling: a verify step of this request
++                # is still in flight. Scheduling counted its draft rows as
++                # computed, but its sampled tokens are not appended yet, so the
++                # count goes negative. Same case as 1.(1) below: wait for it.
++                req_index += 1
++                continue
+             ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
+                 request
+             )
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 2927a7e076..57538e9c64 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -534,7 +534,13 @@ def post_step(self, model_executed: bool) -> None:
+         # When using async scheduling we can't get draft token ids in advance,
+         # so we update draft token ids in the worker process and don't
+         # need to update draft token ids here.
+-        if not self.async_scheduling and self.use_spec_decode and model_executed:
++        # Queued PP outputs carry the drafts of their own completed step.
++        if (
++            not self.async_scheduling
++            and self.use_spec_decode
++            and model_executed
++            and self.batch_queue is None
++        ):
+             profile_ddtree_engine = (
+                 os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE", "0") == "1"
+             )
+@@ -712,6 +718,20 @@ def step_with_batch_queue(
+         if trace_log:
+             trace_update_ms = (time.perf_counter() - trace_update_t0) * 1000.0
+ 
++        if (
++            self.use_spec_decode
++            and not self.async_scheduling
++            and scheduler_output.total_num_scheduled_tokens > 0
++        ):
++            # Apply only this step's proposals, after its sampled tokens. A later
++            # in-flight step must not replace or delay these proposals.
++            draft_token_ids = model_output.draft_token_ids
++            if draft_token_ids is None:
++                raise RuntimeError(
++                    "PP synchronous speculative decoding: missing step drafts"
++                )
++            self.scheduler.update_draft_token_ids(draft_token_ids)
++
+         # NOTE(nick): We can either handle the deferred tasks here or save
+         # in a field and do it immediately once step_with_batch_queue is
+         # re-called. The latter slightly favors TTFT over TPOT/throughput.
+@@ -720,8 +740,14 @@ def step_with_batch_queue(
+             # we need to get the draft token ids from the prior step before
+             # we can compute the grammar bitmask for the deferred request.
+             if self.use_spec_decode:
+-                draft_token_ids = self.model_executor.take_draft_token_ids()
+-                assert draft_token_ids is not None
++                if self.async_scheduling:
++                    draft_token_ids = self.model_executor.take_draft_token_ids()
++                else:
++                    draft_token_ids = model_output.draft_token_ids
++                if draft_token_ids is None:
++                    raise RuntimeError(
++                        "PP speculative decoding: missing deferred drafts"
++                    )
+                 # Update the draft token ids in the scheduler output to
+                 # filter out the invalid spec tokens, which will be padded
+                 # with -1 and skipped by the grammar bitmask computation.
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 8c6c4edca3..770d2ebd8b 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from abc import ABC, abstractmethod
+-from copy import copy
++from copy import copy, deepcopy
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, NamedTuple, TypeAlias
+ 
+@@ -294,6 +294,18 @@ class ModelRunnerOutput:
+     # ``None`` when ``enable_return_routed_experts`` is off.
+     routed_experts: RoutedExpertsLists | None = None
+ 
++    # Synchronous PP drafts belong to this output, never a worker's latest slot.
++    # None is used for empty, non-speculative and asynchronous outputs.
++    draft_token_ids: "DraftTokenIds | None" = None
++
++    def set_draft_token_ids(self, drafts: "DraftTokenIds | None") -> None:
++        if drafts is None:
++            raise RuntimeError(
++                "PP synchronous speculative decoding: missing step drafts"
++            )
++        # CPU proposals and tree payloads can outlive the next worker step.
++        self.draft_token_ids = deepcopy(drafts)
++
+     # Completed GPU timing only; CUDA events never cross process boundaries.
+     mixed_prefill_timing: MixedPrefillTiming | None = None
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index e77043f164..c2f493853c 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1983,6 +1983,8 @@ def sample_tokens(
+ 
+         if self.use_async_scheduling:
+             return async_output
++        if self.use_pp and self.num_speculative_steps:
++            model_runner_output.set_draft_token_ids(self.take_draft_token_ids())
+         return async_output.get_output()
+ 
+     def take_draft_token_ids(self) -> DraftTokenIds | None:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 3c8e61eb9e..d09600dfea 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -2164,6 +2164,50 @@ def _get_or_create_async_output_copy_stream(self) -> torch.cuda.Stream:
+             self.async_output_copy_stream = stream
+         return stream
+ 
++    def _pp_prepend_accepted_drafts(
++        self,
++        req_id: str,
++        req_state: CachedRequestState,
++        req_index: int | None,
++        num_computed_tokens: int,
++        sent_token_ids: list[int],
++        all_token_ids: dict[str, list[int]],
++    ) -> list[int]:
++        """Non-last PP rank, non-async scheduling: rebuild the tokens sampled
++        since this rank's last update.
++
++        The scheduler sends only the tokens at ``num_computed_tokens`` onward
++        (the bonus token after a spec-decode step). The accepted drafts before
++        it, positions ``[req_state.num_tokens, num_computed_tokens)``, are the
++        previous step's scheduled drafts. Without them ``output_token_ids``
++        skips the drafts and ``token_ids_cpu`` gets the bonus token broadcast
++        over every accepted position, which corrupts the token history this
++        rank feeds the model.
++        """
++        num_accepted = num_computed_tokens - req_state.num_tokens
++        if num_accepted <= 0:
++            return sent_token_ids
++        full = all_token_ids.get(req_id)
++        if full is not None:
++            if len(full) < num_computed_tokens:
++                raise RuntimeError(
++                    f"PP spec decode: full token history is shorter than "
++                    f"num_computed_tokens for request {req_id}"
++                )
++            return list(full[req_state.num_tokens : num_computed_tokens]) + list(
++                sent_token_ids
++            )
++        prev_spec = (
++            self.input_batch.spec_token_ids[req_index] if req_index is not None else []
++        )
++        if num_accepted <= len(prev_spec):
++            return list(prev_spec[:num_accepted]) + list(sent_token_ids)
++        raise RuntimeError(
++            f"PP spec decode: accepted draft token(s) missing for request {req_id}; "
++            f"needed {num_accepted}, held {len(prev_spec)}. "
++            "The scheduler and runner disagree about token-history ownership."
++        )
++
+     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
+         """Update the cached states and the persistent batch with the scheduler
+         output.
+@@ -2400,15 +2444,25 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
+                 if not req_data.new_token_ids:
+                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
+                     new_token_ids: list[int] = []
++                    num_sent_tokens = 0
+                 else:
+                     # Non-async scheduling with PP: The scheduler sends
+                     # sampled token ids back because there's no direct communication
+                     # between the first-stage worker and the last-stage worker.
+                     new_token_ids = req_data.new_token_ids[i]
++                    num_sent_tokens = len(new_token_ids)
++                    new_token_ids = self._pp_prepend_accepted_drafts(
++                        req_id,
++                        req_state,
++                        req_index,
++                        num_computed_tokens,
++                        new_token_ids,
++                        req_data.all_token_ids,
++                    )
+                     # Add the sampled token(s) from the previous step (if any).
+                     # This doesn't include "unverified" tokens like spec tokens.
+                     num_new_tokens = (
+-                        num_computed_tokens + len(new_token_ids) - req_state.num_tokens
++                        num_computed_tokens + num_sent_tokens - req_state.num_tokens
+                     )
+                     if num_new_tokens == 1:
+                         # Avoid slicing list in most common case.
+@@ -2477,7 +2531,7 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
+                 # according to num_computed_tokens.
+                 end_token_index = max(
+                     start_token_index,
+-                    num_computed_tokens + len(new_token_ids),
++                    num_computed_tokens + num_sent_tokens,
+                 )
+                 if end_token_index > start_token_index:
+                     if new_token_ids:
+@@ -9396,6 +9450,11 @@ def propose_draft_token_ids(sampled_token_ids):
+                 trace_output_ms = (time.perf_counter() - trace_output_t0) * 1000.0
+ 
+         if not self.use_async_scheduling:
++            if (
++                spec_config is not None
++                and self.parallel_config.pipeline_parallel_size > 1
++            ):
++                output.set_draft_token_ids(self.take_draft_token_ids())
+             if self.routed_experts_initialized:
+                 # Sync path: D2H was issued in ``_bookkeeping_sync`` and
+                 # synchronized by ``_to_list``'s event.synchronize(), so

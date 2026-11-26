@@ -1,0 +1,272 @@
+diff --git a/docs/configuration/env_var_reference.md b/docs/configuration/env_var_reference.md
+index 0cd2a4f70..3ee40acb6 100644
+--- a/docs/configuration/env_var_reference.md
++++ b/docs/configuration/env_var_reference.md
+@@ -338,6 +338,7 @@ This is the user reference. Internal tuning, diagnostics and compatibility alias
+ | `VLLM_V2_CUDAGRAPH_MEM_MIB` | configuration | Explicit CUDA graph memory reservation for the V2 GPU model runner, which does not profile graph memory yet. The default preserves upstream behavior. Set this from a measured capture result when sizing a tight KV cache pool. | 0.0 | 0.0 | None | No SM70 path association |
+ | `VLLM_VIDEO_FETCH_TIMEOUT` | configuration | Timeout for fetching videos when serving multimodal models Default is 30 seconds | 30 | 30 | None | No SM70 path association |
+ | `VLLM_VIDEO_LOADER_BACKEND` | configuration | Backend for Video IO — selects the frame-sampling algorithm. - "opencv": uniform sampling. - "opencv\_dynamic": duration-aware dynamic sampling. - "identity": returns raw video bytes for model processor to handle.  Custom backend implementations can be registered via `@VIDEO_LOADER_REGISTRY.register("my_custom_video_loader")` and imported at runtime. If a non-existing backend is used, an AssertionError will be thrown. | 'opencv' | 'opencv' | None | No SM70 path association |
++| `VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE` | configuration | Temporarily set the CUDA allocator max\_split\_size\_mb to 20 during model loading, preserving the other allocator options. Disabled by default with expandable\_segments:True, enabled otherwise. Set 0 or 1 to override. Does not change SM70 warmup scoping. | auto | False with expandable\_segments:True, otherwise True | Disabled when the effective allocator enables expandable segments. | No SM70 path association |
+ | `VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY` | configuration | Disable using pytorch's pin memory for CPU offloading. | False | False | None | No SM70 path association |
+ | `VLLM_WEIGHT_OFFLOADING_DISABLE_UVA` | configuration | Disable using UVA (Unified Virtual Addressing) for CPU offloading. | False | False | None | No SM70 path association |
+ | `VLLM_WORKER_MULTIPROC_METHOD` | configuration | Use dedicated multiprocess context for workers. Both spawn and fork work | 'fork' | 'fork' | None | No SM70 path association |
+diff --git a/docs/design/sm70_memory_workspace_tuning.md b/docs/design/sm70_memory_workspace_tuning.md
+index 45eaa3bd1..1cf537fcc 100644
+--- a/docs/design/sm70_memory_workspace_tuning.md
++++ b/docs/design/sm70_memory_workspace_tuning.md
+@@ -131,6 +131,23 @@ persistent warmup allocation/reserve, as the actual KV budget already does.
+ This corrects the suggestion without increasing the budget or removing the
+ Graph reserve.
+ 
++The model-load scope is selected at runtime from the effective PyTorch allocator
++configuration. With `expandable_segments:True`, loading preserves the configured
++split limit to avoid stranding memory between resident weights. Otherwise, the
++temporary 20 MiB split limit remains enabled.
++
++`VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE=0` disables the load scope explicitly; `=1`
++forces it on. If unset, the allocator-dependent default applies. This does not
++enable expandable segments or require recompilation.
++
++With the scope enabled, the full configured allocator options are restored even
++if loading raises. With it disabled, loading does not change allocator settings.
++The legacy `PYTORCH_CUDA_ALLOC_CONF` takes precedence over `PYTORCH_ALLOC_CONF`,
++including when empty. This switch does not disable the separate SM70 warmup
++scope, alter the shared allocator helper, or require a native-extension ABI
++change. Platforms without CUDA or PyTorch's optional runtime allocator-settings
++API retain the existing no-op behavior.
++
+ Expandable allocator segments were rejected as a universal default in the prior
+ audit: they improved TP1's estimated KV budget but reduced TP2's budget and
+ increased TP2 request-resident memory. This change is separate from workspace
+diff --git a/tests/v1/worker/test_gpu_worker_allocator.py b/tests/v1/worker/test_gpu_worker_allocator.py
+index a13eefe70..867f3de4a 100644
+--- a/tests/v1/worker/test_gpu_worker_allocator.py
++++ b/tests/v1/worker/test_gpu_worker_allocator.py
+@@ -1,6 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++import subprocess
++import sys
++from pathlib import Path
++
+ import pytest
+ 
+ from vllm.v1.worker import gpu_worker
+@@ -22,8 +27,10 @@ pytestmark = pytest.mark.skip_global_cleanup
+         (
+             "roundup_power2_divisions:[256:1,512:2,>:4], expandable_segments:True",
+             "garbage_collection_threshold:0.6",
+-            "roundup_power2_divisions:[256:1,512:2,>:4], "
+-            "expandable_segments:True,max_split_size_mb:20",
++            (
++                "roundup_power2_divisions:[256:1,512:2,>:4], "
++                "expandable_segments:True,max_split_size_mb:20"
++            ),
+             "roundup_power2_divisions:[256:1,512:2,>:4], expandable_segments:True",
+         ),
+         (
+@@ -60,3 +67,127 @@ def test_load_model_preserves_allocator_config(
+     except RuntimeError as error:
+         assert fail and str(error) == "loading failed"
+     assert settings == [scoped, restored]
++
++
++@pytest.mark.parametrize("scope", [None, "1", "0"])
++@pytest.mark.parametrize("fail", [False, True])
++@pytest.mark.parametrize(
++    "conf_name", ["PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF", "both"]
++)
++@pytest.mark.parametrize("expandable", [False, True], ids=["fixed", "expandable"])
++def test_load_model_allocator_state(scope, fail, conf_name, expandable):
++    """Observe the native allocator, isolated from the test process's settings."""
++    if not gpu_worker.current_platform.is_cuda():
++        pytest.skip("requires the CUDA caching allocator")
++
++    root = Path(__file__).resolve().parents[3]
++    env = dict(os.environ)
++    for name in (
++        "PYTORCH_CUDA_ALLOC_CONF",
++        "PYTORCH_ALLOC_CONF",
++        "VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE",
++    ):
++        env.pop(name, None)
++    config = (
++        "backend:native,max_split_size_mb:512,"
++        "roundup_power2_divisions:2,garbage_collection_threshold:0.8,"
++        f"expandable_segments:{expandable}"
++    )
++    if conf_name == "both":
++        env["PYTORCH_CUDA_ALLOC_CONF"] = config
++        env["PYTORCH_ALLOC_CONF"] = f"expandable_segments:{not expandable}"
++    else:
++        env[conf_name] = config
++    if scope is not None:
++        env["VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE"] = scope
++
++    # A fresh interpreter is required: allocator configuration is process-global
++    # and restoring only the environment would leak runtime state to other tests.
++    code = """
++import os
++import sys
++from types import SimpleNamespace
++
++import torch
++
++if not torch.cuda.is_available():
++    sys.exit(77)
++if not hasattr(torch._C, "_accelerator_setAllocatorSettings"):
++    sys.exit(77)
++
++from vllm.v1.worker.gpu_worker import Worker
++
++MiB = 1024 * 1024
++fail = sys.argv[1] == "True"
++scoped = sys.argv[2] == "True"
++
++def allocator_settings():
++    # memory_stats()["max_split_size"] is initialized with the device allocator
++    # and does not track runtime setter changes. Snapshot metadata reads the
++    # current native allocator configuration instead.
++    return torch.cuda.memory._snapshot()["allocator_settings"]
++
++def split_limit():
++    return allocator_settings()["max_split_size"]
++
++# Initialize the CUDA allocator before entering Worker.load_model.
++initial = torch.empty(1, device="cuda")
++original_settings = allocator_settings()
++assert split_limit() == 512 * MiB
++
++class AllocatingRunner:
++    def load_model(self, *, load_dummy_weights=False):
++        assert split_limit() == (20 if scoped else 512) * MiB
++        settings = allocator_settings()
++        assert settings["garbage_collection_threshold"] == 0.8
++        assert (
++            settings["roundup_power2_divisions"]
++            == original_settings["roundup_power2_divisions"]
++        )
++        # Check a preserved option through allocation behavior, not setter calls:
++        # two power-of-two divisions round 1100 bytes up to 1536, not 2048.
++        before = torch.cuda.memory_allocated()
++        self.weight = torch.empty(1100, dtype=torch.uint8, device="cuda")
++        assert torch.cuda.memory_allocated() - before == 1536
++        if fail:
++            raise RuntimeError("loading failed")
++
++worker = Worker.__new__(Worker)
++worker.vllm_config = SimpleNamespace(
++    model_config=SimpleNamespace(enable_cumem_allocator=False),
++    weight_transfer_config=None,
++)
++worker._ple_offload_enabled = False
++worker.model_runner = AllocatingRunner()
++try:
++    worker.load_model()
++except RuntimeError as error:
++    assert fail and str(error) == "loading failed"
++else:
++    assert not fail
++assert split_limit() == 512 * MiB
++assert allocator_settings() == original_settings
++
++# The same helper used by SM70 warmup must still scope with the load opt-out.
++with worker._scoped_allocator_max_split(20):
++    assert split_limit() == 20 * MiB
++assert split_limit() == 512 * MiB
++assert allocator_settings() == original_settings
++"""
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-c",
++            code,
++            str(fail),
++            str(scope == "1" or (scope is None and not expandable)),
++        ],
++        cwd=root,
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=120,
++    )
++    if result.returncode == 77:
++        pytest.skip("requires CUDA and the runtime allocator-settings API")
++    assert result.returncode == 0, result.stdout + result.stderr
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7f9d3314a..2effafe69 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1047,6 +1047,7 @@ if TYPE_CHECKING:
+     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
+     VLLM_LOG_MODEL_INSPECTION: bool = False
+     VLLM_DEBUG_MFU_METRICS: bool = False
++    VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE: bool = True
+     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
+     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
+     VLLM_DISABLE_LOG_LOGO: bool = False
+@@ -1435,6 +1436,21 @@ def _resolve_rust_frontend_path() -> str | None:
+     return raw
+ 
+ 
++def _get_weight_load_max_split_scope() -> bool:
++    override = os.getenv("VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE")
++    if override is not None:
++        return override != "0"
++    config = os.environ.get(
++        "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
++    )
++    expandable = False
++    for option in config.split(","):
++        name, _, value = option.partition(":")
++        if name.strip() == "expandable_segments":
++            expandable = value.strip() == "True"
++    return not expandable
++
++
+ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_SM70_E4M3_LONG_ATTENTION": env_var(
+         lambda: os.getenv("VLLM_SM70_E4M3_LONG_ATTENTION"),
+@@ -16444,6 +16460,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         acceleration_paths=(),
+         user_visible=True,
+     ),
++    "VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE": env_var(
++        _get_weight_load_max_split_scope,
++        description=(
++            "Temporarily set the CUDA allocator max_split_size_mb to 20 during "
++            "model loading, preserving the other allocator options. Disabled "
++            "by default with expandable_segments:True, enabled otherwise. "
++            "Set 0 or 1 to override. Does not change SM70 warmup scoping."
++        ),
++        category="configuration",
++        declared_default="auto",
++        effective_default="False with expandable_segments:True, otherwise True",
++        automatic_conditions=(
++            "Disabled when the effective allocator enables expandable segments.",
++        ),
++        acceleration_paths=(),
++        user_visible=True,
++    ),
+     # Disable using pytorch's pin memory for CPU offloading.
+     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": env_var(
+         lambda: bool(int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))),
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 275b2a6d5..db7a3128b 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -489,7 +489,11 @@ class Worker(WorkerBase):
+             self._maybe_get_memory_pool_context(tag="weights"),
+             set_current_vllm_config(self.vllm_config),
+             # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
+-            self._scoped_allocator_max_split(max_split_size_mb=20),
++            (
++                self._scoped_allocator_max_split(max_split_size_mb=20)
++                if envs.VLLM_WEIGHT_LOAD_MAX_SPLIT_SCOPE
++                else nullcontext()
++            ),
+         ):
+             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+ 

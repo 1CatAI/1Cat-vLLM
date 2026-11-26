@@ -1,0 +1,107 @@
+{
+  "initial_inventory": {
+    "number": 1161,
+    "title": "[Bugfix][SM70] Serialize set-valued policy fields in the acceleration report",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1161",
+    "isDraft": true,
+    "headRefOid": "a66fcda49f1133b54dbbe8d14daf38e2a6731da4",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    }
+  },
+  "metadata": {
+    "number": 1161,
+    "title": "[Bugfix][SM70] Serialize set-valued policy fields in the acceleration report",
+    "body": "## Purpose\n\n`linear_policy_report()` and the loaded-kernel report JSON-encode each resolved SM70 policy with `asdict()`. Resolved tensor-dump policies carry `frozenset` filters (layer and shape selections, for example `frozenset((0, 1))` for the `qwen_layer` channel), and `json.dumps` raises:\n\n```\nTypeError: Object of type frozenset is not JSON serializable\n```\n\nThe report runs inside `VllmConfig.with_hf_config`, which every speculative setup takes when it registers its draft model, so GLM-5.3-Flash with its MTP head cannot start on current `main` (4e5357b59). Observed on 4x V100 with the EXL3 checkpoint through #1102 + #1125 + #1159; the failing frame is `vllm/sm70_profiles/acceleration.py:30` under `init_vllm_registered_model` for `Glm5NextMTPModel`.\n\n## Change\n\n`vllm/sm70_profiles/acceleration.py`: both `json.dumps(asdict(...))` calls get a `default=` hook that encodes sets as sorted lists, tuples as lists, and anything else unknown through `repr`, instead of failing. No behaviour change for policies without set-valued fields.\n\n## Not a duplicate\n\nNo open or closed PR touches the acceleration report's serialization (searched \"frozenset\", \"linear_policy_report\", \"acceleration report\").\n\n## Test Plan\n\n- `tests/sm70_profiles/test_sm70_acceleration_report.py` (new): a dataclass policy tree with `frozenset`, `None` and tuple fields produces a plain-JSON report with sorted lists.\n- E2E: GLM-5.3-Flash EXL3 (TP4, MTP k=3, FP8 KV, CUDA graphs) on `main` + #1125 + #1159 + #1102 + this fix, which fails at engine init without it.\n- ruff on the changed files.\n\n## Test Result\n\n- Unit test: 1 passed (on a full SM70 build of `main` 4e5357b59 + #1125 + #1159 + #1102 + this commit).\n- E2E: with this fix the stack reaches model load and (on `main` ec60883ad, before the second init-time regression described in the comment below) serves GLM-5.3-Flash at 85.7 tok/s decode with the model card's command; on `main` 4e5357b59 it then hits the Flash-V100 binding error reported in the comment.\n- ruff 0.14.0 format and check clean.\n\nGates before review:\n\n- [x] Test against an independent expectation (hand-built policy tree), failing without the change\n- [x] ruff on the changed files\n- [x] Full wheel build (CMake path) and the test on it\n- [x] E2E (see above)\n",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1161",
+    "isDraft": true,
+    "headRefName": "sm70-acceleration-report-sets",
+    "headRefOid": "a66fcda49f1133b54dbbe8d14daf38e2a6731da4",
+    "baseRefName": "main",
+    "baseRefOid": "16628e2f0a70761ba6525bf46e5e844c04b3e66f",
+    "isCrossRepository": true,
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRepositoryOwner": {
+      "login": "rivetphilbot"
+    },
+    "maintainerCanModify": true,
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "labels": {
+      "nodes": []
+    }
+  },
+  "discussion": {
+    "number": 1161,
+    "id": "PR_kwDORjYFXs8AAAABHq4p4w",
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefOid": "a66fcda49f1133b54dbbe8d14daf38e2a6731da4",
+    "title": "[Bugfix][SM70] Serialize set-valued policy fields in the acceleration report",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1161",
+    "body": "## Purpose\n\n`linear_policy_report()` and the loaded-kernel report JSON-encode each resolved SM70 policy with `asdict()`. Resolved tensor-dump policies carry `frozenset` filters (layer and shape selections, for example `frozenset((0, 1))` for the `qwen_layer` channel), and `json.dumps` raises:\n\n```\nTypeError: Object of type frozenset is not JSON serializable\n```\n\nThe report runs inside `VllmConfig.with_hf_config`, which every speculative setup takes when it registers its draft model, so GLM-5.3-Flash with its MTP head cannot start on current `main` (4e5357b59). Observed on 4x V100 with the EXL3 checkpoint through #1102 + #1125 + #1159; the failing frame is `vllm/sm70_profiles/acceleration.py:30` under `init_vllm_registered_model` for `Glm5NextMTPModel`.\n\n## Change\n\n`vllm/sm70_profiles/acceleration.py`: both `json.dumps(asdict(...))` calls get a `default=` hook that encodes sets as sorted lists, tuples as lists, and anything else unknown through `repr`, instead of failing. No behaviour change for policies without set-valued fields.\n\n## Not a duplicate\n\nNo open or closed PR touches the acceleration report's serialization (searched \"frozenset\", \"linear_policy_report\", \"acceleration report\").\n\n## Test Plan\n\n- `tests/sm70_profiles/test_sm70_acceleration_report.py` (new): a dataclass policy tree with `frozenset`, `None` and tuple fields produces a plain-JSON report with sorted lists.\n- E2E: GLM-5.3-Flash EXL3 (TP4, MTP k=3, FP8 KV, CUDA graphs) on `main` + #1125 + #1159 + #1102 + this fix, which fails at engine init without it.\n- ruff on the changed files.\n\n## Test Result\n\n- Unit test: 1 passed (on a full SM70 build of `main` 4e5357b59 + #1125 + #1159 + #1102 + this commit).\n- E2E: with this fix the stack reaches model load and (on `main` ec60883ad, before the second init-time regression described in the comment below) serves GLM-5.3-Flash at 85.7 tok/s decode with the model card's command; on `main` 4e5357b59 it then hits the Flash-V100 binding error reported in the comment.\n- ruff 0.14.0 format and check clean.\n\nGates before review:\n\n- [x] Test against an independent expectation (hand-built policy tree), failing without the change\n- [x] ruff on the changed files\n- [x] Full wheel build (CMake path) and the test on it\n- [x] E2E (see above)\n",
+    "author": {
+      "login": "rivetphilbot"
+    },
+    "headRepository": {
+      "nameWithOwner": "rivetphilbot/1Cat-vLLM"
+    },
+    "headRefName": "sm70-acceleration-report-sets",
+    "comments": {
+      "totalCount": 1,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOnYyOpHPAAAAAWtPcUw="
+      },
+      "nodes": [
+        {
+          "id": "IC_kwDORjYFXs8AAAABa09xTA",
+          "author": {
+            "login": "rivetphilbot"
+          },
+          "body": "With this fix applied, the same stack (`main` 4e5357b59 + #1125 + #1159 + #1102) fails later in the same init path, which looks like a second regression from the 10 Oct provider-lifecycle series (first-parent merge d4ce51399, #1148, \"Rebind runtime owners after worker transfer\" and the commits that followed):\n\n```\nvllm/v1/attention/backends/mla/prefill/selector.py:180 _auto_select_mla_prefill_backend\nvllm/v1/attention/backends/mla/prefill/flash_attn.py:67 is_available\nvllm/v1/attention/backends/flash_v100/dense_prefill.py:922 flash_v100_dense_prefill_lse_available\nvllm/v1/attention/backends/flash_v100/ops.py:375 get_flash_dense_forward\nvllm/v1/attention/backends/flash_v100/runtime.py:38 bind_attention_operation\nRuntimeError: Flash-V100 resources must be bound before execution\n```\n\nThe MLA prefill selector probes `FlashAttnPrefillBackend.is_available()` while the model is being built, and on SM70 that probe now binds Flash-V100 runtime resources, which `forward_context.activate_runtime_resources` only provides at execution time. The selector catches `ImportError` only, so the `RuntimeError` aborts worker init. `main` at ec60883ad (the parent of that merge) does not have the check and the stack starts and runs there; I have not changed anything in that path and am reporting it here rather than guessing at the intended binding order.\n",
+          "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1161#issuecomment-6095335756",
+          "createdAt": "2026-10-10T07:54:57Z",
+          "updatedAt": "2026-10-10T07:54:57Z"
+        }
+      ]
+    },
+    "reviews": {
+      "totalCount": 0,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    },
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": []
+    }
+  },
+  "diff_summary": {
+    "number": 1161,
+    "title": "[Bugfix][SM70] Serialize set-valued policy fields in the acceleration report",
+    "url": "https://github.com/1CatAI/1Cat-vLLM/pull/1161",
+    "isDraft": true,
+    "headRefOid": "a66fcda49f1133b54dbbe8d14daf38e2a6731da4",
+    "reviews": {
+      "totalCount": 0,
+      "nodes": []
+    },
+    "files": [
+      "tests/sm70_profiles/test_sm70_acceleration_report.py",
+      "vllm/sm70_profiles/acceleration.py"
+    ],
+    "diff_bytes": 2990,
+    "diff_sha256": "3c8fe6cbe4a3224c946e6edb4b8c896996d54d4b8fb24b42a5297e53866a65a9"
+  },
+  "full_tree_diff_proof": null
+}
