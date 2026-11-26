@@ -348,7 +348,17 @@ def rel_attention(
         DRAFT=draft,
         MODE=mode,
         BLOCK_M=block_m,
-        BLOCK_N=64 if (block_m >= 128 or is_sm70()) else 128 if block_m <= 32 else 64,
+        # SM70 decode (16-row query tiles): 32-key blocks (V100 decode attention
+        # 1.66 -> 0.91 ms per step at short context, 4.0 -> 3.4 ms at 7k).
+        BLOCK_N=(
+            32
+            if is_sm70() and block_m == 16
+            else 64
+            if (block_m >= 128 or is_sm70())
+            else 128
+            if block_m <= 32
+            else 64
+        ),
         num_warps=8 if (block_m >= 128 or (is_sm70() and block_m >= 32)) else 4,
         num_stages=2,
     )
