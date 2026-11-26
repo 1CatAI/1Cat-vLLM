@@ -11,7 +11,7 @@ request. The coordinator's four-request barrier is also the read fence.
 
 from collections import deque
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import torch
 
@@ -166,6 +166,7 @@ def _v41_prefill_activation_rows_p(
     COLUMN: tl.constexpr,
     BLOCK: tl.constexpr,
     PROGRAMS: tl.constexpr,
+    SKIP_DEST: tl.constexpr = -1,
 ):
     """Persistent form: a fixed grid strides over [bounds[0], bounds[-1])."""
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -183,11 +184,105 @@ def _v41_prefill_activation_rows_p(
         up = tl.minimum(tl.maximum(up, -10.0), 10.0)
         probability = tl.load(probabilities + tl.load(order + route))
         value = ((gate / (1.0 + tl.exp(-gate))) * up * probability).to(tl.float16)
-        at = route.to(tl.int64) * FULL + COLUMN + col  # type: ignore[attr-defined]
-        tl.store(out0.to(tl.pointer_type(tl.float16)) + at, value, inside)
-        tl.store(out1.to(tl.pointer_type(tl.float16)) + at, value, inside)
-        tl.store(out2.to(tl.pointer_type(tl.float16)) + at, value, inside)
-        tl.store(out3.to(tl.pointer_type(tl.float16)) + at, value, inside)
+        at = tl.cast(route, tl.int64) * FULL + COLUMN + col
+        if SKIP_DEST != 0:
+            dst = tl.cast(out0, tl.uint64).to(tl.pointer_type(tl.float16))
+            tl.store(dst + at, value, inside)
+        if SKIP_DEST != 1:
+            dst = tl.cast(out1, tl.uint64).to(tl.pointer_type(tl.float16))
+            tl.store(dst + at, value, inside)
+        if SKIP_DEST != 2:
+            dst = tl.cast(out2, tl.uint64).to(tl.pointer_type(tl.float16))
+            tl.store(dst + at, value, inside)
+        if SKIP_DEST != 3:
+            dst = tl.cast(out3, tl.uint64).to(tl.pointer_type(tl.float16))
+            tl.store(dst + at, value, inside)
+
+
+@triton.jit
+def _v41_prefill_activation_pair_pull(
+    source,
+    destination,
+    bounds,
+    EXPERTS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    FULL: tl.constexpr,
+    COLUMN: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PROGRAMS: tl.constexpr,
+):
+    """Copy the exact peer FP16 values after the original four-rank fence."""
+    src = tl.cast(source, tl.uint64).to(tl.pointer_type(tl.float16))
+    dst = tl.cast(destination, tl.uint64).to(tl.pointer_type(tl.float16))
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    low = tl.load(bounds)
+    high = tl.load(bounds + EXPERTS)
+    for route in range(low + tl.program_id(0), high, PROGRAMS):
+        at = tl.cast(route, tl.int64) * FULL + COLUMN + col
+        value = tl.load(src + at, col < WIDTH, 0, volatile=True)
+        tl.store(dst + at, value, col < WIDTH)
+
+
+_PAIR_VERIFY_NO_INDEX = (1 << 31) - 1
+
+
+@triton.jit
+def _v41_prefill_activation_pair_compare(
+    actual,
+    shadow,
+    bounds,
+    stats,
+    EXPERTS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Count checked FP16 bit patterns and locate the first differing word."""
+    low = tl.load(bounds)
+    size = (tl.load(bounds + EXPERTS) - low) * WIDTH
+    lane = tl.arange(0, BLOCK)
+    checked = tl.full((BLOCK,), 0, tl.int32)
+    mismatches = tl.full((BLOCK,), 0, tl.int32)
+    first = tl.full((BLOCK,), 2147483647, tl.int32)
+    for block in range(tl.program_id(0), tl.cdiv(size, BLOCK), tl.num_programs(0)):
+        offset = block * BLOCK + lane
+        live = offset < size
+        index = (low + offset // WIDTH) * STRIDE + offset % WIDTH
+        got = tl.load(actual + index, live, 0, volatile=True).to(
+            tl.uint16, bitcast=True
+        )
+        want = tl.load(shadow + index, live, 0, volatile=True).to(
+            tl.uint16, bitcast=True
+        )
+        differed = live & (got != want)
+        checked += live.to(tl.int32)
+        mismatches += differed.to(tl.int32)
+        first = tl.minimum(first, tl.where(differed, index, 2147483647))
+    checked_count = tl.sum(checked, 0)
+    mismatch_count = tl.sum(mismatches, 0)
+    if checked_count > 0:
+        tl.atomic_add(stats, checked_count, sem="relaxed")
+    if mismatch_count > 0:
+        tl.atomic_add(stats + 1, mismatch_count, sem="relaxed")
+        tl.atomic_min(stats + 2, tl.min(first, 0), sem="relaxed")
+
+
+class ActivationPair(NamedTuple):
+    skipped: int
+    partner: int
+
+
+def _activation_pair_plan(
+    setting: str, rows_mode: bool, world_size: int, programs: int, rank: int
+) -> ActivationPair | None:
+    if setting == "0":
+        return None
+    if setting != "1":
+        raise ValueError("VLLM_V41_PREFILL_PAIR_RELAY requires 0 or 1")
+    if not rows_mode or world_size != 4 or programs < 1 or not 0 <= rank < 4:
+        raise ValueError("Pair relay requires persistent row-split prefill on TP4")
+    # Ranks 0–1 and 2–3 are the two pairs in the launch topology.
+    return ActivationPair(skipped=rank ^ 3, partner=rank ^ 1)
 
 
 _ACT_PROGRAMS = int(envs.VLLM_V41_ACT_PROGRAMS)
@@ -324,8 +419,21 @@ class SharedOriginalPrefill:
         if self.dma:
             self._init_staging()
         self.rows_mode = DOWN_ROWS
+        self.activation_pair = _activation_pair_plan(
+            envs.VLLM_V41_PREFILL_PAIR_RELAY,
+            self.rows_mode,
+            cache.group.world_size,
+            _ACT_PROGRAMS,
+            cache.rank,
+        )
+        verify = envs.VLLM_V41_PREFILL_PAIR_RELAY_VERIFY
+        if verify not in ("0", "1") or (verify == "1" and self.activation_pair is None):
+            raise ValueError("PAIR_RELAY_VERIFY requires 0 or 1 and an active relay")
+        self.pair_verify = verify == "1"
         if self.rows_mode:
             self._init_rows()
+        if self.activation_pair is not None:
+            print(f"[prefill pair relay] rank={cache.rank}", flush=True)
 
     def _init_rows(self):
         """Two parity banks of full-width h rows, mapped on all four ranks."""
@@ -349,6 +457,23 @@ class SharedOriginalPrefill:
             )
             for p in self.rows_pointers
         ]
+        if self.pair_verify:
+            self.pair_shadow_pointers = [
+                CustomAllreduce.create_shared_buffer(size, group.cpu_group)
+                for _ in range(2)
+            ]
+            self.pair_shadow_local = [
+                torch.as_tensor(
+                    _DeviceView(p[cache.rank], (self.rows_max, self.rows_full), "<f2"),
+                    device=cache.device,
+                )
+                for p in self.pair_shadow_pointers
+            ]
+            self.pair_verify_stats = torch.zeros(
+                (len(cache.specs), 3), dtype=torch.int32, device=cache.device
+            )
+            self.pair_verify_stats[:, 2].fill_(_PAIR_VERIFY_NO_INDEX)
+            self.pair_verify_sequence = 0
         self.rows_nccl = group.device_communicator.pynccl_comm
         self.rows_fence = torch.zeros(1, dtype=torch.int32, device=cache.device)
         self.rows_parity = 0
@@ -376,6 +501,87 @@ class SharedOriginalPrefill:
     def _rows_barrier(self):
         # Every rank's P2P h writes precede this NCCL turn in stream order.
         self.rows_nccl.all_reduce(self.rows_fence)
+
+    def _publish_shadow_activation(
+        self,
+        parity: int,
+        projection: torch.Tensor,
+        probabilities: torch.Tensor,
+        order: torch.Tensor,
+        bounds: torch.Tensor,
+        expert_count: int,
+        width: int,
+        programs: int,
+        stride: int,
+    ) -> None:
+        _v41_prefill_activation_rows_p[(programs, triton.cdiv(width, 256))](
+            projection,
+            probabilities,
+            order,
+            *self.pair_shadow_pointers[parity],
+            bounds,
+            EXPERTS=expert_count,
+            WIDTH=width,
+            FULL=self.rows_full,
+            COLUMN=self.cache.rank * width,
+            BLOCK=256,
+            PROGRAMS=stride,
+            SKIP_DEST=-1,
+            enable_fp_fusion=False,
+        )
+
+    def report_pair_verify(self, rows: int, layers: int) -> None:
+        stats = self.pair_verify_stats[:layers].tolist()
+        summary = ",".join(
+            f"{checked}:{mismatches}:{first if mismatches else -1}"
+            for checked, mismatches, first in stats
+        )
+        self.pair_verify_stats[:, :2].zero_()
+        self.pair_verify_stats[:, 2].fill_(_PAIR_VERIFY_NO_INDEX)
+        self.pair_verify_sequence += 1
+        print(
+            f"[prefill pair verify] rank={self.cache.rank} "
+            f"sequence={self.pair_verify_sequence} rows={rows} layers={summary}",
+            flush=True,
+        )
+
+    def _pull_activation_pair(
+        self,
+        parity: int,
+        bounds: torch.Tensor,
+        expert_count: int,
+        width: int,
+        programs: int,
+        stride: int,
+        layer: int,
+    ) -> None:
+        pair = self.activation_pair
+        assert pair is not None
+        pointers = self.rows_pointers[parity]
+        _v41_prefill_activation_pair_pull[(programs, triton.cdiv(width, 256))](
+            pointers[pair.partner],
+            pointers[self.cache.rank],
+            bounds,
+            EXPERTS=expert_count,
+            WIDTH=width,
+            FULL=self.rows_full,
+            COLUMN=pair.skipped * width,
+            BLOCK=256,
+            PROGRAMS=stride,
+        )
+        if self.pair_verify:
+            # This comparison and the down GEMM consume the same local bank
+            # on the same stream. The original fence also covers shadow writes.
+            _v41_prefill_activation_pair_compare[(128,)](
+                self.rows_local[parity],
+                self.pair_shadow_local[parity],
+                bounds,
+                self.pair_verify_stats[layer],
+                EXPERTS=expert_count,
+                WIDTH=4 * width,
+                STRIDE=self.rows_full,
+                BLOCK=1024,
+            )
 
     def _init_staging(self):
         cache = self.cache
@@ -989,6 +1195,11 @@ class SharedOriginalPrefill:
                             COLUMN=self.cache.rank * info["rows"],
                             BLOCK=256,
                             PROGRAMS=_ACT_PROGRAMS,  # fixed stride: no recompiles
+                            SKIP_DEST=(
+                                self.activation_pair.skipped
+                                if self.activation_pair is not None
+                                else -1
+                            ),
                             enable_fp_fusion=False,
                         )
                     else:
@@ -1008,8 +1219,36 @@ class SharedOriginalPrefill:
                             BLOCK=256,
                             enable_fp_fusion=False,
                         )
+                    if self.pair_verify:
+                        if 4 * info["rows"] != info["dn_k"]:
+                            raise ValueError(
+                                "PAIR_RELAY_VERIFY requires the full down input width"
+                            )
+                        self._publish_shadow_activation(
+                            parity,
+                            projection,
+                            probabilities[first:last].contiguous(),
+                            order,
+                            bounds,
+                            expert_count,
+                            info["rows"],
+                            programs,
+                            _ACT_PROGRAMS,
+                        )
                     self._sub("barrier")
                     self._rows_barrier()
+                    if self.activation_pair is not None:
+                        # The intervening bank fence precedes reuse of this parity
+                        # on every rank, so the partner's source remains live.
+                        self._pull_activation_pair(
+                            parity,
+                            bounds,
+                            expert_count,
+                            info["rows"],
+                            min(count, _ACT_PROGRAMS),
+                            _ACT_PROGRAMS,
+                            layer,
+                        )
                     h = self.rows_local[parity][:count, : info["dn_k"]]
                 else:
                     _v41_prefill_activation[(count, triton.cdiv(info["rows"], 256))](
@@ -1084,6 +1323,8 @@ class SharedOriginalPrefill:
         self._mark(layer, "end")
         if layer == len(self.cache.specs) - 1:
             self.tuned_passes += 1
+            if self.pair_verify:
+                self.report_pair_verify(x.shape[0], layer + 1)
         if self.timing and layer == len(self.cache.specs) - 1:
             self._report(x.shape[0])
         self.used = True
