@@ -899,6 +899,9 @@ def attention_prologue(
     assert r.stride(2) == 1 and r.stride(1) == d_rel
     assert q_out.is_contiguous() and rel_out.is_contiguous()
     assert q_scale.is_contiguous() and r_scale.is_contiguous()
+    # The clip kernels read per-element scales (one row per query head).
+    assert q_scale.shape == (num_q_heads, head_dim)
+    assert r_scale.shape == (num_q_heads, d_rel)
     assert rel_proj.is_contiguous() and d_rel >= 16
     block_e = min(extent, 256)
     for size in (head_dim, d_rel, block_e):

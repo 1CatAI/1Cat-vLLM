@@ -426,8 +426,9 @@ def test_rel_attention_fp8_kv():
     H, H_kv, D, d_rel, E = 24, 8, 128, 16, 1024
     W = 4
     qk_clip, rel_clip, eps = 22.6274, 8.0, 1e-6
-    q_scale = torch.ones((H,), device="cuda", dtype=torch.float32) * (D**-0.5)
-    r_scale = torch.ones((H,), device="cuda", dtype=torch.float32) * 0.25
+    # Per-element scales, shaped like the model's `q_scale` / `r_scale`.
+    q_scale = torch.full((H, D), D**-0.5, device="cuda", dtype=torch.float32)
+    r_scale = torch.full((H, d_rel), 0.25, device="cuda", dtype=torch.float32)
     rel_proj = shift_rel_proj(
         torch.randn((d_rel, E), device="cuda", dtype=torch.float16) * 0.1,
         is_local=False,
