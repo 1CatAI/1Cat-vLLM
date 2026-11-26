@@ -1,0 +1,712 @@
+diff --git a/tests/kernels/test_kpool_decode_update_batched.py b/tests/kernels/test_kpool_decode_update_batched.py
+index 4835c79347..3adee4ffab 100644
+--- a/tests/kernels/test_kpool_decode_update_batched.py
++++ b/tests/kernels/test_kpool_decode_update_batched.py
+@@ -31,6 +31,7 @@
+ from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+     kpool_compress_and_write_cache,
+     kpool_decode_update_and_maybe_write_cache_batched,
++    kpool_seed_tail_cache,
+ )
+ 
+ HEAD_DIM = 128
+@@ -234,8 +235,9 @@ def _run_kernel(kv, tail, tail_slot, key, score, ape, slot_map, pos):
+ 
+ 
+ @pytest.mark.parametrize("pool_size", [4, 16])
+-def test_decode_writer_matches_prefill_writer(pool_size):
+-    """Compare production decode and prefill writers for pool sizes 4 and 16."""
++@pytest.mark.parametrize("ring_pools", [1, 2])
++def test_decode_writer_matches_prefill_writer(pool_size, ring_pools):
++    ring = ring_pools * pool_size
+     n_pools, page, nblk = 8, 64, 4
+     n_tok = n_pools * pool_size
+     dev = "cuda"
+@@ -258,14 +260,14 @@ def test_decode_writer_matches_prefill_writer(pool_size):
+ 
+     # One request owning tail block 0, fed one token per decode step.
+     kv_decode = torch.zeros_like(kv_prefill)
+-    tail = torch.zeros(nblk, 2, pool_size, HEAD_DIM, dtype=torch.bfloat16, device=dev)
++    tail = torch.zeros(nblk, 2, ring, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+     for t in range(n_tok):
+         completes = t % pool_size == pool_size - 1
+         kpool_decode_update_and_maybe_write_cache_batched(
+             kv_decode,
+             tail,
+             # token-granular: every token has a valid tail slot
+-            torch.tensor([[t % pool_size]], dtype=torch.int32, device=dev),
++            torch.tensor([[t % ring]], dtype=torch.int32, device=dev),
+             k[t].view(1, 1, HEAD_DIM),
+             score[t].view(1, 1, HEAD_DIM),
+             ape,
+@@ -292,6 +294,91 @@ def test_decode_writer_matches_prefill_writer(pool_size):
+     )
+ 
+ 
++@pytest.mark.parametrize("ring_pools", [1, 2])
++def test_rejected_draft_redo_needs_ring_slots(ring_pools):
++    """With a one-pool ring, the drafts behind a rejected pool-completing draft
++    overwrote the pool's earlier keys, so its redo compressed wrong keys."""
++    pool, spec, page, nblk = 4, 3, 64, 2
++    ring = ring_pools * pool
++    dev = "cuda"
++    torch.manual_seed(1)
++    n_tok = 3 * pool
++    k = torch.randn(n_tok, HEAD_DIM, dtype=torch.bfloat16, device=dev)
++    score = torch.randn(n_tok, HEAD_DIM, dtype=torch.bfloat16, device=dev)
++    ape = torch.randn(pool, HEAD_DIM, dtype=torch.float32, device=dev)
++    kv_ref = torch.zeros(nblk, page, HEAD_DIM + 4, dtype=torch.uint8, device=dev)
++    kpool_compress_and_write_cache(
++        kv_ref,
++        k.view(3, pool, HEAD_DIM),
++        score.view(3, pool, HEAD_DIM),
++        ape,
++        torch.arange(3, dtype=torch.int64, device=dev),
++        pool_size=pool,
++        head_dim=HEAD_DIM,
++        round_scale=ROUND_SCALE,
++    )
++
++    kv = torch.zeros_like(kv_ref)
++    tail = torch.zeros(nblk, 2, ring, HEAD_DIM, dtype=torch.bfloat16, device=dev)
++
++    def pool_bytes(cache, p):
++        # Page layout: [page * HEAD_DIM bytes of K rows | page * 4 bytes of scales].
++        flat = cache[0].reshape(-1)
++        k_bytes = flat[p * HEAD_DIM : (p + 1) * HEAD_DIM]
++        s_bytes = flat[page * HEAD_DIM + 4 * p : page * HEAD_DIM + 4 * (p + 1)]
++        return torch.cat([k_bytes, s_bytes])
++
++    def step(positions, keys, scores):
++        pos = torch.tensor([positions], dtype=torch.int32, device=dev)
++        slots = [(p // pool) if p % pool == pool - 1 else -1 for p in positions]
++        kpool_decode_update_and_maybe_write_cache_batched(
++            kv,
++            tail,
++            pos % ring,
++            keys.view(1, -1, HEAD_DIM),
++            scores.view(1, -1, HEAD_DIM),
++            ape,
++            torch.tensor([slots], dtype=torch.int32, device=dev),
++            pos,
++            pool,
++            HEAD_DIM,
++            round_scale=ROUND_SCALE,
++        )
++
++    for t in range(7):
++        step([t], k[t], score[t])
++    # Control: verified token 7 completes pool 1 before drafts 8..10 are stashed.
++    drafts = torch.randn(spec, HEAD_DIM, dtype=torch.bfloat16, device=dev)
++    draft_scores = torch.randn(spec, HEAD_DIM, dtype=torch.bfloat16, device=dev)
++    step(
++        [7, 8, 9, 10],
++        torch.cat([k[7:8], drafts]),
++        torch.cat([score[7:8], draft_scores]),
++    )
++    step([8, 9, 10, 11], k[8:12], score[8:12])  # all drafts rejected
++    for p in (1, 2):
++        assert torch.equal(pool_bytes(kv, p), pool_bytes(kv_ref, p)), p
++
++    # Draft 7 completes pool 1 and is rejected. With a one-pool ring, drafts
++    # 8 and 9 overwrite the slots of positions 4 and 5, which are read by the
++    # redo of 7.
++    kv.zero_()
++    tail.zero_()
++    for t in range(6):
++        step([t], k[t], score[t])
++    step(
++        [6, 7, 8, 9],
++        torch.cat([k[6:7], drafts]),
++        torch.cat([score[6:7], draft_scores]),
++    )
++    step([7, 8, 9, 10], k[7:11], score[7:11])
++    pool1_ok = torch.equal(pool_bytes(kv, 1), pool_bytes(kv_ref, 1))
++    if ring_pools == 1:
++        assert not pool1_ok, "expected a one-pool ring to corrupt pool 1"
++    else:
++        assert pool1_ok
++
++
+ def test_leading_invalid_tail_slot():
+     """A request whose FIRST token carries an invalid (-1) tail slot while a
+     later token is a real pool completion.
+@@ -325,6 +412,52 @@ def test_leading_invalid_tail_slot():
+     _assert_eq(r_ref, r_kern)
+ 
+ 
++# The tail cache takes the model dtype: fp16 on Volta/Turing, bf16 elsewhere.
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++def test_prefill_seed_honors_padded_tail_block_stride(dtype):
++    """The tail shares a padded indexer allocation in production.
++
++    ``get_kv_cache_config_from_groups`` aliases each tail tensor onto its
++    indexer tensor with the indexer's block stride (38016 B for GLM-5.3-Flash
++    at 1152-token blocks vs a dense 2048 B tail block), so a seed kernel that
++    addresses blocks densely writes into an unrelated indexer block and leaves
++    the request's tail block untouched.
++    """
++    kpool = 4
++    num_blocks = 6
++    logical_block_elems = 2 * kpool * HEAD_DIM
++    padded_block_elems = logical_block_elems + 256
++    sentinel = -123.0
++    backing = torch.full(
++        (num_blocks * padded_block_elems,),
++        sentinel,
++        dtype=dtype,
++        device="cuda",
++    )
++    tail = torch.as_strided(
++        backing,
++        size=(num_blocks, 2, kpool, HEAD_DIM),
++        stride=(padded_block_elems, kpool * HEAD_DIM, HEAD_DIM, 1),
++    )
++
++    block = 3
++    ring_slot = 2
++    key = torch.arange(HEAD_DIM, dtype=dtype, device="cuda").unsqueeze(0)
++    score = (key + 256).to(dtype)
++    tail_slot = torch.tensor(
++        [block * kpool + ring_slot], dtype=torch.int32, device="cuda"
++    )
++
++    kpool_seed_tail_cache(tail, key, score, tail_slot, kpool, HEAD_DIM)
++    torch.accelerator.synchronize()
++
++    assert torch.equal(tail[block, 0, ring_slot], key[0])
++    assert torch.equal(tail[block, 1, ring_slot], score[0])
++
++    compact_offset = (block * 2 * kpool + ring_slot) * HEAD_DIM
++    assert torch.all(backing[compact_offset : compact_offset + HEAD_DIM] == sentinel)
++
++
+ @pytest.mark.parametrize(
+     "case_id",
+     [
+diff --git a/tests/v1/attention/test_kpool_tail_slot_mapping.py b/tests/v1/attention/test_kpool_tail_slot_mapping.py
+index baf25a0431..3e4a03e368 100644
+--- a/tests/v1/attention/test_kpool_tail_slot_mapping.py
++++ b/tests/v1/attention/test_kpool_tail_slot_mapping.py
+@@ -3,7 +3,7 @@
+ """CPU tests for the kpool tail slot mapping (no GPU required).
+ 
+ The kpool tail cache is a 1-block-per-request circular ring addressed by
+-``pos % kpool`` (``KpoolTailSpec`` / ``KpoolTailManager``: exactly one block
++``pos % ring`` (``KpoolTailSpec`` / ``KpoolTailManager``: exactly one block
+ allocated per request, never grown, so only column 0 of its block table is
+ ever written; the rest stays zero-initialized).
+ 
+@@ -227,6 +227,34 @@ def test_builder_build_falls_back_without_positions():
+     assert meta.slot_mapping is cam.slot_mapping
+ 
+ 
++@pytest.mark.parametrize(
++    "num_speculative_tokens, ring", [(0, 4), (1, 8), (4, 8), (7, 16), (13, 32)]
++)
++def test_tail_ring_divides_the_attention_block(num_speculative_tokens, ring):
++    """A ring of kpool * cdiv(kpool + num_spec, kpool) would be 12 slots with
++    7 draft tokens. 12 does not divide the 640-token KDA attention block, so
++    the scheduler block would grow to their lcm and prefix-cache hits would be
++    cut down to multiples of 1920."""
++    from vllm.config import VllmConfig, set_current_vllm_config
++    from vllm.models.glm5next.nvidia.attention import Glm5NextTailCache
++
++    with set_current_vllm_config(VllmConfig()):
++        cache = Glm5NextTailCache(
++            head_dim=128,
++            dtype=torch.bfloat16,
++            prefix="tail",
++            cache_config=SimpleNamespace(block_size=640),
++            index_kpool=KPOOL,
++        )
++    spec = cache.get_kv_cache_spec(
++        SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
++    )
++
++    assert spec.block_size == spec.sliding_window == ring
++    assert ring >= KPOOL + num_speculative_tokens
++    assert 640 % ring == 0
++
++
+ # ---------------------------------------------------------------------------
+ # Index-level mirror of the tail kernels: seed / stash / pool completion
+ # (addressing replicated from kpool_compress.py's Triton kernels).
+@@ -234,31 +262,30 @@ def test_builder_build_falls_back_without_positions():
+ 
+ 
+ class TailRingMirror:
+-    """Mirror of _kpool_tail_seed_kernel / _kpool_decode_update_batched_kernel
+-    addressing: block = tail_slot // kpool, ring offset = pos % kpool; a pool
+-    completing at pos reads ring slots (pool_start + s) % kpool and uses the
+-    current token's own K/score for the last member."""
++    """Mirror of the tail-ring addressing in _kpool_tail_seed_kernel and
++    _kpool_decode_update_batched_kernel."""
+ 
+-    def __init__(self, num_blocks, kpool=KPOOL):
++    def __init__(self, num_blocks, kpool=KPOOL, ring=None):
+         self.kpool = kpool
+-        self.k = torch.full((num_blocks, kpool, 3), float("nan"))
+-        self.s = torch.full((num_blocks, kpool, 3), float("nan"))
++        self.ring = ring or kpool
++        self.k = torch.full((num_blocks, self.ring, 3), float("nan"))
++        self.s = torch.full((num_blocks, self.ring, 3), float("nan"))
+ 
+     def stash(self, tail_slot, pos, k, s):
+-        blk, off = tail_slot // self.kpool, pos % self.kpool
++        blk, off = tail_slot // self.ring, pos % self.ring
+         self.k[blk, off] = k
+         self.s[blk, off] = s
+ 
+     seed = stash  # the seed kernel writes with the same addressing
+ 
+     def complete(self, tail_slot, pos, k, s):
+-        blk = tail_slot // self.kpool
++        blk = tail_slot // self.ring
+         start = pos - (self.kpool - 1)
+         kk = torch.stack(
+-            [self.k[blk, (start + i) % self.kpool] for i in range(self.kpool)]
++            [self.k[blk, (start + i) % self.ring] for i in range(self.kpool)]
+         )
+         ss = torch.stack(
+-            [self.s[blk, (start + i) % self.kpool] for i in range(self.kpool)]
++            [self.s[blk, (start + i) % self.ring] for i in range(self.kpool)]
+         )
+         kk[-1], ss[-1] = k, s  # is_current for the completing token
+         w = torch.softmax(ss, dim=0)
+@@ -329,3 +356,35 @@ def test_interleaved_decode_pollution_legacy_vs_circular():
+ 
+     # The circular mapping keeps the rings isolated under interleaving.
+     torch.testing.assert_close(circular, ground_truth)
++
++
++@pytest.mark.parametrize("ring_pools", [1, 2])
++def test_rejected_completing_draft_needs_ring_slots(ring_pools):
++    """With a one-pool ring, the drafts behind a rejected pool-completing draft
++    overwrote the pool's earlier keys, so its redo compressed wrong keys."""
++    ring_size = ring_pools * KPOOL
++    truth = TailRingMirror(num_blocks=2, ring=ring_size)
++    ring = TailRingMirror(num_blocks=2, ring=ring_size)
++    block = 1
++
++    def slot(pos):
++        return block * ring_size + pos % ring_size
++
++    for pos in range(4, 7):
++        truth.stash(slot(pos), pos, *token_kv(0, pos))
++        ring.stash(slot(pos), pos, *token_kv(0, pos))
++    expected = truth.complete(slot(7), 7, *token_kv(0, 7))
++
++    # Draft 7 completes the pool and is rejected. With a one-pool ring, drafts
++    # 8..10 overwrite the slots of positions 4..6, which are read by the redo
++    # of 7.
++    for pos in range(7, 11):
++        k, s = token_kv(9, pos)  # draft values
++        if pos % KPOOL == KPOOL - 1:
++            ring.complete(slot(pos), pos, k, s)
++        ring.stash(slot(pos), pos, k, s)
++    redo = ring.complete(slot(7), 7, *token_kv(0, 7))
++    if ring_pools == 1:
++        assert not torch.allclose(redo, expected)
++    else:
++        torch.testing.assert_close(redo, expected)
+diff --git a/tests/v1/core/test_glm5_kv_cache_layout.py b/tests/v1/core/test_glm5_kv_cache_layout.py
+index 8812e70aef..b62647d5af 100644
+--- a/tests/v1/core/test_glm5_kv_cache_layout.py
++++ b/tests/v1/core/test_glm5_kv_cache_layout.py
+@@ -3,6 +3,7 @@
+ 
+ from types import SimpleNamespace
+ 
++import pytest
+ import torch
+ 
+ from vllm.v1.core import kv_cache_utils
+@@ -33,7 +34,9 @@ def test_kpool_tail_admission_uses_in_flight_keyword() -> None:
+     )
+ 
+ 
+-def test_glm53_pp2_kpool_tail_shares_indexer_storage(monkeypatch):
++# Ring 4 without speculation, 16 with 7 draft tokens (kpool 4).
++@pytest.mark.parametrize("tail_ring", [4, 16])
++def test_glm53_pp2_kpool_tail_shares_indexer_storage(monkeypatch, tail_ring):
+     monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+     model_config = SimpleNamespace(
+         max_model_len=32768,
+@@ -77,12 +80,12 @@ def test_glm53_pp2_kpool_tail_shares_indexer_storage(monkeypatch):
+                 compress_ratio=4,
+             )
+             specs[f"{prefix}.indexer.tail_cache"] = KpoolTailSpec(
+-                block_size=4,
++                block_size=tail_ring,
+                 num_kv_heads=1,
+                 head_size=256,
+                 head_size_v=0,
+                 dtype=torch.bfloat16,
+-                sliding_window=4,
++                sliding_window=tail_ring,
+             )
+         else:
+             specs[prefix] = mamba_spec
+@@ -103,7 +106,11 @@ def test_glm53_pp2_kpool_tail_shares_indexer_storage(monkeypatch):
+         if group.kv_cache_spec.prefix_cacheable
+     ]
+     assert min(participating_block_sizes) == block_size
+-    assert min(group.kv_cache_spec.block_size for group in groups) == 4
++    assert min(group.kv_cache_spec.block_size for group in groups) == tail_ring
++    # The ring's page must fit the indexer page it is padded to and shares.
++    (tail_group,) = [g for g in groups if g.layer_names[0] in tail_names]
++    tail_specs = tail_group.kv_cache_spec.kv_cache_specs.values()
++    assert all(spec.page_size_bytes == idx_page for spec in tail_specs)
+ 
+     bytes_per_block = 11 * (mla_page + idx_page)
+     cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+index ff16be68f5..a60be0704b 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+@@ -385,7 +385,7 @@ def sparse_attn_indexer_kpool(
+                 )
+                 # Persist each request's incomplete prefill pool so decode can
+                 # finish it, including after PD transfer. Tail slots use
+-                # ``pos % kpool`` within the request's tail block. Processing
++                # ``pos % ring`` within the request's tail block. Processing
+                 # only the batch's trailing tokens would miss all but the last
+                 # request in a multi-request prefill.
+                 if (
+@@ -590,7 +590,7 @@ def sparse_attn_indexer_kpool(
+         # Spec verification groups tokens by request and preserves position
+         # order so each token is stashed before the next completes its pool.
+         # Positions must remain token-granular because the kernel derives the
+-        # pool phase and tail index from ``pos % kpool``.
++        # pool phase from ``pos % kpool`` and the ring slot from ``pos % ring``.
+         if (
+             index_kpool > 1
+             and gate_score is not None
+@@ -667,7 +667,7 @@ def sparse_attn_indexer_kpool(
+             # Paged tail cache replaces the transient _DECODE_TAIL ring. Group
+             # the tail group's token-granular slot_mapping per-request, mirroring
+             # dec_slot / dec_pos, so the kernel gets each request's current-token
+-            # tail slot (block * kpool + pos % kpool).
++            # tail slot (block * ring + pos % ring).
+             if tail_meta is not None:
+                 assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
+             if tail_meta is None or tail_kv_cache is None:
+diff --git a/vllm/models/glm5next/nvidia/attention.py b/vllm/models/glm5next/nvidia/attention.py
+index e28077f73d..5c111be1c8 100644
+--- a/vllm/models/glm5next/nvidia/attention.py
++++ b/vllm/models/glm5next/nvidia/attention.py
+@@ -37,6 +37,7 @@
+ )
+ from vllm.platforms import current_platform
+ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
++from vllm.utils.math_utils import cdiv, next_power_of_2
+ from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
+ 
+ logger = init_logger(__name__)
+@@ -160,7 +161,7 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
+     """Paged circular buffer for the kpool indexer's in-progress (tail) pool.
+ 
+     Holds the trailing incomplete pool's raw K + gate score: one block of
+-    ``index_kpool`` slots per request, overwritten in place by ``pos % kpool``
++    ``ring`` slots per request, overwritten in place by ``pos % ring``
+     as decode/spec-decode advances. Prefill seeds it (instead of discarding the
+     tail raw K+gate); the connector transfers it across PD; decode reads it to
+     compress the boundary pool correctly. ``KpoolTailSpec`` /
+@@ -188,17 +189,31 @@ def __init__(
+         self._index_kpool = index_kpool
+ 
+     def get_kv_cache_spec(self, vllm_config: VllmConfig):
++        # Drafts are stashed before acceptance. With a one-pool ring, the
++        # drafts behind a rejected pool-completing draft overwrite the keys
++        # read by its redo, so the ring holds kpool + num_spec slots, rounded
++        # up to a power-of-two number of pools.
++        span = self._index_kpool + vllm_config.num_speculative_tokens
++        ring = self._index_kpool * next_power_of_2(cdiv(span, self._index_kpool))
++        # The scheduler block is the lcm of all group block sizes; a ring that
++        # does not divide the attention block would coarsen prefix-cache hits
++        # to that lcm.
++        assert self.cache_config.block_size % ring == 0, (
++            f"Glm5NextTailCache: cache_config.block_size "
++            f"({self.cache_config.block_size}) must be a multiple of the "
++            f"tail ring ({ring})"
++        )
+         # K + gate score packed into head_size (== 2*head_dim), head_size_v=0:
+         # KpoolTailBackend.get_kv_cache_shape only consumes head_size and splits
+-        # it into [2, kpool, head_dim] (K | score halves), so the connectors'
++        # it into [2, ring, head_dim] (K | score halves), so the connectors'
+         # non-MLA K/V half-split transfers K and score as separate halves.
+         return KpoolTailSpec(
+-            block_size=self._index_kpool,
++            block_size=ring,
+             num_kv_heads=1,
+             head_size=2 * self.head_dim,
+             head_size_v=0,
+             dtype=self.dtype,
+-            sliding_window=self._index_kpool,
++            sliding_window=ring,
+         )
+ 
+     def get_attn_backend(self):
+diff --git a/vllm/models/glm5next/nvidia/ops/kpool_compress.py b/vllm/models/glm5next/nvidia/ops/kpool_compress.py
+index b7419045a0..c7e74b7dda 100644
+--- a/vllm/models/glm5next/nvidia/ops/kpool_compress.py
++++ b/vllm/models/glm5next/nvidia/ops/kpool_compress.py
+@@ -528,37 +528,45 @@ def _kpool_tail_seed_kernel(
+     tslot_ptr,
+     tail_ptr,
+     n_tokens,
++    TAIL_BLOCK_ELEMS: tl.constexpr,
++    KPOOL_HEAD: tl.constexpr,
+     HEAD_DIM: tl.constexpr,
+     KPOOL: tl.constexpr,
++    RING: tl.constexpr,
+     BLOCK_D: tl.constexpr,
+ ):
+-    """Copy token ``i``'s raw K + gate into its request's tail block.
++    """Copy token ``i``'s raw K + gate into its request's tail ring.
+ 
+     Token ``i`` is among its request's last KPOOL tokens iff the token KPOOL
+     ahead belongs to a different tail block (or is past the batch / padding,
+-    slot < 0). ``tslot = block * KPOOL + pos % KPOOL``; the destination is
+-    ``tail[block, {0:K, 1:score}, pos % KPOOL, :]``.
++    slot < 0). ``tslot = block * RING + pos % RING``; the destination is
++    ``tail[block, {0:K, 1:score}, pos % RING, :]``.
++
++    The tail cache aliases the indexer cache with the indexer's (padded) block
++    stride, so blocks are addressed through ``TAIL_BLOCK_ELEMS`` /
++    ``KPOOL_HEAD`` (``tail.stride(0)`` / ``tail.stride(1)``), never as a dense
++    ``[num_blocks, 2, KPOOL, HEAD_DIM]`` array.
+     """
+     i = tl.program_id(0)
+     t = tl.load(tslot_ptr + i).to(tl.int64)
+     if t < 0:
+         return
+-    blk = t // KPOOL  # t >= 0 here, so trunc == floor
++    blk = t // RING  # t >= 0 here, so trunc == floor
+     ahead = tl.load(tslot_ptr + i + KPOOL, mask=i + KPOOL < n_tokens, other=-1).to(
+         tl.int64
+     )
+     # Match the torch semantics exactly: a negative ahead slot floors to a
+     # block id that differs from every real block -> token is in the tail.
+     # Only divide non-negative slots (Triton int div truncates, torch floors).
+-    if ahead >= 0 and ahead // KPOOL == blk:
++    if ahead >= 0 and ahead // RING == blk:
+         return
+     offs = tl.arange(0, BLOCK_D)
+     m = offs < HEAD_DIM
+-    base = (blk * 2 * KPOOL + t % KPOOL) * HEAD_DIM
++    base = blk * TAIL_BLOCK_ELEMS + (t % RING) * HEAD_DIM
+     k = tl.load(key_ptr + i * HEAD_DIM + offs, mask=m)
+     s = tl.load(score_ptr + i * HEAD_DIM + offs, mask=m)
+     tl.store(tail_ptr + base + offs, k, mask=m)
+-    tl.store(tail_ptr + base + KPOOL * HEAD_DIM + offs, s, mask=m)
++    tl.store(tail_ptr + base + KPOOL_HEAD + offs, s, mask=m)
+ 
+ 
+ def kpool_seed_tail_cache(
+@@ -571,6 +579,8 @@ def kpool_seed_tail_cache(
+ ) -> None:
+     """Seed the paged tail cache from a prefill batch (see the kernel)."""
+     assert tail_kv_cache.dtype in (torch.bfloat16, torch.float16)
++    assert tail_kv_cache.ndim == 4 and tail_kv_cache.shape[1] == 2
++    assert tail_kv_cache.stride(3) == 1 and tail_kv_cache.stride(2) == head_dim
+     assert key.dtype == tail_kv_cache.dtype
+     assert gate_score.dtype == key.dtype
+     n = tslot.shape[0]
+@@ -582,8 +592,11 @@ def kpool_seed_tail_cache(
+         tslot,
+         tail_kv_cache,
+         n,
++        TAIL_BLOCK_ELEMS=tail_kv_cache.stride(0),
++        KPOOL_HEAD=tail_kv_cache.stride(1),
+         HEAD_DIM=head_dim,
+         KPOOL=kpool,
++        RING=tail_kv_cache.shape[2],
+         BLOCK_D=triton.next_power_of_2(head_dim),
+     )
+ 
+@@ -611,6 +624,7 @@ def _kpool_decode_update_batched_kernel(
+     PAGE_SIZE: tl.constexpr,
+     BUF_NUMEL_PER_PAGE: tl.constexpr,
+     POOL_SIZE: tl.constexpr,
++    RING: tl.constexpr,
+     TAIL_BLOCK_ELEMS: tl.constexpr,
+     KPOOL_HEAD: tl.constexpr,
+     HEAD_DIM: tl.constexpr,
+@@ -627,10 +641,7 @@ def _kpool_decode_update_batched_kernel(
+     the tail-ring slots that tokens t < t* (same request) just stashed in this
+     same invocation. ``tl.range`` iterates sequentially within the program, so
+     those stashes are visible to the later completion read. Cross-request
+-    programs are independent (distinct tail blocks). With NEXT_N < POOL_SIZE
+-    (the spec-verify case: NEXT_N ~= num_spec+1, POOL_SIZE=16) at most one
+-    completion can occur per request per call, but the ordered loop is correct
+-    for any NEXT_N.
++    programs are independent (distinct tail blocks). RING >= POOL_SIZE.
+     """
+     req = tl.program_id(0)
+     offs = tl.arange(0, BLOCK_D)
+@@ -644,7 +655,7 @@ def _kpool_decode_update_batched_kernel(
+         pos_valid = (cache_loc >= 0) & (pos >= 0)
+ 
+         slot = safe_pos % POOL_SIZE
+-        phys_slot = safe_pos % POOL_SIZE
++        phys_slot = safe_pos % RING
+ 
+         # Derive the tail block from THIS token's tail_slot (the request's block
+         # is constant across a pool, but a padded / invalid entry carries a
+@@ -652,7 +663,7 @@ def _kpool_decode_update_batched_kernel(
+         # token's base address). Clamp so an invalid entry can never form an
+         # out-of-bounds base; the accesses below are gated on pos_valid anyway.
+         tail_slot = tl.load(tail_slot_mapping_ptr + idx)
+-        block = tl.maximum(tail_slot, 0).to(tl.int64) // POOL_SIZE
++        block = tl.maximum(tail_slot, 0).to(tl.int64) // RING
+         block_base = block * TAIL_BLOCK_ELEMS
+ 
+         # The tail-ring stash must run for EVERY real token, so it is gated on
+@@ -680,7 +691,7 @@ def _kpool_decode_update_batched_kernel(
+             max_score = tl.full((BLOCK_D,), -float("inf"), tl.float32)
+             for pool_slot in tl.static_range(0, POOL_SIZE):
+                 is_current = pool_slot == slot
+-                phys = (pool_logical_start + pool_slot) % POOL_SIZE
++                phys = (pool_logical_start + pool_slot) % RING
+                 score_buf = tl.load(
+                     tail_kv_ptr + block_base + KPOOL_HEAD + phys * HEAD_DIM + offs,
+                     mask=dim_mask,
+@@ -698,7 +709,7 @@ def _kpool_decode_update_batched_kernel(
+             denom = tl.full((BLOCK_D,), 0.0, tl.float32)
+             for pool_slot in tl.static_range(0, POOL_SIZE):
+                 is_current = pool_slot == slot
+-                phys = (pool_logical_start + pool_slot) % POOL_SIZE
++                phys = (pool_logical_start + pool_slot) % RING
+                 score_buf = tl.load(
+                     tail_kv_ptr + block_base + KPOOL_HEAD + phys * HEAD_DIM + offs,
+                     mask=dim_mask,
+@@ -800,8 +811,9 @@ def kpool_decode_update_and_maybe_write_cache_batched(
+ 
+     Args:
+         kv_cache: indexer K cache ``[num_blocks, block_size, head_dim+4]`` uint8.
+-        tail_kv_cache: paged tail cache ``[num_blocks, 2, pool_size, head_dim]``
+-            FP16/BF16 (K at half 0, gate score at half 1).
++        tail_kv_cache: paged tail cache ``[num_blocks, 2, ring, head_dim]``
++            FP16/BF16 (K at half 0, gate score at half 1); ``ring`` is a
++            multiple of ``pool_size``.
+         tail_slot_mapping: ``[num_requests, next_n]`` int32.
+         key / slot_score: ``[num_requests, next_n, head_dim]`` FP16/BF16.
+         ape: ``[pool_size, head_dim]`` fp32.
+@@ -812,7 +824,8 @@ def kpool_decode_update_and_maybe_write_cache_batched(
+         return
+     assert tail_kv_cache.ndim == 4
+     assert tail_kv_cache.shape[1] == 2
+-    assert tail_kv_cache.shape[2] == pool_size
++    ring = tail_kv_cache.shape[2]
++    assert ring >= pool_size and ring % pool_size == 0, (ring, pool_size)
+     assert tail_kv_cache.shape[3] == head_dim
+     assert tail_kv_cache.dtype in (torch.bfloat16, torch.float16)
+     assert key.ndim == 3 and key.shape[2] == head_dim
+@@ -860,6 +873,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
+         PAGE_SIZE=page_size,
+         BUF_NUMEL_PER_PAGE=buf.stride(0),
+         POOL_SIZE=pool_size,
++        RING=ring,
+         TAIL_BLOCK_ELEMS=tail_kv_cache.stride(0),
+         KPOOL_HEAD=tail_kv_cache.stride(1),
+         HEAD_DIM=head_dim,
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index 97d93b7edb..40e1cfb070 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -164,9 +164,10 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
+     metadata builder (token-granular when ``compress_ratio == 1``) but exposes a
+     4D K||score shape and unrestricted head/block sizes: the indexer backend
+     hard-requires ``head_size in {32,64,128}`` and ``kernel_block_size 64``,
+-    which the tail's ``block_size == kpool`` (e.g. 4) violates. The 4D
+-    ``[2, block_size, head_dim]`` layout keeps K and score as separate block
+-    halves so the connectors' non-MLA K/V half-split transfers them correctly.
++    which the tail's ring-sized block (``block_size`` = ring, e.g. 16)
++    violates. The 4D ``[2, block_size, head_dim]`` layout keeps K and score as
++    separate block halves so the connectors' non-MLA K/V half-split transfers
++    them correctly.
+     """
+ 
+     @staticmethod
+@@ -179,8 +180,8 @@ def get_supported_head_sizes(cls) -> list[int]:
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+-        # block_size == kpool; no sub-block splitting (kernel_block_size ==
+-        # block_size), so the tensor stays [num_blocks, 2, kpool, head_dim].
++        # block_size == ring; no sub-block splitting (kernel_block_size ==
++        # block_size), so the tensor stays [num_blocks, 2, ring, head_dim].
+         return [MultipleOf(1)]
+ 
+     @staticmethod
+@@ -292,7 +293,7 @@ def compute_kpool_tail_slot_mapping(
+     positions: torch.Tensor,
+     num_actual_tokens: int,
+     num_reqs: int,
+-    kpool: int,
++    ring: int,
+ ) -> torch.Tensor:
+     """Circular tail slots: every token of request r lands in r's own block.
+ 
+@@ -300,12 +301,13 @@ def compute_kpool_tail_slot_mapping(
+     pos % bs`` (``_compute_slot_mappings_kernel``). The tail group's block
+     table only ever has its FIRST column written -- ``KpoolTailManager``
+     allocates exactly one block per request and never grows -- so for any
+-    token at ``pos >= kpool`` that kernel reads a zero column and the slot
++    token at ``pos >= ring`` that kernel reads a zero column and the slot
+     collapses onto physical tail block 0. All concurrently running requests
+-    then share one ``kpool``-slot ring and corrupt each other's pool
+-    compression (seed / stash / completion all target block 0). This maps
+-    ``slot = own_block * kpool + pos % kpool`` instead, which is the layout
+-    the tail kernels and ``KpoolTailManager`` are designed around.
++    then share one ring and corrupt each other's pool compression (seed /
++    stash / completion all target block 0). This maps
++    ``slot = own_block * ring + pos % ring`` instead, which is the layout the
++    tail kernels and ``KpoolTailManager`` are designed around. ``ring`` is the
++    tail spec's ``block_size``.
+ 
+     Pure torch (no Triton, no device sync): the indexer op consumes the tail
+     slot mapping on its eager break, so the returned tensor need not be the
+@@ -321,7 +323,7 @@ def compute_kpool_tail_slot_mapping(
+     req = req.clamp_(min=0, max=num_reqs - 1)
+     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
+     pos = positions[:num_actual_tokens].to(torch.int64)
+-    out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
++    out[:num_actual_tokens] = own_block * ring + torch.remainder(pos, ring)
+     return out
+ 
+ 
+@@ -330,7 +332,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
+ 
+     The tail is storage-only (no attention / MQA-logits), so it skips the
+     DeepseekV32 indexer builder's DeepGEMM paged-MQA path -- which requires
+-    ``block_kv in {32,64}`` and asserts on the tail's ``block_size == kpool``.
++    ``block_kv in {32,64}`` and asserts on the tail's ring-sized block.
+     It exports only the group's token-granular ``slot_mapping`` plus the
+     prefill/decode counts; the indexer op reads
+     ``attn_metadata[tail_prefix].slot_mapping``. The slot mapping is
+@@ -369,7 +371,7 @@ def build(
+         positions = common_attn_metadata.positions
+         if positions is not None:
+             # Circular per-request layout; the generic kernel output collapses
+-            # onto tail block 0 for pos >= kpool (see compute_... docstring).
++            # onto tail block 0 for pos >= ring (see compute_... docstring).
+             slot_mapping = compute_kpool_tail_slot_mapping(
+                 slot_mapping,
+                 common_attn_metadata.block_table_tensor,
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index eef76511d6..7154e5d5ef 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1803,7 +1803,8 @@ def _glm5_next_tensor_layout(
+         tail_names = list(tail_group.layer_names)
+         # The tail spec is padded to idx_page (co-owns the indexer tensor), so
+         # page_size_bytes returns idx_page. Callers need the *logical* tail page
+-        # (2048 B) for transfer sizing and accounting; use unpadded.
++        # (ring * 2 * head_dim elements) for transfer sizing and accounting;
++        # use unpadded.
+         tail_pages = {
+             cast(KpoolTailSpec, s).real_page_size_bytes
+             for s in cast(
