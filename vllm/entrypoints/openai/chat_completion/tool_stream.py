@@ -111,6 +111,25 @@ def flush_tool_calls(
     record_tool_calls(result.tool_calls or [], snapshot)
     complete = parser.extract_tool_calls(text, request)
     if not complete.tools_called:
+        # [本地 2026-11-27] 孤立标签正文回吐（verify_r9 G2 回归修复）。
+        # 模型的正文就是一个孤立/未闭合的工具标签（如 `<function=Write>`）时，
+        # 流式状态机会把它 hold 住等后续结构；而 1.5.4 的 finish 帧
+        # `output.token_ids` 为空 ⇒ parser 包装层的 `_is_eos` 判据不成立
+        # ⇒ 被 hold 的正文既不进 content 也不进 tool_calls，整段丢失
+        # （实测 completion_tokens 含 8 个 content token 但客户端收到空串）。
+        # 此处用非流式重解析的完整正文，与 parser 记录的**已下发正文**做前缀
+        # 比对后补发差集；`_opt22e_content_out` 只有本地移植的 qwen3coder
+        # parser 具备（哨兵 None），其它 parser 保持官方行为不变。
+        sent_content = getattr(parser, "_opt22e_content_out", None)
+        if sent_content is not None:
+            full_content = getattr(complete, "content", None) or ""
+            if (
+                full_content
+                and len(full_content) > len(sent_content)
+                and full_content.startswith(sent_content)
+            ):
+                result.content = (result.content or "") + full_content[len(sent_content):]
+                return result, False
         return delta, False
     result.tool_calls = list(result.tool_calls or [])
     for index, call in enumerate(complete.tool_calls):

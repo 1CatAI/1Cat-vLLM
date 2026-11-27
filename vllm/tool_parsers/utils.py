@@ -4,6 +4,7 @@
 import ast
 import json
 import math
+import re
 from collections.abc import Sequence
 from decimal import Decimal
 from json import JSONDecodeError, JSONDecoder
@@ -147,6 +148,39 @@ def consume_space(i: int, s: str) -> int:
     return i
 
 
+def _is_json_finite(value: Any) -> bool:
+    """Reject non-finite floats that would serialise to non-JSON constants.
+
+    ``json.dumps`` emits ``Infinity``/``-Infinity``/``NaN`` for these, which
+    Python accepts on read-back but every strict JSON consumer rejects. The
+    usual source is a model writing ``1e999`` into a numeric argument.
+    """
+    return math.isfinite(value)
+
+
+def json_dumps_safe(obj: Any, **kwargs: Any) -> str:
+    """``json.dumps`` that never emits ``Infinity``/``NaN``.
+
+    Non-finite floats are replaced with ``None`` so the payload stays valid
+    JSON: dropping them silently keeps the tool call usable, whereas emitting
+    the Python extension would break the caller's parser.
+    """
+    kwargs.setdefault("ensure_ascii", False)
+    if not kwargs.get("allow_nan", True):
+        return json.dumps(obj, **kwargs)
+    return json.dumps(_sanitise_non_finite(obj), allow_nan=False, **kwargs)
+
+
+def _sanitise_non_finite(obj: Any) -> Any:
+    if isinstance(obj, float):
+        return obj if _is_json_finite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitise_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitise_non_finite(v) for v in obj]
+    return obj
+
+
 def _extract_tool_info(
     tool: Tool,
 ) -> tuple[str, dict[str, Any] | None]:
@@ -172,6 +206,96 @@ def find_tool_properties(
     return {}
 
 
+# opt22e：请求侧「明确禁止调用」信号。用于把「只做分析/展示格式、不要执行」
+# 的意图**在服务端识别出来**并整轮降级。
+#
+# ⚠️ 模式必须**窄**：system prompt 里常见的「不要调用未注册的工具」「只能调用
+# 下列工具」属于**格式约束**而非禁止意图，误匹配会把真实调用整轮吞掉。
+# 故只认**明确的禁止性表述**（「不要真的调用/执行」「禁止调用/执行」）。
+_NO_CALL_INTENT_RE = re.compile(
+    r"不要真的(?:调用|执行|运行|写|写入|创建|修改|删除|保存|生成)"
+    r"|不得真的(?:调用|执行|运行|写|写入|创建|修改|删除|保存|生成)"
+    r"|禁止(?:调用|执行)"
+    r"|不要执行任何|不得执行任何"
+    # opt22e C 扩展（2026-10-04）：**格式讲解/展示**意图（「只讲/只看格式」）。
+    # 用于覆盖用户消息里的 E5 类场景：「请展示 Write 的调用格式，不要真的写文件」。
+    # 需 **只/仅 + 看/讲/… + 格式/用法** 同现，避免误伤「只能调用下列工具」等格式约束。
+    r"|只(?:想|需|要)?(?:看|讲|说|展示|了解|介绍|对比|描述).{0,12}(?:格式|用法|写法|长什么样)"
+    r"|仅(?:想|需|要)?(?:看|讲|说|展示|了解|介绍|对比|描述).{0,12}(?:格式|用法|写法|长什么样)"
+)
+
+
+def _msg_field(m, key):
+    """消息字段取值：兼容 **dict**（生产：`ChatCompletionRequest.messages` 元素为 dict）
+    与**对象**（离线测试的 Msg）。⚠️ 此前只用 `getattr` ⇒ 生产中 role/content 恒为
+    None ⇒ C 规则（含 system 分支）**从未生效**，是 E5 幽灵长期漏网的根因。"""
+    if isinstance(m, dict):
+        return m.get(key)
+    return getattr(m, key, None)
+
+
+def _no_call_intent_hit(content) -> bool:
+    if isinstance(content, str):
+        return bool(_NO_CALL_INTENT_RE.search(content))
+    if isinstance(content, (list, tuple)):
+        for part in content:
+            text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+            if isinstance(text, str) and _NO_CALL_INTENT_RE.search(text):
+                return True
+    return False
+
+
+def request_forbids_tool_calls(request) -> bool:
+    """opt22e：请求是否**明确禁止**工具调用（整轮降级为文本）。
+
+    仅用于补足 `tool_choice="none"`：客户端可能把该意图写在 prompt 里
+    （如「这只是格式分析，不要真的调用工具」），而未传 `tool_choice`。
+    此时模型可能在 **content** 里裸写完整调用，其字节形态与真实调用**无法区分**
+    ⇒ 只能靠请求侧信号判定。
+
+    扫描范围（2026-10-04 扩展）：
+      - **system / developer**：**全部**消息（沿用原行为）。
+      - **user**：**仅最后一条**（当前请求；避免历史轮次里的禁调语句误伤后续真实调用）。
+
+    ⚠️ 模式刻意取窄（见 `_NO_CALL_INTENT_RE`），避免误伤格式约束类提示词
+    （如「不要调用未注册的工具」**不得**命中）。
+    """
+    msgs = getattr(request, "messages", None)
+    if not msgs:
+        return False
+    last_user = None
+    for m in msgs:
+        role = _msg_field(m, "role")
+        if role in ("system", "developer"):
+            if _no_call_intent_hit(_msg_field(m, "content")):
+                return True
+        elif role == "user":
+            last_user = m
+    if last_user is not None and _no_call_intent_hit(_msg_field(last_user, "content")):
+        return True
+    return False
+
+
+def find_tool_required(
+    tools: list[Tool] | None,
+    tool_name: str,
+) -> list[str]:
+    """opt22e：返回该工具 schema 中 ``required`` 声明的参数名列表（无则 []）。
+
+    用于「必填参数兜底」：模型写文档时正文里的**完整示例**会被文本层误判为
+    真实调用，其参数往往缺失或与 schema 不符。真实调用必然带齐必填参数，
+    故「缺必填 ⇒ 不是真实调用」是一条**不依赖枚举形态**的通用判据。
+    """
+    if not tools:
+        return []
+    for tool in tools:
+        name, params = _extract_tool_info(tool)
+        if name == tool_name:
+            req = (params or {}).get("required")
+            return list(req) if isinstance(req, (list, tuple)) else []
+    return []
+
+
 _OPEN_SCHEMA_COMBINATORS = (
     "additionalProperties",
     "patternProperties",
@@ -192,6 +316,29 @@ def is_closed_empty_object_schema(schema: Any) -> bool:
         and schema.get("additionalProperties") is False
         and not any(k in schema for k in _OPEN_SCHEMA_COMBINATORS[1:])
     )
+
+
+def _parse_finite_number(value: str) -> int | float | None:
+    """Parse a finite JSON number; whole values (also "3.0", "1e3") as int.
+
+    int() comes first so that integers above 2**53 stay exact. inf/-inf/nan
+    are not valid JSON numbers and give None.
+    """
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        pass
+    try:
+        number = float(value)
+    except (ValueError, TypeError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if number.is_integer():
+        exact = Decimal(value)
+        if exact == exact.to_integral_value():
+            return int(exact)
+    return number
 
 
 def _params_or_empty_object(params: dict[str, Any] | None) -> dict[str, Any]:
@@ -216,10 +363,11 @@ def _params_or_empty_object(params: dict[str, Any] | None) -> dict[str, Any]:
 
 def _get_tool_schema_from_tool(tool: Tool) -> dict:
     name, params = _extract_tool_info(tool)
+    params = params if params else {"type": "object", "properties": {}}
     return {
         "properties": {
             "name": {"type": "string", "enum": [name]},
-            "parameters": _params_or_empty_object(params),
+            "parameters": params,
         },
         "required": ["name", "parameters"],
     }
@@ -256,8 +404,8 @@ def _get_json_schema_from_tools(
             "anyOf": [_get_tool_schema_from_tool(tool) for tool in tools],
         },
     }
-    # Only an explicit `false` asks for a single call; `None` means the field
-    # was not set and the default (parallel calls allowed) applies.
+    # [本地 2026-11-26 对齐 1.5.4 官方] 仅显式 False 要求单次调用；
+    # None 表示字段未设，按默认（允许并行）处理。
     if parallel_tool_calls is False:
         json_schema["maxItems"] = 1
     json_schema_defs = _get_tool_schema_defs(tools)
@@ -282,20 +430,21 @@ def get_json_schema_from_tools(
         tool_map = {tool.name: tool for tool in tools if isinstance(tool, FunctionTool)}
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
+        # [本地 2026-11-26 对齐 1.5.4 官方] 空参数也约束为 object。
         return _params_or_empty_object(tool_map[tool_name].parameters)
     # tool_choice: Forced Function (ChatCompletion)
     if (not isinstance(tool_choice, str)) and isinstance(
         tool_choice, ChatCompletionNamedToolChoiceParam
     ):
         tool_name = tool_choice.function.name
-        chat_tool_map = {
+        tool_map = {
             tool.function.name: tool
             for tool in tools
             if isinstance(tool, ChatCompletionToolsParam)
         }
-        if tool_name not in chat_tool_map:
+        if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return _params_or_empty_object(chat_tool_map[tool_name].function.parameters)
+        return _params_or_empty_object(tool_map[tool_name].function.parameters)
     # tool_choice: "required"
     if tool_choice == "required":
         return _get_json_schema_from_tools(tools, parallel_tool_calls)
@@ -573,44 +722,6 @@ _TYPE_ALIASES: dict[str, str] = {
 }
 
 
-def _is_json_finite(obj: Any) -> bool:
-    """Whether *obj* can be serialized to valid JSON.
-
-    ``json.dumps(..., allow_nan=False)`` raises ``ValueError`` on any
-    non-finite float (``inf``/``-inf``/``nan``) anywhere in the value, so this
-    detects non-finite floats nested inside parsed lists/dicts too.
-    """
-    try:
-        json.dumps(obj, allow_nan=False)
-        return True
-    except (ValueError, TypeError):
-        return False
-
-
-def _parse_finite_number(value: str) -> int | float | None:
-    """Parse a finite JSON number; whole values (also "3.0", "1e3") as int.
-
-    int() comes first so that integers above 2**53 stay exact. inf/-inf/nan
-    are not valid JSON numbers and give None (int(float("inf")) would raise
-    OverflowError, json.dumps(inf) would emit invalid JSON "Infinity").
-    """
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        pass
-    try:
-        number = float(value)
-    except (ValueError, TypeError):
-        return None
-    if not math.isfinite(number):
-        return None
-    if number.is_integer():
-        exact = Decimal(value)
-        if exact == exact.to_integral_value():
-            return int(exact)
-    return number
-
-
 def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
     """Best-effort coercion of a raw string value to a JSON Schema type.
 
@@ -652,17 +763,16 @@ def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
         if candidate_type == "string":
             return value
         if candidate_type == "integer":
-            number = _parse_finite_number(value)
-            # JSON Schema integers include whole numbers written as floats.
-            if isinstance(number, int):
-                return number
-            continue
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                continue
         if candidate_type == "number":
-            number = _parse_finite_number(value)
-            if number is not None:
-                return number
-            # Not a number, or inf/nan: try the next type.
-            continue
+            try:
+                val = float(value)
+                return val if val != int(val) else int(val)
+            except (ValueError, TypeError):
+                continue
         if candidate_type == "boolean":
             lower_val = value.lower().strip()
             if lower_val in ("true", "1"):
@@ -672,25 +782,14 @@ def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
             continue
         if candidate_type in ("object", "array"):
             try:
-                parsed = json.loads(value)
+                return json.loads(value)
             except (json.JSONDecodeError, ValueError, TypeError):
                 continue
-            if _is_json_finite(parsed):
-                return parsed
-            # Non-finite floats (e.g. "[1e999]" -> [inf]) cannot be
-            # serialized back to valid JSON; preserve the raw string.
-            continue
 
     try:
-        parsed = json.loads(value)
+        return json.loads(value)
     except (json.JSONDecodeError, ValueError):
         return value
-    # Reject non-finite results (e.g. json.loads("1e999") -> inf, or nested
-    # inf/nan inside a parsed list/dict) which json.dumps would render as
-    # invalid JSON (Infinity/NaN). Preserve the raw string instead.
-    if not _is_json_finite(parsed):
-        return value
-    return parsed
 
 
 def compute_tool_delta(
@@ -737,3 +836,189 @@ def compute_tool_delta(
         if arg_diff
         else None
     )
+
+
+import re as _re
+
+# opt22d(R1): 形似工具调用的标签匹配。
+# 后缀分支 \"<[^<>]*$\" 覆盖“无右尖括号的截断残片”。
+TOOL_LIKE_TAG_RE = _re.compile(
+    r"</?(?:tool_call|toolcall|tool|function|parameter|param)\b[^<>]*?/?>"
+    r"|</?(?:tool_call|toolcall|tool|function|parameter|param)\b[^<>]*$"
+)
+
+
+def escape_tool_like_tags(text: str) -> str:
+    """opt22d(R1): 把“形似工具调用”的裸标签换成显示安全的形式，使下游无法把它们当真实调用执行。
+
+    转义形如 `<function=Write>` -> `⟨'function=Write'⟩`（数学尖括号 + 成对单引号）。
+    不用 `&lt;`/`&gt;` 实体的原因：① 纯文本渲染下很难看；② 若下游做 HTML 解码
+    会被还原成 `<` 而失效。不用全角 `＜＞` 的原因：NFKC 会映射回 ASCII `<`/`>`。
+
+    仅命中工具调用词族的标签名——`a<b`、`20<3`、`<p>` 等普通文本不受影响。
+    **幂等**：已转义的 `⟨'...'⟩` 不再匹配（正则要求标签名紧跟 `<`），
+    故对“已由工具解析器转义过”的内容重复施加也无害。
+    """
+    if not text:
+        return text
+    return TOOL_LIKE_TAG_RE.sub(
+        lambda m: m.group(0).replace("<", "⟨'").replace(">", "'⟩"), text
+    )
+
+
+# [example 区间 2026-10-18] `example` 容器（`etool_call` = example tool call）。
+# 区间内是模型**展示给用户**的示例，必须原样呈现（用户会复制粘贴），
+# 既不转义、也不得被下游当成真实调用。未闭合区间延伸到文本末尾。
+EXAMPLE_SPAN_RE = _re.compile(
+    r"<example>.*?</example>|<etool_call>.*?</etool_call>"
+    r"|<example>.*$|<etool_call>.*$",
+    _re.S,
+)
+
+
+# markdown 代码围栏的**行首**标记（``` 或 ~~~，允许缩进）。
+_FENCE_LINE_RE = _re.compile(r"(?m)^[ \t]*(?:`{3,}|~{3,})[^\n]*")
+
+
+def _verbatim_spans(text: str) -> list[tuple[int, int]]:
+    """示例区间：`<example>`/`<etool_call>` 块 + markdown 代码块，按位置合并。
+
+    未闭合的一律延伸到文本末尾（此处是**展示收口**，内容已完整，不需延迟）。
+    """
+    raw: list[tuple[int, int]] = [
+        (m.start(), m.end()) for m in EXAMPLE_SPAN_RE.finditer(text)
+    ]
+    marks = [(m.start(), m.end()) for m in _FENCE_LINE_RE.finditer(text)]
+    for i in range(0, len(marks) - 1, 2):
+        raw.append((marks[i][0], marks[i + 1][1]))
+    if len(marks) % 2:
+        raw.append((marks[-1][0], len(text)))
+    raw.sort()
+    merged: list[tuple[int, int]] = []
+    for s, e in raw:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def escape_tool_like_tags_outside_examples(text: str) -> str:
+    """对示例区间**之外**的形似工具标签做展示转义。
+
+    serving 层统一收口用：示例区间内的裸标签是**示例正文**，必须原样下发；
+    区间外仍按原规则转义（防止下游 harness 把文档里的标签当真实调用执行）。
+
+    示例区间 = `<example>` / `<etool_call>` **以及 markdown 代码块**（2026-10-19）：
+    代码块是模型展示工具调用写法的标准容器，块内标签属于示例而非可执行调用。
+    """
+    if not text:
+        return text
+    if (
+        "<example" not in text
+        and "<etool_call" not in text
+        and "```" not in text
+        and "~~~" not in text
+    ):
+        return escape_tool_like_tags(text)
+    out: list[str] = []
+    last = 0
+    for start, end in _verbatim_spans(text):
+        out.append(escape_tool_like_tags(text[last:start]))
+        out.append(text[start:end])
+        last = end
+    out.append(escape_tool_like_tags(text[last:]))
+    return "".join(out)
+
+
+# opt22d（L-E）：工具类标签名（含别名），用于判断“残缺前缀”是否还可能是工具标签
+_TOOL_TAG_NAMES = ("tool_call", "toolcall", "tool", "function", "parameter", "param")
+
+
+def split_incomplete_tool_tag_tail(text: str) -> tuple[str, str]:
+    """opt22d（L-E）：把末尾“尚未闭合、仍可能长成工具类标签”的片段摘出来。
+
+    流式下标签会被切分（如 ``<p`` + ``arameter=file_path>``、``</function`` + ``>``）。
+    若在**片段粒度**上做转义，两种失败模式：
+      ① 标签名不完整（``<p``）→ 转义正则两个分支都不匹配 → **裸 ``<`` 泄漏**；
+      ② 名完整而缺 ``>``（``</function``）→ 只替换 ``<`` → 后到的 ``>`` 不匹配
+         → 产出 ``⟨'/function>`` 这类**畸形**（开一半、闭一半）。
+    故调用方应把这种尾部**暂存**到下一轮，等 ``>`` 到齐后整体转义。
+
+    Args:
+        text: 待处理的文本（通常是累积缓冲/整段文本）
+
+    Returns:
+        ``(可安全转义的部分, 需暂存的尾部)``；无此类尾部时返回 ``(text, "")``。
+    """
+    i = text.rfind("<")
+    if i == -1:
+        return text, ""
+    tail = text[i:]
+    if ">" in tail:
+        return text, ""
+    # 仅 "<" / "</"（其后还没有任何字符）才可能长成任意工具标签：暂存一个字符宽度，
+    # 下一字符到达即重新判定（自限，不会长期扣留）。
+    if tail in ("<", "</"):
+        return text[:i], tail
+    inner = tail[1:]
+    if inner.startswith("/"):
+        inner = inner[1:]
+    tok = ""
+    for ch in inner:
+        if ch.isalnum() or ch == "_":
+            tok += ch
+        else:
+            break
+    # opt22d 修正（2026-09-17）：tok 必须**非空**才算候选。空 tok 意味着 "<" 后紧跟
+    # 空格/标点（正文里的 `a < b`、`tokenCount < limit`），永远长不成标签；旧写法
+    # `name.startswith("")` 恒真 ⇒ 这类孤立 "<" 被当成候选暂存，其后全部文本被扣在
+    # 缓冲里，流式结束不补发 ⇒ **消息在孤立 "<" 处被截断**（xml/coder 双路径实测复现）。
+    if tok and any(name.startswith(tok) for name in _TOOL_TAG_NAMES):
+        return text[:i], tail
+    return text, ""
+
+
+def mask_tool_like_tags_holding_tail(text: str) -> str:
+    """opt22d（L-E）：转义的同时**丢弃**末尾未闭合的工具类标签片段。
+
+    供 coder 使用——它靠“当前文本 − 上一轮文本”相减推导增量，
+    必须保证遮罩结果的前缀关系稳定，故暂存片段不能出现在遮罩输出里，
+    留待下一轮片段闭合后以整体转义的形式出现。
+    """
+    head, _held = split_incomplete_tool_tag_tail(text)
+    return escape_tool_like_tags(head)
+
+
+# [opt22 去重 2026-10-14 → 抽分 2026-10-14晚] 三判据本体移至 qwen3_opt22_core
+# （qwen 双 parser 专用核心；发版 wheel 中该模块编译为二进制，见 patches/release-gated/）。
+# 此处 re-export 保持既有 import 路径兼容（coder/xml 及任何调用方零改动）。
+#
+# [2026-11-27] 循环导入打断（PEP 562 延迟导出）。
+# `qwen3_opt22_core` 反向依赖本模块的 `_extract_tool_info` / `find_tool_required` /
+# `request_forbids_tool_calls`，模块级 `from ... import` 构成环。原生 import 恰好
+# 能容忍（先加载方已定义被依赖符号），但热重载 `_hotreload.prepare_reload()` 的
+# 隔离执行按模块名字母序先 stage `qwen3_opt22_core`：此时 core 卡在 import utils，
+# utils 执行到这里又会 import 半成品 core ⇒ ImportError
+# （实测 `POST /v1/internal/reload` 恒返 409 "cannot import name
+# 'missing_required_args'"）。改为延迟导出后 utils 加载期不再依赖 core，
+# 调用方 `from ...utils import missing_required_args` 的语义完全不变。
+_DEFERRED_CORE_EXPORTS = (
+    "missing_required_args",
+    "opt22d_should_force_all",
+    "registered_tool_names",
+)
+
+
+def __getattr__(name: str):  # noqa: D401 - PEP 562 module-level lazy export
+    if name in _DEFERRED_CORE_EXPORTS:
+        from vllm.tool_parsers import qwen3_opt22_core as _core
+
+        value = getattr(_core, name)
+        # 缓存进模块 globals：后续访问直接命中，不再走 __getattr__。
+        # 热重载 stage 出来的新模块是全新对象、有独立 globals，缓存互不影响。
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+

@@ -1214,6 +1214,8 @@ if TYPE_CHECKING:
     VLLM_SYSTEM_START_DATE: str | None = None
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = False
+    # [本地 2026-11-26 重放 opt22] qwen3-coder / qwen3-xml 工具调用修复开关
+    VLLM_QWEN3X_TOOL_FIX: int = 1
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
@@ -18530,6 +18532,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
+    # [本地 2026-11-26 重放 opt22] qwen3-coder / qwen3-xml 工具调用修复开关
+    # (0/1/2/3/4)。双 parser 直接 `from vllm.envs import VLLM_QWEN3X_TOOL_FIX`，
+    # 故必须注册。fallback 到 legacy 名 VLLM_QWEN3CODER_STREAMING_FIX。
+    "VLLM_QWEN3X_TOOL_FIX": env_var(
+        lambda: int(
+            os.getenv(
+                "VLLM_QWEN3X_TOOL_FIX",
+                os.getenv("VLLM_QWEN3CODER_STREAMING_FIX", "1"),
+            )
+        ),
+        description=(
+            "Shared tool-call fix switch for qwen3-coder / qwen3-xml "
+            "(0/1/2/3/4); opt22d/e."
+        ),
+        category="configuration",
+        declared_default="1",
+        effective_default="1",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     # Add optional custom scopes for profiling, disable to avoid overheads
     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": env_var(
         lambda: bool(int(os.getenv("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "0"))),
@@ -23023,6 +23046,8 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        # [本地 2026-11-26 重放 opt22] 工具解析器运行时开关，不影响编译内核
+        "VLLM_QWEN3X_TOOL_FIX",
         "VLLM_SM70_PHASE_SEPARATION",
         "VLLM_SM70_PHASE_DECODE_SHARE",
         "VLLM_SM70_PHASE_MAX_WAIT_MS",
