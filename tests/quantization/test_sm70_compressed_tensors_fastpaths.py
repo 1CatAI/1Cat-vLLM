@@ -3,7 +3,9 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
+from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
@@ -11,13 +13,115 @@ from compressed_tensors.quantization import (
 )
 
 import vllm.envs as envs
+from vllm.model_executor.layers.fused_moe import MoEActivation
+from vllm.model_executor.layers.fused_moe.experts import skinny_sm70_moe
+from vllm.model_executor.layers.quantization import nvfp4_sm70_moe
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsConfig,
     CompressedTensorsLinearMethod,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+    CompressedTensorsMoEMethod,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+    compressed_tensors_moe_w4a4_nvfp4 as ct_nvfp4,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
     CompressedTensorsW8A16Fp8,
     _sm70_channel_fp8_qpn8_config,
 )
+
+
+@pytest.mark.parametrize(
+    ("override", "a16", "native_enabled", "skinny", "use_turbomind"),
+    [
+        ({}, True, True, False, True),
+        ({"moe_backend": "marlin"}, True, True, False, False),
+        ({"intermediate_size_per_partition": 320}, True, True, False, False),
+        ({"num_local_experts": 256}, True, True, False, True),
+        ({"in_dtype": torch.bfloat16}, True, True, False, True),
+        ({}, False, True, False, True),
+        ({}, True, False, False, False),
+        ({}, True, True, True, False),
+        (
+            {
+                "hidden_dim": 2048,
+                "intermediate_size_per_partition": 128,
+                "num_experts": 256,
+                "num_local_experts": 256,
+                "experts_per_token": 8,
+            },
+            True,
+            True,
+            False,
+            True,
+        ),
+    ],
+)
+def test_ct_nvfp4_sm70_backend_selection(
+    monkeypatch, override, a16, native_enabled, skinny, use_turbomind
+):
+    monkeypatch.setattr(
+        nvfp4_sm70_moe, "should_use_nvfp4_moe_turbomind", lambda: native_enabled
+    )
+    monkeypatch.setattr(skinny_sm70_moe, "skinny_backend_admitted", lambda _: skinny)
+    monkeypatch.setattr(
+        ct_nvfp4,
+        "select_nvfp4_moe_backend",
+        lambda **_: (ct_nvfp4.NvFp4MoeBackend.MARLIN, None),
+    )
+    weight = QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.FLOAT,
+        symmetric=True,
+        strategy=QuantizationStrategy.TENSOR_GROUP,
+        group_size=16,
+        dynamic=False,
+    )
+    fmt = CompressionFormat.nvfp4_pack_quantized.value
+    scheme = {"weights": weight, "input_activations": None if a16 else weight}
+    config = CompressedTensorsConfig(
+        {f"experts.0.{proj}_proj": scheme for proj in ("gate", "up", "down")},
+        [],
+        fmt,
+    )
+    layer = torch.nn.Module()
+    layer.moe_config = SimpleNamespace(
+        **(
+            dict(
+                tp_size=4,
+                dp_size=1,
+                pcp_size=1,
+                use_ep=False,
+                is_sequence_parallel=False,
+                moe_parallel_config=SimpleNamespace(
+                    enable_eplb=False, use_all2all_kernels=False
+                ),
+                device=torch.device("cuda"),
+                in_dtype=torch.float16,
+                moe_backend="auto",
+                num_experts=512,
+                num_local_experts=512,
+                experts_per_token=10,
+                hidden_dim=2560,
+                intermediate_size_per_partition=160,
+                activation=MoEActivation.SILU,
+                is_act_and_mul=True,
+                swiglu_limit=None,
+                has_bias=False,
+                is_lora_enabled=False,
+                apply_router_weight_on_input=False,
+            )
+            | override
+        )
+    )
+    method = CompressedTensorsMoEMethod.get_moe_method(config, layer, "experts")
+    cls = (
+        nvfp4_sm70_moe.CompressedTensorsNvfp4SM70MoEMethod
+        if use_turbomind
+        else ct_nvfp4.CompressedTensorsW4A4Nvfp4MoEMethod
+    )
+    assert type(method) is cls
 
 
 def _make_channel_fp8_scheme(monkeypatch, *, static_input: bool = False):

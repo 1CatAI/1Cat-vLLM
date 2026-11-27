@@ -384,7 +384,13 @@ def apply_runtime_defaults(cfg, defaults, phase: str, *, is_sm70: bool):
             and cfg.parallel_config.decode_context_parallel_size in (1, 2)
             and cfg.parallel_config.prefill_context_parallel_size == 1
             and getattr(cfg.model_config, "quantization", None)
-            in ("gguf", "modelopt", "modelopt_fp4")
+            in (
+                "gguf",
+                "modelopt",
+                "modelopt_fp4",
+                "modelopt_mixed",
+                "compressed-tensors",
+            )
         ):
             layers = cfg.kernel_config.layer_execution
             if layers.sources.get("hc_prefill_sequence_parallel") != "typed":

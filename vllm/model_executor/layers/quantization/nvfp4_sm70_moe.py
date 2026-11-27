@@ -10,7 +10,7 @@ expert-weight copy.
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Final, Literal
 
 import torch
 from torch.nn import Parameter
@@ -49,9 +49,13 @@ from vllm.model_executor.layers.fused_moe.sm70.reduction import (
 from vllm.model_executor.layers.fused_moe.sm70.reduction import (
     _single_token_weighted_reduce as _single_token_weighted_reduce,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
+    CompressedTensorsW4A4Nvfp4MoEMethod,
+)
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
+    _sm70_moe_backend_requested_explicitly,
 )
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
     Sm70MoeStageRoute as Stage,
@@ -62,6 +66,7 @@ from vllm.model_executor.layers.quantization.sm70_moe_router import (
 from vllm.model_executor.layers.quantization.sm70_turbomind import (
     NVFP4_GROUP_SIZE,
     is_exact_sm70_cuda,
+    should_use_nvfp4_moe_turbomind,
 )
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     LayerWorkspaceView,
@@ -660,25 +665,51 @@ def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
         )
 
 
-def _validate_weight_layout(layer: RoutedExperts) -> None:
+_CheckpointFormat = Literal["modelopt", "compressed-tensors"]
+_CHECKPOINT_FIELDS: Final = {
+    "modelopt": (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale_2",
+        "w2_weight_scale_2",
+        "w13_input_scale",
+        "w2_input_scale",
+    ),
+    "compressed-tensors": (
+        "w13_weight_packed",
+        "w2_weight_packed",
+        "w13_weight_global_scale",
+        "w2_weight_global_scale",
+        "w13_input_global_scale",
+        "w2_input_global_scale",
+    ),
+}
+
+
+def _validate_weight_layout(
+    layer: RoutedExperts, *, checkpoint_format: _CheckpointFormat = "modelopt"
+) -> None:
+    w13_weight, w2_weight, w13_global, w2_global, *_ = _CHECKPOINT_FIELDS[
+        checkpoint_format
+    ]
     local_experts = int(layer.local_num_experts)
     hidden = int(layer.moe_config.hidden_dim)
     intermediate = int(layer.moe_config.intermediate_size_per_partition)
     expected = {
-        "w13_weight": (local_experts, 2 * intermediate, hidden // 2),
+        w13_weight: (local_experts, 2 * intermediate, hidden // 2),
         "w13_weight_scale": (
             local_experts,
             2 * intermediate,
             hidden // NVFP4_GROUP_SIZE,
         ),
-        "w13_weight_scale_2": (local_experts, 2),
-        "w2_weight": (local_experts, hidden, intermediate // 2),
+        w13_global: (local_experts, 2),
+        w2_weight: (local_experts, hidden, intermediate // 2),
         "w2_weight_scale": (
             local_experts,
             hidden,
             intermediate // NVFP4_GROUP_SIZE,
         ),
-        "w2_weight_scale_2": (local_experts,),
+        w2_global: (local_experts,),
     }
     tensors = {name: getattr(layer, name) for name in expected}
     for name, shape in expected.items():
@@ -687,7 +718,7 @@ def _validate_weight_layout(layer: RoutedExperts) -> None:
                 f"SM70 NVFP4 MoE layout mismatch for {name}: "
                 f"expected {shape}, got {tuple(tensors[name].shape)}."
             )
-    if layer.w13_weight.dtype != torch.uint8 or layer.w2_weight.dtype != torch.uint8:
+    if any(tensors[name].dtype != torch.uint8 for name in (w13_weight, w2_weight)):
         raise TypeError("SM70 NVFP4 MoE requires packed uint8 expert weights.")
     if (
         layer.w13_weight_scale.dtype != torch.float8_e4m3fn
@@ -696,23 +727,13 @@ def _validate_weight_layout(layer: RoutedExperts) -> None:
         raise TypeError("SM70 NVFP4 MoE requires FP8 E4M3 block scales.")
 
 
-class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
-    """ModelOpt NVFP4 experts with FP16 activations on native SM70."""
+class NvFp4SM70MoEMethod(FusedMoEMethodBase):
+    """Prepare and run native SM70 experts from loaded NVFP4 tensors."""
 
-    def __init__(
-        self,
-        quant_config: ModelOptNvFp4Config,
-        moe_config: FusedMoEConfig,
-    ) -> None:
+    def __init__(self, moe_config: FusedMoEConfig) -> None:
         FusedMoEMethodBase.__init__(self, moe_config)
         self.sm70_moe_policy = capture_nvfp4_moe_config()
         self.native_ops = NativeBindings(self.sm70_moe_policy.native.values)
-        if quant_config.quant_method not in {"NVFP4", "W4A16_NVFP4"}:
-            raise NotImplementedError(
-                "SM70 TurboMind ModelOpt NVFP4 MoE requires NVFP4-family "
-                f"checkpoint weights, got {quant_config.quant_method}."
-            )
-        self.quant_config = quant_config
         self.use_a16 = True
         self.use_global_sf = False
         validate_nvfp4_sm70_moe_contract(moe_config)
@@ -726,11 +747,16 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         # This method owns routing, TurboMind expert GEMMs, and unpermutation.
-        # Do not wrap it in the generic ModelOpt modular-kernel path.
+        # Do not wrap it in the generic modular-kernel path.
         del routing_tables
         return None
 
-    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+    def process_weights_after_loading(
+        self,
+        layer: RoutedExperts,
+        *,
+        checkpoint_format: _CheckpointFormat = "modelopt",
+    ) -> None:
         layer.sm70_moe_policy = self.sm70_moe_policy
         layer.sm70_nvfp4_batch_capabilities = {
             "w13": self.native_ops.has_nvfp4_qpn_w13_swiglu_batch_dispatch(),
@@ -807,9 +833,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             raise NotImplementedError("SM70 NVFP4 MoE does not support expert bias.")
         if layer.activation != MoEActivation.SILU:
             raise NotImplementedError(
-                f"SM70 NVFP4 MoE supports SwiGLU/SILU only, got "
-                f"{layer.activation}; quantize with compressed-tensors "
-                f"for the generic MoE path."
+                f"SM70 NVFP4 MoE supports SwiGLU/SILU only, got {layer.activation}."
             )
         if layer.apply_router_weight_on_input:
             raise NotImplementedError(
@@ -825,7 +849,22 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             )
 
         validate_nvfp4_sm70_moe_contract(layer.moe_config)
-        _validate_weight_layout(layer)
+        _validate_weight_layout(layer, checkpoint_format=checkpoint_format)
+        checkpoint_fields = _CHECKPOINT_FIELDS[checkpoint_format]
+        w13_weight_name, w2_weight_name, w13_global_name, w2_global_name, *_ = (
+            checkpoint_fields
+        )
+        w13_weight = getattr(layer, w13_weight_name).data
+        w2_weight = getattr(layer, w2_weight_name).data
+        w13_globals = getattr(layer, w13_global_name).data.float()
+        w2_globals = getattr(layer, w2_global_name).data.float()
+        if checkpoint_format == "compressed-tensors":
+            # Compressed-tensors stores the inverse dequantization multiplier.
+            w13_globals = w13_globals.reciprocal()
+            w2_globals = w2_globals.reciprocal()
+            scales = torch.cat((w13_globals.flatten(), w2_globals))
+            if not ((scales > 0) & torch.isfinite(scales)).all():
+                raise ValueError(f"Invalid NVFP4 global scales for {layer.layer_name}")
         num_experts = int(layer.local_num_experts)
         hidden = int(layer.moe_config.hidden_dim)
         intermediate = int(layer.moe_config.intermediate_size_per_partition)
@@ -989,7 +1028,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         for start in range(0, num_experts, chunk_size):
             end = min(start + chunk_size, num_experts)
 
-            w13_chunk = layer.w13_weight[start:end].data
+            w13_chunk = w13_weight[start:end]
             if w13_chunk.dim() > 3:
                 w13_chunk = torch.flatten(w13_chunk, start_dim=-2)
             w13_unpacked = (
@@ -1005,12 +1044,12 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 .contiguous()
             )
             w13_scales_chunk = layer.w13_weight_scale[start:end].float().clone()
-            w13_global_chunk = layer.w13_weight_scale_2[start:end].float()
+            w13_global_chunk = w13_globals[start:end]
             w13_scales_chunk[:, :intermediate].mul_(w13_global_chunk[:, 0:1, None])
             w13_scales_chunk[:, intermediate:].mul_(w13_global_chunk[:, 1:2, None])
             w13_scales_half = w13_scales_chunk.half().transpose(-1, -2).contiguous()
 
-            w2_chunk = layer.w2_weight[start:end].data
+            w2_chunk = w2_weight[start:end]
             if w2_chunk.dim() > 3:
                 w2_chunk = torch.flatten(w2_chunk, start_dim=-2)
             w2_unpacked = (
@@ -1025,9 +1064,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 .transpose(-1, -2)
                 .contiguous()
             )
-            w2_global_chunk = (
-                layer.w2_weight_scale_2[start:end].float().reshape(end - start, 1, 1)
-            )
+            w2_global_chunk = w2_globals[start:end].reshape(end - start, 1, 1)
             w2_scales_half = (
                 (layer.w2_weight_scale[start:end].float() * w2_global_chunk)
                 .half()
@@ -1067,7 +1104,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         prepared_w2_scales = torch.stack(w2_tm_scales)
         raw_fast_qpn = True
         if raw_scale:
-            raw_w13_globals = layer.w13_weight_scale_2.data.float().contiguous()
+            raw_w13_globals = w13_globals.contiguous()
             if fused_swiglu_prefill:
                 physical_global = raw_w13_globals.repeat(
                     1, intermediate // 32
@@ -1080,11 +1117,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 .view(torch.uint8)
                 .contiguous()
             )
-            raw_w2_globals = (
-                layer.w2_weight_scale_2.data.float()
-                .reshape(num_experts, 1)
-                .contiguous()
-            )
+            raw_w2_globals = w2_globals.reshape(num_experts, 1).contiguous()
             raw_w2_codes = (
                 (prepared_w2_scales.float() / raw_w2_globals[:, :, None])
                 .to(torch.float8_e4m3fn)
@@ -1340,14 +1373,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             layer, raw_scale=raw_scale
         )
 
-        del layer.w13_weight
-        del layer.w13_weight_scale
-        del layer.w13_weight_scale_2
-        del layer.w13_input_scale
-        del layer.w2_weight
-        del layer.w2_weight_scale
-        del layer.w2_weight_scale_2
-        del layer.w2_input_scale
+        del w13_weight, w2_weight
+        for name in (*checkpoint_fields, "w13_weight_scale", "w2_weight_scale"):
+            delattr(layer, name)
         # Release unused conversion blocks when allocator slack grows large
         # instead of synchronizing the device on every layer.
         if layer.w13_tm_weight.is_cuda:
@@ -1358,7 +1386,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             if slack > 512 * 1024 * 1024:
                 torch.accelerator.empty_cache()
         logger.info_once(
-            "SM70 ModelOpt NVFP4 TurboMind MoE path enabled "
+            "SM70 NVFP4 TurboMind MoE path enabled "
             "(hidden=%d, local_intermediate=%d, local_experts=%d, top_k=%d, "
             "graph_safe_decode=B1-B%d, compact_grouped_decode<=%d routed rows).",
             hidden,
@@ -2021,3 +2049,46 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
     ) -> FusedMoEQuantConfig | None:
         del layer
         return None
+
+
+class ModelOptNvFp4SM70MoEMethod(NvFp4SM70MoEMethod, ModelOptNvFp4FusedMoE):
+    """Use the ModelOpt loader with the native SM70 implementation."""
+
+    def __init__(
+        self,
+        quant_config: ModelOptNvFp4Config,
+        moe_config: FusedMoEConfig,
+    ) -> None:
+        if quant_config.quant_method not in {"NVFP4", "W4A16_NVFP4"}:
+            raise NotImplementedError(
+                "SM70 TurboMind ModelOpt NVFP4 MoE requires NVFP4-family "
+                f"checkpoint weights, got {quant_config.quant_method}."
+            )
+        super().__init__(moe_config)
+        self.quant_config = quant_config
+
+
+class CompressedTensorsNvfp4SM70MoEMethod(
+    NvFp4SM70MoEMethod, CompressedTensorsW4A4Nvfp4MoEMethod
+):
+    """Load CT NVFP4 expert tensors and run the native SM70 W4A16 path."""
+
+    group_size = 16
+
+    @staticmethod
+    def supports(layer: RoutedExperts) -> bool:
+        if (
+            not should_use_nvfp4_moe_turbomind()
+            or _sm70_moe_backend_requested_explicitly(layer)
+        ):
+            return False
+        try:
+            validate_nvfp4_sm70_moe_contract(layer.moe_config)
+        except NotImplementedError:
+            return False
+        return True
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        super().process_weights_after_loading(
+            layer, checkpoint_format="compressed-tensors"
+        )

@@ -1296,7 +1296,14 @@ class Qwen4ExpForCausalLM(
             and not is_offload_process()
             and current_platform.is_device_capability(70)
             and self.model_config.dtype == torch.float16
-            and self.model_config.quantization in ("gguf", "modelopt", "modelopt_fp4")
+            and self.model_config.quantization
+            in (
+                "gguf",
+                "modelopt",
+                "modelopt_fp4",
+                "modelopt_mixed",
+                "compressed-tensors",
+            )
             and (config.hc_count, config.hidden_size, config.hc_lowrank)
             == (4, 2560, 320)
             and self.vllm_config.kernel_config.hc_weight_storage == "sharded"

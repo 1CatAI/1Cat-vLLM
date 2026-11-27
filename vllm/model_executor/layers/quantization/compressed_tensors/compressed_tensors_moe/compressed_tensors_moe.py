@@ -136,6 +136,12 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     "For NVFP4 weights, input quantization must also be NVFP4 format ",
                     f"or None for NVFP4A16, found {input_quant}",
                 )
+            from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+                CompressedTensorsNvfp4SM70MoEMethod,
+            )
+
+            if CompressedTensorsNvfp4SM70MoEMethod.supports(layer):
+                return CompressedTensorsNvfp4SM70MoEMethod(layer.moe_config)
             return CompressedTensorsW4A4Nvfp4MoEMethod(
                 layer.moe_config, layer_name, use_a16=(input_quant is None)
             )

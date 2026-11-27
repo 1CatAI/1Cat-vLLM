@@ -144,6 +144,23 @@ def test_unqualified_model_keeps_collective_default(monkeypatch):
     assert not cfg.parallel_config.communication.value("gemma_rms_tp2")
 
 
+@pytest.mark.parametrize(
+    "quantization", ["modelopt_fp4", "modelopt_mixed", "compressed-tensors"]
+)
+@pytest.mark.parametrize("spec", [None, "mtp"])
+def test_flashnext_prefill_defaults_match_nvfp4_checkpoint_formats(
+    monkeypatch, quantization, spec
+):
+    cfg = engine(spec=spec)
+    cfg.model_config.quantization = quantization
+    apply(cfg, monkeypatch)
+    policy = cfg.kernel_config.layer_execution
+    assert policy.hc_prefill_sequence_parallel
+    assert policy.hc_prefill_peer_norm
+    assert policy.ple_prefill_conv
+    assert cfg.kernel_config.sm70_sparse.qsa_prefill_tp_rows
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_engines_do_not_inherit_auto_defaults(monkeypatch, reverse):
     fast = engine(spec="mtp")
