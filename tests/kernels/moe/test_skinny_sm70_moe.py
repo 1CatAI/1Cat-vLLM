@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -12,10 +13,13 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
     Mxfp4SkinnySm70Experts,
     Nvfp4SkinnySm70Experts,
+    QpnFragmentOrder,
+    _fragment_tables,
     _ScaleCaches,
     grouped_splitk,
     nvfp4_skinny_scale_reason,
     qpn_prepack,
+    qpn_scale_entries,
     rebase_e8m0_for_fp16,
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
@@ -27,9 +31,14 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     NvFp4MoeBackend,
     map_nvfp4_backend,
 )
+from vllm.model_executor.layers.quantization.utils.csf32_expand import (
+    CsfExpertScales,
+)
+from vllm.model_executor.layers.quantization.utils.csf32_scales import encode_csf32
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     break_fp4_bytes,
 )
+from vllm.model_executor.layers.quantization.utils.s5_scales import encode_s5
 from vllm.platforms import current_platform
 
 
@@ -180,15 +189,16 @@ def test_nvfp4_gate_and_up_require_the_same_global_factor():
     assert "shared factor" in nvfp4_skinny_scale_reason(g1, torch.ones(2))
 
 
+@pytest.mark.parametrize("order", list(QpnFragmentOrder))
 @pytest.mark.parametrize("scale_group", [16, 32])
-def test_qpn_prepack_only_permutes_the_checkpoint_bytes(scale_group):
+def test_qpn_prepack_only_permutes_the_checkpoint_bytes(scale_group, order):
     generator = torch.Generator().manual_seed(2)
     codes = torch.randint(0, 256, (64, 128), generator=generator).to(torch.uint8)
     scales = torch.randint(0, 256, (64, 256 // scale_group), generator=generator).to(
         torch.uint8
     )
 
-    qc, qs = qpn_prepack(codes, scales, scale_group)
+    qc, qs = qpn_prepack(codes, scales, scale_group, order)
 
     nibbles = torch.cat([codes & 0xF, codes >> 4]).flatten()
     packed_nibbles = torch.cat([qc & 0xF, qc >> 4])
@@ -196,11 +206,32 @@ def test_qpn_prepack_only_permutes_the_checkpoint_bytes(scale_group):
     assert torch.equal(torch.sort(qs).values, torch.sort(scales.flatten()).values)
 
 
+@pytest.mark.parametrize("order", list(QpnFragmentOrder))
+def test_fragment_tables_place_every_code_and_scale_once(order):
+    code_col, code_k, scale_col = _fragment_tables(order, torch.device("cpu"))
+    positions = (code_col * 16 + code_k).flatten()
+    assert torch.equal(torch.sort(positions).values, torch.arange(512))
+    assert torch.equal(torch.sort(scale_col).values, torch.arange(32))
+
+
+def test_m16n8k8_scale_bytes_follow_their_lanes_columns():
+    # A lane reads the four scale bytes of its row group, which must belong to
+    # the columns its code words hold.
+    code_col, _, scale_col = _fragment_tables(
+        QpnFragmentOrder.M16N8K8, torch.device("cpu")
+    )
+    for lane in range(32):
+        row_group = scale_col[(lane >> 2) * 4 : (lane >> 2) * 4 + 4]
+        assert set(code_col[lane].tolist()) == set(row_group.tolist())
+
+
 def test_qpn_prepack_refuses_shapes_the_kernels_do_not_tile():
     with pytest.raises(ValueError, match="N % 32"):
         qpn_prepack(
             torch.zeros(48, 64, dtype=torch.uint8),
             torch.zeros(48, 8, dtype=torch.uint8),
+            16,
+            QpnFragmentOrder.M8N8K4,
         )
 
 
@@ -210,16 +241,39 @@ def test_backend_is_registered_for_automatic_selection():
     assert Mxfp4MoeBackend.SM70_SKINNY in _get_priority_backends()
 
 
-@pytest.mark.parametrize("k", [128, 256, 320, 512, 640, 1024, 4096, 5120])
-def test_grouped_launch_uses_actual_alignment(k):
-    split = grouped_splitk(k, 16)
+@pytest.mark.parametrize("order", list(QpnFragmentOrder))
+@pytest.mark.parametrize("k", [128, 256, 320, 512, 640, 1024, 2048, 4096, 5120])
+def test_grouped_launch_uses_actual_alignment(k, order):
+    split = grouped_splitk(k, order)
     assert (k // 16) % split == 0
 
 
-@pytest.mark.parametrize("k", [0, 64, 192, 319])
-def test_grouped_launch_rejects_unsupported_alignment(k):
+def test_m16n8k8_split_keeps_sixteen_groups_per_warp_where_it_can():
+    order = QpnFragmentOrder.M16N8K8
+    assert grouped_splitk(4096, order) == 8
+    assert grouped_splitk(2048, order) == 8
+    assert grouped_splitk(640, order) == 4
+    assert grouped_splitk(320, order) == 4
+
+
+def test_m8n8k4_split_prefers_eight_warps():
+    order = QpnFragmentOrder.M8N8K4
+    assert grouped_splitk(4096, order) == 8
+    assert grouped_splitk(2048, order) == 8
+    assert grouped_splitk(640, order) == 8
+    # K/16 = 20: 8 does not divide, 16 neither, 10 does
+    assert grouped_splitk(320, order) == 10
+
+
+@pytest.mark.parametrize(
+    "order,k",
+    [(order, k) for order in QpnFragmentOrder for k in (0, 319)]
+    # Volta's 8, 10 and 16 warps cannot split 4 or 12 groups; Turing's 4 can.
+    + [(QpnFragmentOrder.M8N8K4, 64), (QpnFragmentOrder.M8N8K4, 192)],
+)
+def test_grouped_launch_rejects_unsupported_alignment(k, order):
     with pytest.raises(ValueError):
-        grouped_splitk(k, 16)
+        grouped_splitk(k, order)
 
 
 @pytest.mark.parametrize("scale_mode", [0, 1])
@@ -263,8 +317,9 @@ def test_large_batches_keep_the_scale_format_and_device_routing(scale_mode):
     [
         ({}, None),
         ({"hidden_dim": 320, "intermediate_size_per_partition": 640}, None),
-        ({"hidden_dim": 192}, "hidden dimension"),
-        ({"intermediate_size_per_partition": 64}, "intermediate dimension"),
+        # Not a multiple of 64: no fragment order can tile these.
+        ({"hidden_dim": 160}, "hidden dimension"),
+        ({"intermediate_size_per_partition": 96}, "intermediate dimension"),
         ({"in_dtype": torch.bfloat16}, "FP16"),
         ({"has_bias": True}, "expert bias"),
         ({"swiglu_limit": 7.0}, None),
@@ -343,6 +398,15 @@ def device(request) -> torch.device:
     return torch.device("cuda", devices[0])
 
 
+@pytest.fixture(params=list(QpnFragmentOrder), ids=lambda o: o.name.lower())
+def order(request, device) -> QpnFragmentOrder:
+    if request.param == QpnFragmentOrder.M16N8K8 and not (
+        current_platform.has_device_capability(75, device_id=device.index)
+    ):
+        pytest.skip("the m16n8k8 MMA needs SM75 or later")
+    return request.param
+
+
 def _nvfp4_expert(generator, rows, cols):
     codes = torch.randint(0, 256, (rows, cols // 2), generator=generator)
     scales = (torch.rand(rows, cols // 16, generator=generator) * 1.5 + 0.25).to(
@@ -365,15 +429,19 @@ def test_qpn_gemm_matches_the_dequantized_weights(device, m):
     x = torch.randn(m, cols, generator=generator).to(torch.float16) * 0.1
     reference = x.float() @ _nvfp4_weight(codes, scales, global_scale).T
 
-    qc, qs = qpn_prepack(codes.to(device), scales.to(device))
+    qc, qs = qpn_prepack(
+        codes.to(device), scales.to(device), 16, QpnFragmentOrder.M8N8K4
+    )
     out = torch.ops._C.skinny_qpn_gemm_sm70(x.to(device), qc, qs, global_scale, rows)
 
     torch.testing.assert_close(out.float().cpu(), reference, rtol=2e-2, atol=2e-3)
 
 
-def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device):
+@pytest.mark.parametrize("tokens", [5, 40])
+@pytest.mark.parametrize("cols", [256, 320, 4096])
+def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device, order, cols, tokens):
     generator = torch.Generator().manual_seed(1)
-    experts, rows, cols, tokens = 2, 64, 256, 5
+    experts, rows = 2, 64
     codes = torch.randint(0, 256, (experts, rows, cols // 2), generator=generator)
     codes = codes.to(torch.uint8)
     scales = (
@@ -392,7 +460,7 @@ def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device):
     w = codes.to(device)
     s = rebased.to(device)
     for e in range(experts):
-        qc, qs = qpn_prepack(w[e], s[e], 32)
+        qc, qs = qpn_prepack(w[e], s[e], 32, order)
         w[e].view(-1).copy_(qc)
         s[e].view(-1).copy_(qs)
 
@@ -415,13 +483,140 @@ def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device):
             out,
             False,
             tokens,
-            16,
+            grouped_splitk(cols, order),
             1,
-            1,
+            order,
         )
         torch.testing.assert_close(
             out.float().cpu(), reference[e], rtol=2e-2, atol=2e-2
         )
+
+
+@pytest.mark.parametrize(
+    "counts", [[300, 1, 33], [520, 0, 70, 9], [32, 32, 32], [257, 3]], ids=str
+)
+def test_moe_qpn_multi_pass_groups_cover_every_row(device, order, counts):
+    # Prefill shapes (more than 8 rows per expert on average) take several passes
+    # per expert: groups of many 32-row passes, a last pass that is not full and
+    # experts without rows must all land in place.
+    generator = torch.Generator().manual_seed(2)
+    experts, rows, cols = len(counts), 128, 256
+    tokens = sum(counts)
+    codes = torch.randint(0, 256, (experts, rows, cols // 2), generator=generator).to(
+        torch.uint8
+    )
+    scales = (
+        torch.randint(0, 8, (experts, rows, cols // 32), generator=generator) + 112
+    ).to(torch.uint8)
+    hidden = torch.randn(tokens, cols, generator=generator).to(torch.float16)
+
+    reference = torch.empty(tokens, rows)
+    start = 0
+    for e, count in enumerate(counts):
+        values = break_fp4_bytes(codes[e], torch.float32)
+        weight = values * _pow2(scales[e]).repeat_interleave(32, dim=1).float()
+        reference[start : start + count] = hidden[start : start + count].float() @ (
+            weight.T
+        )
+        start += count
+
+    rebased = scales.clone()
+    global_scale = rebase_e8m0_for_fp16(rebased)
+    w = codes.to(device)
+    s = rebased.to(device)
+    for e in range(experts):
+        qc, qs = qpn_prepack(w[e], s[e], 32, order)
+        w[e].view(-1).copy_(qc)
+        s[e].view(-1).copy_(qs)
+
+    # Compact routing: only experts with rows get a group, the rest is padding.
+    gids = torch.zeros(tokens, dtype=torch.int32)
+    goff = torch.full((tokens + 1,), tokens, dtype=torch.int32)
+    group, start = 0, 0
+    for e, count in enumerate(counts):
+        if count:
+            gids[group], goff[group] = e, start
+            group, start = group + 1, start + count
+    out = torch.empty((tokens, rows), dtype=torch.float16, device=device)
+    torch.ops._C.skinny_moe_qpn_sm70(
+        hidden.to(device),
+        w,
+        s,
+        global_scale.to(device),
+        torch.arange(tokens, dtype=torch.int32, device=device),
+        gids.to(device),
+        goff.to(device),
+        1,
+        out,
+        False,
+        tokens,
+        grouped_splitk(cols, order),
+        1,
+        order,
+    )
+    torch.testing.assert_close(out.float().cpu(), reference, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "counts", [[1, 2, 1, 0], [5, 0, 0, 3], [300, 1, 33, 9], [32, 32, 32, 32]], ids=str
+)
+def test_moe_qpn_five_bit_scales_give_the_raster_result(device, order, counts):
+    # Decode shapes read the five-bit planes in place (m16n8k8), every other launch
+    # first writes the raster from them: both must equal the run on the raster the
+    # planes were encoded from, bit for bit.
+    generator = torch.Generator().manual_seed(3)
+    experts, rows, cols = len(counts), 128, 256
+    tokens = sum(counts)
+    codes, scales = [], []
+    for _ in range(experts):
+        c, sc = _nvfp4_expert(generator, rows, cols)
+        codes.append(c)
+        scales.append(sc)
+    w = torch.stack(codes).to(device)
+    raster = torch.empty(
+        experts, rows // 32 * (cols // 16) * 32, dtype=torch.uint8, device=device
+    )
+    for e in range(experts):
+        qc, qs = qpn_prepack(w[e], scales[e].to(device), 16, order)
+        w[e].view(-1).copy_(qc)
+        raster[e].copy_(qs.reshape(-1))
+    planes = encode_s5(raster, cols // 16)
+    gscales = (torch.rand(experts, generator=generator) * 0.2 + 0.05).to(device)
+    hidden = torch.randn(tokens, cols, generator=generator).to(torch.float16)
+
+    gids = torch.zeros(tokens, dtype=torch.int32)
+    goff = torch.full((tokens + 1,), tokens, dtype=torch.int32)
+    group, start = 0, 0
+    for e, count in enumerate(counts):
+        if count:
+            gids[group], goff[group] = e, start
+            group, start = group + 1, start + count
+
+    def run(scale_raster, five_bit):
+        out = torch.empty((tokens, rows), dtype=torch.float16, device=device)
+        extra = (planes.base, planes.nib, planes.hi) if five_bit else ()
+        torch.ops._C.skinny_moe_qpn_sm70(
+            hidden.to(device),
+            w,
+            scale_raster,
+            gscales,
+            torch.arange(tokens, dtype=torch.int32, device=device),
+            gids.to(device),
+            goff.to(device),
+            1,
+            out,
+            False,
+            tokens,
+            grouped_splitk(cols, order),
+            0,
+            order,
+            *extra,
+        )
+        return out
+
+    expected = run(raster, False)
+    scratch = torch.zeros_like(raster)  # the op writes the routed experts' rows
+    assert torch.equal(run(scratch, True), expected)
 
 
 def _nvfp4_moe(generator, num_experts, hidden_size, intermediate):
@@ -451,12 +646,20 @@ def _reference_moe(x, w13, s13, w2, s2, g1, g2, topk_weights, topk_ids):
     return out
 
 
-def _skinny_experts(device, w13, s13, w2, s2, g1, g2):
+def _skinny_experts(device, order, w13, s13, w2, s2, g1, g2):
     experts = Nvfp4SkinnySm70Experts.__new__(Nvfp4SkinnySm70Experts)
-    experts.quant_config = SimpleNamespace(gemm1_clamp_limit=None)
+    experts.quant_config = SimpleNamespace(
+        gemm1_clamp_limit=None,
+        _w1=SimpleNamespace(scale=s13),
+        _w2=SimpleNamespace(scale=s2),
+    )
     experts._scale_mode = 0
+    experts._fragment_order = order
+    experts._triton_tensor_cores = False
     experts._w1_block_scales = s13
     experts._w2_block_scales = s2
+    experts._csf_planes = None
+    experts._s5 = None
     experts._scale_caches = _ScaleCaches(
         g1=g1.tolist(),
         g2=g2.tolist(),
@@ -470,7 +673,7 @@ def _skinny_experts(device, w13, s13, w2, s2, g1, g2):
 
 @pytest.mark.parametrize("path", ["grouped", "dispatch"])
 @pytest.mark.parametrize("num_tokens", [1, 6, 40])
-def test_both_serving_paths_match_the_reference(device, path, num_tokens):
+def test_both_serving_paths_match_the_reference(device, order, path, num_tokens):
     generator = torch.Generator().manual_seed(4)
     num_experts, hidden_size, intermediate, top_k = 8, 256, 128, 3
     w13, s13, w2, s2, g1, g2 = _nvfp4_moe(
@@ -487,10 +690,10 @@ def test_both_serving_paths_match_the_reference(device, path, num_tokens):
     w13_d, s13_d, w2_d, s2_d = (t.to(device) for t in (w13, s13, w2, s2))
     for e in range(num_experts):
         for w, s in ((w13_d, s13_d), (w2_d, s2_d)):
-            qc, qs = qpn_prepack(w[e], s[e])
+            qc, qs = qpn_prepack(w[e], s[e], 16, order)
             w[e].view(-1).copy_(qc)
             s[e].view(-1).copy_(qs)
-    experts = _skinny_experts(device, w13_d, s13_d, w2_d, s2_d, g1, g2)
+    experts = _skinny_experts(device, order, w13_d, s13_d, w2_d, s2_d, g1, g2)
     output = torch.empty(num_tokens, hidden_size, dtype=torch.float16, device=device)
     args = dict(
         output=output,
@@ -525,7 +728,8 @@ def test_both_serving_paths_match_the_reference(device, path, num_tokens):
     )
 
 
-def test_large_mxfp4_dispatch_matches_reference(device):
+@pytest.mark.parametrize("skewed", [False, True], ids=["uniform", "skewed"])
+def test_large_mxfp4_dispatch_matches_reference(device, order, skewed):
     generator = torch.Generator().manual_seed(42)
     tokens, experts_count, hidden, intermediate, top_k = 513, 4, 256, 128, 2
     w13 = torch.randint(
@@ -562,7 +766,17 @@ def test_large_mxfp4_dispatch_matches_reference(device):
     nv_s2 = _pow2(s2).repeat_interleave(2, -1).to(torch.float8_e4m3fn).view(torch.uint8)
     global_scales = torch.ones(experts_count)
     x = (torch.randn(tokens, hidden, generator=generator) * 0.1).half()
-    ids = torch.randint(experts_count, (tokens, top_k), generator=generator)
+    if skewed:
+        # A popular expert spread over many prefill row blocks next to a rare
+        # one in a single partial block, as real routers skew.
+        popularity = torch.tensor([0.85, 0.12, 0.027, 0.003])
+        ids = torch.multinomial(
+            popularity.expand(tokens, -1), top_k, generator=generator
+        )
+        rows = torch.bincount(ids.reshape(-1), minlength=experts_count)
+        assert rows.max() > 4 * 32 and 0 < rows.min() < 16
+    else:
+        ids = torch.randint(experts_count, (tokens, top_k), generator=generator)
     weights = torch.rand(tokens, top_k, generator=generator)
     reference = _reference_moe(
         x, w13, nv_s13, w2, nv_s2, global_scales, global_scales, weights, ids
@@ -570,10 +784,12 @@ def test_large_mxfp4_dispatch_matches_reference(device):
     w13, s13, w2, s2 = (t.to(device) for t in (w13, s13, w2, s2))
     for e in range(experts_count):
         for w, s in ((w13, s13), (w2, s2)):
-            qc, qs = qpn_prepack(w[e], s[e], 32)
+            qc, qs = qpn_prepack(w[e], s[e], 32, order)
             w[e].view(-1).copy_(qc)
             s[e].view(-1).copy_(qs)
-    experts = _skinny_experts(device, w13, s13, w2, s2, global_scales, global_scales)
+    experts = _skinny_experts(
+        device, order, w13, s13, w2, s2, global_scales, global_scales
+    )
     experts._scale_mode = 1
     output = torch.empty_like(x, device=device)
     experts.apply(
@@ -599,3 +815,122 @@ def test_large_mxfp4_dispatch_matches_reference(device):
         rtol=0,
         atol=3e-3 * reference.abs().max().item(),
     )
+
+
+def _csf_planes(scales: list[np.ndarray], rows, groups, projections, device):
+    parts = [encode_csf32(m) for m in scales]
+
+    def stack(name, dtype):
+        return torch.stack(
+            [torch.from_numpy(part[name].astype(dtype)) for part in parts]
+        ).to(device)
+
+    counts = [part["exceptions"].size for part in parts]
+    return CsfExpertScales(
+        rows=rows,
+        groups=groups,
+        projections=projections,
+        bases=stack("bases", np.uint8),
+        codes=stack("codes", np.uint8),
+        page_bases=stack("page_bases", np.int32),
+        offsets=stack("offsets", np.int32),
+        exceptions=torch.from_numpy(
+            np.concatenate([part["exceptions"] for part in parts]).astype(np.int32)
+        ).to(device),
+        exception_start=torch.tensor(
+            np.concatenate(([0], np.cumsum(counts)[:-1])),
+            dtype=torch.int64,
+            device=device,
+        ),
+    )
+
+
+def _spread_scales(rng, rows, groups, spread):
+    """fp8-e4m3 scale bytes whose rows span `spread` (and leave csf's 4-bit window)."""
+    low = 100 + rng.integers(0, 6, (rows, 1))
+    scale = low + rng.integers(0, spread + 1, (rows, groups))
+    scale[:, 0] = low[:, 0]
+    scale[:, 1] = low[:, 0] + spread
+    return scale.astype(np.uint8)
+
+
+@pytest.mark.parametrize("w2_spread", [26, 40], ids=["both_fit", "w2_too_wide"])
+@pytest.mark.parametrize("num_tokens", [1, 6, 40])
+def test_csf_experts_give_the_same_output_as_five_bit_planes(
+    device, order, w2_spread, num_tokens
+):
+    # A layer whose scale rows fit five bits is served from planes, the same layer
+    # kept on csf planes expands per call; a projection that does not fit stays on
+    # csf next to a packed one. All three must produce the same bytes.
+    rng = np.random.default_rng(5)
+    generator = torch.Generator().manual_seed(6)
+    experts, hidden, inter, top_k = 8, 256, 128, 3
+    w13 = torch.randint(0, 256, (experts, 2 * inter, hidden // 2), generator=generator)
+    w2 = torch.randint(0, 256, (experts, hidden, inter // 2), generator=generator)
+    w13, w2 = w13.to(torch.uint8).to(device), w2.to(torch.uint8).to(device)
+    for e in range(experts):
+        w13[e].view(-1).copy_(qpn_prepack(w13[e], None, 16, order)[0])
+        w2[e].view(-1).copy_(qpn_prepack(w2[e], None, 16, order)[0])
+    g1 = torch.rand(experts, generator=generator) * 1e-4 + 5e-5
+    g2 = torch.rand(experts, generator=generator) * 1e-4 + 5e-5
+    planes13 = _csf_planes(
+        [_spread_scales(rng, inter, hidden // 16, 26) for _ in range(experts * 2)],
+        inter,
+        hidden // 16,
+        2,
+        device,
+    )
+    planes2 = _csf_planes(
+        [_spread_scales(rng, hidden, inter // 16, w2_spread) for _ in range(experts)],
+        hidden,
+        inter // 16,
+        1,
+        device,
+    )
+    x = (torch.randn(num_tokens, hidden, generator=generator) * 0.1).half()
+    topk_ids = torch.stack(
+        [torch.randperm(experts, generator=generator)[:top_k] for _ in x]
+    )
+    topk_weights = torch.rand(num_tokens, top_k, generator=generator)
+
+    def serve(convert: bool):
+        rasters = (
+            torch.zeros(
+                experts, 2 * inter * (hidden // 16), dtype=torch.uint8, device=device
+            ),
+            torch.zeros(
+                experts, hidden * (inter // 16), dtype=torch.uint8, device=device
+            ),
+        )
+        served = _skinny_experts(device, order, w13, rasters[0], w2, rasters[1], g1, g2)
+        served._csf_planes = (planes13, planes2)
+        served._csf_scale_entries = qpn_scale_entries(order, device)
+        if convert:
+            served._s5 = served._csf_to_s5()
+        output = torch.empty(num_tokens, hidden, dtype=torch.float16, device=device)
+        served._apply_grouped(
+            output=output,
+            hidden_states=x.to(device),
+            w1=w13,
+            w2=w2,
+            topk_weights=topk_weights.to(device),
+            topk_ids=topk_ids.to(device),
+            activation=MoEActivation.SILU,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
+        return output, served
+
+    expected, _ = serve(convert=False)
+    assert torch.isfinite(expected).all()
+    got, served = serve(convert=True)
+    assert torch.equal(got, expected)
+    fits = w2_spread <= 31
+    assert (served._s5[0] is not None) and (served._s5[1] is not None) == fits
+    assert (served._csf_planes is None) == fits
+    # Packed projections let go of their raster, the others keep it.
+    assert served.scale_rasters_released() == (True, fits)
+    caches = served._scale_caches
+    assert caches.w1_scales_u8.numel() == 0
+    assert (caches.w2_scales_u8.numel() == 0) == fits
+    assert served.quant_config._w1.scale.numel() == 0

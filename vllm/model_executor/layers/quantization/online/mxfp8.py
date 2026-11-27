@@ -16,7 +16,10 @@ if TYPE_CHECKING:
     )
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
-from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+from vllm.model_executor.kernels.linear import (
+    Mxfp8LinearLayerConfig,
+    init_mxfp8_linear_kernel,
+)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
@@ -42,7 +45,6 @@ class Mxfp8OnlineLinearMethod(_Fp8OnlineLinearBase):
 
     def __init__(self):
         super().__init__()
-        self.kernel = init_mxfp8_linear_kernel()
 
     def create_weights(
         self,
@@ -60,6 +62,11 @@ class Mxfp8OnlineLinearMethod(_Fp8OnlineLinearBase):
                 f"({input_size_per_partition}) to be divisible by "
                 f"{MXFP8_BLOCK_SIZE}."
             )
+        self.kernel = init_mxfp8_linear_kernel(
+            Mxfp8LinearLayerConfig(
+                (sum(output_partition_sizes), input_size_per_partition)
+            )
+        )
 
         super().create_weights(
             layer,
