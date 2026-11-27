@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import math
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -243,6 +245,8 @@ class KVCacheManager:
         self.partial_cache: PartialPrefixCache | None = None
         if partial_prefix_cache and enable_caching:
             self._init_partial_prefix_cache(hash_block_size)
+        # warm 三档水位（按池容量自适应），与 partial 是否开启无关。
+        self._apply_warm_tiers(max_model_len)
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -324,23 +328,39 @@ class KVCacheManager:
         if any(self.partial_block_size % m.block_size for m in managers):
             logger.warning("Partial prefix cache needs nested block sizes.")
             return
+        # [本地 2026-11-27 修改 · 用户拍板] partial 上限 = 并发数 × 5：
+        #   16 并发 ⇒ 80 块，8 并发 ⇒ 40 块，4 并发 ⇒ 20 块。
+        # 按「每 entry 12 块」（9 group 各一份 + 2 块 pinned 父链余量）折算，
+        # 80 块 ≈ 6 个 entry 常驻（长上下文时 pinned 变大，entry 数会降）。
+        #
+        # ⚠️ 块口径 vs token 口径：一个 entry 在 9 个 group 里各持 1 块，
+        # 且与尾巴长度无关（尾巴 1 token 和 2048 tokens 都只占同一块/组）。
+        # 所以「16 路 × 2K 尾巴 = 32K tokens」是 token 口径，换算成物理块要 ×9。
+        #
+        # TTL 600s（命中不刷新）保证它不会长期占块：10 分钟内接续 ⇒ 命中一次 ⇒
+        # 该段历史转由普通前缀缓存纳管 ⇒ entry 到期释放。池紧张时
+        # `_reclaim_partial_blocks` 还会让它提前让路。
+        _PARTIAL_TTL_SECONDS = float(
+            os.environ.get("ONECAT_PARTIAL_CACHE_TTL", "600")
+        )
+        _partial_concurrency = int(
+            os.environ.get("ONECAT_PARTIAL_CACHE_CONCURRENCY", "16")
+        )
+        _blocks_per_entry = len(managers) + 1 + 2  # 9 group + pinned 父链余量
+        _partial_cap = max(4, _partial_concurrency * 5)
         state_blocks = getattr(self.block_pool, "_device_state_blocks", 0) or 0
         if state_blocks > 0:
             mamba_groups = max(
                 1, sum(1 for m in managers if isinstance(m, MambaManager))
             )
             max_state_entries = max(2, state_blocks * 2 // (5 * mamba_groups))
-            max_partial_blocks = min(
-                self.block_pool.num_gpu_blocks * 2 // 5,
-                max_state_entries * len(managers),
-            )
+            max_partial_blocks = min(_partial_cap, max_state_entries * len(managers))
         else:
-            max_partial_blocks = self.block_pool.num_gpu_blocks * 2 // 5
+            max_partial_blocks = _partial_cap
         self.partial_cache = PartialPrefixCache(
             block_pool=self.block_pool,
-            # Leave pool headroom for active requests and full-block prefix
-            # parents while retaining active multi-turn agent snapshots.
             max_blocks=max(4 * len(managers), max_partial_blocks),
+            ttl_seconds=_PARTIAL_TTL_SECONDS,
         )
         self._mamba_group_ids = tuple(
             i for i, m in enumerate(managers) if isinstance(m, MambaManager)
@@ -353,10 +373,100 @@ class KVCacheManager:
         )
         logger.info(
             "Partial prefix cache enabled: %d-token boundary blocks, %d groups, "
-            "up to %d entry blocks.",
+            "up to %d entry blocks (%.1f%% of pool = concurrency %d × 5, "
+            "%d blocks/entry ⇒ ~%d entries, ttl %.0fs).",
             self.partial_block_size,
             len(managers),
             self.partial_cache.max_blocks,
+            100.0 * self.partial_cache.max_blocks / self.block_pool.num_gpu_blocks,
+            _partial_concurrency,
+            _blocks_per_entry,
+            self.partial_cache.max_blocks // _blocks_per_entry,
+            _PARTIAL_TTL_SECONDS,
+        )
+
+    def _apply_warm_tiers(self, max_model_len: int) -> None:
+        """[本地 2026-11-27 · 用户拍板] 按池的总上下文容量选 warm 三档水位。
+
+        档位（soft / hard / abs，单位 K tokens）：
+
+        ===================  ===============  ============================
+        池总上下文           档位             典型用途
+        ===================  ===============  ============================
+        > 1000K             32 / 56 / 80     长上下文：系统+工具+自定义
+                                              提示词 20~30K，其余给记忆
+        > 500K              24 / 32 / 48
+        > 200K              16 / 24 / 32
+        <= 200K             不设（关闭 warm）
+        ===================  ===============  ============================
+
+        换算口径与 vLLM 的 ``GPU KV cache size``（= max_concurrency ×
+        max_model_len）一致：先按每个 manager 在满上下文时的块需求反推
+        ``tokens_per_block``，再用它把 K 值折算成块数。
+
+        ``ONECAT_WARM_TIER=manual`` 可关闭本逻辑，改用 unit 里的
+        ``VLLM_KV_RETENTION_*_CAP`` 比例。
+        """
+        if os.environ.get("ONECAT_WARM_TIER", "auto") != "auto":
+            return
+        pool = self.block_pool
+        if not getattr(pool, "_warm_enabled", False):
+            return
+        managers = self.coordinator.single_type_managers
+        # 满上下文时每个 group 需要的块数（复现 vLLM 的并发度分母）。
+        blocks_per_request = 0
+        for manager in managers:
+            if isinstance(manager, FullAttentionManager):
+                blocks_per_request += cdiv(max_model_len, manager.block_size)
+            elif isinstance(manager, SlidingWindowManager):
+                window = min(max_model_len, manager.sliding_window)
+                blocks_per_request += cdiv(window, manager.block_size)
+            else:
+                # Mamba align：state 固定占用，与长度无关。
+                blocks_per_request += 2 + self.num_speculative_tokens
+        if blocks_per_request <= 0:
+            return
+        tokens_per_block = max_model_len / blocks_per_request
+        pool_tokens = pool.num_gpu_blocks * tokens_per_block
+
+        if pool_tokens > 1_000_000:
+            tiers, floor_k = (32, 56, 80), 1000
+        elif pool_tokens > 500_000:
+            tiers, floor_k = (24, 32, 48), 500
+        elif pool_tokens > 200_000:
+            tiers, floor_k = (16, 24, 32), 200
+        else:
+            tiers, floor_k = None, 0
+
+        if tiers is None:
+            logger.info(
+                "Warm tiers: pool %.0fK tokens <= 200K, retention left at "
+                "configured caps (soft=%d hard=%d abs=%d).",
+                pool_tokens / 1000,
+                pool._warm_soft_cap,
+                pool._warm_hard_cap,
+                pool._warm_abs_cap,
+            )
+            return
+
+        # 向上取整：截断会让实际保护量低于标称档位（32K 若取 37 块只有 31.2K）。
+        to_blocks = lambda k: max(1, math.ceil(k * 1000 / tokens_per_block))  # noqa: E731
+        soft, hard, absolute = (to_blocks(k) for k in tiers)
+        pool._warm_soft_cap = soft
+        pool._warm_hard_cap = hard
+        pool._warm_abs_cap = absolute
+        logger.info(
+            "Warm tiers: pool %.0fK tokens (>%dK 档) ⇒ soft/hard/abs = "
+            "%dK/%dK/%dK = %d/%d/%d blocks (%.1f tokens/block).",
+            pool_tokens / 1000,
+            floor_k,
+            tiers[0],
+            tiers[1],
+            tiers[2],
+            soft,
+            hard,
+            absolute,
+            tokens_per_block,
         )
 
     def _partial_parent(self, request: Request, boundary: int):
@@ -888,10 +998,14 @@ class KVCacheManager:
         cache = self.partial_cache
         soft_reserve = min(24, self.block_pool.num_gpu_blocks // 8)
         if cache is not None:
+            # [本地 2026-11-27] 原硬编码 `len(entries) > 10` 在 3% 上限（约 4 个
+            # entry）下永远不成立，等于关了这条让路分支。改为按上限缩放：
+            # 上限越小，允许的「不打扰」entry 数也越小。
+            _lenient_entries = max(2, min(10, cache.max_blocks // 20))
             while (
                 num_blocks + soft_reserve > self.block_pool.get_num_free_blocks()
                 and (
-                    len(cache.entries) > 10
+                    len(cache.entries) > _lenient_entries
                     or (
                         len(cache.entries) > 2
                         and cache.num_blocks > cache.max_blocks // 2

@@ -358,6 +358,128 @@ class EngineCore:
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 
+    def reload_kv_tuning(self, overrides: dict | None = None) -> dict:
+        """[本地 2026-11-27] 热应用 KV 缓存调参，无需重启引擎。
+
+        通过 utility RPC 通道调用，因此在引擎线程内、两步之间执行 —— 与修改
+        这些结构的代码同线程，无需加锁。
+
+        支持的键（均可选，只改传入的）：
+          max_blocks      partial prefix cache 的块上限
+          ttl_seconds     partial entry 的存活秒数（<=0 关闭过期）
+          warm_soft_cap   warm 表软水位（块）
+          warm_hard_cap   warm 表硬水位（块）
+
+        返回实际生效值；未知键被忽略并在 ``ignored`` 里列出。
+        """
+        overrides = dict(overrides or {})
+        applied: dict = {"partial": {}, "warm": {}, "ignored": []}
+        handled: set[str] = set()
+        manager = getattr(self.scheduler, "kv_cache_manager", None)
+        if manager is None:
+            return {"error": "scheduler exposes no kv_cache_manager", **applied}
+
+        cache = getattr(manager, "partial_cache", None)
+        if cache is not None:
+            if "max_blocks" in overrides:
+                value = int(overrides["max_blocks"])
+                if value < 1:
+                    raise ValueError("max_blocks must be positive")
+                cache.max_blocks = value
+                # Trim right away so the new bound is visible this step.
+                while cache.num_blocks > cache.max_blocks and len(cache.entries) > 1:
+                    if not cache.evict_one():
+                        break
+                handled.add("max_blocks")
+            if "ttl_seconds" in overrides:
+                cache.ttl_seconds = float(overrides["ttl_seconds"])
+                handled.add("ttl_seconds")
+            applied["partial"] = {
+                "max_blocks": cache.max_blocks,
+                "ttl_seconds": cache.ttl_seconds,
+                "num_blocks": cache.num_blocks,
+                "entries": len(cache.entries),
+            }
+
+        pool = getattr(manager, "block_pool", None)
+        if pool is not None:
+            for key, attr in (
+                ("warm_soft_cap", "_warm_soft_cap"),
+                ("warm_hard_cap", "_warm_hard_cap"),
+                ("warm_abs_cap", "_warm_abs_cap"),
+            ):
+                if key not in overrides:
+                    continue
+                if getattr(pool, attr, None) is None:
+                    continue
+                setattr(pool, attr, int(overrides[key]))
+                handled.add(key)
+            soft = getattr(pool, "_warm_soft_cap", None)
+            hard = getattr(pool, "_warm_hard_cap", None)
+            absolute = getattr(pool, "_warm_abs_cap", None)
+            if None not in (soft, hard, absolute) and not soft <= hard <= absolute:
+                raise ValueError(
+                    "warm caps must satisfy soft <= hard <= abs "
+                    f"(got {soft}/{hard}/{absolute})"
+                )
+            applied["warm"] = {
+                "soft_cap": soft,
+                "hard_cap": hard,
+                "abs_cap": absolute,
+                "blocks": len(getattr(pool, "warm_blocks", {}) or {}),
+                "tiers": (
+                    pool.warm_tier_stats()
+                    if hasattr(pool, "warm_tier_stats")
+                    else None
+                ),
+            }
+
+        # [本地 2026-11-27] 价值分层参数热改（对齐 1.5.2 的 reload_tier_settings）。
+        if pool is not None:
+            for key, attr, caster in (
+                ("tier_l1_min_hits", "_tier_l1_min_hits", int),
+                ("tier_l1_frac", "_tier_l1_frac", float),
+                ("tier_age_span", "_tier_age_span", float),
+                ("tier_freq_sat", "_tier_freq_sat", float),
+                ("tier_hot_freq", "_tier_hot_freq", float),
+                ("tier_hot_age", "_tier_hot_age", float),
+            ):
+                if key not in overrides:
+                    continue
+                if getattr(pool, attr, None) is None:
+                    continue
+                setattr(pool, attr, caster(overrides[key]))
+                handled.add(key)
+            if "tier_l3_ttl" in overrides or "tier_l1_ttl" in overrides:
+                ttl = list(getattr(pool, "_tier_ttl", ()))
+                if ttl:
+                    if "tier_l3_ttl" in overrides:
+                        ttl[0] = float(overrides["tier_l3_ttl"])
+                        handled.add("tier_l3_ttl")
+                    if "tier_l1_ttl" in overrides:
+                        ttl[-1] = float(overrides["tier_l1_ttl"])
+                        handled.add("tier_l1_ttl")
+                    pool._tier_ttl = tuple(ttl)
+            if any(k.startswith("tier_") for k in handled):
+                applied["tiers"] = {
+                    "l1_min_hits": getattr(pool, "_tier_l1_min_hits", None),
+                    "l1_frac": getattr(pool, "_tier_l1_frac", None),
+                    "age_span": getattr(pool, "_tier_age_span", None),
+                    "freq_sat": getattr(pool, "_tier_freq_sat", None),
+                    "hot_freq": getattr(pool, "_tier_hot_freq", None),
+                    "hot_age": getattr(pool, "_tier_hot_age", None),
+                    "ttl": list(getattr(pool, "_tier_ttl", ())),
+                    "distribution": (
+                        pool.warm_tier_stats()
+                        if hasattr(pool, "warm_tier_stats")
+                        else None
+                    ),
+                }
+
+        applied["ignored"] = [k for k in overrides if k not in handled]
+        logger.info("KV tuning hot-applied: %s", applied)
+        return applied
+
     def get_kv_cache_group_metadata(self) -> list[dict[str, int | str | None]]:
         """Return msgspec-serializable metadata for scheduler KV cache groups."""
         kv_cache_config = getattr(self.scheduler, "kv_cache_config", None)

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
@@ -229,6 +230,20 @@ class SchedulerOffloadConfig(NamedTuple):
         )
 
 
+# Upper bound on consecutive steps a store may keep failing before the request
+# gives up on host offloading. The CPU tier's prepare_store() is *atomically*
+# unable to accept a batch when its block pool is full and too few blocks are
+# evictable (in-flight stores hold ref_cnt == -1). Without this bound each
+# subsequent step re-attempts the exact same batch, producing one warning per
+# step per request (measured: 12,969 warnings across 597 requests, worst
+# request 214 retries). The KV stays valid in GPU memory either way -- the host
+# tier is a value buffer, not a capacity tier, so giving up only forfeits a
+# caching opportunity.
+_MAX_STORE_FAIL_STEPS = int(
+    os.environ.get("ONECAT_OFFLOAD_MAX_STORE_FAIL_STEPS", "8")
+)
+
+
 @dataclass
 class RequestGroupState:
     offload_keys: list[OffloadKey] = field(default_factory=list)
@@ -265,6 +280,12 @@ class RequestOffloadState:
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
+    # Consecutive steps on which the host tier could not accept a store batch.
+    # Reset to 0 whenever a store is accepted. See _MAX_STORE_FAIL_STEPS.
+    store_fail_steps: int = 0
+    # Same, for the Mamba boundary-state hand-off path. Kept separate so a
+    # blocked boundary state cannot cause token-block stores to be abandoned.
+    boundary_fail_steps: int = 0
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -938,8 +959,30 @@ class OffloadingConnectorScheduler:
                 new_offload_keys, req_status.req_context
             )
             if store_output is None:
-                logger.warning("Request %s: cannot store blocks", req_id)
+                req_status.store_fail_steps += 1
+                if req_status.store_fail_steps == 1:
+                    logger.warning(
+                        "Request %s: host buffer cannot accept %d blocks; "
+                        "retrying up to %d steps",
+                        req_id,
+                        len(new_offload_keys),
+                        _MAX_STORE_FAIL_STEPS,
+                    )
+                elif req_status.store_fail_steps >= _MAX_STORE_FAIL_STEPS:
+                    logger.warning(
+                        "Request %s: giving up host offload past block %d "
+                        "(buffer full after %d attempts)",
+                        req_id,
+                        max(
+                            gs.next_stored_block_idx
+                            for gs in req_status.group_states
+                        ),
+                        req_status.store_fail_steps,
+                    )
+                    req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
+
+            req_status.store_fail_steps = 0
 
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
@@ -1137,6 +1180,19 @@ class OffloadingConnectorScheduler:
                     [offload_key], req_status.req_context
                 )
                 if store_output is None:
+                    # Separate counter from store_fail_steps: boundary states
+                    # and token blocks are distinct store paths and must not
+                    # give up on each other's failures.
+                    req_status.boundary_fail_steps += 1
+                    if req_status.boundary_fail_steps >= _MAX_STORE_FAIL_STEPS:
+                        logger.warning(
+                            "Request %s: giving up Mamba boundary state at %d "
+                            "tokens (host buffer full after %d attempts)",
+                            req_id,
+                            boundary_tokens,
+                            req_status.boundary_fail_steps,
+                        )
+                        continue
                     logger.debug(
                         "Request %s: host tier busy, retrying Mamba boundary "
                         "state at %d tokens next step",
@@ -1145,6 +1201,7 @@ class OffloadingConnectorScheduler:
                     )
                     still_pending.append(entry)
                     continue
+                req_status.boundary_fail_steps = 0
                 keys_to_store = set(store_output.keys_to_store)
                 if not keys_to_store:
                     continue

@@ -411,11 +411,22 @@ class Scheduler(SchedulerInterface):
             actual_block_size = (
                 self.mamba_state_block_size or self.cache_config.block_size
             )
+            # [本地 2026-11-27] 放宽：移除 `is_multimodal_model` 限制。
+            # 理由：① `phase_separation.py`（PhaseCreditAllocator，237 行）**没有任何**
+            #   multimodal / encoder 分支——它只按步分配 prefill vs decode 的时间配额
+            #   （decode_time_share / max_decode_wait_ms / block_size），与 vision
+            #   encoder 的算力无关；② 本机模型 Qwen3_5ForConditionalGeneration 在
+            #   1.5.4 registry.py:581 被归入 _MULTIMODAL_MODELS（架构自带
+            #   vision_config），但生产只发文本请求；③ 1.5.2 时代同一模型 PD-time
+            #   正常启用（11-09/11-10 启动日志有 "Phase separation enabled"），
+            #   升级 1.5.4 后该校验让 PD-time 静默不可用 ⇒ 长上下文高并发退化。
+            # 残余风险：含图片的请求在 prefill 步要额外跑 vision encoder，其算力
+            # 不在 token 预算内 ⇒ 该 prefill 步可能超过 decode_time_share 的均分，
+            # 但 `phase_max_wait_ms` 守卫会在下一步强制切回 decode，不会饿死。
             if (
                 self.scheduler_config.async_scheduling
                 or self.parallel_config.pipeline_parallel_size != 1
                 or self.is_encoder_decoder
-                or vllm_config.model_config.is_multimodal_model
                 or vllm_config.model_config.runner_type != "generate"
                 or not self.scheduler_config.enable_chunked_prefill
                 or self.max_num_scheduled_tokens
