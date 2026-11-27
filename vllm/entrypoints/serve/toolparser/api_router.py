@@ -82,6 +82,37 @@ def _prepare_template(app):
     return content, holders
 
 
+@router.post("/v1/internal/kv_tuning")
+async def kv_tuning(request: Request):
+    """[本地 2026-11-27] 热应用 KV 缓存调参，避免推进 KV 机制时反复重启引擎。
+
+    Body（全部可选，只改传入的键）::
+
+        {"max_blocks": 160, "ttl_seconds": 600,
+         "warm_soft_cap": 46, "warm_hard_cap": 77}
+
+    走 EngineCore 的 utility RPC 通道，在引擎线程内两步之间生效。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    client = getattr(request.app.state, "engine_client", None)
+    core = getattr(client, "engine_core", None)
+    invoke = getattr(core, "call_utility_async", None)
+    if invoke is None:
+        return JSONResponse(
+            {"error": "engine core utility channel unavailable"}, status_code=501
+        )
+    try:
+        applied = await invoke("reload_kv_tuning", body)
+    except Exception as error:
+        return JSONResponse({"error": str(error)}, status_code=500)
+    return JSONResponse(applied)
+
+
 @router.post("/v1/internal/reload")
 async def reload_all(request: Request):
     with reload_lock:

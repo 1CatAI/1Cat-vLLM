@@ -27,8 +27,16 @@ never modified.
 
 Entries hold one reference on each of their blocks and are released in LRU
 order, or when the block pool runs short.
+
+[本地 2026-11-27] Entries also expire by age (``ttl_seconds``, default 600s).
+The intended life cycle is: a follow-up turn lands within the window, the entry
+is hit once, and from then on the ordinary prefix cache owns that history --
+the entry has no further value and must yield its blocks. Age is measured from
+insertion and is not refreshed by hits, so a hot entry cannot pin blocks
+indefinitely.
 """
 
+import time
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -80,6 +88,8 @@ class PartialEntry:
     pinned_blocks: list[KVCacheBlock] = field(default_factory=list)
     # Number of prefix-cache lookups served by this entry.
     hit_count: int = 0
+    # ``time.monotonic()`` at insertion; 0 means "stamp on insert".
+    created_at: float = 0.0
 
     @property
     def owned_blocks(self) -> int:
@@ -95,6 +105,8 @@ class PartialPrefixCache:
     block_pool: BlockPool
     # Upper bound on the physical blocks held by entries.
     max_blocks: int
+    # Entry lifetime from insertion, in seconds. <=0 disables expiry.
+    ttl_seconds: float = 600.0
     entries: "OrderedDict[PartialKey, PartialEntry]" = field(
         default_factory=OrderedDict
     )
@@ -108,6 +120,11 @@ class PartialPrefixCache:
     def insert(self, entry: PartialEntry) -> None:
         if entry.key in self.entries:
             self._remove(entry.key)
+        if entry.created_at <= 0.0:
+            entry.created_at = time.monotonic()
+        # Reclaim aged-out entries before adding a new one, so the new entry
+        # competes with live entries only.
+        self.evict_expired()
         self.entries[entry.key] = entry
         self.by_parent.setdefault(entry.key[0], set()).add(entry.key)
         self.num_blocks += entry.owned_blocks
@@ -152,14 +169,32 @@ class PartialPrefixCache:
             e is not protected and e.hit_count == 0 for e in self.entries.values()
         )
 
+    def _expired(self, entry: PartialEntry, now: float) -> bool:
+        return self.ttl_seconds > 0 and now - entry.created_at >= self.ttl_seconds
+
+    def evict_expired(self, now: float | None = None) -> int:
+        """Drop every entry older than ``ttl_seconds``; return how many went."""
+        if self.ttl_seconds <= 0 or not self.entries:
+            return 0
+        now = time.monotonic() if now is None else now
+        stale = [k for k, e in self.entries.items() if self._expired(e, now)]
+        for key in stale:
+            self._remove(key)
+        return len(stale)
+
     def evict_one(self, protected: PartialEntry | None = None) -> bool:
-        """Release the least wanted entry (unhit LRU first, then hit LRU).
+        """Release the least wanted entry (expired, then unhit LRU, then hit LRU).
 
         Never evicts ``protected`` (e.g. an entry already matched for the
         in-progress ``allocate_slots`` call).
         """
         if not self.entries:
             return False
+        now = time.monotonic()
+        for key, entry in self.entries.items():
+            if entry is not protected and self._expired(entry, now):
+                self._remove(key)
+                return True
         for key, entry in self.entries.items():
             if entry is not protected and entry.hit_count == 0:
                 self._remove(key)
@@ -186,9 +221,14 @@ class PartialPrefixCache:
         The tail starts at ``block_start``, the start of the block after
         ``parent``.
         """
+        # Aged-out entries are dead weight; drop them before matching so a
+        # stale entry never shadows a live one.
+        self.evict_expired()
         best: PartialEntry | None = None
-        for key in self.by_parent.get(parent, ()):
-            entry = self.entries[key]
+        for key in tuple(self.by_parent.get(parent, ())):
+            entry = self.entries.get(key)
+            if entry is None:
+                continue
             if (
                 entry.ready_step >= current_step
                 or entry.length > max_length

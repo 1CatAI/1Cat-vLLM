@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
@@ -268,6 +270,52 @@ class BlockPool:
         self._warm_soft_cap = int(history_blocks * policy.soft_cap)
         self._warm_hard_cap = int(history_blocks * policy.hard_cap)
         self._warm_abs_cap = int(history_blocks * policy.absolute_cap)
+        self._init_value_tiers()
+
+    def _init_value_tiers(self) -> None:
+        """[本地 2026-11-27 移植 1.5.2 P-05/P-06] warm 价值分层参数。
+
+        背景：原来的逐出只看「释放时间」，命中次数仅在时间戳相同时做
+        tie-breaker。于是系统提示词（命中上千次）在夜里闲 30 分钟就会被
+        一个只被读过一次的新块挤掉，下次请求要重算 20~30K 前缀。
+
+        1.5.2 那套机制的核心是给每个块一个价值等级，逐出时先走低等级：
+          L3(0) → L2C(1) → L2B(2) → L2A(3) → L1(4)
+        等级由两条证据决定：**累计命中次数**（freq）和**最近一次复用距今**
+        （age）。命中多 ⇒ 高等级，且 L1 刻意不看年龄 —— 固定提示词深夜
+        无人使用，但它仍是每个会话都要读的内容。
+
+        数据源映射（1.5.4 没有 KVCacheBlock.tier/hit_count/last_hit_ts）：
+          hit_count   → self._warm_hits[block_hash]（已有，按内容计）
+          last_hit_ts → self._warm_freed_at[block_id]（释放时间；命中会先
+                        把块移出 warm，重新释放时拿新时间戳，故等价且更保守）
+        """
+        _f = lambda k, d: float(os.environ.get(k, d))  # noqa: E731
+        _i = lambda k, d: int(os.environ.get(k, d))  # noqa: E731
+        # 各层 TTL（秒）：0=L3 … 4=L1。到期只降级，L3 到期才清 hash。
+        self._tier_ttl: tuple[float, ...] = (
+            _f("VLLM_KV_TIER_L3_TTL", 600.0),
+            _f("VLLM_KV_TIER_L2C_TTL", 1800.0),
+            _f("VLLM_KV_TIER_L2B_TTL", 3600.0),
+            _f("VLLM_KV_TIER_L2A_TTL", 7200.0),
+            _f("VLLM_KV_TIER_L1_TTL", 21600.0),
+        )
+        # L1 门槛的绝对值地板（1.5.2 P0-α：原来设 512，实测 220 分钟 L1 从未
+        # 出现过任何块 ⇒ 降为 3）。
+        self._tier_l1_min_hits: int = max(_i("VLLM_KV_TIER_L1_MIN_HITS", 3), 1)
+        # 分位点：0.9 ⇒ 有命中的块里前 10% 进 L1（1.5.2 P0-α）。
+        self._tier_l1_frac: float = min(
+            max(_f("VLLM_KV_TIER_L1_FRAC", 0.9), 0.5), 0.999
+        )
+        # age_score 的衰减跨度：这么久没被复用 ⇒ age_score 归零。
+        self._tier_age_span: float = max(_f("VLLM_KV_TIER_AGE_SPAN", 21600.0), 1.0)
+        # freq_score 的饱和点：命中这么多次即视为满分（log 压缩长尾）。
+        self._tier_freq_sat: float = max(_f("VLLM_KV_TIER_FREQ_SAT", 64.0), 1.0)
+        # 中等级判定线（沿用 1.5.2 的 0.6 / 0.5）。
+        self._tier_hot_freq: float = _f("VLLM_KV_TIER_HOT_FREQ", 0.6)
+        self._tier_hot_age: float = _f("VLLM_KV_TIER_HOT_AGE", 0.5)
+        # 批量操作期间固定的 L1 门槛，避免排序中门槛漂移。
+        self._tier_l1_dyn: int | None = None
 
     def _warm_active(self) -> bool:
         """warm 机制是否可用（开关打开且确实处于缓存模式）。"""
@@ -714,21 +762,116 @@ class BlockPool:
         """Target size; above it only expired entries are trimmed."""
         return self._warm_soft_cap
 
-    def _trim_order(self, block_id: int) -> tuple[float, int]:
-        """Eviction rank: release time first, hit count second.
+    def _trim_order(self, block_id: int, now: float | None = None) -> tuple:
+        """Eviction rank, least-wanted-first.
 
-        Time is the primary axis because age is what "nobody is using this
-        anymore" means. Two entries from the same moment are then separated by
-        how often their content was reused: within equally old entries, the
-        one hit by every session outlives the one that was used once.
+        [本地 2026-11-27 移植 1.5.2] 主键从「释放时间」改为「价值等级」：
 
-        Ascending on both keys, so the result reads least-wanted-first.
+            (tier, freed_at, hits)      升序 ⇒ 先淘汰低价值、再淘汰最老的块
+
+        原实现是 ``(freed_at, hits)`` —— 时间是主键，命中次数只在时间戳
+        相同时做 tie-breaker。结果是系统提示词（命中上千次）在夜里闲 30 分钟
+        就会被只读过一次的新块挤掉。改成分层后，L1/L2A 的高价值内容无论多老
+        都排在 L3 的一次性内容之后被淘汰。同一层内仍按 LRU。
         """
-        block_hash = self.warm_blocks[block_id].block_hash
+        if now is None:
+            now = time.monotonic()
+        block = self.warm_blocks.get(block_id)
+        block_hash = block.block_hash if block is not None else None
         return (
+            self._value_tier(block_id, now),
             self._warm_freed_at.get(block_id, 0.0),
             self._warm_hits.get(block_hash, 0) if block_hash is not None else 0,
         )
+
+    def _compute_l1_threshold(self) -> int:
+        """[本地 2026-11-27 移植 1.5.2 P0-α] L1 门槛 = max(地板, 池内分位数)。
+
+        只用绝对值地板的问题是：warm 表里命中次数普遍为个位数时，地板 3
+        会让绝大多数块都进 L1，分层形同虚设。分位数让门槛随负载自适应 ——
+        高频场景门槛自然抬高，低频自然降低。
+        """
+        floor = self._tier_l1_min_hits
+        if not self.warm_blocks:
+            return floor
+        hits = sorted(
+            (
+                self._warm_hits.get(b.block_hash, 0)
+                for b in self.warm_blocks.values()
+                if b.block_hash is not None
+            ),
+            reverse=True,
+        )
+        if not hits:
+            return floor
+        # 前 (1-frac) 的比例进 L1；至少有 1 个名额。
+        idx = min(max(0, int(len(hits) * (1.0 - self._tier_l1_frac))), len(hits) - 1)
+        return max(floor, hits[idx])
+
+    def _value_tier(self, block_id: int, now: float) -> int:
+        """[本地 2026-11-27 移植 1.5.2 P-05] warm 块的价值等级 0(L3)~4(L1)。
+
+        等级只由**复用证据**决定，再按各层 TTL 逐级衰减：
+
+        * ``hit_count >= 门槛`` ⇒ L1。刻意不看年龄：固定提示词在深夜可能
+          几小时没人用，但它仍是每个会话都要读的内容。
+        * ``hit_count == 0`` ⇒ 只有 L3_TTL 的观察期（默认 10 分钟）。没被读过
+          的新内容本来就该最先退场；不给观察期会让刚写完的块立刻消失。
+        * 其余按 (freq_score, age_score) 分到 L2A/L2B/L2C。
+
+        freq_score 用 log 压缩长尾：命中次数是幂律分布（系统提示词上万次、
+        普通块个位数），线性归一化会让除 L1 外所有块挤在 0.01 以下。
+        """
+        block = self.warm_blocks.get(block_id)
+        if block is None:
+            return 0
+        block_hash = block.block_hash
+        if block_hash is None:
+            return 0
+        hits = self._warm_hits.get(block_hash, 0)
+        freed_at = self._warm_freed_at.get(block_id, 0.0)
+        idle = now - freed_at if freed_at > 0.0 else 0.0
+        l1_threshold = (
+            self._tier_l1_dyn
+            if self._tier_l1_dyn is not None
+            else self._tier_l1_min_hits
+        )
+
+        if hits >= l1_threshold:
+            base = 4
+        elif hits == 0:
+            return 1 if idle < self._tier_ttl[0] else 0
+        else:
+            age_score = (
+                0.0
+                if freed_at <= 0.0
+                else min(max(1.0 - idle / self._tier_age_span, 0.0), 1.0)
+            )
+            freq_score = min(1.0, math.log1p(hits) / math.log1p(self._tier_freq_sat))
+            if freq_score >= self._tier_hot_freq:
+                base = 3 if age_score >= self._tier_hot_age else 2
+            else:
+                base = 2 if age_score >= self._tier_hot_age else 1
+
+        # 该层 TTL 到期就掉一级；L1 闲置超过 6h 也会一路降到 L3。
+        while base > 0 and idle >= self._tier_ttl[base]:
+            base -= 1
+        return base
+
+    def warm_tier_stats(self) -> dict[str, int]:
+        """[本地 2026-11-27] 当前 warm 表按价值等级的分布，用于诊断。"""
+        now = time.monotonic()
+        counts = [0, 0, 0, 0, 0]
+        for block_id in self.warm_blocks:
+            counts[self._value_tier(block_id, now)] += 1
+        return {
+            "L3": counts[0],
+            "L2C": counts[1],
+            "L2B": counts[2],
+            "L2A": counts[3],
+            "L1": counts[4],
+            "total": len(self.warm_blocks),
+        }
 
     def _trim_warm(self, now: float) -> list[KVCacheBlock]:
         """Trim the warm table under two watermarks and two ranking signals.
@@ -770,6 +913,10 @@ class BlockPool:
             Blocks moved back to the free queue.
         """
         returned: list[KVCacheBlock] = []
+        # 本轮固定 L1 门槛：排序过程中 warm 表会变小，若门槛随之漂移，
+        # 同一批候选块会拿到不一致的等级。
+        prev_l1_dyn = self._tier_l1_dyn
+        self._tier_l1_dyn = self._compute_l1_threshold()
 
         def _release(block_id: int) -> None:
             block = self.warm_blocks.pop(block_id)
@@ -799,7 +946,7 @@ class BlockPool:
                 if _evictable(block_id)
                 and (now - self._warm_freed_at.get(block_id, 0.0)) >= retention
             ]
-            candidates.sort(key=self._trim_order)
+            candidates.sort(key=lambda b: self._trim_order(b, now))
             for block_id in candidates[:surplus]:
                 _release(block_id)
 
@@ -809,7 +956,7 @@ class BlockPool:
         if len(self.warm_blocks) > self._warm_hard_cap:
             excess = len(self.warm_blocks) - self._warm_soft_cap
             candidates = [b for b in self.warm_blocks if _evictable(b)]
-            candidates.sort(key=self._trim_order)
+            candidates.sort(key=lambda b: self._trim_order(b, now))
             for block_id in candidates[:excess]:
                 _release(block_id)
 
@@ -818,7 +965,10 @@ class BlockPool:
             # absolute cap below bounds how much of the pool retention may
             # hold, so a sustained burst cannot starve the free queue.
             if len(self.warm_blocks) > self._warm_abs_cap:
-                victims = sorted(self.warm_blocks.keys(), key=self._trim_order)[
+                victims = sorted(
+                    self.warm_blocks.keys(),
+                    key=lambda b: self._trim_order(b, now),
+                )[
                     : len(self.warm_blocks) - self._warm_abs_cap
                 ]
                 for block_id in victims:
@@ -835,6 +985,7 @@ class BlockPool:
                 retention,
                 self._warm_grace_s,
             )
+        self._tier_l1_dyn = prev_l1_dyn
         return returned
 
     def _get_retention_seconds(self) -> float:
@@ -859,12 +1010,10 @@ class BlockPool:
     ) -> int:
         """[本地 2026-11-09 重放 P-05] 把 warm 块降级回 free 队列。
 
-        始终 oldest-first（cold→hot）。两阶段：
-          Phase 1 —— 逐出**已超过**当前保留时长的块；
-          Phase 2 —— 若仍不足，无论年龄继续从队头逐出（保证调用方拿到块）。
-
-        频繁命中的块天然受保护：每次命中都会被 `touch()` 移出 warm，重新释放时
-        拿到新时间戳并排到队尾，因此能熬过很多轮回收；冷块从队头先老死。
+        [本地 2026-11-27 移植 1.5.2] 顺序从 oldest-first 改为 value-first：
+        按 `_trim_order`（价值 tier 主键、LRU 次键）从小到大逐出，保证
+        池压力下先牺牲低价值内容（一次性问答），最后才动 L1 高价值固定前缀
+        （系统/工具/自定义提示词、记忆）。
 
         逐出时一并清掉 hash（`_maybe_evict_cached_block`），此后该块不再可能
         被前缀命中 —— 这正是「降级」的含义。
@@ -877,6 +1026,8 @@ class BlockPool:
         now = time.monotonic()
         retention = self._get_retention_seconds()
         promoted = 0
+        prev_l1_dyn = self._tier_l1_dyn
+        self._tier_l1_dyn = self._compute_l1_threshold()
 
         def _promote(block_id: int) -> None:
             block = self.warm_blocks.pop(block_id)
@@ -884,29 +1035,18 @@ class BlockPool:
             self._maybe_evict_cached_block(block)
             self.free_block_queue.append_n([block])
 
-        # Phase 1：按 FIFO 序逐出已超时的块。
-        expired: list[int] = []
-        for block_id in self.warm_blocks:
+        ordered = sorted(
+            self.warm_blocks.keys(), key=lambda b: self._trim_order(b, now)
+        )
+        for block_id in ordered:
             if promoted >= num_blocks:
                 break
+            if block_id not in self.warm_blocks:
+                continue
             if not self._belongs_to_group(block_id, kv_cache_group_id):
                 continue
-            freed_at = self._warm_freed_at.get(block_id, 0.0)
-            if freed_at <= 0.0 or (now - freed_at) >= retention:
-                expired.append(block_id)
-                promoted += 1
-        for block_id in expired:
             _promote(block_id)
-
-        # Phase 2：仍不足 ⇒ 无视年龄继续从队头取。
-        if promoted < num_blocks:
-            for block_id in list(self.warm_blocks.keys()):
-                if promoted >= num_blocks:
-                    break
-                if not self._belongs_to_group(block_id, kv_cache_group_id):
-                    continue
-                _promote(block_id)
-                promoted += 1
+            promoted += 1
 
         if promoted:
             logger.debug(
@@ -915,6 +1055,7 @@ class BlockPool:
                 retention,
                 len(self.warm_blocks),
             )
+        self._tier_l1_dyn = prev_l1_dyn
         return promoted
 
     def get_num_free_blocks(self, kv_cache_group_id: int | None = None) -> int:
