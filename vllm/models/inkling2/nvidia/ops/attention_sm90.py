@@ -247,6 +247,17 @@ def _block_m(max_query_len: int, group: int) -> int:
     return 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
 
 
+def _block_n(block_m: int) -> int:
+    if is_sm70():
+        # 16-row (decode) tiles: 32-key blocks. V100 decode attention 1.66 ->
+        # 0.91 ms per step at short context, 4.0 -> 3.4 ms at 7k; tuned on V100,
+        # unmeasured on SM75.
+        return 32 if block_m == 16 else 64
+    if block_m >= 128:
+        return 64
+    return 128 if block_m <= 32 else 64
+
+
 def rel_attention(
     q: torch.Tensor,
     key_cache: torch.Tensor,
@@ -348,17 +359,7 @@ def rel_attention(
         DRAFT=draft,
         MODE=mode,
         BLOCK_M=block_m,
-        # SM70 decode (16-row query tiles): 32-key blocks (V100 decode attention
-        # 1.66 -> 0.91 ms per step at short context, 4.0 -> 3.4 ms at 7k).
-        BLOCK_N=(
-            32
-            if is_sm70() and block_m == 16
-            else 64
-            if (block_m >= 128 or is_sm70())
-            else 128
-            if block_m <= 32
-            else 64
-        ),
+        BLOCK_N=_block_n(block_m),
         num_warps=8 if (block_m >= 128 or (is_sm70() and block_m >= 32)) else 4,
         num_stages=2,
     )

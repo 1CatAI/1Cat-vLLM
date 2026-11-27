@@ -25,7 +25,8 @@ from .pdl import gdc_launch_dependents, gdc_wait
 LOW_M_MAX_TOKENS = 32
 # Decode-size row counts take the SM70 GEMV for split-K partials: the mma
 # tile kernel pads each row to a 16-row tile (the Inkling2 router logits,
-# [128, 2304], took ~58 us per call on V100 that way).
+# [128, 2304], took ~58 us per call on V100 that way). Tuned on V100;
+# `is_sm70()` also covers SM75, where it is unmeasured.
 SM70_GEMV_MAX_TOKENS = 8
 
 
@@ -286,8 +287,18 @@ def k_group_partials(
     groups = triton.cdiv(hidden, 1024)
     if is_sm70() and 0 < tokens <= SM70_GEMV_MAX_TOKENS and groups > 1:
         out = torch.empty((groups, tokens, n), dtype=torch.float32, device=x.device)
+        # No PDL: this branch runs only on SM70 / SM75, which lack it.
         _k_group_gemv_kernel[(triton.cdiv(n, 8), tokens, groups)](
-            x, weight, out, tokens, n, hidden, 8, 256, num_warps=4
+            x,
+            weight,
+            out,
+            tokens,
+            n,
+            hidden,
+            8,
+            256,
+            num_warps=4,
+            enable_fp_fusion=False,
         )
         return out
     block_m = 16 if tokens <= 128 else 64

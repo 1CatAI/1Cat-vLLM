@@ -424,7 +424,8 @@ def short_conv(
     prefill = num_tokens > 256
     if num_tokens <= 8:
         # Decode: 128-channel tiles spread the convolution over the SMs (1024-wide
-        # tiles leave 3 programs for 2304 channels; V100: 9.5 -> 5.7 us a call).
+        # tiles leave 3 programs for 2304 channels; V100: 9.5 -> 5.7 us a call;
+        # tuned on V100, unmeasured on SM75).
         block_t, block_c = 1, 128 if is_sm70() else 1024
     else:
         block_t, block_c = (4, 256) if prefill else (2, 512)
@@ -987,9 +988,10 @@ def attention_prologue(
         BLOCK_E=block_e,
         QR_TOKENS=triton.cdiv(block_t, num_heads),
         FUSE_QR=not qr_tokens,
-        # The fused decode launch is latency bound on SM70: 8 warps per program
-        # (V100: 16.8 -> 9.6 us a call).
-        num_warps=8 if is_sm70() and not qr_tokens else 4,
+        # Decode-size launches are latency bound on SM70: 8 warps per program
+        # (V100, one token: 16.8 -> 9.6 us a call). Prefill keeps 4. Tuned on
+        # V100; `is_sm70()` also covers SM75, where it is unmeasured.
+        num_warps=8 if is_sm70() and num_tokens <= 8 else 4,
         enable_fp_fusion=False,
         launch_pdl=use_pdl(),
     )

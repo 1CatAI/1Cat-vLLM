@@ -70,7 +70,7 @@ CUDA graphs:
 
 | decode tok/s (short / 4k / 16k) | before | after | change |
 | --- | --- | --- | --- |
-| this branch | 44.2 / 41.4 / 38.4 | 51.3 / 47.7 / 43.7 | +16 / +15 / +14 % |
+| PR 1 (#1598 kernels) → this commit | 44.2 / 41.4 / 38.4 | 51.3 / 47.7 / 43.7 | +16 / +15 / +14 % |
 
 Prefill is unchanged (~772 tok/s at 16k).
 
@@ -92,7 +92,7 @@ profile at TP=1, ms per decode step):
 
 | Kernel | Change | Before | After |
 | --- | --- | --- | --- |
-| `_attn_prologue_kernel` | 8 warps for decode (no fused q/r tokens) | 16.8 µs | 9.6 µs |
+| `_attn_prologue_kernel` | 8 warps for decode-size launches (≤ 8 tokens) | 16.8 µs | 9.6 µs |
 | `_sconv_kernel` | 128-channel decode tile | 9.5 µs | 5.7 µs |
 | `_rel_attention_kernel` | 32-key blocks for 16-row decode tiles | 1.66 ms | 0.91 ms |
 | `_rel_attention_kernel` at 7k context | same | 4.0 ms | 3.4 ms |
@@ -103,18 +103,24 @@ launches) for attention. Rejected in the attention sweep:
 - 1 pipeline stage: no change;
 - fewer local splits: slower at 4k.
 
-Prefill launches and other architectures are unchanged.
+All three apply to decode-size launches only: the prologue and short conv at ≤ 8 tokens,
+and attention at 16-row query tiles (≤ 5 tokens per request at G = 3). Prefill,
+including short and chunked prefill, and other architectures are unchanged. The
+per-kernel figures were measured with one decode token.
+
+The SM70 checks (`is_sm70()`) also cover SM75 (Turing). These settings were tuned on
+V100 only and are unmeasured on SM75.
 
 Q8 GGUF, TP=1, one V100, CUDA graphs, decode tok/s (short / 4k / 16k):
 
 | Stage | tok/s |
 | --- | --- |
-| #1598 | 44.2 / 41.4 / 38.4 |
+| PR 1 (#1598 kernels) | 44.2 / 41.4 / 38.4 |
 | + router GEMV | 51.3 / 47.7 / 43.7 |
 | + prologue and short-conv configs | 52.8 / 49.0 / 44.8 |
 | + 32-key decode attention blocks | 55.8 / 51.5 / 46.9 |
 
-That is +26 / +24 / +22 % over #1598. Greedy output matches the official checkpoint on all
+That is +26 / +24 / +22 % over PR 1. Greedy output matches the official checkpoint on all
 parity prompts at every stage.
 
 ### TP=2
@@ -159,7 +165,8 @@ in both runs of this branch, so the numerics were measured directly.
 | --- | --- | --- | --- |
 | + router GEMV | 0.0182 | 0.00099 | 0.90 % |
 | + launch configs | 0.0186 | 0.00104 | 0.93 % |
-| + 32-key attention blocks (this branch) | 0.0190 | 0.00101 | 1.00 % |
+| + 32-key attention blocks | 0.0190 | 0.00101 | 1.00 % |
+| this branch (GEMV without FMA contraction) | 0.0189 | 0.00099 | 0.96 % |
 | PR 1 itself at TP=2 | 0.0212 | 0.00134 | 1.08 % |
 
 - Almost all of the difference comes from the router GEMV's summation order. The launch
