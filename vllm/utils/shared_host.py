@@ -89,6 +89,12 @@ class SharedHostArena:
     def size(self) -> int:
         return self.identity.size
 
+    def fileno(self) -> int:
+        """The descriptor, for a creator that publishes it as /proc/<pid>/fd/<fd>."""
+        if self._fd < 0:
+            raise ValueError("Shared host arena is closed")
+        return self._fd
+
     @property
     def address(self) -> int:
         """This process's CPU address, not a transferable handle."""
