@@ -1,0 +1,75 @@
+diff --git a/tests/kernels/test_deepseek_v4_sm70_indexer.py b/tests/kernels/test_deepseek_v4_sm70_indexer.py
+index 1a46cba71f..7cb3b5639f 100644
+--- a/tests/kernels/test_deepseek_v4_sm70_indexer.py
++++ b/tests/kernels/test_deepseek_v4_sm70_indexer.py
+@@ -142,6 +142,33 @@ def test_prefill_relu_off_restores_the_factored_form(monkeypatch):
+     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+ 
+ 
++@requires_sm70
++def test_prefill_cublas_scores_survive_unscaled_key_magnitudes(monkeypatch):
++    """The cuBLAS route multiplies by keys with their scale left out, so e4m3
++    values reach 448 and one q . k passes fp16's 65504. Such scores are finite
++    once scaled and must stay finite; with an fp16 score tile they became inf,
++    and NaN where the mixed-sign head weights summed +inf and -inf."""
++    torch.manual_seed(20261031)
++    generator = torch.Generator().manual_seed(20261031)
++    num_queries, num_heads, num_keys = 3, 8, 16
++    monkeypatch.setattr(sparse_policy(), "indexer_prefill_cublas", True)
++
++    q, weights = _make_queries(num_queries, num_heads)
++    q[:, :2] = 2.0  # 128 * 2.0 * 448 = 114688 against the full-scale keys
++    weights[:, 0], weights[:, 1] = 1.0, -1.0
++    bits, values = _random_fp8_keys(num_keys, generator)
++    bits[: num_keys // 2] = 0x7E  # e4m3fn 448, the format's largest finite value
++    values[: num_keys // 2] = 448.0
++    scales = torch.full((num_keys,), 2.0**-8, device="cuda", dtype=torch.float32)
++
++    actual = sm70_indexer_prefill_logits(
++        q, bits.view(torch.float8_e4m3fn), scales, weights
++    )
++    expected = _reference_index_logits(q, weights, values * scales[:, None])
++    assert torch.isfinite(actual).all()
++    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-2)
++
++
+ @requires_sm70
+ @pytest.mark.parametrize(
+     "relu,fused",
+diff --git a/vllm/models/deepseek_v4/sm70/indexer.py b/vllm/models/deepseek_v4/sm70/indexer.py
+index 43813ede60..f349718574 100644
+--- a/vllm/models/deepseek_v4/sm70/indexer.py
++++ b/vllm/models/deepseek_v4/sm70/indexer.py
+@@ -51,8 +51,8 @@
+ # Route prefill scoring through cuBLAS instead of the Triton MMA. Set 0 for an
+ # A/B against the Triton kernel above (which stays as the reference shape and
+ # is what the decode path still uses, since decode gathers from a paged cache).
+-# Cap (MiB) on the [tokens*heads, key_tile] fp16 score tile. At the default
+-# 2048-token prefill chunk and 64 heads this is 128 KiB per key, so the tile
++# Cap (MiB) on the [tokens*heads, key_tile] fp32 score tile. At the default
++# 2048-token prefill chunk and 64 heads this is 512 KiB per key, so the tile
+ # is what keeps a long-context chunk from asking for gigabytes in one go.
+ _EPILOGUE_BLOCK_K = 256
+ _EPILOGUE_BLOCK_H = 8
+@@ -609,16 +609,16 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
+         q2 = q2.contiguous()
+ 
+     rows = num_q * num_heads
+-    budget = max(1, policy.value("indexer_prefill_tile_mb") * 2**20 // max(1, rows * 2))
++    budget = max(1, policy.value("indexer_prefill_tile_mb") * 2**20 // max(1, rows * 4))
+     k_tile = max(_RELU_BLOCK_N, min(num_k, budget // _RELU_BLOCK_N * _RELU_BLOCK_N))
+ 
+     for start in range(0, num_k, k_tile):
+         stop = min(start + k_tile, num_k)
+         width = stop - start
+-        # fp16 out with fp32 accumulate: the epilogue reduces in fp32 and only
+-        # the top-k *set* is consumed downstream, so the 5e-4 rounding here is
+-        # far below the gap between neighbouring index scores.
+-        scores = torch.mm(q2, k_fp16[start:stop].t())
++        # fp32 out: the keys enter unscaled (e4m3 reaches 448), so one q . k can
++        # pass fp16's 65504; an fp16 tile overflowed to inf, and to NaN where
++        # mixed-sign head weights summed +inf and -inf in the epilogue.
++        scores = torch.mm(q2, k_fp16[start:stop].t(), out_dtype=torch.float32)
+         _relu_weight_headsum_kernel[(num_q, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
+             scores,
+             weights,

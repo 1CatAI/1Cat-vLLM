@@ -1,0 +1,53 @@
+diff --git a/tests/v1/cudagraph/test_cudagraph_dispatch.py b/tests/v1/cudagraph/test_cudagraph_dispatch.py
+index 46058f72f..65bab73ff 100644
+--- a/tests/v1/cudagraph/test_cudagraph_dispatch.py
++++ b/tests/v1/cudagraph/test_cudagraph_dispatch.py
+@@ -439,8 +439,18 @@ class TestCudagraphDispatcher:
+         ("max_model_len", "expected"),
+         [
+             (4096, (2048, 4096)),
+-            (131072, (2048, 4096, 16384, 65536, 131072)),
+-            (307200, (2048, 4096, 16384, 65536, 131072, 307200)),
++            (8192, (2048, 4096, 8192)),
++            (131072, (2048, 4096, 16384, 32768, 49152, 65536, 98304, 131072)),
++            (
++                307200,
++                (2048, 4096, 16384, 32768, 49152, 65536, 98304, 131072)
++                + (163840, 196608, 229376, 262144, 307200),
++            ),
++            (
++                500000,
++                (2048, 4096, 16384, 32768, 49152, 65536, 98304, 131072)
++                + (163840, 196608, 229376, 262144, 327680, 393216, 458752, 500000),
++            ),
+         ],
+     )
+     def test_dsv4_decode_context_buckets_end_at_the_model_length(
+diff --git a/vllm/model_executor/models/graph_contract.py b/vllm/model_executor/models/graph_contract.py
+index 8c4577910..f45ad0a15 100644
+--- a/vllm/model_executor/models/graph_contract.py
++++ b/vllm/model_executor/models/graph_contract.py
+@@ -33,9 +33,20 @@ class GraphModelContract:
+         short = self.index_topk * min(self.compress_ratios)
+         if short <= 0 or self.max_model_len <= short:
+             return ()
+-        buckets = tuple(
+-            short * m for m in (1, 2, 8, 32, 64) if short * m < self.max_model_len
+-        )
++        buckets = [m * short for m in (1, 2) if m * short < self.max_model_len]
++        # A decode round costs time with the width of its bucket, not with the
++        # context, so a context just above a bucket pays for the whole gap to
++        # the next one. From 8 * short on, the buckets are a step apart that
++        # starts at 8 * short and doubles each time the bucket passes four
++        # times the bucket where the step last changed.
++        bucket = step = 8 * short
++        widen_at = 4 * bucket
++        while bucket < self.max_model_len:
++            buckets.append(bucket)
++            if bucket >= widen_at:
++                step *= 2
++                widen_at *= 4
++            bucket += step
+         # Above the largest bucket a decode graph would be bound by the model's
+         # maximum length, which keeps the indexer off its cuBLAS decode route;
+         # a last bucket at the maximum length keeps it on.

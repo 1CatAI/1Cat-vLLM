@@ -1,0 +1,1439 @@
+diff --git a/docs/design/sm70_flash_v100_fp8_kv_long_context.md b/docs/design/sm70_flash_v100_fp8_kv_long_context.md
+index b56163d627..76728325a6 100644
+--- a/docs/design/sm70_flash_v100_fp8_kv_long_context.md
++++ b/docs/design/sm70_flash_v100_fp8_kv_long_context.md
+@@ -298,6 +298,10 @@ attention shape is covered by the bitwise operator regression.
+ ## Runtime Controls
+ 
+ - `VLLM_FLASH_V100_FP8_PREFILL_BRIDGE=0`: disable the prefill bridge.
++- `VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS=N`: force sequential KV-head
++  groups for the existing FP8 prefill bridge (`1` forces one unsplit pass).
++- `VLLM_FLASH_V100_FP8_BRIDGE_WORKSPACE_BYTES=N`: override the automatic
++  bridge conversion/scratch envelope in bytes (`0` selects native FP8).
+ - `VLLM_FLASH_V100_DECODE_USE_XQA=0`: disable all XQA decode.
+ - `VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN=8192`: non-graph FP8 XQA
+   crossover threshold.
+@@ -305,11 +309,67 @@ attention shape is covered by the bitwise operator regression.
+ The bridge and FP8 XQA are enabled by default under their strict shape and
+ dtype gates. FP8 E4M3 is not routed through either E5M2 implementation.
+ 
++Long-context prefill needs a large FP16 K/V conversion workspace. Grouping
++reduces this storage while retaining the fast bridge, but adds conversion/
++attention passes and query/output copies. Therefore the automatic policy keeps
++one pass when it fits and otherwise selects the smallest valid KV-head divisor;
++it is a memory/latency tradeoff, not a universal throughput improvement.
++
++The default cap is **1/32 of the engine's configured GPU-memory allowance**:
++the existing worker startup snapshot computes
++`ceil(total_device_memory * gpu_memory_utilization)`, and automatic bridge
++planning uses that allowance divided by 32 (integer bytes). This is a chosen
++memory/latency policy, not a measured universal optimum or a guarantee of free
++memory. It scales with device capacity and the user's utilization setting, not
++with one model's observed allocation. The snapshot is worker-local and reused
++by subsequent layers; CPU configuration construction never queries a device.
++`fp8_bridge_workspace_bytes` overrides this derivation. An explicit head-group
++count overrides both the cap and automatic selection.
++
++The initialization-time projection uses the configured maximum model context,
++rounded through input KV pages and native 784-token conversion pages, and the
++maximum scheduler-admitted query chunk (bounded by model context). It includes FP16 K/V,
++the int32 remap table, retained 64-token tail-padding Q/output, and grouped
++Q/output copies. A group is admitted only when this complete envelope fits the
++per-engine cap. If even one KV head per group cannot fit, native FP8 paged
++attention is used. No request-time free-memory probe influences the decision.
++Hybrid KV grouping can enlarge a layer's physical page after weight loading.
++The final per-layer KV-group page refines the provisional constructor plan
++before profiling and again at backend initialization for fixed-KV-budget
++startup. Selected kernel pages divide that physical page, so its padding is a
++conservative bound; the global cache default is not assumed to be the final
++input page. A deferred page is not replaced with a guessed size. The native
++conversion contract requires covering the padded input block table, not only
++the live sequence length.
++Normal model memory profiling materializes the selected maximum workspace so
++KV-cache sizing accounts for it; forced KV-cache byte sizing remains the user's
++responsibility. Growth is bounded by these configured capacities, not just the
++current request. Workspace banks remain isolated by engine and CUDA stream;
++the envelope describes one stream/head geometry, not an aggregate cap across
++arbitrarily many concurrent streams or heterogeneous attention geometries.
++The profile reserves each geometry bank actually used by that engine.
++
++```bash
++vllm serve <model> --attention-config \
++  '{"backend":"FLASH_ATTN_V100","flash_v100":{"options":{"fp8_bridge_workspace_bytes":536870912}}}'
++```
++
++Omitting `fp8_bridge_head_groups` is distinct from explicitly setting `1`.
++Typed group counts override the retained environment input and the automatic
++budget. Counts below one or counts that do not divide the KV-head count retain
++the legacy unsplit behavior. Independent callers without engine dimensions also
++retain unsplit behavior. Neither eligibility nor FP8 scale interpretation
++changes. Allocation failure still falls back to native FP8 paged attention.
++Automatic grouped query/output scratch is reused; explicit legacy grouping
++retains its allocation-failure contract.
++
+ ## Tests And Artifacts
+ 
+ Tests:
+ 
+ - `tests/kernels/attention/test_sm70_flash_v100_varlen_layout.py`
++- `tests/config/test_flash_v100_lifecycle.py` (budget boundaries, overrides,
++  worker snapshot ownership, and bounded backing storage)
+ - `tests/quantization/test_fp8.py`
+ - `tests/v1/attention/test_sm70_flash_v100_policy.py`
+ - `tests/v1/spec_decode/test_static_draft_vocab.py`
+diff --git a/tests/config/test_flash_v100_lifecycle.py b/tests/config/test_flash_v100_lifecycle.py
+index 2348acded9..77a04b3b5e 100644
+--- a/tests/config/test_flash_v100_lifecycle.py
++++ b/tests/config/test_flash_v100_lifecycle.py
+@@ -209,6 +209,55 @@ def test_attention_workspace_shutdown_keeps_other_engine_and_legacy(monkeypatch)
+     assert legacy == {}
+ 
+ 
++def test_fp8_bridge_workspace_stays_within_addressable_context():
++    import math
++
++    import torch
++
++    from vllm.config import set_current_vllm_config
++    from vllm.runtime_resources import release_runtime_resources
++    from vllm.v1.attention.backends.flash_v100 import dense_prefill
++
++    engine = SimpleNamespace()
++    input_page_size = 1616
++    output_page_size = dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE
++    max_model_len = 262144
++    table_width = math.ceil(max_model_len / input_page_size)
++    max_blocks = math.ceil(table_width * input_page_size / output_page_size)
++    # Small head dimensions keep the resource-contract test CPU-sized. Page
++    # counts and FP16 storage follow the production 262K-context boundary.
++    key_cache = torch.empty((1, input_page_size, 1, 2), dtype=torch.uint8)
++    max_kv_bytes = max_blocks * output_page_size * 1 * 2 * 2
++    try:
++        with set_current_vllm_config(engine):
++            for seq_len in (180000, max_model_len, 8000):
++                active_pages = math.ceil(seq_len / input_page_size)
++                required_blocks = math.ceil(
++                    active_pages * input_page_size / output_page_size
++                )
++                workspace = dense_prefill.get_fp8_prefill_bridge_workspace(
++                    key_cache, required_blocks, max_blocks=max_blocks
++                )
++                assert workspace is not None
++                key, value, table = workspace
++                assert key.shape == (required_blocks, output_page_size, 1, 2)
++                assert value.shape == key.shape
++                # The backing allocations, not just returned views, must fit
++                # the addressable context even after a shorter prior request.
++                for tensor in (key, value):
++                    assert tensor.untyped_storage().nbytes() <= max_kv_bytes
++                    tensor[-1].fill_(7)
++                    assert torch.all(tensor[-1] == 7)
++                assert table.shape == (1, required_blocks)
++                assert table[0, -1].item() == required_blocks - 1
++                assert (
++                    table.untyped_storage().nbytes()
++                    <= max_blocks * table.element_size()
++                )
++    finally:
++        release_runtime_resources(engine)
++
++
+ def test_attention_diagnostic_budgets_and_output_do_not_cross_engines(tmp_path):
+     import json
+ 
+@@ -237,3 +286,344 @@ def test_attention_diagnostic_budgets_and_output_do_not_cross_engines(tmp_path):
+     for path in paths:
+         with open(path) as stream:
+             assert json.load(stream) == {"equal": True}
++
++
++def bridge_engine(
++    options, *, context=4097, chunk=65, block_size=1056,
++    gpu_memory_budget_bytes=16 * 1024**3,
++):
++    from vllm.config import set_current_vllm_config
++    from vllm.runtime_resources import runtime_resources_for
++    from vllm.v1.attention.backends.flash_v100.impl import FlashAttnV100Impl
++
++    policy = prepare(options)[0]
++    engine = SimpleNamespace(
++        attention_config=SimpleNamespace(flash_v100=policy),
++        model_config=SimpleNamespace(max_model_len=context),
++        scheduler_config=SimpleNamespace(max_num_batched_tokens=chunk),
++        cache_config=SimpleNamespace(block_size=block_size),
++    )
++    if gpu_memory_budget_bytes is not None:
++        runtime_resources_for(engine)["gpu_memory_budget_bytes"] = (
++            gpu_memory_budget_bytes
++        )
++    impl = object.__new__(FlashAttnV100Impl)
++    impl.num_heads, impl.num_kv_heads, impl.head_size = 24, 6, 256
++    impl.kv_cache_dtype = "fp8_e4m3"
++    for name in (
++        "flash_attn_prefill_paged", "fp8_e4m3_paged_kv_to_fp16",
++        "fp8_e5m2_paged_kv_to_fp16", "flash_attn_prefill_paged_splitkv",
++        "flash_attn_prefill_paged_bfla", "flash_attn_func",
++    ):
++        setattr(impl, name, object())
++    with set_current_vllm_config(engine):
++        impl._initialize_prefill_policy()
++    return engine, impl
++
++
++@pytest.mark.parametrize(
++    "budget,groups",
++    [
++        (32_047_128, 1),  # Exact unsplit fit; tail padding is included.
++        (32_047_127, 2),
++        (29_884_484, 2),  # Old 256-page projection incorrectly admitted unsplit.
++        (16_822_296, 2),
++        (16_822_295, 3),  # One byte below the two-group fit.
++        (11_214_872, 3),
++        (11_214_871, 6),
++        (5_607_448, 6),
++        (5_607_447, 0),  # No valid divisor fits.
++        (0, 0),
++    ],
++)
++def test_bridge_budget_selects_smallest_divisor_and_native_route(
++    monkeypatch, budget, groups
++):
++    import torch
++
++    monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", raising=False)
++    _, impl = bridge_engine(FlashV100Options(fp8_bridge_workspace_bytes=budget))
++    assert impl.fp8_bridge_head_groups == groups
++    key = torch.empty((1, 1056, 6, 256), dtype=torch.uint8)
++    assert impl._should_use_fp8_prefill_bridge(
++        q_len=65, head_dim=256, key_cache=key, value_cache=key,
++        causal=True, window_size=(-1, -1),
++    ) is (groups != 0)
++    if groups:
++        plan = impl.fp8_bridge_workspace_plan
++        assert plan.max_kv_tokens == 4704  # Six native 784-token pages.
++        assert plan.max_query_tokens == 65
++        assert plan.projected_bytes <= budget
++
++
++@pytest.mark.parametrize("typed", [1, 2, 3, 0, -2])
++def test_bridge_explicit_groups_override_budget_and_legacy(monkeypatch, typed):
++    monkeypatch.setenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", "6")
++    engine, impl = bridge_engine(
++        FlashV100Options(
++            fp8_bridge_head_groups=typed, fp8_bridge_workspace_bytes=0
++        )
++    )
++    assert impl.fp8_bridge_head_groups == max(1, typed)
++    assert impl.fp8_bridge_workspace_plan is None
++    assert engine.attention_config.flash_v100.options.sources[
++        "fp8_bridge_head_groups"
++    ] == "typed"
++
++
++def test_bridge_legacy_force_and_budget_errors_remain_engine_owned(monkeypatch):
++    monkeypatch.setenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", "1")
++    first, unsplit = bridge_engine(FlashV100Options(fp8_bridge_workspace_bytes=0))
++    monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS")
++    second, native = bridge_engine(FlashV100Options(fp8_bridge_workspace_bytes=0))
++    assert unsplit.fp8_bridge_head_groups == 1
++    assert native.fp8_bridge_head_groups == 0
++    assert first.attention_config.flash_v100.compute_hash() != (
++        second.attention_config.flash_v100.compute_hash()
++    )
++    monkeypatch.setenv("VLLM_FLASH_V100_FP8_BRIDGE_WORKSPACE_BYTES", "-1")
++    with pytest.raises(ValueError, match="nonnegative"):
++        bridge_engine(FlashV100Options())
++    monkeypatch.setenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", "bad")
++    with pytest.raises(ValueError):
++        bridge_engine(FlashV100Options())
++    # An explicit group count does not evaluate an irrelevant malformed budget.
++    monkeypatch.setenv("VLLM_FLASH_V100_FP8_BRIDGE_WORKSPACE_BYTES", "bad")
++    _, forced = bridge_engine(FlashV100Options(fp8_bridge_head_groups=1))
++    assert forced.fp8_bridge_head_groups == 1
++
++
++def test_bridge_auto_workspace_storage_fits_after_growth_and_engine_shutdown(
++    monkeypatch,
++):
++    import torch
++
++    from vllm.config import set_current_vllm_config
++    from vllm.runtime_resources import release_runtime_resources
++    from vllm.v1.attention.backends.flash_v100 import dense_prefill
++
++    monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", raising=False)
++    engine, impl = bridge_engine(
++        FlashV100Options(fp8_bridge_workspace_bytes=11_214_872)
++    )
++    other, _ = bridge_engine(FlashV100Options(fp8_bridge_workspace_bytes=0))
++    plan = impl.fp8_bridge_workspace_plan
++    kv_heads, q_heads = 6 // plan.head_groups, 24 // plan.head_groups
++    key = torch.empty((0, 1056, kv_heads, 256), dtype=torch.uint8)
++    query = torch.empty((1, 65, q_heads, 256), dtype=torch.float16)
++    try:
++        with set_current_vllm_config(engine):
++            for blocks, tokens in ((4, 48), (6, 65), (2, 32)):
++                kv = dense_prefill.get_fp8_prefill_bridge_workspace(
++                    key, blocks, max_blocks=6
++                )
++                scratch = dense_prefill.get_fp8_prefill_bridge_tail_workspace(
++                    query, tokens, max_query_len=65, group_scratch=True
++                )
++                tail = dense_prefill.get_fp8_prefill_bridge_tail_workspace(
++                    query, (tokens + 63) // 64 * 64, max_query_len=128
++                )
++                tensors = (*kv, *scratch, *tail)
++                assert sum(
++                    tensor.untyped_storage().nbytes() for tensor in tensors
++                ) <= plan.projected_bytes <= plan.budget_bytes
++                scratch[0].fill_(3)
++                assert torch.all(scratch[0] == 3)
++            previous_ptr = kv[0].data_ptr()
++        with set_current_vllm_config(other):
++            other_kv = dense_prefill.get_fp8_prefill_bridge_workspace(key, 2)
++            assert other_kv[0].data_ptr() != previous_ptr
++        release_runtime_resources(other)
++        with set_current_vllm_config(engine):
++            assert dense_prefill.get_fp8_prefill_bridge_workspace(
++                key, 2, max_blocks=6
++            )[0].data_ptr() == previous_ptr
++    finally:
++        release_runtime_resources(engine)
++        release_runtime_resources(other)
++
++
++@pytest.mark.parametrize("dimension", ["context", "chunk", "block_size"])
++def test_bridge_rejects_invalid_configured_dimensions(monkeypatch, dimension):
++    monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", raising=False)
++    with pytest.raises(ValueError, match="planning dimensions"):
++        bridge_engine(
++            FlashV100Options(fp8_bridge_workspace_bytes=32 * 1024**2),
++            **{dimension: 0},
++        )
++
++
++@pytest.mark.parametrize("query_tokens,table_blocks", [(66, 4), (65, 5)])
++def test_bridge_out_of_envelope_uses_native_without_conversion(
++    monkeypatch, query_tokens, table_blocks
++):
++    import torch
++
++    from vllm.v1.attention.backends.flash_v100 import prefill
++
++    monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", raising=False)
++    _, impl = bridge_engine(
++        FlashV100Options(fp8_bridge_workspace_bytes=11_214_872)
++    )
++    query = torch.zeros((1, query_tokens, 24, 256), dtype=torch.float16)
++    key = torch.empty((0, 1056, 6, 256), dtype=torch.uint8)
++    output = torch.full_like(query, float("nan"))
++    # The fixture's native callbacks are deliberately noncallable: an invalid
++    # request envelope must decline before allocating or launching conversion.
++    assert prefill._run_fp8_prefill_bridge(
++        impl, query=query, key_cache=key, value_cache=key,
++        block_table=torch.zeros((1, table_blocks), dtype=torch.int32),
++        seq_lens=torch.tensor([4097], dtype=torch.int32),
++        seq_len=4097, k_scale=0.75, v_scale=1.25, causal=True,
++        window_size=(-1, -1), out=output,
++    ) is None
++    assert torch.isnan(output).all()
++
++
++def test_bridge_default_uses_engine_worker_snapshot_without_runtime_probe(monkeypatch):
++    from vllm.config import set_current_vllm_config
++
++    monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", raising=False)
++    monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_WORKSPACE_BYTES", raising=False)
++    first, grouped = bridge_engine(
++        FlashV100Options(), gpu_memory_budget_bytes=32 * 11_214_872
++    )
++    second, unsplit = bridge_engine(
++        FlashV100Options(), gpu_memory_budget_bytes=32 * 32_047_128
++    )
++    assert grouped.fp8_bridge_head_groups == 3
++    assert unsplit.fp8_bridge_head_groups == 1
++    assert grouped.fp8_bridge_workspace_plan.budget_bytes == 11_214_872
++    assert unsplit.fp8_bridge_workspace_plan.budget_bytes == 32_047_128
++    assert first.attention_config.flash_v100.options.sources[
++        "fp8_bridge_workspace_bytes"
++    ] == "default"
++    # Subsequent layers use the worker-owned snapshot, never live free memory.
++    monkeypatch.setattr(
++        "torch.cuda.mem_get_info",
++        lambda *a, **kw: pytest.fail("attention probed live free memory"),
++    )
++    with set_current_vllm_config(first):
++        grouped._initialize_prefill_policy()
++    assert grouped.fp8_bridge_head_groups == 3
++    assert unsplit.fp8_bridge_head_groups == 1
++    _, forced = bridge_engine(
++        FlashV100Options(fp8_bridge_workspace_bytes=0),
++        gpu_memory_budget_bytes=32 * 32_047_128,
++    )
++    assert forced.fp8_bridge_head_groups == 0
++    # Configuration-only callers cannot accidentally probe a GPU at import or
++    # config construction; worker initialization or an explicit cap is required.
++    with pytest.raises(RuntimeError, match="worker memory snapshot"):
++        bridge_engine(FlashV100Options(), gpu_memory_budget_bytes=None)
++
++
++@pytest.mark.parametrize("fixed_kv_bytes", [None, 64 * 1024**2])
++def test_full_engine_default_cache_and_hybrid_page_reservation(
++    monkeypatch, tmp_path, fixed_kv_bytes
++):
++    import torch
++    from transformers import Qwen3Config
++
++    from vllm.config import (
++        CacheConfig,
++        DeviceConfig,
++        ModelConfig,
++        SchedulerConfig,
++        VllmConfig,
++        set_current_vllm_config,
++    )
++    from vllm.runtime_resources import release_runtime_resources, runtime_resources_for
++    from vllm.v1.attention.backends.flash_v100 import config, dense_prefill
++    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
++
++    monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", raising=False)
++    monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_WORKSPACE_BYTES", raising=False)
++    hf = Qwen3Config(
++        architectures=["Qwen3ForCausalLM"], num_hidden_layers=2,
++        hidden_size=6144, intermediate_size=8192, num_attention_heads=24,
++        num_key_value_heads=6, head_dim=256, max_position_embeddings=8192,
++        vocab_size=64,
++    )
++    hf.save_pretrained(tmp_path)
++    model = ModelConfig(
++        model=str(tmp_path), tokenizer=str(tmp_path), dtype="half",
++        skip_tokenizer_init=True, enforce_eager=True, max_model_len=4097,
++    )
++    engine = VllmConfig(
++        model_config=model, device_config=DeviceConfig(device="cpu"),
++        cache_config=CacheConfig(kv_cache_memory_bytes=fixed_kv_bytes),
++        scheduler_config=SchedulerConfig(
++            max_model_len=4097, max_num_batched_tokens=65, max_num_seqs=1,
++            is_encoder_decoder=False, enable_chunked_prefill=True,
++        ),
++    )
++    assert engine.cache_config.block_size == CacheConfig.DEFAULT_BLOCK_SIZE
++    assert not engine.cache_config.user_specified_block_size
++    engine.attention_config.flash_v100 = prepare()[0]
++    runtime_resources_for(engine)["gpu_memory_budget_bytes"] = 32 * 32_047_128
++    _, impl = bridge_engine(FlashV100Options(fp8_bridge_head_groups=1))
++    with set_current_vllm_config(engine):
++        impl._initialize_prefill_policy()
++    assert impl.fp8_bridge_head_groups == 1
++    assert impl.fp8_bridge_workspace_plan.max_kv_tokens == 4704
++
++    # Real KV-group data after hybrid page-size equalization. The ordinary
++    # CacheConfig default remains 16 and must not override this 1616-token page.
++    spec = FullAttentionSpec(
++        block_size=1616, num_kv_heads=6, head_size=256, dtype=torch.uint8
++    )
++    groups = [KVCacheGroupSpec(["attention"], spec)]
++    config.configure_fp8_bridge_workspace_plans(
++        engine, groups, {"attention": SimpleNamespace(impl=impl)}
++    )
++    plan = impl.fp8_bridge_workspace_plan
++    assert plan.max_kv_tokens == 5488
++    assert impl.fp8_bridge_head_groups == 2
++    assert engine.cache_config.block_size == CacheConfig.DEFAULT_BLOCK_SIZE
++    # The same finalization runs before normal profile_run and before backend
++    # initialization when fixed KV bytes skip profiling. Reserve actual buffers,
++    # rather than merely asserting that a hook forwarded its arguments.
++    key = torch.empty((0, 1616, 3, 256), dtype=torch.uint8)
++    query = torch.empty((1, 65, 12, 256), dtype=torch.float16)
++    try:
++        with set_current_vllm_config(engine):
++            kv = dense_prefill.get_fp8_prefill_bridge_workspace(
++                key, 7, max_blocks=7
++            )
++            tail = dense_prefill.get_fp8_prefill_bridge_tail_workspace(
++                query, 128, max_query_len=128
++            )
++            scratch = dense_prefill.get_fp8_prefill_bridge_tail_workspace(
++                query, 65, max_query_len=65, group_scratch=True
++            )
++            assert sum(
++                tensor.untyped_storage().nbytes()
++                for tensor in (*kv, *tail, *scratch)
++            ) == plan.projected_bytes <= plan.budget_bytes
++    finally:
++        release_runtime_resources(engine)
++
++
++def test_deferred_input_page_waits_for_resolved_group(monkeypatch):
++    import torch
++
++    from vllm.v1.attention.backends.flash_v100.config import (
++        configure_fp8_bridge_workspace_plans,
++    )
++    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
++
++    monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", raising=False)
++    engine, impl = bridge_engine(
++        FlashV100Options(fp8_bridge_workspace_bytes=32_047_128), block_size=None
++    )
++    assert impl.fp8_bridge_workspace_plan is None
++    spec = FullAttentionSpec(
++        block_size=1616, num_kv_heads=6, head_size=256, dtype=torch.uint8
++    )
++    configure_fp8_bridge_workspace_plans(
++        engine, [KVCacheGroupSpec(["attention"], spec)],
++        {"attention": SimpleNamespace(impl=impl)},
++    )
++    assert impl.fp8_bridge_head_groups == 2
++    assert impl.fp8_bridge_workspace_plan.max_kv_tokens == 5488
+diff --git a/tests/kernels/attention/test_sm70_flash_v100_varlen_layout.py b/tests/kernels/attention/test_sm70_flash_v100_varlen_layout.py
+index b10449ac40..40e70ea6fd 100644
+--- a/tests/kernels/attention/test_sm70_flash_v100_varlen_layout.py
++++ b/tests/kernels/attention/test_sm70_flash_v100_varlen_layout.py
+@@ -973,3 +973,341 @@ def test_sm70_flash_v100_fp8_e4m3_g6_routes_wave_partitions_exactly(
+     ).float()
+     assert torch.all(delta <= torch.maximum(one_ulp, torch.full_like(delta, 1e-4)))
+     assert float(delta.mean()) <= 1e-5
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
++@pytest.mark.parametrize(
++    "cache_dtype,torch_dtype",
++    [("fp8_e4m3", torch.float8_e4m3fn), ("fp8_e5m2", torch.float8_e5m2)],
++)
++@pytest.mark.parametrize("k_scale,v_scale", [(1.0, 1.0), (0.75, 1.25)])
++@pytest.mark.parametrize(
++    "head_groups,num_q_heads,num_kv_heads,input_page_size,seq_len,query_len",
++    [
++        (1, 12, 4, 1568, 1700, 32),
++        (2, 24, 4, 1568, 1700, 32),
++        (4, 4, 4, 1056, 2048, 48),
++        (3, 12, 6, 1088, 4096, 1024),
++        (2, 6, 1, 1056, 1700, 32),  # MQA cannot be split.
++        (3, 12, 4, 1568, 2048, 48),  # Non-divisor stays unsplit.
++        (8, 12, 4, 1088, 1700, 32),  # More groups than KV heads.
++        (0, 12, 4, 1568, 1700, 32),
++        (-2, 12, 4, 1056, 2048, 48),
++        ("auto1", 12, 4, 1568, 1700, 32),
++        ("auto2", 24, 4, 1568, 1700, 32),
++        ("auto4", 4, 4, 1056, 2048, 48),
++        ("auto3", 12, 6, 1088, 4096, 1024),
++    ],
++)
++@torch.inference_mode()
++def test_sm70_flash_v100_fp8_bridge_head_groups_exact(
++    monkeypatch,
++    cache_dtype,
++    torch_dtype,
++    k_scale,
++    v_scale,
++    head_groups,
++    num_q_heads,
++    num_kv_heads,
++    input_page_size,
++    seq_len,
++    query_len,
++):
++    if torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
++    pytest.importorskip("flash_attn_v100")
++
++    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
++
++    automatic = isinstance(head_groups, str)
++    monkeypatch.setenv(
++        "VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS",
++        "1" if automatic else str(head_groups),
++    )
++    monkeypatch.setenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1")
++    impl = FlashAttnV100Impl(
++        num_heads=num_q_heads,
++        num_kv_heads=num_kv_heads,
++        head_size=256,
++        scale=256**-0.5,
++        alibi_slopes=None,
++        sliding_window=None,
++        kv_cache_dtype=cache_dtype,
++    )
++    # Match the production operator owner: E4M3 uses the FA2 bridge, not the
++    # similarly named conversion wrapper exported by flash_attn_v100.
++    if cache_dtype == "fp8_e4m3":
++        if impl.fp8_e4m3_paged_kv_to_fp16 is None:
++            pytest.skip(
++                "installed FA2 extension lacks "
++                "_vllm_fa2_C.sm70_v37_e4m3_bridge"
++            )
++    elif impl.fp8_e5m2_paged_kv_to_fp16 is None:
++        pytest.skip("installed Flash-V100 extension lacks the E5M2 bridge")
++    torch.manual_seed(20261026)
++    input_blocks = math.ceil(seq_len / input_page_size)
++    shape = (input_blocks, input_page_size, num_kv_heads, 256)
++    key_cache = (
++        torch.randn(shape, dtype=torch.float16, device="cuda")
++        .to(torch_dtype)
++        .view(torch.uint8)
++    )
++    value_cache = (
++        torch.randn(shape, dtype=torch.float16, device="cuda")
++        .to(torch_dtype)
++        .view(torch.uint8)
++    )
++    query = torch.randn(
++        1, query_len, num_q_heads, 256, dtype=torch.float16, device="cuda"
++    )
++    # Reverse physical pages and retain a partial final page to catch indexing
++    # errors independently of the GQA head ranges.
++    block_table = torch.arange(
++        input_blocks - 1, -1, -1, dtype=torch.int32, device="cuda"
++    ).unsqueeze(0)
++    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
++    assert impl._should_use_fp8_prefill_bridge(
++        q_len=query_len,
++        head_dim=256,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        causal=True,
++        window_size=(-1, -1),
++    )
++    arguments = dict(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        block_table=block_table,
++        seq_lens=seq_lens,
++        seq_len=seq_len,
++        k_scale=k_scale,
++        v_scale=v_scale,
++        causal=True,
++        window_size=(-1, -1),
++    )
++    unsplit = impl._run_fp8_prefill_bridge(
++        **arguments, out=torch.empty_like(query), head_groups=1
++    )
++    assert unsplit is not None
++    # The grouped execution reuses workspace; preserve the reference output.
++    expected = unsplit[0].clone()
++    if automatic:
++        from types import SimpleNamespace
++
++        from vllm.config import set_current_vllm_config
++        from vllm.config.execution_policy import FlashV100Policy, GraphPolicy
++        from vllm.config.flash_v100 import FlashV100Diagnostics, FlashV100Options
++        from vllm.config.sm70_runtime import RuntimeTraceConfig
++        from vllm.v1.attention.backends.flash_v100.config import (
++            FP8_PREFILL_BRIDGE_PAGE_SIZE,
++        )
++
++        head_groups = int(head_groups.removeprefix("auto"))
++        page_size = FP8_PREFILL_BRIDGE_PAGE_SIZE
++        kv_tokens = math.ceil(
++            input_blocks * input_page_size / page_size
++        ) * page_size
++        projected = (
++            4 * kv_tokens * (num_kv_heads // head_groups) * 256
++            + kv_tokens // page_size * 4
++            + 4 * math.ceil(query_len / 64) * 64
++            * (num_q_heads // head_groups) * 256
++            + (
++                4 * query_len * (num_q_heads // head_groups) * 256
++                if head_groups > 1 else 0
++            )
++        )
++        monkeypatch.delenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS")
++        policy = FlashV100Policy(
++            options=FlashV100Options(fp8_bridge_workspace_bytes=projected)
++        )
++        policy.resolve()
++        policy.options.finalize(
++            GraphPolicy(), FlashV100Diagnostics(), cache_dtype=cache_dtype
++        )
++        engine = SimpleNamespace(
++            attention_config=SimpleNamespace(flash_v100=policy),
++            model_config=SimpleNamespace(max_model_len=seq_len),
++            scheduler_config=SimpleNamespace(max_num_batched_tokens=query_len),
++            cache_config=SimpleNamespace(block_size=16),
++            observability_config=SimpleNamespace(runtime_trace=RuntimeTraceConfig()),
++        )
++        with set_current_vllm_config(engine):
++            impl._initialize_prefill_policy()
++        from vllm.v1.attention.backends.flash_v100.config import (
++            configure_fp8_bridge_workspace_plans,
++        )
++        from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
++
++        configure_fp8_bridge_workspace_plans(
++            engine,
++            [KVCacheGroupSpec(
++                ["attention"],
++                FullAttentionSpec(
++                    block_size=input_page_size, num_kv_heads=num_kv_heads,
++                    head_size=256, dtype=torch.uint8,
++                ),
++            )],
++            {"attention": SimpleNamespace(impl=impl)},
++        )
++        assert impl.fp8_bridge_head_groups == head_groups
++    from contextlib import nullcontext
++
++    from vllm.runtime_resources import release_runtime_resources
++
++    context = set_current_vllm_config(engine) if automatic else nullcontext()
++    try:
++        with context:
++            if automatic:
++                from vllm.v1.attention.backends.flash_v100.runtime import (
++                    prepare_prefill_runtime,
++                )
++
++                prepare_prefill_runtime(torch.ops._vllm_fa2_C)
++            if automatic:
++                from vllm.v1.attention.backends.flash_v100 import dense_prefill
++                from vllm.v1.attention.ops.sm70_workspaces import workspace_cache
++
++                dense_prefill.profile_fp8_prefill_bridge_workspace(
++                    query[0], num_kv_heads, impl.fp8_bridge_workspace_plan
++                )
++            out = torch.full_like(query, float("nan"))
++            grouped = impl._run_fp8_prefill_bridge(**arguments, out=out)
++            assert grouped is not None
++            if head_groups > 1 and num_kv_heads % head_groups == 0:
++                assert grouped[0] is out
++                assert grouped[1]
++            torch.accelerator.synchronize()
++            assert torch.equal(grouped[0], expected)
++            if automatic:
++                retained_bytes = sum(
++                    tensor.untyped_storage().nbytes()
++                    for name in (
++                        "fp8_prefill_bridge_workspaces",
++                        "fp8_prefill_bridge_tail_workspaces",
++                        "fp8_prefill_bridge_group_workspaces",
++                    )
++                    for buffers in workspace_cache(name, {}).values()
++                    for tensor in buffers
++                )
++                plan = impl.fp8_bridge_workspace_plan
++                assert retained_bytes == plan.projected_bytes <= plan.budget_bytes
++    finally:
++        if automatic:
++            release_runtime_resources(engine)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
++@pytest.mark.parametrize(
++    "failed_buffer", ["query", "output", "budget", "auto_query", "auto_output"]
++)
++@pytest.mark.parametrize(
++    "cache_dtype,torch_dtype",
++    [("fp8_e4m3", torch.float8_e4m3fn), ("fp8_e5m2", torch.float8_e5m2)],
++)
++@torch.inference_mode()
++def test_sm70_flash_v100_grouped_bridge_oom_falls_back(
++    monkeypatch, failed_buffer, cache_dtype, torch_dtype
++):
++    import weakref
++    from types import SimpleNamespace
++
++    from vllm.v1.attention.backends.flash_v100.impl import FlashAttnV100Impl
++    from vllm.v1.attention.backends.flash_v100.prefill_candidates import (
++        Fp8BridgePrefill,
++    )
++
++    if torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
++    pytest.importorskip("flash_attn_v100")
++    monkeypatch.setenv("VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS", "2")
++    impl = FlashAttnV100Impl(
++        num_heads=24,
++        num_kv_heads=4,
++        head_size=256,
++        scale=256**-0.5,
++        alibi_slopes=None,
++        sliding_window=None,
++        kv_cache_dtype=cache_dtype,
++    )
++    automatic = failed_buffer.startswith("auto_")
++    if failed_buffer == "budget" or automatic:
++        from vllm.v1.attention.backends.flash_v100.config import (
++            Fp8BridgeWorkspacePlan,
++        )
++
++        impl.fp8_bridge_workspace_plan = Fp8BridgeWorkspacePlan.build(
++            budget_bytes=6 * 1024**2 if automatic else 0,
++            max_model_len=1700, max_query_tokens=32,
++            block_size=1056, num_kv_heads=4, num_heads=24, head_size=256,
++        )
++        impl.fp8_bridge_head_groups = impl.fp8_bridge_workspace_plan.head_groups
++        if automatic:
++            assert impl.fp8_bridge_head_groups == 2
++            failed_buffer = failed_buffer.removeprefix("auto_")
++    torch.manual_seed(127)
++    query = torch.randn(1, 32, 24, 256, device="cuda", dtype=torch.float16)
++    key = torch.randn(2, 1056, 4, 256, device="cuda").to(torch_dtype).view(torch.uint8)
++    value = torch.randn_like(key, dtype=torch.float16).to(torch_dtype).view(torch.uint8)
++    blocks = torch.tensor([[1, 0]], device="cuda", dtype=torch.int32)
++    lengths = torch.tensor([1700], device="cuda", dtype=torch.int32)
++    expected = impl.flash_attn_prefill_paged(
++        query,
++        key,
++        value,
++        blocks,
++        lengths,
++        softmax_scale=256**-0.5,
++        kv_cache_dtype=cache_dtype,
++        k_scale=0.75,
++        v_scale=1.25,
++        causal=True,
++        window_size=(-1, -1),
++    ).clone()
++    request = SimpleNamespace(
++        q_seq=query,
++        key_cache=key,
++        value_cache=value,
++        attn_metadata=SimpleNamespace(block_table=blocks, seq_lens=lengths),
++        i=0,
++        start=0,
++        end=32,
++        seq_len=1700,
++        layer=SimpleNamespace(_k_scale_float=0.75, _v_scale_float=1.25),
++        causal=True,
++        window_size=(-1, -1),
++        out_view=torch.full_like(query[0], float("nan")),
++    )
++    executor = SimpleNamespace(
++        ops=SimpleNamespace(
++            bridge=impl._run_fp8_prefill_bridge,
++            paged=impl.flash_attn_prefill_paged,
++        ),
++        config=SimpleNamespace(scale=256**-0.5, kv_cache_dtype=cache_dtype),
++    )
++    group_shape = (1, 32, 12, 256)
++    empty, empty_like = torch.empty, torch.empty_like
++    scratch_refs = []
++
++    def allocate_query(*args, **kwargs):
++        if args and isinstance(args[0], tuple) and args[0] == group_shape:
++            if failed_buffer == "query":
++                raise torch.OutOfMemoryError("group query scratch")
++            tensor = empty(*args, **kwargs)
++            scratch_refs.append(weakref.ref(tensor))
++            return tensor
++        return empty(*args, **kwargs)
++
++    def allocate_output(tensor, *args, **kwargs):
++        if tuple(tensor.shape) == group_shape and failed_buffer == "output":
++            raise torch.OutOfMemoryError("group output scratch")
++        return empty_like(tensor, *args, **kwargs)
++
++    with monkeypatch.context() as allocation_failure:
++        allocation_failure.setattr(torch, "empty", allocate_query)
++        allocation_failure.setattr(torch, "empty_like", allocate_output)
++        result = Fp8BridgePrefill(executor).run(request, lambda *args, **kwargs: None)
++    torch.accelerator.synchronize()
++    assert torch.equal(result.output, expected)
++    assert all(reference() is None for reference in scratch_refs)
+diff --git a/tests/v1/attention/test_sm70_flash_v100_policy.py b/tests/v1/attention/test_sm70_flash_v100_policy.py
+index 77fc1da50c..bdf9decf4d 100644
+--- a/tests/v1/attention/test_sm70_flash_v100_policy.py
++++ b/tests/v1/attention/test_sm70_flash_v100_policy.py
+@@ -2819,6 +2819,7 @@ def test_flash_v100_fp8_prefill_bridge_prefers_logical_dense_exact(monkeypatch):
+     impl = object.__new__(FlashAttnV100Impl)
+     impl.kv_cache_dtype = "fp8_e5m2"
+     impl.scale = 256**-0.5
++    impl.fp8_bridge_head_groups = 1
+     bridge_calls = []
+     exact_calls = []
+ 
+@@ -2840,7 +2841,7 @@ def exact_op(query, key, value, **kwargs):
+     monkeypatch.setattr(
+         mod,
+         "_get_fp8_prefill_bridge_workspace",
+-        lambda key_cache, required_blocks: (
++        lambda key_cache, required_blocks, max_blocks=None: (
+             key_workspace,
+             value_workspace,
+             output_block_table,
+diff --git a/vllm/config/flash_v100.py b/vllm/config/flash_v100.py
+index 8b8b0663f8..614675fa12 100644
+--- a/vllm/config/flash_v100.py
++++ b/vllm/config/flash_v100.py
+@@ -432,6 +432,8 @@ def resolve(self):
+                         raw = self.legacy_inputs[self.legacy_aliases[field][0]]
+                     value = native_value(parser.removeprefix("native:"), raw, default)
+                 elif parser in ("int", "threshold", "partition"):
++                    if value is None and parser == "int":
++                        continue
+                     assert isinstance(value, str)
+                     try:
+                         value = int(value)
+@@ -754,6 +756,13 @@ def hash_values(self):
+     """Retained VLLM_FLASH_V100_DECODE_USE_XQA input."""
+     fp8_prefill_bridge: bool | None = None
+     """Retained VLLM_FLASH_V100_FP8_PREFILL_BRIDGE input."""
++    fp8_bridge_head_groups: int | None = None
++    """FP8 bridge KV-head groups; unset selects an engine-budgeted policy.
++    Explicit values below one and non-divisors retain the unsplit bridge."""
++    fp8_bridge_workspace_bytes: int | None = Field(default=None, ge=0)
++    """Automatic bridge conversion/scratch cap; unset uses 1/32 of the worker's
++    configured GPU-memory allowance. Explicit groups override the cap; zero
++    selects native FP8 attention."""
+     smallq_decode_use_xqa: bool | None = None
+     """Retained VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA input."""
+     prefill_prefix_decode_rows: bool | None = None
+@@ -1048,6 +1057,16 @@ def hash_values(self):
+         ),
+         "decode_use_xqa": ("VLLM_FLASH_V100_DECODE_USE_XQA", "eq1", "1"),
+         "fp8_prefill_bridge": ("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "ne0", "1"),
++        "fp8_bridge_head_groups": (
++            "VLLM_FLASH_V100_FP8_BRIDGE_HEAD_GROUPS",
++            "int",
++            None,
++        ),
++        "fp8_bridge_workspace_bytes": (
++            "VLLM_FLASH_V100_FP8_BRIDGE_WORKSPACE_BYTES",
++            "int",
++            None,
++        ),
+         "smallq_decode_use_xqa": ("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", "eq1", "1"),
+         "prefill_prefix_decode_rows": (
+             "VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS",
+diff --git a/vllm/v1/attention/backends/flash_v100/config.py b/vllm/v1/attention/backends/flash_v100/config.py
+index d60003120f..01f18eadc1 100644
+--- a/vllm/v1/attention/backends/flash_v100/config.py
++++ b/vllm/v1/attention/backends/flash_v100/config.py
+@@ -10,6 +10,8 @@
+ 
+ import vllm.envs as envs
+ 
++FP8_PREFILL_BRIDGE_PAGE_SIZE = 784
++
+ 
+ def options():
+     from vllm.config.execution_policy import flash_v100_policy
+@@ -89,6 +91,85 @@ def env_is_set(name: str) -> bool:
+     return name in os.environ
+ 
+ 
++@dataclass(frozen=True)
++class Fp8BridgeWorkspacePlan:
++    """Construction-time bound for one stream's optional bridge workspace."""
++
++    head_groups: int
++    budget_bytes: int
++    projected_bytes: int
++    max_kv_tokens: int
++    max_query_tokens: int
++
++    @classmethod
++    def build(
++        cls,
++        *,
++        budget_bytes: int,
++        max_model_len: int,
++        max_query_tokens: int,
++        block_size: int,
++        num_kv_heads: int,
++        num_heads: int,
++        head_size: int,
++    ) -> Fp8BridgeWorkspacePlan:
++        if budget_bytes < 0:
++            raise ValueError("fp8_bridge_workspace_bytes must be nonnegative")
++        if min(
++            max_model_len, max_query_tokens, block_size,
++            num_kv_heads, num_heads, head_size,
++        ) <= 0 or num_heads % num_kv_heads:
++            raise ValueError("invalid FP8 bridge planning dimensions")
++        # Input block-table capacity may exceed max_model_len by a partial page.
++        # Conversion then rounds again to its native output pages.
++        input_tokens = (
++            (max_model_len + block_size - 1) // block_size * block_size
++        )
++        page_size = FP8_PREFILL_BRIDGE_PAGE_SIZE
++        kv_tokens = (input_tokens + page_size - 1) // page_size * page_size
++        query_tokens = min(max_model_len, max_query_tokens)
++        padded_query_tokens = (query_tokens + 63) // 64 * 64
++        table_bytes = kv_tokens // page_size * 4
++        for groups in range(1, num_kv_heads + 1):
++            if num_kv_heads % groups:
++                continue
++            # FP16 K/V, optional tail Q/output, and grouped Q/output copies.
++            # Count retained tail buffers even for an aligned maximum chunk:
++            # a shorter, unaligned chunk can have allocated them previously.
++            projected = (
++                4 * kv_tokens * (num_kv_heads // groups) * head_size
++                + table_bytes
++                + 4 * padded_query_tokens * (num_heads // groups) * head_size
++                + (
++                    4 * query_tokens * (num_heads // groups) * head_size
++                    if groups > 1 else 0
++                )
++            )
++            if projected <= budget_bytes:
++                return cls(groups, budget_bytes, projected, kv_tokens, query_tokens)
++        return cls(0, budget_bytes, 0, kv_tokens, query_tokens)
++
++
++def configure_fp8_bridge_workspace_plans(engine, kv_cache_groups, layers) -> None:
++    """Refine each layer from its final physical KV-group page, before use."""
++    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
++
++    for group in kv_cache_groups:
++        for name in group.layer_names:
++            layer = layers.get(name)
++            configure = getattr(
++                getattr(layer, "impl", None), "configure_fp8_bridge_workspace", None
++            )
++            if configure is None:
++                continue
++            spec = group.kv_cache_spec
++            if isinstance(spec, UniformTypeKVCacheSpecs):
++                spec = spec.kv_cache_specs[name]
++            # Kernel pages divide physical group pages, so this covers their
++            # maximum block-table padding without assuming a default page size.
++            configure(engine, spec.block_size)
++
++
+ @dataclass(frozen=True)
+ class V100AttnConfig:
+     """Resolved construction-time policy, separate from native ops and buffers."""
+@@ -101,6 +182,8 @@ class V100AttnConfig:
+     compare_triton_tensor_dump_dir: str | None
+     compare_triton_tensor_dump_max_tokens: int
+     decode_strategy: str
++    fp8_bridge_head_groups: int
++    fp8_bridge_workspace_plan: Fp8BridgeWorkspacePlan | None
+     prefill_bfla_mask_block_n: int
+     prefill_bfla_min_kv: int
+     prefill_bfla_min_q: int
+diff --git a/vllm/v1/attention/backends/flash_v100/dense_prefill.py b/vllm/v1/attention/backends/flash_v100/dense_prefill.py
+index ed64175797..0268262b19 100644
+--- a/vllm/v1/attention/backends/flash_v100/dense_prefill.py
++++ b/vllm/v1/attention/backends/flash_v100/dense_prefill.py
+@@ -29,7 +29,7 @@
+ ] = {}
+ 
+ 
+-_FP8_PREFILL_BRIDGE_PAGE_SIZE = 784
++_FP8_PREFILL_BRIDGE_PAGE_SIZE = _config.FP8_PREFILL_BRIDGE_PAGE_SIZE
+ _SM70_79T_CORE_QUERY_LEN = 8000
+ _SM70_79T_MAX_QUERY_LEN = 8192
+ # Native Q4096 specialization for 4096-token chunks; 4000..4095 are
+@@ -49,6 +49,10 @@
+     tuple[int, int, torch.dtype, int, int],
+     tuple[torch.Tensor, torch.Tensor],
+ ] = {}
++_fp8_prefill_bridge_group_workspaces: dict[
++    tuple[int, int, torch.dtype, int, int],
++    tuple[torch.Tensor, torch.Tensor],
++] = {}
+ _prefill_dense_splitkv3_workspaces: dict[
+     tuple[int, int, torch.dtype],
+     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+@@ -83,6 +87,7 @@ def clear_flash_attn_v100_workspaces(config=None) -> None:
+     _sm70_fa2_cu_seqlens_cache.clear()
+     _fp8_prefill_bridge_workspaces.clear()
+     _fp8_prefill_bridge_tail_workspaces.clear()
++    _fp8_prefill_bridge_group_workspaces.clear()
+     _kv_layout._prefill_gather_dense_workspaces.clear()
+     _prefill_dense_splitkv3_workspaces.clear()
+     _prefill_dense_splitkv_workspaces.clear()
+@@ -855,6 +860,7 @@ def profile_sm70_long_prefix_workspaces(
+     max_model_len: int | None,
+     kv_block_size: int | None,
+     fp8_bridge: bool,
++    fp8_bridge_plan: _config.Fp8BridgeWorkspacePlan | None,
+ ) -> None:
+     """Reserve the long-prefix prefill workspaces during memory profiling.
+ 
+@@ -879,30 +885,11 @@ def profile_sm70_long_prefix_workspaces(
+         return
+     profiled = workspace_cache("prefill_profiled", _sm70_prefill_profiled_workspaces)
+     if fp8_bridge:
+-        blocks = _masks.cdiv_int(
+-            _masks.cdiv_int(max_model_len, kv_block_size) * kv_block_size,
+-            _FP8_PREFILL_BRIDGE_PAGE_SIZE,
++        profile_fp8_prefill_bridge_workspace(
++            query, num_kv_heads, fp8_bridge_plan
+         )
+-        cache_key = (query.device, "fp8_bridge", blocks)
+-        if cache_key not in profiled:
+-            layout = torch.empty(
+-                (1, 1, num_kv_heads, 256), dtype=torch.uint8, device=query.device
+-            )
+-            if get_fp8_prefill_bridge_workspace(layout, blocks) is not None:
+-                profiled.add(cache_key)
+-                logger.info_once(
+-                    "SM70 FP8 prefill bridge workspace for %d prefix tokens "
+-                    "included in memory profiling.",
+-                    blocks * _FP8_PREFILL_BRIDGE_PAGE_SIZE,
+-                )
+     chunk = int(query.shape[0])
+     padded = _masks.cdiv_int(chunk, 64) * 64
+-    if fp8_bridge and padded != chunk:
+-        cache_key = (query.device, "fp8_bridge_tail", padded)
+-        if cache_key not in profiled:
+-            shaped = query.new_empty((1, chunk, query.shape[1], 256))
+-            if get_fp8_prefill_bridge_tail_workspace(shaped, padded) is not None:
+-                profiled.add(cache_key)
+     if (
+         fp8_bridge
+         and num_kv_heads == 1
+@@ -937,9 +924,42 @@ def profile_sm70_long_prefix_workspaces(
+                 )
+ 
+ 
++def profile_fp8_prefill_bridge_workspace(
++    query: torch.Tensor,
++    num_kv_heads: int,
++    plan: _config.Fp8BridgeWorkspacePlan | None,
++) -> None:
++    """Expose the selected conversion/scratch envelope to KV memory profiling."""
++    if plan is None or plan.head_groups == 0 or not query.is_cuda:
++        return
++    groups = plan.head_groups
++    group_query = query.unsqueeze(0)[:, :, :query.shape[1] // groups]
++    key = torch.empty(
++        (0, _FP8_PREFILL_BRIDGE_PAGE_SIZE, num_kv_heads // groups, query.shape[2]),
++        dtype=torch.uint8,
++        device=query.device,
++    )
++    blocks = plan.max_kv_tokens // _FP8_PREFILL_BRIDGE_PAGE_SIZE
++    if get_fp8_prefill_bridge_workspace(key, blocks, max_blocks=blocks) is None:
++        return
++    padded_query_len = (plan.max_query_tokens + 63) // 64 * 64
++    if get_fp8_prefill_bridge_tail_workspace(
++        group_query, padded_query_len, max_query_len=padded_query_len
++    ) is None:
++        return
++    if groups > 1:
++        get_fp8_prefill_bridge_tail_workspace(
++            group_query,
++            plan.max_query_tokens,
++            max_query_len=plan.max_query_tokens,
++            group_scratch=True,
++        )
++
++
+ def get_fp8_prefill_bridge_workspace(
+     key_cache: torch.Tensor,
+     required_blocks: int,
++    max_blocks: int | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+     cache = workspace_cache(
+         "fp8_prefill_bridge_workspaces", _fp8_prefill_bridge_workspaces
+@@ -974,6 +994,9 @@ def get_fp8_prefill_bridge_workspace(
+ 
+     previous_capacity = workspace[0].shape[0] if workspace is not None else 0
+     capacity = max(required_blocks, previous_capacity * 2)
++    if max_blocks is not None:
++        # Do not reserve more pages than the full input block table addresses.
++        capacity = min(capacity, max(required_blocks, int(max_blocks)))
+     shape = (
+         capacity,
+         _FP8_PREFILL_BRIDGE_PAGE_SIZE,
+@@ -1019,9 +1042,15 @@ def _allocate() -> tuple[torch.Tensor, ...]:
+ def get_fp8_prefill_bridge_tail_workspace(
+     query: torch.Tensor,
+     padded_query_len: int,
++    *,
++    max_query_len: int | None = None,
++    group_scratch: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor] | None:
+     cache = workspace_cache(
+-        "fp8_prefill_bridge_tail_workspaces", _fp8_prefill_bridge_tail_workspaces
++        "fp8_prefill_bridge_group_workspaces"
++        if group_scratch else "fp8_prefill_bridge_tail_workspaces",
++        _fp8_prefill_bridge_group_workspaces
++        if group_scratch else _fp8_prefill_bridge_tail_workspaces,
+     )
+     device_index = (
+         query.device.index
+@@ -1051,6 +1080,8 @@ def get_fp8_prefill_bridge_tail_workspace(
+ 
+     previous_capacity = workspace[0].shape[1] if workspace is not None else 0
+     capacity = max(padded_query_len, previous_capacity * 2)
++    if max_query_len is not None:
++        capacity = min(capacity, max(padded_query_len, max_query_len))
+     shape = (1, capacity, query.shape[2], query.shape[3])
+ 
+     def _allocate() -> tuple[torch.Tensor, ...]:
+diff --git a/vllm/v1/attention/backends/flash_v100/impl.py b/vllm/v1/attention/backends/flash_v100/impl.py
+index 468031ea4e..e7837bcc37 100644
+--- a/vllm/v1/attention/backends/flash_v100/impl.py
++++ b/vllm/v1/attention/backends/flash_v100/impl.py
+@@ -115,6 +115,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
+         "use_flash_v100_prefill_splitkv"
+     )
+     use_fp8_prefill_bridge = _config.ConfigField[bool]("use_fp8_prefill_bridge")
++    fp8_bridge_head_groups = _config.ConfigField[int]("fp8_bridge_head_groups")
++    fp8_bridge_workspace_plan = _config.ConfigField[
++        _config.Fp8BridgeWorkspacePlan | None
++    ]("fp8_bridge_workspace_plan")
+     use_prefill_paged_cache = _config.ConfigField[bool]("use_prefill_paged_cache")
+     use_smallq_decode_xqa = _config.ConfigField[bool]("use_smallq_decode_xqa")
+     use_triton_prefill = _config.ConfigField[bool]("use_triton_prefill")
+@@ -241,6 +245,41 @@ def _initialize_native_ops(self):
+             self.flash_attn_prefill_paged
+         )
+ 
++    def configure_fp8_bridge_workspace(self, engine, block_size):
++        """Bind the resolved KV-group page envelope before profiling/capture."""
++        options = engine.attention_config.flash_v100.options
++        if (
++            options.value("fp8_bridge_head_groups") is not None
++            or self.kv_codec not in (FP8_E4M3, FP8_E5M2)
++            or self.head_size != 256
++            or not self.use_fp8_prefill_bridge
++            or not self.use_flash_v100_prefill_paged
++            or block_size is None
++        ):
++            return
++        budget = options.value("fp8_bridge_workspace_bytes")
++        if budget is None:
++            from vllm.runtime_resources import runtime_resources_for
++
++            requested = runtime_resources_for(engine).get("gpu_memory_budget_bytes")
++            if requested is None:
++                raise RuntimeError(
++                    "automatic FP8 bridge budgeting requires the GPU "
++                    "worker memory snapshot; initialize the worker or set "
++                    "fp8_bridge_workspace_bytes/fp8_bridge_head_groups"
++                )
++            budget = requested // 32
++        self.fp8_bridge_workspace_plan = _config.Fp8BridgeWorkspacePlan.build(
++            budget_bytes=budget,
++            max_model_len=engine.model_config.max_model_len,
++            max_query_tokens=engine.scheduler_config.max_num_batched_tokens,
++            block_size=block_size,
++            num_kv_heads=self.num_kv_heads,
++            num_heads=self.num_heads,
++            head_size=self.head_size,
++        )
++        self.fp8_bridge_head_groups = self.fp8_bridge_workspace_plan.head_groups
++
+     def _initialize_prefill_policy(self):
+         paged_prefill_enable = _config.options().value("enable_paged_prefill")
+         paged_prefill_disable = _config.options().value("disable_paged_prefill")
+@@ -254,6 +293,25 @@ def _initialize_prefill_policy(self):
+             if self.kv_codec is FP8_E4M3
+             else self.fp8_e5m2_paged_kv_to_fp16 is not None
+         ) and _config.options().value("fp8_prefill_bridge")
++        self.fp8_bridge_workspace_plan = None
++        groups = _config.options().value("fp8_bridge_head_groups")
++        if groups is None:
++            from vllm.config import get_current_vllm_config_or_none
++
++            engine = get_current_vllm_config_or_none()
++            # A cache-group hook refines this provisional page envelope before
++            # profiling and final KV initialization. A genuinely deferred page
++            # remains unsplit until that hook receives its resolved spec.
++            self.fp8_bridge_head_groups = 1
++            if engine is not None:
++                self.configure_fp8_bridge_workspace(
++                    engine, engine.cache_config.block_size
++                )
++            groups = self.fp8_bridge_head_groups
++        else:
++            # Preserve forced unsplit behavior for old zero/negative inputs.
++            groups = max(1, groups)
++        self.fp8_bridge_head_groups = groups
+         self.use_flash_v100_prefill_splitkv = (
+             self.flash_attn_prefill_paged_splitkv is not None
+             and _config.options().value("prefill_split_kv")
+@@ -796,6 +854,7 @@ def forward(
+                     max_model_len=self._prefix_max_model_len,
+                     kv_block_size=self._prefix_kv_block_size,
+                     fp8_bridge=self.use_fp8_prefill_bridge,
++                    fp8_bridge_plan=self.fp8_bridge_workspace_plan,
+                 )
+             _routing.record_route(
+                 _routing.ROUTE_SPECS["metadata_none_zero_output"].name
+diff --git a/vllm/v1/attention/backends/flash_v100/prefill.py b/vllm/v1/attention/backends/flash_v100/prefill.py
+index 9dcbc46a98..2e01a2d5e5 100644
+--- a/vllm/v1/attention/backends/flash_v100/prefill.py
++++ b/vllm/v1/attention/backends/flash_v100/prefill.py
+@@ -96,6 +96,7 @@ def _should_use_fp8_prefill_bridge(
+         return False
+     return (
+         self.use_fp8_prefill_bridge
++        and getattr(self, "fp8_bridge_head_groups", 1) != 0
+         and self.use_flash_v100_prefill_paged
+         and self.kv_codec in (FP8_E4M3, FP8_E5M2)
+         and self.kv_codec.stores(key_cache, value_cache)
+@@ -130,9 +131,78 @@ def _run_fp8_prefill_bridge(
+     causal: bool,
+     window_size: tuple[int, int],
+     out: torch.Tensor,
++    head_groups: int | None = None,
+ ) -> tuple[torch.Tensor, bool] | None:
+     if block_table.shape[0] != 1:
+         return None
++    if head_groups is None:
++        head_groups = self.fp8_bridge_head_groups
++    if head_groups == 0:
++        return None
++    plan = getattr(self, "fp8_bridge_workspace_plan", None)
++    if plan is not None and (
++        int(query.shape[1]) > plan.max_query_tokens
++        or int(block_table.shape[1]) * int(key_cache.shape[1]) > plan.max_kv_tokens
++    ):
++        # Configuration envelopes are not resized on a request or graph replay.
++        return None
++    kv_heads = int(key_cache.shape[2])
++    q_heads = int(query.shape[2])
++    if kv_heads <= 0 or q_heads % kv_heads != 0:
++        return None
++    if head_groups > 1 and kv_heads % head_groups == 0:
++        # Keep whole KV heads and their contiguous GQA query-head ranges.
++        # Reuse one group's FP16 KV, query and output buffers for every pass.
++        kv_per_group = kv_heads // head_groups
++        q_per_kv = q_heads // kv_heads
++        q_per_group = kv_per_group * q_per_kv
++
++        if plan is not None:
++            scratch = _dense_prefill.get_fp8_prefill_bridge_tail_workspace(
++                query[:, :, :q_per_group],
++                int(query.shape[1]),
++                max_query_len=plan.max_query_tokens,
++                group_scratch=True,
++            )
++        else:
++            def allocate_group_scratch() -> tuple[torch.Tensor, ...]:
++                group_query = torch.empty(
++                    (*query.shape[:2], q_per_group, query.shape[3]),
++                    dtype=query.dtype,
++                    device=query.device,
++                )
++                return group_query, torch.empty_like(group_query)
++
++            scratch = _workspace.allocate_growing_workspace(
++                allocate_group_scratch, on_cuda=query.is_cuda
++            )
++        if scratch is None:
++            return None
++        group_query, group_out = scratch
++        for group in range(head_groups):
++            kv_lo = group * kv_per_group
++            kv_hi = kv_lo + kv_per_group
++            q_lo = kv_lo * q_per_kv
++            q_hi = kv_hi * q_per_kv
++            group_query.copy_(query[:, :, q_lo:q_hi])
++            group_result = self._run_fp8_prefill_bridge(
++                query=group_query,
++                key_cache=key_cache[:, :, kv_lo:kv_hi],
++                value_cache=value_cache[:, :, kv_lo:kv_hi],
++                block_table=block_table,
++                seq_lens=seq_lens,
++                seq_len=seq_len,
++                k_scale=k_scale,
++                v_scale=v_scale,
++                causal=causal,
++                window_size=window_size,
++                out=group_out,
++                head_groups=1,
++            )
++            if group_result is None:
++                return None
++            out[:, :, q_lo:q_hi].copy_(group_result[0])
++        return out, True
+     input_block_size = int(key_cache.shape[1])
+     active_input_blocks = min(
+         int(block_table.shape[1]),
+@@ -149,6 +219,10 @@ def _run_fp8_prefill_bridge(
+     workspace = _dense_prefill.get_fp8_prefill_bridge_workspace(
+         key_cache,
+         required_blocks,
++        max_blocks=_masks.cdiv_int(
++            int(block_table.shape[1]) * input_block_size,
++            _dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE,
++        ),
+     )
+     if workspace is None:
+         return None
+@@ -193,6 +267,10 @@ def _run_fp8_prefill_bridge(
+             tail_workspace = _dense_prefill.get_fp8_prefill_bridge_tail_workspace(
+                 query,
+                 padded_q_len,
++                max_query_len=(
++                    _masks.cdiv_int(plan.max_query_tokens, 64) * 64
++                    if plan is not None else None
++                ),
+             )
+             if tail_workspace is not None:
+                 exact_query, exact_out = tail_workspace
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 3c8e61eb9e..93b9935e21 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -11547,6 +11547,27 @@ def _dummy_pooler_run(
+         max_task = max(output_size.items(), key=lambda x: x[1])[0]
+         return self._dummy_pooler_run_task(hidden_states, max_task)
+ 
++    def _configure_attention_workspace_plans(self, kv_cache_groups=None) -> None:
++        layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
++        if not any(
++            hasattr(getattr(layer, "impl", None), "configure_fp8_bridge_workspace")
++            for layer in layers.values()
++        ):
++            return
++        from vllm.v1.attention.backends.flash_v100.config import (
++            configure_fp8_bridge_workspace_plans,
++        )
++
++        if kv_cache_groups is None:
++            from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
++
++            kv_cache_groups = get_kv_cache_groups(
++                self.vllm_config, self.get_kv_cache_spec()
++            )
++        configure_fp8_bridge_workspace_plans(
++            self.vllm_config, kv_cache_groups, layers
++        )
++
+     def profile_run(self) -> None:
+         profile_start = time.perf_counter()
+         _sm70_profile_trace(
+@@ -11554,6 +11575,10 @@ def profile_run(self) -> None:
+             self.max_num_tokens,
+             self.scheduler_config.max_num_seqs,
+         )
++        # Hybrid grouping can enlarge physical attention pages after weight
++        # loading. Bind that final envelope before metadata=None profiling
++        # reserves optional bridge storage for KV-memory admission.
++        self._configure_attention_workspace_plans()
+         # Profile with multimodal encoder & encoder cache.
+         if self.supports_mm_inputs:
+             mm_config = self.model_config.multimodal_config
+@@ -12130,6 +12155,8 @@ def initialize_attn_backend(
+         Initialize the attention backends and attention metadata builders.
+         """
+         assert len(self.attn_groups) == 0, "Attention backends are already initialized"
++        # This path also runs when fixed KV bytes skip memory profiling.
++        self._configure_attention_workspace_plans(kv_cache_config.kv_cache_groups)
+ 
+         class AttentionGroupKey(NamedTuple):
+             """Deduplication key for attention groups within a KV cache group.
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 275b2a6d51..65ce765137 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -51,6 +51,7 @@
+ from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+ from vllm.platforms import current_platform
+ from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
++from vllm.runtime_resources import runtime_resources_for
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
+ from vllm.tracing import instrument
+@@ -450,6 +451,11 @@ def init_device(self):
+             # take current memory snapshot
+             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+             self.requested_memory = request_memory(init_snapshot, self.cache_config)
++            # Reuse the worker's one-time capacity/admission snapshot. Optional
++            # attention workspace policies must not probe free memory per call.
++            runtime_resources_for(self.vllm_config)["gpu_memory_budget_bytes"] = int(
++                self.requested_memory
++            )
+             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+             logger.debug(
+                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
