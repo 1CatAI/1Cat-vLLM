@@ -24,6 +24,7 @@ from vllm.v1.core.partial_prefix_cache import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     FullAttentionManager,
+    KpoolTailManager,
     MambaManager,
     SlidingWindowManager,
 )
@@ -308,13 +309,14 @@ class KVCacheManager:
                 CircularBufferManager,
             )
             or (isinstance(m, MambaManager) and m.mamba_cache_mode == "align")
+            or isinstance(m, KpoolTailManager)
             for m in managers
         )
         if not supported:
             logger.warning(
                 "Partial prefix cache supports full-attention, sliding-window, "
-                "circular-buffer and aligned Mamba groups; keeping block-aligned "
-                "hits (groups: %s).",
+                "circular-buffer, kpool-tail and aligned Mamba groups; keeping "
+                "block-aligned hits (groups: %s).",
                 [type(m).__name__ for m in managers],
             )
             return
@@ -376,10 +378,37 @@ class KVCacheManager:
             tail_mm_items(request.mm_features, block_start, boundary),
         )
 
+    def _partial_boundary_ok(self, boundary: int) -> bool:
+        """Whether a partial entry can resume at ``boundary``.
+
+        It must lie inside a block, and on a multiple of every kpool-tail ring:
+        a ring holds only the in-progress pool, which is empty there, so the
+        request continues on a fresh ring as after a block-aligned hit."""
+        return bool(boundary % self.partial_block_size) and all(
+            boundary % m.block_size == 0
+            for m in self.coordinator.single_type_managers
+            if isinstance(m, KpoolTailManager)
+        )
+
+    def _partial_ready_step(
+        self, copy_last: list[bool], targets: list[list[KVCacheBlock]]
+    ) -> int:
+        """First step in which a new entry can be hit.
+
+        Only groups that keep blocks count: a kpool-tail group keeps none and
+        has nothing to wait for."""
+        if all(copy for copy, blocks in zip(copy_last, targets) if blocks):
+            return self._step - 1
+        return self._step
+
     def _partial_block_range(self, manager, boundary: int) -> tuple[int, int]:
         """Block indices ``[first, last]`` an entry keeps for one group."""
         if isinstance(manager, CircularBufferManager):
             return 0, 0
+        if isinstance(manager, KpoolTailManager):
+            # Nothing to keep: the ring is empty at a valid boundary (see
+            # _partial_boundary_ok) and the hit allocates a fresh one.
+            return 0, -1
         block_size = manager.block_size
         last = (boundary - 1) // block_size
         if isinstance(manager, SlidingWindowManager):
@@ -404,7 +433,7 @@ class KVCacheManager:
             b
             for b in request.prefix_cache_boundaries
             if start < b < end
-            and b % self.partial_block_size
+            and self._partial_boundary_ok(b)
             and not (coalesce_gen_tail and end - b < 80)
             and b // self.partial_block_size * self.partial_block_size <= hashed
             and not self.partial_cache.contains(self._partial_key(request, b))
@@ -450,6 +479,10 @@ class KVCacheManager:
             first, _ = self._partial_block_range(manager, boundary)
             if isinstance(manager, CircularBufferManager):
                 blocks.append(list(entry.blocks[group_id]))
+            elif isinstance(manager, KpoolTailManager):
+                # No cached blocks: allocate_new_computed_blocks gives the
+                # request a fresh ring.
+                blocks.append([])
             elif isinstance(manager, FullAttentionManager):
                 group_hashes = (
                     hashes
@@ -504,12 +537,19 @@ class KVCacheManager:
         req_blocks_by_group: list[list[KVCacheBlock]] = []
         for group_id, manager in enumerate(self.coordinator.single_type_managers):
             req_blocks = manager.req_to_blocks.get(request.request_id)
+            # A kpool-tail group keeps no entry blocks: the request already
+            # continues on its own fresh ring.
+            if isinstance(manager, KpoolTailManager):
+                req_blocks_by_group.append([])
+                continue
             if not req_blocks or req_blocks[-1] is not entry.blocks[group_id][-1]:
                 raise KVPartialHitDriftError(request, entry)
             req_blocks_by_group.append(req_blocks)
 
         sources = []
         for group_id, manager in enumerate(self.coordinator.single_type_managers):
+            if isinstance(manager, KpoolTailManager):
+                continue
             req_blocks = req_blocks_by_group[group_id]
             last = len(req_blocks) - 1
             # Blocks before the last one are full and only read.
@@ -589,8 +629,10 @@ class KVCacheManager:
                 continue
             targets: list[list[KVCacheBlock]] = []
             for group_id, group_sources in enumerate(sources):
-                group_targets = self.block_pool.get_new_blocks(
-                    len(group_sources), group_id
+                group_targets = (
+                    self.block_pool.get_new_blocks(len(group_sources), group_id)
+                    if group_sources
+                    else []
                 )
                 for source, target in zip(group_sources, group_targets):
                     self._block_copies.append((source.block_id, target.block_id))
@@ -613,7 +655,7 @@ class KVCacheManager:
                     length=boundary,
                     blocks=targets,
                     copy_last=copy_last,
-                    ready_step=self._step - 1 if all(copy_last) else self._step,
+                    ready_step=self._partial_ready_step(copy_last, targets),
                     pinned_blocks=pinned_parents,
                 )
             )
@@ -650,8 +692,10 @@ class KVCacheManager:
                     targets.append([chosen_mamba[group_id]])
                     continue
                 group_sources = non_mamba_sources[group_id]
-                group_targets = self.block_pool.get_new_blocks(
-                    len(group_sources), group_id
+                group_targets = (
+                    self.block_pool.get_new_blocks(len(group_sources), group_id)
+                    if group_sources
+                    else []
                 )
                 for source, target in zip(group_sources, group_targets):
                     self._block_copies.append((source.block_id, target.block_id))
@@ -668,7 +712,7 @@ class KVCacheManager:
                     length=boundary,
                     blocks=targets,
                     copy_last=copy_last,
-                    ready_step=self._step - 1 if all(copy_last) else self._step,
+                    ready_step=self._partial_ready_step(copy_last, targets),
                     pinned_blocks=pinned_parents,
                 )
             )
@@ -731,7 +775,7 @@ class KVCacheManager:
             and request.is_finished()
             and not request.skip_reading_prefix_cache
             and boundary > mounted_at
-            and boundary % self.partial_block_size != 0
+            and self._partial_boundary_ok(boundary)
             and request.num_in_flight_tokens < 64
             and boundary // self.partial_block_size * self.partial_block_size <= hashed
         )
@@ -821,7 +865,7 @@ class KVCacheManager:
                 (b, self._partial_key(request, b))
                 for b in request.prefix_cache_boundaries
                 if 128 <= b < request.num_prompt_tokens
-                and b % self.partial_block_size
+                and self._partial_boundary_ok(b)
                 and b // self.partial_block_size * self.partial_block_size <= hashed
                 and not cache.contains(self._partial_key(request, b))
             }
@@ -859,7 +903,7 @@ class KVCacheManager:
                 for b in request.prefix_cache_boundaries:
                     if (
                         128 <= b < request.num_prompt_tokens
-                        and b % self.partial_block_size
+                        and self._partial_boundary_ok(b)
                         and leader_start < b <= leader.num_prompt_tokens
                         and b in leader.prefix_cache_boundaries
                         and b // self.partial_block_size * self.partial_block_size
@@ -1245,7 +1289,7 @@ class KVCacheManager:
             step_end = total_computed_tokens + num_new_tokens
             if (
                 step_end in request.prefix_cache_boundaries
-                and step_end % self.partial_block_size
+                and self._partial_boundary_ok(step_end)
                 and step_end < request.num_prompt_tokens
             ):
                 # The state at ``step_end`` exists once this step has run;
