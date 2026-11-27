@@ -117,6 +117,60 @@ Q8 GGUF, TP=1, one V100, CUDA graphs, decode tok/s (short / 4k / 16k):
 That is +26 / +24 / +22 % over #1598. Greedy output matches the official checkpoint on all
 parity prompts at every stage.
 
+### TP=2
+
+Q4 GGUF, TP=2 on both V100s, 262k context, CUDA graphs, served with the #1599 parsers.
+Decode tok/s (short / 4k / 16k), median of 3 runs:
+
+| Tree | tok/s |
+| --- | --- |
+| PR 1 (#1598 kernels) | 47.2 / 44.8 / 42.9 |
+| this branch | 58.1 / 54.3 / 51.7 |
+
+That is +23 / +21 / +21 %. Prefill (~1,310 tok/s at 16k), weight memory (11.43 GiB per
+GPU) and KV capacity (562,555 tokens) are unchanged.
+
+### Quality
+
+**Coding benchmarks.** Q4 GGUF, TP=2, temperature 1.0, up to 65,536 tokens, single
+samples:
+
+| | HumanEval / HE+ | LiveCodeBench v6 (60) |
+| --- | --- | --- |
+| PR 1 (#1598 kernels) | 98.2 / 93.3 | 85.0 |
+| this branch, run 1 | 98.8 / 95.1 | 76.7 |
+| this branch, run 2 | | 83.3 |
+
+Earlier runs of other configurations scored 80.0–90.0 on the same 60 problems. The two
+runs of this branch average 80.0. Three problems that four earlier runs all solved failed
+in both runs of this branch, so the numerics were measured directly.
+
+**Decode-path teacher forcing** (`forced_decode.py`, kept with the benchmark harness):
+- Method:
+  - sample traces on PR 1 for four LiveCodeBench problems: the three above, plus a hard
+    problem every run solved, as a control; 16,728 tokens in all;
+  - replay the traces through each tree with a logits processor that forces the trace's
+    tokens;
+  - record the model's raw top-20 log-probs at every step.
+- Conditions: decode kernels, CUDA graphs, batch 4, Q4 GGUF.
+- Determinism: replays are bit-identical run to run, and identical to the sampling run.
+
+| Against PR 1 at TP=1 | mean \|Δ log p\| (chosen token) | KL (base top-20) | argmax flips |
+| --- | --- | --- | --- |
+| + router GEMV | 0.0182 | 0.00099 | 0.90 % |
+| + launch configs | 0.0186 | 0.00104 | 0.93 % |
+| + 32-key attention blocks (this branch) | 0.0190 | 0.00101 | 1.00 % |
+| PR 1 itself at TP=2 | 0.0212 | 0.00134 | 1.08 % |
+
+- Almost all of the difference comes from the router GEMV's summation order. The launch
+  configs and attention blocks add nothing measurable.
+- The difference is uniform across problems: the control problem shows the same size as
+  the three that failed.
+- It is smaller than the difference between #1598 at TP=1 and at TP=2, the same kernels
+  with a different reduction split.
+- The benchmark differences are therefore consistent with sampled trajectories diverging
+  under a perturbation no larger than the one TP=2 already introduces.
+
 ### Test fix: FP8 KV attention test read past its scale buffers
 
 `test_rel_attention_fp8_kv` (from #1598) failed intermittently in full-file runs:
