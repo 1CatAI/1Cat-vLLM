@@ -1298,10 +1298,22 @@ def unify_kv_cache_spec_page_size(
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size != 0:
                 # Payload, scale and state regions need not have an integral
-                # size ratio. Their logical token/checkpoint grids still agree
-                # with the scheduler; padding belongs to the physical page.
+                # size ratio. For AttentionSpec, first scale block_size by the
+                # largest power-of-2 factor <= max_page_size // layer_page_size
+                # (keeping block_size a power-of-2 kernel multiple) so per-token
+                # scale metadata does not cause >100% padding waste on hybrids.
                 if isinstance(layer_spec, (AttentionSpec, MambaSpec)):
-                    padded_spec = replace(layer_spec, page_size_padded=max_page_size)
+                    base_spec = layer_spec
+                    if isinstance(layer_spec, AttentionSpec):
+                        ratio = max_page_size // layer_page_size
+                        scale = 1 << (ratio.bit_length() - 1) if ratio >= 1 else 1
+                        if scale > 1:
+                            cand = layer_spec.copy_with_new_block_size(
+                                layer_spec.block_size * scale
+                            )
+                            if cand.page_size_bytes <= max_page_size:
+                                base_spec = cand
+                    padded_spec = replace(base_spec, page_size_padded=max_page_size)
                     if padded_spec.page_size_bytes == max_page_size:
                         new_kv_cache_spec[layer_name] = padded_spec
                         continue
