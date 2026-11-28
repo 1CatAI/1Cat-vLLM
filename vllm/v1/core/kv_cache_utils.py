@@ -3488,6 +3488,11 @@ def get_kv_cache_configs(
         The generated KVCacheConfigs for each worker.
     """
 
+    overflow_gib = getattr(vllm_config.cache_config, "kv_cpu_overflow_gib", 0.0) or 0.0
+    if overflow_gib > 0:
+        overflow_bytes = int(overflow_gib * (1 << 30))
+        available_memory = [mem + overflow_bytes for mem in available_memory]
+
     # Merge the KV cache specs of all workers. Different PP stages may have
     # different layer names, and different TP ranks of the same PP stage should
     # have the same KV cache spec.

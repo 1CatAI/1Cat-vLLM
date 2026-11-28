@@ -8817,6 +8817,19 @@ class GPUModelRunner(
                 "runtime replay."
             )
 
+        from vllm.v1.attention.ops.cpu_overflow_kv import _OVERFLOW_STATE
+
+        n_gpu_overflow = int(_OVERFLOW_STATE["n_gpu"])
+        step_has_overflow = False
+        if n_gpu_overflow > 0 and num_reqs > 0 and force_uniform_decode is None:
+            for bt in self.input_batch.block_table.block_tables:
+                if (bt.block_table.np[:num_reqs] >= n_gpu_overflow).any():
+                    step_has_overflow = True
+                    break
+        _OVERFLOW_STATE["step_has_overflow"] = step_has_overflow
+        if step_has_overflow:
+            force_eager = True
+
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
@@ -13524,15 +13537,46 @@ class GPUModelRunner(
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+        from vllm.v1.attention.ops.cpu_overflow_kv import (
+            _OVERFLOW_STATE,
+            compute_cpu_overflow_split,
+        )
+
+        overflow_gib = getattr(self.cache_config, "kv_cpu_overflow_gib", 0.0) or 0.0
+        overflow_bytes = int(overflow_gib * (1 << 30)) if overflow_gib > 0 else 0
+        total_dev_bytes = sum(
+            t.size for t in kv_cache_config.kv_cache_tensors if not t.host_backed
+        )
+        n_gpu, n_cpu = compute_cpu_overflow_split(
+            kv_cache_config.num_blocks, total_dev_bytes, overflow_bytes
+        )
         kv_cache_raw_tensors = allocate_host_kv_cache_pool(kv_cache_config, self.device)
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if kv_cache_tensor.host_backed:
-                continue
-            tensor = torch.zeros(
-                kv_cache_tensor.size, dtype=torch.int8, device=self.device
-            )
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_cache_raw_tensors[layer_name] = tensor
+        self._cpu_overflow_raw_tensors: dict[str, torch.Tensor] = {}
+        if n_cpu > 0:
+            _OVERFLOW_STATE["n_gpu"] = n_gpu
+            _OVERFLOW_STATE["n_cpu"] = n_cpu
+            num_blocks = kv_cache_config.num_blocks
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                if kv_cache_tensor.host_backed:
+                    continue
+                gpu_size = (kv_cache_tensor.size // num_blocks) * n_gpu
+                cpu_size = kv_cache_tensor.size - gpu_size
+                gpu_t = torch.zeros(gpu_size, dtype=torch.int8, device=self.device)
+                cpu_t = torch.zeros(
+                    cpu_size, dtype=torch.int8, device="cpu", pin_memory=True
+                )
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = gpu_t
+                    self._cpu_overflow_raw_tensors[layer_name] = cpu_t
+        else:
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                if kv_cache_tensor.host_backed:
+                    continue
+                tensor = torch.zeros(
+                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                )
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = tensor
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -13739,7 +13783,12 @@ class GPUModelRunner(
 
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
-        if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
+        overflow_active = (
+            getattr(self.cache_config, "kv_cpu_overflow_gib", 0.0) or 0.0
+        ) > 0
+        if not overflow_active and self.use_uniform_kv_cache(
+            self.attn_groups, cache_dtype
+        ):
             kv_caches, cross_layers_kv_cache, attn_backend = (
                 self.allocate_uniform_kv_caches(
                     kv_cache_config,
@@ -13760,6 +13809,29 @@ class GPUModelRunner(
             kv_caches = self._reshape_kv_cache_tensors(
                 kv_cache_raw_tensors, kernel_block_sizes
             )
+
+        # Attach matching pinned CPU overflow views when 2-tier overflow is active.
+        cpu_raw_map = getattr(self, "_cpu_overflow_raw_tensors", None)
+        if cpu_raw_map:
+            from vllm.v1.attention.ops.cpu_overflow_kv import _OVERFLOW_STATE
+
+            n_gpu = int(_OVERFLOW_STATE["n_gpu"])
+            n_cpu = int(_OVERFLOW_STATE["n_cpu"])
+            for layer_name, gpu_t in kv_caches.items():
+                cpu_raw = cpu_raw_map.get(layer_name)
+                if cpu_raw is None or gpu_t.shape[0] != n_gpu:
+                    continue
+                cpu_shape = (n_cpu, *gpu_t.shape[1:])
+                cpu_typed = cpu_raw.view(gpu_t.dtype)
+                cpu_view = (
+                    cpu_typed.view(cpu_shape)
+                    if gpu_t.is_contiguous()
+                    else torch.as_strided(
+                        cpu_typed, size=cpu_shape, stride=gpu_t.stride()
+                    )
+                )
+                gpu_t._cpu_overflow_kv = cpu_view  # type: ignore[attr-defined]
+                gpu_t._cpu_overflow_n_gpu = n_gpu  # type: ignore[attr-defined]
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():

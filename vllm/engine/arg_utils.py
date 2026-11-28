@@ -793,6 +793,7 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+    kv_cpu_overflow_gib: float = CacheConfig.kv_cpu_overflow_gib
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1273,6 +1274,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--kv-cpu-overflow-gib", **cache_kwargs["kv_cpu_overflow_gib"]
         )
 
         # Model weight offload related configs
@@ -2193,6 +2197,7 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            kv_cpu_overflow_gib=self.kv_cpu_overflow_gib,
         )
 
         cache_config.cache_dtype_from_checkpoint = cache_dtype_from_checkpoint

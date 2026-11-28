@@ -686,6 +686,49 @@ class TritonAttentionImpl(AttentionImpl):
                 " for TritonAttentionImpl"
             )
 
+        if attn_metadata is not None and output is not None:
+            from vllm.v1.attention.ops.cpu_overflow_kv import (
+                _OVERFLOW_STATE,
+                overflow_attention_req,
+            )
+
+            cpu_kv = getattr(kv_cache, "_cpu_overflow_kv", None)
+            if (
+                _OVERFLOW_STATE["step_has_overflow"]
+                and cpu_kv is not None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                n_gpu = int(kv_cache._cpu_overflow_n_gpu)  # type: ignore[attr-defined]
+                q_start_loc = attn_metadata.query_start_loc.cpu().tolist()
+                seq_lens = attn_metadata.seq_lens.cpu().tolist()
+                bt = attn_metadata.block_table
+                sw = self.sliding_window
+                window = (1 + sw[0]) if (sw is not None and sw[0] >= 0) else 0
+                softcap = getattr(self, "logits_soft_cap", None) or 0.0
+                is_q = is_quantized_kv_cache(self.kv_cache_dtype)
+                dtype_view = self.fp8_dtype if is_q else None
+                k_des = getattr(layer, "_k_scale", None) if is_q else None
+                v_des = getattr(layer, "_v_scale", None) if is_q else None
+                for r, slen in enumerate(seq_lens):
+                    qs, qe = q_start_loc[r], q_start_loc[r + 1]
+                    if qe > qs:
+                        overflow_attention_req(
+                            query[qs:qe],
+                            kv_cache,
+                            cpu_kv,
+                            n_gpu,
+                            output[qs:qe],
+                            int(slen),
+                            self.scale,
+                            window,
+                            bt[r],
+                            softcap=softcap,
+                            dtype_view=dtype_view,
+                            k_descale=k_des,
+                            v_descale=v_des,
+                        )
+                return output
+
         if attn_metadata is None:
             # Profiling run.
             return output.fill_(0)
@@ -885,6 +928,43 @@ class TritonAttentionImpl(AttentionImpl):
                 slot_mapping,
             )
             return
+        from vllm.v1.attention.ops.cpu_overflow_kv import _OVERFLOW_STATE
+
+        cpu_kv = getattr(kv_cache, "_cpu_overflow_kv", None)
+        if (
+            _OVERFLOW_STATE["step_has_overflow"]
+            and cpu_kv is not None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            n_gpu = int(kv_cache._cpu_overflow_n_gpu)  # type: ignore[attr-defined]
+            bs = kv_cache.shape[2]
+            is_cpu = slot_mapping >= (n_gpu * bs)
+            if is_cpu.any():
+                idx = is_cpu.nonzero(as_tuple=False).squeeze(-1)
+                c_slots = slot_mapping[idx].cpu()
+                blks, offs = (c_slots // bs) - n_gpu, c_slots % bs
+                k_sel, v_sel = key[idx], value[idx]
+                if is_quantized_kv_cache(self.kv_cache_dtype):
+                    ks = getattr(layer, "_k_scale", None)
+                    vs = getattr(layer, "_v_scale", None)
+                    k_sel = (
+                        (k_sel.float() / ks.float()).to(self.fp8_dtype).view(cpu_kv.dtype)
+                        if ks is not None
+                        else k_sel.to(self.fp8_dtype).view(cpu_kv.dtype)
+                    )
+                    v_sel = (
+                        (v_sel.float() / vs.float()).to(self.fp8_dtype).view(cpu_kv.dtype)
+                        if vs is not None
+                        else v_sel.to(self.fp8_dtype).view(cpu_kv.dtype)
+                    )
+                else:
+                    k_sel, v_sel = k_sel.to(cpu_kv.dtype), v_sel.to(cpu_kv.dtype)
+                cpu_kv[blks, 0, offs] = k_sel.cpu()
+                cpu_kv[blks, 1, offs] = v_sel.cpu()
+                slot_mapping = torch.where(
+                    is_cpu, torch.full_like(slot_mapping, -1), slot_mapping
+                )
+
         # For decoder and cross-attention, use KV cache as before.
         key_cache, value_cache = kv_cache.unbind(1)
         if _sm70_fp8_kv_needs_cpp_cache_update(self.kv_cache_dtype, key):

@@ -269,6 +269,12 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    kv_cpu_overflow_gib: float = 0.0
+    """Optional extra pinned host RAM (GiB per GPU worker) appended to the
+    active KV block pool as a GPU-first 2-tier emergency overflow tier.
+    Normal requests stay 100% on GPU VRAM with zero overhead; requests that
+    exceed GPU KV capacity automatically spill into pinned host RAM."""
+
     retention: KVRetentionConfig = field(default_factory=KVRetentionConfig)
     """Warm history-block retention policy, captured once per engine."""
 
