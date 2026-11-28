@@ -10,7 +10,7 @@ expert-weight copy.
 
 from __future__ import annotations
 
-from typing import Final, Literal
+from typing import ClassVar, Final, Literal
 
 import torch
 from torch.nn import Parameter
@@ -49,13 +49,9 @@ from vllm.model_executor.layers.fused_moe.sm70.reduction import (
 from vllm.model_executor.layers.fused_moe.sm70.reduction import (
     _single_token_weighted_reduce as _single_token_weighted_reduce,
 )
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
-    CompressedTensorsW4A4Nvfp4MoEMethod,
-)
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
-    _sm70_moe_backend_requested_explicitly,
 )
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
     Sm70MoeStageRoute as Stage,
@@ -66,7 +62,6 @@ from vllm.model_executor.layers.quantization.sm70_moe_router import (
 from vllm.model_executor.layers.quantization.sm70_turbomind import (
     NVFP4_GROUP_SIZE,
     is_exact_sm70_cuda,
-    should_use_nvfp4_moe_turbomind,
 )
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     LayerWorkspaceView,
@@ -730,6 +725,8 @@ def _validate_weight_layout(
 class NvFp4SM70MoEMethod(FusedMoEMethodBase):
     """Prepare and run native SM70 experts from loaded NVFP4 tensors."""
 
+    _checkpoint_format: ClassVar[_CheckpointFormat] = "modelopt"
+
     def __init__(self, moe_config: FusedMoEConfig) -> None:
         FusedMoEMethodBase.__init__(self, moe_config)
         self.sm70_moe_policy = capture_nvfp4_moe_config()
@@ -751,12 +748,7 @@ class NvFp4SM70MoEMethod(FusedMoEMethodBase):
         del routing_tables
         return None
 
-    def process_weights_after_loading(
-        self,
-        layer: RoutedExperts,
-        *,
-        checkpoint_format: _CheckpointFormat = "modelopt",
-    ) -> None:
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         layer.sm70_moe_policy = self.sm70_moe_policy
         layer.sm70_nvfp4_batch_capabilities = {
             "w13": self.native_ops.has_nvfp4_qpn_w13_swiglu_batch_dispatch(),
@@ -849,6 +841,7 @@ class NvFp4SM70MoEMethod(FusedMoEMethodBase):
             )
 
         validate_nvfp4_sm70_moe_contract(layer.moe_config)
+        checkpoint_format = self._checkpoint_format
         _validate_weight_layout(layer, checkpoint_format=checkpoint_format)
         checkpoint_fields = _CHECKPOINT_FIELDS[checkpoint_format]
         w13_weight_name, w2_weight_name, w13_global_name, w2_global_name, *_ = (
@@ -2044,8 +2037,8 @@ class NvFp4SM70MoEMethod(FusedMoEMethodBase):
         del layer, x, router_logits, input_ids
         raise NotImplementedError("SM70 NVFP4 MoE is not a monolithic route.")
 
-    def get_fused_moe_quant_config(  # type: ignore[override]
-        self, layer: RoutedExperts
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
         del layer
         return None
@@ -2066,29 +2059,3 @@ class ModelOptNvFp4SM70MoEMethod(NvFp4SM70MoEMethod, ModelOptNvFp4FusedMoE):
             )
         super().__init__(moe_config)
         self.quant_config = quant_config
-
-
-class CompressedTensorsNvfp4SM70MoEMethod(
-    NvFp4SM70MoEMethod, CompressedTensorsW4A4Nvfp4MoEMethod
-):
-    """Load CT NVFP4 expert tensors and run the native SM70 W4A16 path."""
-
-    group_size = 16
-
-    @staticmethod
-    def supports(layer: RoutedExperts) -> bool:
-        if (
-            not should_use_nvfp4_moe_turbomind()
-            or _sm70_moe_backend_requested_explicitly(layer)
-        ):
-            return False
-        try:
-            validate_nvfp4_sm70_moe_contract(layer.moe_config)
-        except NotImplementedError:
-            return False
-        return True
-
-    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        super().process_weights_after_loading(
-            layer, checkpoint_format="compressed-tensors"
-        )

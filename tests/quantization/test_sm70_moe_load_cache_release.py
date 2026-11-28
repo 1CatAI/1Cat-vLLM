@@ -17,6 +17,9 @@ from vllm.config.sm70_moe import NVFP4_ALIASES, Sm70MoEFormatConfig, Sm70NvFp4Mo
 from vllm.model_executor.layers.fused_moe.sm70.weight_codec import Sm70MoEWeightCodec
 from vllm.model_executor.layers.quantization import awq_sm70_moe as awq
 from vllm.model_executor.layers.quantization import nvfp4_sm70_moe as nvfp4
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+    compressed_tensors_moe_nvfp4_turbomind as ct_turbomind,
+)
 
 
 @pytest.fixture
@@ -112,7 +115,8 @@ def _nvfp4_case(monkeypatch):
         return weight.clone(), scales.clone(), torch.tensor([64, 64])
 
     monkeypatch.setattr(native, "nvfp4_sm70_prepare", prepare)
-    method = SimpleNamespace(
+    method = object.__new__(nvfp4.ModelOptNvFp4SM70MoEMethod)
+    method.__dict__.update(
         native_ops=native,
         sm70_moe_policy=Sm70NvFp4MoEConfig(**dict.fromkeys(NVFP4_ALIASES, False)),
         moe=SimpleNamespace(has_bias=False),
@@ -145,7 +149,7 @@ def test_ct_nvfp4_consumes_inverse_scales_with_the_modelopt_packing(monkeypatch)
         for suffix in ("weight", "weight_scale_2", "input_scale"):
             delattr(ct, f"{stem}_{suffix}")
 
-    method = object.__new__(nvfp4.CompressedTensorsNvfp4SM70MoEMethod)
+    method = object.__new__(ct_turbomind.CompressedTensorsNvfp4SM70MoEMethod)
     method.__dict__.update(vars(reference_method))
     load(reference_method, reference)
     method.process_weights_after_loading(ct)
@@ -160,7 +164,7 @@ def test_ct_nvfp4_consumes_inverse_scales_with_the_modelopt_packing(monkeypatch)
 def test_ct_nvfp4_rejects_partial_expert_replication_during_load(monkeypatch):
     _, reference_method, layer, _ = _nvfp4_case(monkeypatch)
     layer.local_num_experts = 1
-    method = object.__new__(nvfp4.CompressedTensorsNvfp4SM70MoEMethod)
+    method = object.__new__(ct_turbomind.CompressedTensorsNvfp4SM70MoEMethod)
     method.__dict__.update(vars(reference_method))
 
     with pytest.raises(NotImplementedError, match="local and global experts to match"):

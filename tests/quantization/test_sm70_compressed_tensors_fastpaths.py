@@ -15,13 +15,15 @@ from compressed_tensors.quantization import (
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts import skinny_sm70_moe
-from vllm.model_executor.layers.quantization import nvfp4_sm70_moe
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
     CompressedTensorsLinearMethod,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+    compressed_tensors_moe_nvfp4_turbomind as ct_turbomind,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     compressed_tensors_moe_w4a4_nvfp4 as ct_nvfp4,
@@ -62,7 +64,7 @@ def test_ct_nvfp4_sm70_backend_selection(
     monkeypatch, override, a16, native_enabled, skinny, use_turbomind
 ):
     monkeypatch.setattr(
-        nvfp4_sm70_moe, "should_use_nvfp4_moe_turbomind", lambda: native_enabled
+        ct_turbomind, "should_use_nvfp4_moe_turbomind", lambda: native_enabled
     )
     monkeypatch.setattr(skinny_sm70_moe, "skinny_backend_admitted", lambda _: skinny)
     monkeypatch.setattr(
@@ -117,7 +119,7 @@ def test_ct_nvfp4_sm70_backend_selection(
     )
     method = CompressedTensorsMoEMethod.get_moe_method(config, layer, "experts")
     cls = (
-        nvfp4_sm70_moe.CompressedTensorsNvfp4SM70MoEMethod
+        ct_turbomind.CompressedTensorsNvfp4SM70MoEMethod
         if use_turbomind
         else ct_nvfp4.CompressedTensorsW4A4Nvfp4MoEMethod
     )
