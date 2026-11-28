@@ -124,10 +124,6 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     weight_quant, input_quant, layer.moe_config
                 )
         elif quant_config._is_nvfp4_format(weight_quant):
-            from .compressed_tensors_moe_w4a4_nvfp4 import (
-                CompressedTensorsW4A4Nvfp4MoEMethod,
-            )
-
             _is_valid_nvfp4_activations = (
                 quant_config._is_nvfp4_format(input_quant) or input_quant is None
             )
@@ -136,8 +132,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     "For NVFP4 weights, input quantization must also be NVFP4 format ",
                     f"or None for NVFP4A16, found {input_quant}",
                 )
-            return CompressedTensorsW4A4Nvfp4MoEMethod(
-                layer.moe_config, layer_name, use_a16=(input_quant is None)
+            from .compressed_tensors_moe_nvfp4_turbomind import make_nvfp4_moe_method
+
+            return make_nvfp4_moe_method(
+                layer, layer_name, use_a16=(input_quant is None)
             )
         elif (
             quant_config._is_fp8_w8a8_sm90(weight_quant, input_quant)
