@@ -579,6 +579,11 @@ class BlockPool:
         freed_blocks = [
             block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
         ]
+        from vllm.v1.attention.ops.cpu_overflow_kv import _OVERFLOW_STATE
+
+        n_gpu = int(_OVERFLOW_STATE["n_gpu"])
+        if n_gpu > 0:
+            freed_blocks.sort(key=lambda b: b.block_id >= n_gpu)
         if self.enable_caching:
             # Uncached scratch has no reusable prefix to evict, and blocks a
             # sliding window has moved past (``reuse_first``) can never serve a

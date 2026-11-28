@@ -187,7 +187,34 @@ class FreeKVCacheBlockQueue:
         blocks: A list of KVCacheBlock objects.
     """
 
-    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        gpu_block_limit: int | None = None,
+        _subq: bool = False,
+    ) -> None:
+        if gpu_block_limit is None and not _subq:
+            from vllm.v1.attention.ops.cpu_overflow_kv import _OVERFLOW_STATE
+
+            gpu_block_limit = int(_OVERFLOW_STATE["n_gpu"])
+        if not _subq and gpu_block_limit and gpu_block_limit > 0:
+            gpu_blks = [b for b in blocks if b.block_id < gpu_block_limit]
+            cpu_blks = [b for b in blocks if b.block_id >= gpu_block_limit]
+            self._gpu_q: FreeKVCacheBlockQueue | None = FreeKVCacheBlockQueue(
+                gpu_blks, gpu_block_limit=0, _subq=True
+            )
+            self._cpu_q: FreeKVCacheBlockQueue | None = FreeKVCacheBlockQueue(
+                cpu_blks, gpu_block_limit=0, _subq=True
+            )
+            self._gpu_block_limit = gpu_block_limit
+            self.num_free_blocks = (
+                self._gpu_q.num_free_blocks + self._cpu_q.num_free_blocks
+            )
+            return
+
+        self._gpu_q = None
+        self._cpu_q = None
+        self._gpu_block_limit = 0
         self.num_free_blocks = len(blocks)
 
         # Initialize doubly links of consecutive blocks
@@ -223,6 +250,17 @@ class FreeKVCacheBlockQueue:
         Returns:
             The first free block.
         """
+        if self._gpu_q is not None:
+            assert self._cpu_q is not None
+            blk = (
+                self._gpu_q.popleft()
+                if self._gpu_q.num_free_blocks > 0
+                else self._cpu_q.popleft()
+            )
+            self.num_free_blocks = (
+                self._gpu_q.num_free_blocks + self._cpu_q.num_free_blocks
+            )
+            return blk
         if (
             self.fake_free_list_head.next_free_block is self.fake_free_list_tail
             or self.fake_free_list_head.next_free_block is None
@@ -265,6 +303,18 @@ class FreeKVCacheBlockQueue:
         """
         if n == 0:
             return []
+        if self._gpu_q is not None:
+            assert self._cpu_q is not None
+            assert self.num_free_blocks >= n
+            take_g = min(n, self._gpu_q.num_free_blocks)
+            ret = self._gpu_q.popleft_n(take_g) if take_g > 0 else []
+            rem = n - take_g
+            if rem > 0:
+                ret.extend(self._cpu_q.popleft_n(rem))
+            self.num_free_blocks = (
+                self._gpu_q.num_free_blocks + self._cpu_q.num_free_blocks
+            )
+            return ret
         assert self.num_free_blocks >= n
         self.num_free_blocks -= n
 
@@ -293,6 +343,16 @@ class FreeKVCacheBlockQueue:
         Args:
             block: The block to remove.
         """
+        if self._gpu_q is not None:
+            assert self._cpu_q is not None
+            if block.block_id < self._gpu_block_limit:
+                self._gpu_q.remove(block)
+            else:
+                self._cpu_q.remove(block)
+            self.num_free_blocks = (
+                self._gpu_q.num_free_blocks + self._cpu_q.num_free_blocks
+            )
+            return
         if block.prev_free_block is None or block.next_free_block is None:
             # This should not happen if the block is from the free list.
             # It indicates a bug in the caller's logic.
@@ -314,6 +374,16 @@ class FreeKVCacheBlockQueue:
         Args:
             block: The block to append.
         """
+        if self._gpu_q is not None:
+            assert self._cpu_q is not None
+            if block.block_id < self._gpu_block_limit:
+                self._gpu_q.append(block)
+            else:
+                self._cpu_q.append(block)
+            self.num_free_blocks = (
+                self._gpu_q.num_free_blocks + self._cpu_q.num_free_blocks
+            )
+            return
         if self.fake_free_list_tail.prev_free_block is None:
             raise RuntimeError(
                 "prev_free_block of fake_free_list_tail should always exist"
@@ -333,6 +403,18 @@ class FreeKVCacheBlockQueue:
     def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks at the front of the free list."""
         if len(blocks) == 0:
+            return
+        if self._gpu_q is not None:
+            assert self._cpu_q is not None
+            g = [b for b in blocks if b.block_id < self._gpu_block_limit]
+            c = [b for b in blocks if b.block_id >= self._gpu_block_limit]
+            if g:
+                self._gpu_q.prepend_n(g)
+            if c:
+                self._cpu_q.prepend_n(c)
+            self.num_free_blocks = (
+                self._gpu_q.num_free_blocks + self._cpu_q.num_free_blocks
+            )
             return
 
         first_block = self.fake_free_list_head.next_free_block
@@ -359,6 +441,18 @@ class FreeKVCacheBlockQueue:
         """
         if len(blocks) == 0:
             return
+        if self._gpu_q is not None:
+            assert self._cpu_q is not None
+            g = [b for b in blocks if b.block_id < self._gpu_block_limit]
+            c = [b for b in blocks if b.block_id >= self._gpu_block_limit]
+            if g:
+                self._gpu_q.append_n(g)
+            if c:
+                self._cpu_q.append_n(c)
+            self.num_free_blocks = (
+                self._gpu_q.num_free_blocks + self._cpu_q.num_free_blocks
+            )
+            return
 
         last_block = self.fake_free_list_tail.prev_free_block
         assert last_block is not None, (
@@ -382,6 +476,9 @@ class FreeKVCacheBlockQueue:
         Returns:
             A list of free blocks.
         """
+        if self._gpu_q is not None:
+            assert self._cpu_q is not None
+            return self._gpu_q.get_all_free_blocks() + self._cpu_q.get_all_free_blocks()
         ret = []
         if self.fake_free_list_head.next_free_block is None:
             raise RuntimeError(
@@ -3488,6 +3585,11 @@ def get_kv_cache_configs(
         The generated KVCacheConfigs for each worker.
     """
 
+    overflow_gib = getattr(vllm_config.cache_config, "kv_cpu_overflow_gib", 0.0) or 0.0
+    if overflow_gib > 0:
+        overflow_bytes = int(overflow_gib * (1 << 30))
+        available_memory = [mem + overflow_bytes for mem in available_memory]
+
     # Merge the KV cache specs of all workers. Different PP stages may have
     # different layer names, and different TP ranks of the same PP stage should
     # have the same KV cache spec.
@@ -3608,6 +3710,21 @@ def get_kv_cache_configs(
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
+
+    if overflow_gib > 0 and kv_cache_configs:
+        from vllm.v1.attention.ops.cpu_overflow_kv import (
+            _OVERFLOW_STATE,
+            compute_cpu_overflow_split,
+        )
+
+        total_bytes = sum(
+            t.size for t in kv_cache_configs[0].kv_cache_tensors if not t.host_backed
+        )
+        n_gpu, n_cpu = compute_cpu_overflow_split(
+            kv_cache_configs[0].num_blocks, total_bytes, int(overflow_gib * (1 << 30))
+        )
+        _OVERFLOW_STATE["n_gpu"] = n_gpu
+        _OVERFLOW_STATE["n_cpu"] = n_cpu
 
     return kv_cache_configs
 
