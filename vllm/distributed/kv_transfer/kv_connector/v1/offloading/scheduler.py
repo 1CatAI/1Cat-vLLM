@@ -121,6 +121,9 @@ class SchedulerOffloadConfig(NamedTuple):
     num_kv_cache_groups: int
     # See OffloadingSpec.demote_superseded_states.
     demote_superseded_states: bool = True
+    # When True, skip storing interior prompt SWA blocks that fall before the
+    # prompt's trailing sliding window (paired with grouped SWA CPU pools).
+    swa_tail_only_offload: bool = False
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -226,6 +229,10 @@ class SchedulerOffloadConfig(NamedTuple):
             offload_prompt_only=spec.offload_prompt_only,
             num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
             demote_superseded_states=getattr(spec, "demote_superseded_states", True),
+            swa_tail_only_offload=bool(
+                getattr(spec, "swa_tail_only_offload", False)
+                and getattr(spec, "_swa_partition", False)
+            ),
         )
 
 
@@ -917,6 +924,16 @@ class OffloadingConnectorScheduler:
                 ):
                     if block_id == 0:
                         continue
+                    # For grouped Full+SWA CPU pools, interior prompt SWA blocks
+                    # before the trailing sliding window are never needed when
+                    # reloading or extending the prompt.
+                    if self.config.swa_tail_only_offload and tail is not None:
+                        prompt_full_blocks = (
+                            req.num_prompt_tokens // group_config.offloaded_block_size
+                        )
+                        abs_block_idx = start_block_idx + key_idx
+                        if abs_block_idx < prompt_full_blocks - tail - 1:
+                            continue
                     # Skip SWA blocks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
                     # trailing `tail` blocks are reachable by
