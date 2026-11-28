@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MRV2 warmup must reserve the same speculative KV tail as the scheduler."""
+"""MRV2 warmup must match the scheduler's KV block reservation."""
 
 from types import SimpleNamespace
 from typing import Any
@@ -53,6 +53,7 @@ def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
     connector_states: list[bool] = []
     attention_spec = _full_attention_spec()
     runner = SimpleNamespace(
+        dcp_size=1,
         num_speculative_steps=4,
         scheduler_config=SimpleNamespace(
             max_num_seqs=4,
@@ -165,6 +166,50 @@ def _full_attention_spec() -> FullAttentionSpec:
     )
 
 
+@pytest.mark.parametrize(("dcp_size", "sharded_prefill"), [(1, 8), (2, 4)])
+def test_long_warmup_reserves_global_dcp_blocks(
+    monkeypatch: pytest.MonkeyPatch, dcp_size: int, sharded_prefill: int
+) -> None:
+    groups = []
+    for sharded in (True, False):
+        spec = FullAttentionSpec(
+            block_size=1024,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float16,
+            dcp_sharded=sharded,
+        )
+        group_spec = UniformTypeKVCacheSpecs.from_specs({"attention": spec}, dcp_size)
+        assert group_spec is not None
+        groups.append(SimpleNamespace(kv_cache_spec=group_spec))
+    runner = SimpleNamespace(
+        dcp_size=dcp_size,
+        num_speculative_steps=0,
+        scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=8192),
+        max_model_len=16384,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=groups, num_blocks=32),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=0),
+        model_state=SimpleNamespace(),
+        is_pooling_model=False,
+        is_last_pp_rank=False,
+        kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
+    )
+    executions: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    warmup_kernels(runner, executions.append, lambda *_: None)
+
+    prefill, decode, _ = executions[-3:]
+    assert prefill.total_num_scheduled_tokens == 8192
+    assert decode.scheduled_cached_reqs.num_computed_tokens == [8192]
+    assert decode.total_num_scheduled_tokens == 1
+    assert [len(ids) for ids in prefill.scheduled_new_reqs[0].block_ids] == [
+        sharded_prefill,
+        8,
+    ]
+    assert tuple(map(len, decode.scheduled_cached_reqs.new_block_ids[0])) == (1, 1)
+
+
 def _mamba_spec(mode: str) -> MambaSpec:
     return MambaSpec(
         block_size=BLOCK_SIZE,
@@ -226,6 +271,7 @@ def test_reserved_block_count_matches_speculative_tail(spec, expected) -> None:
         _reserved_block_count(
             14,
             spec,
+            dcp_size=1,
             num_lookahead_tokens=NUM_SPEC_TOKENS + 1,
             max_model_len=MAX_MODEL_LEN,
             max_encoder_len=0,
@@ -241,6 +287,7 @@ def test_warmup_keeps_state_groups_inside_a_bounded_state_pool(
     # ``device_state_blocks``; warmup handed them sequential IDs past it.
     state_blocks = 6
     runner = SimpleNamespace(
+        dcp_size=1,
         num_speculative_steps=4,
         scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=256),
         max_model_len=512,
@@ -320,6 +367,7 @@ def _glm53_warmup_runner(num_spec: int, num_blocks: int) -> SimpleNamespace:
         ),
     ]
     return SimpleNamespace(
+        dcp_size=1,
         num_speculative_steps=num_spec,
         scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1024),
         max_model_len=524288,
