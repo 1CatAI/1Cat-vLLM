@@ -1,0 +1,1043 @@
+diff --git a/benchmarks/kernels/benchmark_sm70_qsa_shared_key.py b/benchmarks/kernels/benchmark_sm70_qsa_shared_key.py
+index 806bf1e155..d4e4744beb 100644
+--- a/benchmarks/kernels/benchmark_sm70_qsa_shared_key.py
++++ b/benchmarks/kernels/benchmark_sm70_qsa_shared_key.py
+@@ -10,6 +10,76 @@
+ import torch
+ 
+ from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_mqa_paged, qsa_select_paged_tokens
++from vllm.v1.attention.ops.sm70_qsa_shared_key import shared_key_reason
++
++# Both scorers accumulate FP16 inputs in FP32 with different reduction orders.
++# A paired FP64 check at M8/M9 found a 2.28e-6 difference near zero while
++# each scorer was within 1.49e-6 of FP64, with identical top-512 sets. Retain
++# a bounded absolute floor instead of treating the Triton scorer as exact.
++_SCORE_RTOL = 2e-6
++_SCORE_ATOL = 1e-5
++
++
++def check_selection(layers, reference, candidate):
++    """Allow rounded score ties, while checking each selector's exact semantics."""
++    result = dict(
++        changed_rows=0,
++        changed_set_rows=0,
++        minimum_block_overlap=1.0,
++        max_boundary_score_gap=0.0,
++    )
++    for inputs, expected, actual in zip(layers, reference, candidate):
++        changed = torch.nonzero((expected != actual).any(dim=1)).flatten().tolist()
++        if not changed:
++            continue
++        ref_scores, visible = qsa_mqa_paged(*inputs, 4)
++        scores, av = qsa_mqa_paged(*inputs, 4, shared_key_scoring=True)
++        assert torch.equal(av, visible)
++        mask = (
++            torch.arange(scores.shape[1], device=scores.device)[None, :] < av[:, None]
++        )
++        torch.testing.assert_close(
++            scores[mask], ref_scores[mask], rtol=_SCORE_RTOL, atol=_SCORE_ATOL
++        )
++        for row in changed:
++            count = min(int(visible[row]), 512)
++            expanded = count * 4
++            # Open-group tails and padding remain exact regardless of scores.
++            assert torch.equal(actual[row, expanded:], expected[row, expanded:])
++            selected = []
++            for output, logits in ((expected, ref_scores), (actual, scores)):
++                tokens = output[row, :expanded].reshape(count, 4)
++                blocks = tokens[:, 0] // 4
++                offsets = torch.arange(4, device=tokens.device)
++                assert torch.equal(tokens, blocks[:, None] * 4 + offsets)
++                # The selected set must be exact for the scores that arm used,
++                # including logical-index tie breaking. Output order may differ.
++                canonical = torch.argsort(
++                    logits[row, : int(visible[row])], stable=True, descending=True
++                )[:count]
++                assert torch.equal(blocks.sort().values, canonical.sort().values)
++                selected.append(blocks)
++            old, new = selected
++            overlap = int(torch.isin(old, new).sum())
++            result["changed_rows"] += 1
++            result["minimum_block_overlap"] = min(
++                result["minimum_block_overlap"], overlap / max(count, 1)
++            )
++            if overlap == count:
++                continue
++            removed = old[~torch.isin(old, new)]
++            added = new[~torch.isin(new, old)]
++            boundary = ref_scores[row, torch.cat((removed, added))]
++            gap = float(boundary.max() - boundary.min())
++            # Changes are confined to the uncertainty of the two FP32 score
++            # estimates. This is an operator gate, not model-quality evidence.
++            bound = 2 * (_SCORE_ATOL + _SCORE_RTOL * float(boundary.abs().max()))
++            assert gap <= bound, "Selection differs beyond score-rounding bounds"
++            result["changed_set_rows"] += 1
++            result["max_boundary_score_gap"] = max(
++                result["max_boundary_score_gap"], gap
++            )
++    return result
+ 
+ 
+ def compare_time(a, b, count):
+@@ -50,17 +120,42 @@ def main():
+     parser.add_argument("--position-dtype", choices=("int32", "int64"), default="int64")
+     parser.add_argument("--page-size", type=int, default=204)
+     parser.add_argument("--pages-per-request", type=int, default=12)
++    parser.add_argument("--query-rows", type=int, nargs="+", default=[5])
++    parser.add_argument("--requests", type=int, nargs="+", default=[1, 4])
++    parser.add_argument("--live-length", type=int, default=8197)
++    parser.add_argument("--layers", type=int, default=12)
++    parser.add_argument(
++        "--component", choices=("scorer", "selection", "both"), default="both"
++    )
+     args = parser.parse_args()
+-    if args.page_size <= 0 or args.pages_per_request <= 0:
+-        parser.error("Page dimensions must be positive")
++    if (
++        min(
++            args.page_size,
++            args.pages_per_request,
++            args.layers,
++            *args.query_rows,
++            *args.requests,
++        )
++        <= 0
++    ):
++        parser.error(
++            "Page dimensions, layers, query rows and requests must be positive"
++        )
++    columns = args.page_size * args.pages_per_request
++    if not max(args.query_rows) <= args.live_length <= columns * 4:
++        parser.error("Live length must cover query rows and fit the compressed cache")
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
++        parser.error("An SM70 GPU is required")
+     position_dtype = getattr(torch, args.position_dtype)
+     torch.manual_seed(902)
+     results = []
+-    for m in (5, 20):
++    workloads = [
++        (rows, requests) for rows in args.query_rows for requests in args.requests
++    ]
++    for query_rows, requests in workloads:
++        m = query_rows * requests
+         layers = []
+-        for _ in range(12):
+-            requests = m // 5
+-            columns = args.page_size * args.pages_per_request
++        for _ in range(args.layers):
+             cache = torch.randn(
+                 requests * args.pages_per_request,
+                 args.page_size,
+@@ -73,11 +168,22 @@ def main():
+                 requests * args.pages_per_request, device="cuda", dtype=torch.int32
+             ).view(requests, -1)
+             q = torch.randn(m, 4, 128, device="cuda", dtype=torch.float16)
+-            req = torch.arange(m, device="cuda", dtype=torch.int32) // 5
+-            pos = 8192 + torch.arange(m, device="cuda", dtype=position_dtype) % 5
+-            lengths = torch.full((requests,), 8197, device="cuda", dtype=torch.int32)
++            req = torch.arange(m, device="cuda", dtype=torch.int32) // query_rows
++            pos = (
++                args.live_length
++                - query_rows
++                + torch.arange(m, device="cuda", dtype=position_dtype) % query_rows
++            )
++            lengths = torch.full(
++                (requests,), args.live_length, device="cuda", dtype=torch.int32
++            )
+             layers.append((q, cache, table, req, pos, lengths))
++        admission_reason = shared_key_reason(*layers[0])
+         for full_selection in (False, True):
++            if args.component == "scorer" and full_selection:
++                continue
++            if args.component == "selection" and not full_selection:
++                continue
+ 
+             def run(enabled, full_selection=full_selection, layers=layers):
+                 if full_selection:
+@@ -89,22 +195,68 @@ def run(enabled, full_selection=full_selection, layers=layers):
+                     qsa_mqa_paged(*v, 4, shared_key_scoring=enabled) for v in layers
+                 ]
+ 
+-            ref, cand = run(False), run(True)
++            ref = run(False)
++            # Observe dispatch outside timed capture. A requested switch or an
++            # admission decision alone is not proof of native execution.
++            with torch.profiler.profile(
++                activities=[torch.profiler.ProfilerActivity.CPU]
++            ) as profile:
++                cand = run(True)
++            native_calls = sum(
++                event.count
++                for event in profile.key_averages()
++                if event.key == "vllm_sm70_qsa_indexer::run"
++            )
++            compared_scores = 0
++            max_abs_score_error = None
++            selection_quality = None
+             if full_selection:
+-                assert all(torch.equal(a, b) for a, b in zip(ref, cand))
++                selection_quality = check_selection(layers, ref, cand)
++            else:
++                max_abs_score_error = 0.0
++                assert native_calls == (args.layers if admission_reason is None else 0)
++                for (expected, ev), (actual, av) in zip(ref, cand):
++                    assert torch.equal(av, ev)
++                    mask = torch.arange(columns, device="cuda")[None, :] < ev[:, None]
++                    actual_scores, expected_scores = actual[mask], expected[mask]
++                    torch.testing.assert_close(
++                        actual_scores,
++                        expected_scores,
++                        rtol=_SCORE_RTOL,
++                        atol=_SCORE_ATOL,
++                    )
++                    compared_scores += actual_scores.numel()
++                    if actual_scores.numel():
++                        max_abs_score_error = max(
++                            max_abs_score_error,
++                            (actual_scores - expected_scores).abs().max().item(),
++                        )
+             timing = compare_time(lambda: run(False), lambda: run(True), 1)
+             row = dict(
+                 m=m,
++                query_rows_per_request=query_rows,
++                requests=requests,
++                live_length_tokens=args.live_length,
++                capacity_tokens=columns * 4,
++                compression_ratio=4,
+                 full_selection=full_selection,
+-                layers=12,
++                layers=args.layers,
+                 position_dtype=args.position_dtype,
+                 page_size=args.page_size,
+                 columns=columns,
++                admission_reason=admission_reason,
++                observed_native_calls=native_calls,
++                score_rtol=None if full_selection else _SCORE_RTOL,
++                score_atol=None if full_selection else _SCORE_ATOL,
++                compared_scores=compared_scores,
++                max_abs_score_error=max_abs_score_error,
++                selection_quality=selection_quality,
+                 timing=timing,
+             )
+             results.append(row)
+             print(row, flush=True)
+-    args.out.write_text(json.dumps(results, indent=2) + "\n")
++            # Retain completed cases if a later workload fails qualification.
++            args.out.write_text(json.dumps(results, indent=2) + "\n")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/csrc/sm70_turbomind/ops/qsa_indexer_sm70.cu b/csrc/sm70_turbomind/ops/qsa_indexer_sm70.cu
+index d0be9cf100..c2346c3d78 100644
+--- a/csrc/sm70_turbomind/ops/qsa_indexer_sm70.cu
++++ b/csrc/sm70_turbomind/ops/qsa_indexer_sm70.cu
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: Apache-2.0
+ // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-// Reuse each compressed key across a single request's speculative queries.
++// Reuse each compressed key across tiles of a single request's queries.
+ #include <ATen/cuda/CUDAContext.h>
+ #include <c10/cuda/CUDAGuard.h>
+ #include <c10/cuda/CUDAException.h>
+@@ -11,6 +11,9 @@
+ #include <pybind11/pybind11.h>
+ 
+ namespace {
++constexpr int kQueryTile = 8;
++// CUDA's grid.y limit, independent of model geometry or speculative width.
++constexpr int kMaxQueryRows = 65535 * kQueryTile;
+ #define QSA_MMA(C, A0, A1, B0, B1)                                  \
+   asm volatile(                                                     \
+       "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "            \
+@@ -28,6 +31,13 @@ __global__ void mqa_multiquery(const half* q, const half* cache,
+                                int pages, int page_size, int table_width,
+                                int sq0, int sq1, int sq2, int sc0, int sc1,
+                                int sc3, int st1, float divisor, int compress) {
++  const int row_base = blockIdx.y * kQueryTile;
++  q += static_cast<int64_t>(row_base) * sq0;
++  requests += row_base;
++  positions += row_base;
++  scores += static_cast<int64_t>(row_base) * columns;
++  visible += row_base;
++  m = min(m - row_base, kQueryTile);
+   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+   const int quad = (lane >> 2) & 3;
+   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+@@ -115,7 +125,8 @@ __global__ void mqa_multiquery(const half* q, const half* cache,
+       if ((lane & 2) == 0 && row < m && requests[row] == 0 &&
+           column < columns && column < (positions[row] + 1) / compress &&
+           column < lengths[0] / compress) {
+-        scores[row * columns + column] = valid ? sum / divisor : -CUDART_INF_F;
++        scores[static_cast<int64_t>(row) * columns + column] =
++            valid ? sum / divisor : -CUDART_INF_F;
+       }
+     }
+   }
+@@ -128,10 +139,13 @@ void mqa_out(torch::Tensor scores, torch::Tensor visible, torch::Tensor q,
+              torch::Tensor positions, torch::Tensor lengths, double divisor,
+              int64_t compress) {
+   const c10::cuda::CUDAGuard guard(q.device());
+-  TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf && q.dim() == 3 &&
+-                  q.size(0) > 0 && q.size(0) <= 8 && q.size(1) == 4 &&
+-                  q.size(2) == 128 && table.dim() == 2 && table.size(0) == 1,
+-              "Shared-key MQA requires FP16 M1..8/H4/D128 and one request");
++  TORCH_CHECK(
++      q.is_cuda() && q.scalar_type() == at::kHalf && q.dim() == 3 &&
++          q.size(0) > 0 && q.size(0) <= kMaxQueryRows && q.size(1) == 4 &&
++          q.size(2) == 128 && table.dim() == 2 && table.size(0) == 1,
++      "Shared-key MQA requires FP16 H4/D128, one request and a supported "
++      "query tile grid");
++  TORCH_CHECK(scores.dim() == 2, "MQA scores must be a matrix");
+   const int m = q.size(0), columns = scores.size(1);
+   TORCH_CHECK(cache.dim() == 4 && cache.size(2) == 1 && cache.size(3) == 128 &&
+                   cache.scalar_type() == at::kHalf &&
+@@ -156,28 +170,25 @@ void mqa_out(torch::Tensor scores, torch::Tensor visible, torch::Tensor q,
+   const auto* props = at::cuda::getCurrentDeviceProperties();
+   TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
+   if (!columns) return;
++  const dim3 grid((columns + 31) / 32, (m + kQueryTile - 1) / kQueryTile);
+   if (positions.scalar_type() == at::kLong) {
+-    mqa_multiquery<int64_t>
+-        <<<(columns + 31) / 32, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+-            reinterpret_cast<const half*>(q.data_ptr()),
+-            reinterpret_cast<const half*>(cache.data_ptr()),
+-            table.data_ptr<int>(), requests.data_ptr<int>(),
+-            positions.data_ptr<int64_t>(), lengths.data_ptr<int>(),
+-            scores.data_ptr<float>(), visible.data_ptr<int>(), m, columns,
+-            cache.size(0), cache.size(1), table.size(1), q.stride(0),
+-            q.stride(1), q.stride(2), cache.stride(0), cache.stride(1),
+-            cache.stride(3), table.stride(1), divisor, compress);
++    mqa_multiquery<int64_t><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const half*>(q.data_ptr()),
++        reinterpret_cast<const half*>(cache.data_ptr()), table.data_ptr<int>(),
++        requests.data_ptr<int>(), positions.data_ptr<int64_t>(),
++        lengths.data_ptr<int>(), scores.data_ptr<float>(),
++        visible.data_ptr<int>(), m, columns, cache.size(0), cache.size(1),
++        table.size(1), q.stride(0), q.stride(1), q.stride(2), cache.stride(0),
++        cache.stride(1), cache.stride(3), table.stride(1), divisor, compress);
+   } else {
+-    mqa_multiquery<int32_t>
+-        <<<(columns + 31) / 32, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+-            reinterpret_cast<const half*>(q.data_ptr()),
+-            reinterpret_cast<const half*>(cache.data_ptr()),
+-            table.data_ptr<int>(), requests.data_ptr<int>(),
+-            positions.data_ptr<int>(), lengths.data_ptr<int>(),
+-            scores.data_ptr<float>(), visible.data_ptr<int>(), m, columns,
+-            cache.size(0), cache.size(1), table.size(1), q.stride(0),
+-            q.stride(1), q.stride(2), cache.stride(0), cache.stride(1),
+-            cache.stride(3), table.stride(1), divisor, compress);
++    mqa_multiquery<int32_t><<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const half*>(q.data_ptr()),
++        reinterpret_cast<const half*>(cache.data_ptr()), table.data_ptr<int>(),
++        requests.data_ptr<int>(), positions.data_ptr<int>(),
++        lengths.data_ptr<int>(), scores.data_ptr<float>(),
++        visible.data_ptr<int>(), m, columns, cache.size(0), cache.size(1),
++        table.size(1), q.stride(0), q.stride(1), q.stride(2), cache.stride(0),
++        cache.stride(1), cache.stride(3), table.stride(1), divisor, compress);
+   }
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+@@ -189,4 +200,6 @@ TORCH_LIBRARY(vllm_sm70_qsa_indexer, m) {
+       "float divisor, int compress) -> ()");
+   m.impl("run", torch::kCUDA, &mqa_out);
+ }
+-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++  m.attr("MAX_QUERY_ROWS") = kMaxQueryRows;
++}
+diff --git a/docs/design/architecture/README.md b/docs/design/architecture/README.md
+index 8bf078e765..0025e13a61 100644
+--- a/docs/design/architecture/README.md
++++ b/docs/design/architecture/README.md
+@@ -57,6 +57,7 @@ Maintenance rules:
+ | --- | --- |
+ | KV storage identity and conversion | [KV codecs](../../../vllm/v1/attention/kv_codecs.README.md); independent of weight quantization |
+ | Flash-V100 selection and execution | [Attention component](../../../vllm/v1/attention/backends/flash_v100/README.md); assembly, executors and feature-owned metadata |
++| Shared-key sparse index scoring | [SM70 QSA provider](../../../vllm/v1/attention/ops/sm70_qsa_shared_key.py); model-independent tensor admission and native row tiles; former model module forwards imports |
+ | MoE stages, codecs and resources | [SM70 MoE component](../../../vllm/model_executor/layers/fused_moe/sm70/README.md); existing `sm70_moe_router` selector |
+ | Linear dispatch and QPN | `vllm/model_executor/kernels/linear/`, including `qpn/`; existing selector and prepared provider state |
+ | Native SM70 bindings | `vllm/_sm70/`; `_sm70_ops.py` is a compatibility facade |
+@@ -87,6 +88,91 @@ Legacy names are initialization adapters. The
+ metadata; [Phase D](sm70_phase_d.md) records parsing, provenance, effective hashes,
+ native ABI and retained process/standalone boundaries.
+ 
++## Generalizing existing paths
++
++Keep the owners above as the integration targets. New models supply layout,
++head geometry, codec and state requirements to those owners; they should inherit
++qualified implementations without copying another model's dispatch chain.
++Consolidating ownership and widening qualification are separate deliverables.
++The following work queue records decisions, not a second runtime registry.
++
++Classify a restriction before changing it:
++
++| Restriction | Required action |
++| --- | --- |
++| Hardware, ABI or layout correctness | Implement the missing capability or retain a reasoned fallback; deleting the guard does not add support |
++| Implementation coverage, such as one query tile | Extend the existing algorithm over a range with tails and lifecycle handling |
++| Numerical/model qualification | Use bounded operator error and representative task-quality evidence; identical generated tokens are not a universal requirement |
++| Performance tuning, such as a crossover or measured geometry | Keep tuning separate from correctness admission; compare the affected real route before selecting a new range |
++
++Prioritize a missing capability that blocks multiple inputs or models. Keep
++preserved cases as controls and test the changed boundary/interior plus the
++affected startup or graph interaction. Stop after the decision is established;
++do not remeasure unrelated historical paths.
++
++| Family / current source | Restriction to resolve | Reuse target and next decision |
++| --- | --- | --- |
++| [QSA shared-key scoring](../../../vllm/v1/attention/ops/sm70_qsa_shared_key.py) | Old native ABI handles one eight-query tile; FP16/H4/D128 and one request remain implementation constraints | Common attention provider now tiles query rows; validate the added row range before qualification. Older binaries keep their row limit and fallback |
++| [QSA Top-K](../../../csrc/qsa_lexicographic_topk.cuh) | M5/M10 score-capacity gap between short MTP and long compact routes | First compare the same selector around 9216/9217 and 32767/32768 score columns, distinguishing live length from capacity; extend interval selection only if useful |
++| [QSA sparse page4](../../../vllm/models/qwen4_exp/nvidia/ops/qsa.py) | H6/D256, index budget and page layout | Parameterize the existing sparse attention provider after checking its native layout; preserve exact selection/masking semantics for the supplied scores |
++| [Grouped long attention](../../../vllm/v1/attention/ops/sm70_grouped_long.py) | D256/GQA6, fixed per-request query width in batches, context qualification | Extend request metadata and existing workspace/graph plan to ragged groups; do not conflate a certified context limit with a hardware limit |
++| [AWQ active grouped MoE](../../../vllm/model_executor/layers/quantization/awq_sm70_moe.py) | Model geometry, TP4, group32, top-k and M2..8 bundled in qualification | Separate native geometry capability from quality/tuning in the existing MoE plan; qualify one useful neighboring geometry against the same AWQ/FP8 migration criteria |
++| [DFlash2 FP16 projections](../../../vllm/model_executor/layers/quantization/sm70_dflash2_fp16.py) | Five measured geometries and M8-specific packed provider | Reuse the linear preparation/provider interface; retain geometry data as tuning and keep the ordinary GEMM fallback. Avoid another model-specific linear dispatch chain |
++| [GDN native verifier](../../../vllm/model_executor/layers/fla/ops/sm70/gdn_verify.py) | One request, at most eight rows, K/V128 | Extend the existing `GdnExecutionPlan` provider and metadata/state contract; qualify batches and tails before attempting a new head dimension |
++| [DFlash2 defaults](../../../vllm/model_executor/models/config.py) and [online QPN8](../../../vllm/model_executor/layers/quantization/sm70_online_qpn8.py) | Model-quality packages and explicit precision conversion | Separate independently reusable operators from package qualification; evaluate precision changes through task quality, preserving the fallback |
++
++### First delivery: shared QSA scorer
++
++The public provider accepts tensor metadata without a model name. The old model
++import is a compatibility facade. The packaged CUDA operator uses an eight-row
++query tile over `grid.y`, with a masked last tile and 64-bit output offsets.
++`MAX_QUERY_ROWS` reports the native launch bound; it is not a measured throughput
++or model-quality envelope. Native libraries predating this capability remain
++limited to eight rows, even with newer Python.
++
++CPU admission tests cover tile boundaries, invalid metadata and old binaries.
++The 22 CPU cases and 19 distinct GPU cases pass. GPU checks exercise non-aligned
++score widths, query tails, padded rows, changed live lengths and replay, against
++both the existing scorer and independent native tiles. Actual 32K/256K scorer
++and score-to-selection measurements are recorded in the
++[migration control log](../sm70_v100_migration_control.md#shared-path-generalization-qsa-query-tiles-2026-10-11).
++Model task quality, startup parity and model speed remain unqualified. The
++change does not establish multi-request native scoring or other-head support.
++
++```bash
++.venv/bin/python -m pytest --confcutdir=tests/v1/attention -q \
++  tests/v1/attention/test_sm70_qsa_shared_key_admission.py
++# Build/install standard _C, _C_stable_libtorch and _sm70_qsa_indexer_C targets:
++.venv/bin/python -m pytest --confcutdir=tests/kernels -q \
++  tests/kernels/test_sm70_qsa_shared_key.py
++```
++
++The existing scorer benchmark accepts query rows and live length independently
++of allocated capacity. Its defaults retain the former M5/C1 and M20/C4 workloads.
++It records actual native dispatcher calls outside timed capture, numerical error
++and same-process ABBA CUDA Graph timings. Use the model's 204-key page layout to
++compare actual 32K and 256K prefixes; larger capacity alone does not test a
++longer prefix:
++
++```bash
++.venv/bin/python -m benchmarks.kernels.benchmark_sm70_qsa_shared_key \
++  --out /tmp/qsa-scorer-32k.json --component scorer --requests 1 \
++  --query-rows 8 9 17 33 65 --page-size 204 --pages-per-request 41 \
++  --live-length 32768 --layers 12
++.venv/bin/python -m benchmarks.kernels.benchmark_sm70_qsa_shared_key \
++  --out /tmp/qsa-scorer-256k.json --component scorer --requests 1 \
++  --query-rows 8 9 17 33 65 --page-size 204 --pages-per-request 322 \
++  --live-length 262144 --layers 12
++```
++
++The benchmark records `rtol=2e-6, atol=1e-5` for FP32 scores from FP16 inputs.
++An FP64 diagnostic established rounding error in both scorers; unchanged unit
++fixtures still pass their tighter comparison. For changed selection rows, each
++arm must produce the exact Top-K set for its own scores, retain causal tails and
++padding, and confine exchanges to score-rounding uncertainty. Overlap and
++boundary gaps are reported; malformed-tail and non-Top-K negative controls are
++rejected. This operator criterion does not replace model task-quality evidence.
++
+ ## Source-derived reference
+ 
+ The [architecture reference](runtime_reference.md) is generated from reachable
+diff --git a/docs/design/sm70_v100_migration_control.md b/docs/design/sm70_v100_migration_control.md
+index 14d7441a6f..c5d40c9f40 100644
+--- a/docs/design/sm70_v100_migration_control.md
++++ b/docs/design/sm70_v100_migration_control.md
+@@ -2,6 +2,113 @@
+ 
+ Date: 2026-05-30
+ 
++## Shared-path generalization: QSA query tiles, 2026-10-11
++
++Base `be3722bc095b9792bf9833068595f0b1ef70ad37` (`onecat/main`);
++native source `6d3c789a1f8370e5c4ba71bbe17d093e20c23810`.
++The first delivery moves QSA shared-key loading/admission to the common
++attention-ops owner and tiles queries across the existing eight-row CUDA kernel.
++The former model import forwards the same functions. Old binaries retain their
++eight-row fallback; FP16/H4/D128, one request and causal metadata remain required.
++`MAX_QUERY_ROWS` is the CUDA launch bound, not a measured performance range.
++The [eight-family queue](architecture/README.md#generalizing-existing-paths)
++separates implementation coverage, layout correctness, quality and tuning.
++
++CPU admission/old-binary checks pass 22 cases. All 19 distinct GPU cases pass:
++14 initial controls, four remaining negative-position/query-tile cases and one
++selector replay retest after installing its missing standard extension. The
++first selector failure was a missing `_C_stable_libtorch` target in the partial
++build, not a scoring error. Do not repeat the completed controls. Added cases
++cover M9/17/32, non-aligned columns, strided tensors, padded rows, invalid pages
++and changing live lengths during Graph replay. Existing unit tolerances remain;
++independent native tiles match exactly as an indexing oracle.
++
++All three normal CMake targets build, install and load from the owned source
++in a fresh process without sidecars, private library overlays or platform
++patches. Environment: one Tesla V100-SXM2-32GB, Python 3.12.13, Torch
++2.10.0+cu128, Triton 3.6.0, CUDA toolkit 12.8.93, NVIDIA 580.178.04. Artifact
++SHA256 values:
++
++- `_sm70_qsa_indexer_C`:
++  `1e8160781fadb3a679ef13018b6f24a18c564e2cd46153dd60c34224bf85068f`
++- `_C`:
++  `37ae3c4d09459a87d98a97375b3e5dd5a862a36a510ffae08d1641df57c4f772`
++- `_C_stable_libtorch`:
++  `5cb29547d7f3d62e6e0d1e9fe2d44a798e20ab4afaead8352416ffd324dd0c26`
++
++### Measured operator range
++
++The same-process ABBA Graph benchmark uses 12 synthetic layers, one request,
++FP16 compressed keys, four heads of width 128 and 204-key pages. Live lengths
++are 32,768/262,144 tokens; allocated capacities are separately recorded as
++33,456/262,752 tokens, compression ratio four. Each of the ten scorer cases
++observes 12 native dispatcher calls outside timed capture. The existing Triton
++scorer is the control; no clock settings were changed by this task.
++
++| Query rows | 32K control / candidate (ms) | Speedup | 256K control / candidate (ms) | Speedup |
++| --- | --- | --- | --- | --- |
++| 8 | 1.0400 / 0.2031 | 5.12x | 7.1105 / 0.8767 | 8.11x |
++| 9 | 1.0493 / 0.2132 | 4.92x | 7.8844 / 1.2821 | 6.15x |
++| 17 | 1.8990 / 0.3072 | 6.18x | 14.5061 / 2.1606 | 6.71x |
++| 33 | 4.1338 / 0.5105 | 8.10x | 27.4684 / 3.9022 | 7.04x |
++| 65 | 7.2345 / 0.8989 | 8.05x | 53.3764 / 7.4229 | 7.19x |
++
++All 116,767,152 compared scores pass `rtol=2e-6, atol=1e-5`; maximum observed
++absolute difference is `9.5367431640625e-6`. These times cover the 12-layer
++synthetic scorer graph, not model token latency. The accepted timing runs
++started after the standard extension build completed, with no second GPU
++workload on the measured device.
++
++At M17, the existing full score-to-selection chain gives:
++
++| Live tokens | Control / candidate (ms) | Speedup | Selection evidence |
++| --- | --- | --- | --- |
++| 32,768 | 2.3442 / 0.7777 | 3.01x | All output index arrays identical |
++| 262,144 | 15.7132 / 3.4242 | 4.59x | One of 204 query rows changes one of 512 selected blocks at a rounding boundary |
++
++Both caller-chain cases observe 12 native scoring calls. The 256K case retains
++511/512 blocks in the affected row; every other row is unchanged. Its two
++boundary candidates differ by approximately `2.90e-7` in FP64 score. This is a
++bounded operator difference, not an identical-output or model-quality claim.
++
++### Numerical decision and retained limits
++
++The first scorer sweep stopped at one of 1,670,904 M8/M9 scores: native and
++Triton differ by `2.2798776626586914e-6`, while their respective FP64 errors at
++that point are `1.4826840482734527e-6` and `7.971936143852387e-7`. Neither
++FP32 scorer is an exact reference. All selected top-512 sets in that diagnostic
++match, and tiled native execution equals independent native tiles.
++
++The benchmark therefore records a bounded absolute floor of `1e-5` while
++retaining `rtol=2e-6`. For changed selection rows it checks both arms against
++exact stable Top-K sets for their own scores, preserves expanded groups, causal
++tails and padding, and permits only boundary exchanges within the two score
++error budgets. It reports the overlap and boundary gap. The observed reference
++boundary gap is `4.76837158203125e-7`. Negative controls with a corrupt tail
++and a non-Top-K group are both rejected. Position-by-position equality alone
++would misclassify the boundary exchange: sorted block IDs shift 488 token slots
++although only one selected block changes. No model-generation equality gate is
++introduced.
++
++The host driver mismatch during compilation was resolved by an observed reboot
++after the other build, wheel packaging and installation completed. The initial
++automated reboot attempt required host administrator authentication. Preserve
++the completed builds and resolved dependency record; no rebuild or platform
++spoofing was needed for driver recovery.
++
++Raw evidence is retained under `runtime-path-generalization-20261011`:
++`qsa-gpu-tests.xml`, `qsa-scorer-remaining-tests.xml`, `qsa-selector-retest.xml`,
++`scorer-32k.json`, `scorer-256k.json`, `selection-32k.json`,
++`selection-256k.json`, both numerical/selection diagnostic JSON files,
++`selection-gate-check.json` and `runtime.json`. The benchmark version used
++before the selection-gate refinement and its hash are also retained.
++
++This qualifies the measured operator/caller range. Model task quality, startup
++parity, pure decode speed and 35B AWQ/FP8 parity remain unmeasured, so retain
++Draft status before wider default promotion. Other head geometries,
++multi-request native scoring and the separate Top-K capacity gap remain in
++the generalization queue; the ten measured points are not a runtime whitelist.
++
+ ## Pre-release packaging and video cancellation fixes, 2026-09-29
+ 
+ The release audit against main `357d07bcb0ee` reproduced three P2 issues:
+diff --git a/tests/kernels/test_sm70_qsa_shared_key.py b/tests/kernels/test_sm70_qsa_shared_key.py
+index 419ea7d66a..e2d8b8cdb3 100644
+--- a/tests/kernels/test_sm70_qsa_shared_key.py
++++ b/tests/kernels/test_sm70_qsa_shared_key.py
+@@ -9,7 +9,7 @@
+     qsa_mqa_paged,
+     qsa_select_paged_tokens,
+ )
+-from vllm.models.qwen4_exp.nvidia.ops.qsa_shared_key import (
++from vllm.v1.attention.ops.sm70_qsa_shared_key import (
+     load_operator,
+     shared_key_reason,
+ )
+@@ -74,7 +74,7 @@ def test_c4_falls_back_without_changing_scores():
+     pos = torch.full((20,), 1024, device="cuda", dtype=torch.int64)
+     lengths = torch.full((4,), 1025, device="cuda", dtype=torch.int32)
+     args = (q, cache, table, req, pos, lengths, 4)
+-    assert shared_key_reason(*args[:6]) == "requires_M2_8_H4_D128"
++    assert shared_key_reason(*args[:6]) == "multiple_requests"
+     expected, ev = qsa_mqa_paged(*args)
+     actual, av = qsa_mqa_paged(*args, shared_key_scoring=True)
+     assert torch.equal(av, ev)
+@@ -147,3 +147,80 @@ def test_negative_positions_match_triton_integer_division():
+     _, expected = qsa_mqa_paged(*args)
+     _, actual = qsa_mqa_paged(*args, shared_key_scoring=True)
+     assert torch.equal(actual, expected)
++
++
++@pytest.mark.parametrize(
++    "rows,columns,strided,position_dtype",
++    [
++        (9, 2497, False, torch.int32),
++        (17, 9217, True, torch.int64),
++        (32, 32769, False, torch.int64),
++    ],
++)
++def test_query_tiles_match_reference_and_independent_tiles_on_replay(
++    rows, columns, strided, position_dtype
++):
++    """Exercise row/column tails, padded rows and growing live lengths together."""
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
++        pytest.skip("SM70 required")
++    assert load_operator(), "Build the packaged QSA indexer extension"
++    torch.manual_seed(8100 + rows)
++    page_size = 16
++    pages = (columns + page_size - 1) // page_size
++    width = 256 if strided else 128
++    query = torch.randn(rows, 4, width, device="cuda", dtype=torch.float16)
++    cache = torch.randn(pages, page_size, 1, width, device="cuda", dtype=torch.float16)
++    if strided:
++        query, cache = query[..., ::2], cache[..., ::2]
++    table = torch.randperm(pages, device="cuda", dtype=torch.int32)[None, :]
++    requests = torch.zeros(rows, device="cuda", dtype=torch.int32)
++    positions = torch.zeros(rows, device="cuda", dtype=position_dtype)
++    lengths = torch.zeros(1, device="cuda", dtype=torch.int32)
++    args = (query, cache, table, requests, positions, lengths, 4)
++    assert shared_key_reason(*args[:6]) is None, "Rebuild for query-tile capability"
++    qsa_mqa_paged(*args, num_columns=columns, shared_key_scoring=True)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        actual, visible = qsa_mqa_paged(
++            *args, num_columns=columns, shared_key_scoring=True
++        )
++    for case, live in enumerate((65, columns * 4 - rows, columns * 4)):
++        query.normal_()
++        lengths.fill_(live)
++        positions.copy_(torch.arange(rows, device="cuda") + live - rows)
++        requests.zero_()
++        if case == 1:
++            requests[8] = -1  # First row in a later query tile is padding.
++        if case == 2:
++            positions[-1] = -5
++            table[0, 1] = -1
++        actual.fill_(float("nan"))
++        graph.replay()
++        reference, expected_visible = qsa_mqa_paged(*args, num_columns=columns)
++        assert torch.equal(visible, expected_visible)
++        mask = torch.arange(columns, device="cuda")[None, :] < visible[:, None]
++        torch.testing.assert_close(actual[mask], reference[mask], rtol=2e-6, atol=2e-6)
++        # Launching each tile independently is an indexing oracle. Both paths
++        # execute identical arithmetic, so this check deliberately uses equality.
++        for start in range(0, rows, 8):
++            stop = min(start + 8, rows)
++            tile_scores = torch.empty(
++                (stop - start, columns), device="cuda", dtype=torch.float32
++            )
++            tile_visible = torch.empty(stop - start, device="cuda", dtype=torch.int32)
++            torch.ops.vllm_sm70_qsa_indexer.run(
++                tile_scores,
++                tile_visible,
++                query[start:stop],
++                cache,
++                table,
++                requests[start:stop],
++                positions[start:stop],
++                lengths,
++                query.shape[2] ** 0.5,
++                4,
++            )
++            assert torch.equal(tile_visible, visible[start:stop])
++            assert torch.equal(
++                tile_scores[mask[start:stop]], actual[start:stop][mask[start:stop]]
++            )
+diff --git a/tests/v1/attention/test_sm70_qsa_shared_key_admission.py b/tests/v1/attention/test_sm70_qsa_shared_key_admission.py
+new file mode 100644
+index 0000000000..75fef6ed4c
+--- /dev/null
++++ b/tests/v1/attention/test_sm70_qsa_shared_key_admission.py
+@@ -0,0 +1,121 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU coverage for public QSA admission and installed-binary compatibility."""
++
++from math import prod
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.v1.attention.ops import sm70_qsa_shared_key as scorer
++
++
++def descriptor(shape, dtype=torch.float16, device="cuda:0", contiguous=True):
++    return SimpleNamespace(
++        shape=shape,
++        ndim=len(shape),
++        dtype=dtype,
++        device=torch.device(device),
++        is_cuda=device.startswith("cuda"),
++        numel=lambda: prod(shape),
++        is_contiguous=lambda: contiguous,
++    )
++
++
++def inputs(rows=9):
++    return [
++        descriptor((rows, 4, 128)),
++        descriptor((128, 16, 1, 128)),
++        descriptor((1, 128), torch.int32),
++        descriptor((rows,), torch.int32),
++        descriptor((rows,), torch.int64),
++        descriptor((1,), torch.int32),
++    ]
++
++
++@pytest.fixture
++def native(monkeypatch):
++    module = SimpleNamespace(MAX_QUERY_ROWS=65535 * 8)
++    monkeypatch.setattr(scorer.current_platform, "is_device_capability", lambda _: True)
++    monkeypatch.setattr(scorer, "load_operator", lambda: True)
++    monkeypatch.setattr(scorer.logger, "info_once", lambda *args, **kwargs: None)
++    monkeypatch.setattr(
++        scorer, "importlib", SimpleNamespace(import_module=lambda _: module)
++    )
++    scorer._native_query_limit.cache_clear()
++    yield module
++    scorer._native_query_limit.cache_clear()
++
++
++@pytest.mark.parametrize("rows", [2, 8, 9, 16, 17, 32, 65535 * 8])
++def test_row_tiles_cover_interiors_and_native_grid_boundary(native, rows):
++    assert scorer.shared_key_reason(*inputs(rows)) is None
++
++
++def test_legacy_binary_keeps_its_fallback_instead_of_receiving_extra_rows(native):
++    del native.MAX_QUERY_ROWS
++    assert scorer.shared_key_reason(*inputs(8)) is None
++    assert scorer.shared_key_reason(*inputs(9)) == "native_query_row_limit"
++    # Admission rejects before allocating CUDA outputs or invoking the operator.
++    assert scorer.maybe_shared_key_scores(*inputs(9), 4, 2048, 1.0) is None
++
++
++def test_native_grid_limit_is_not_a_model_limit(native):
++    assert (
++        scorer.shared_key_reason(*inputs(native.MAX_QUERY_ROWS + 1))
++        == "native_query_row_limit"
++    )
++
++
++@pytest.mark.parametrize(
++    "index,replacement,reason",
++    [
++        (0, descriptor((9, 3, 128)), "requires_H4_D128"),
++        (0, descriptor((1, 4, 128)), "requires_multiple_query_rows"),
++        (1, descriptor((128, 16, 2, 128)), "requires_single_head_D128_cache"),
++        (
++            1,
++            descriptor((128, 16, 1, 128), torch.float32),
++            "requires_FP16_query_and_indexer_cache",
++        ),
++        (2, descriptor((2, 64), torch.int32), "multiple_requests"),
++        (2, descriptor((1, 128), torch.int64), "requires_int32_request_metadata"),
++        (3, descriptor((8,), torch.int32), "insufficient_row_metadata"),
++        (4, descriptor((9,), torch.float32), "requires_integer_positions"),
++        (
++            4,
++            descriptor((9,), torch.int64, contiguous=False),
++            "noncontiguous_row_metadata",
++        ),
++        (5, descriptor((0,), torch.int32), "missing_request_length"),
++        (
++            5,
++            descriptor((1,), torch.int32, device="cuda:1"),
++            "requires_same_CUDA_device",
++        ),
++    ],
++)
++def test_other_capability_and_metadata_constraints_remain(
++    native, index, replacement, reason
++):
++    args = inputs()
++    args[index] = replacement
++    assert scorer.shared_key_reason(*args) == reason
++
++
++def test_missing_binary_and_wrong_device_remain_fallbacks(native, monkeypatch):
++    monkeypatch.setattr(scorer, "load_operator", lambda: False)
++    assert scorer.shared_key_reason(*inputs()) == "native_extension_unavailable"
++    monkeypatch.setattr(
++        scorer.current_platform, "is_device_capability", lambda _: False
++    )
++    assert scorer.shared_key_reason(*inputs()) == "requires_SM70"
++
++
++def test_model_compatibility_module_uses_the_same_provider():
++    from vllm.models.qwen4_exp.nvidia.ops import qsa_shared_key as legacy
++
++    assert legacy.load_operator is scorer.load_operator
++    assert legacy.shared_key_reason is scorer.shared_key_reason
++    assert legacy.maybe_shared_key_scores is scorer.maybe_shared_key_scores
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index aa5e6a6830..86b2530dd4 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -1205,7 +1205,7 @@ def qsa_mqa_paged(
+     if columns < 0:
+         raise ValueError("QSA score width must be non-negative")
+     if shared_key_scoring and 0 < columns <= capacity and q.shape[0]:
+-        from .qsa_shared_key import maybe_shared_key_scores
++        from vllm.v1.attention.ops.sm70_qsa_shared_key import maybe_shared_key_scores
+ 
+         result = maybe_shared_key_scores(
+             q,
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py
+index 8b5f9b884d..c03593cc22 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_shared_key.py
+@@ -1,83 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Capability-gated shared-key scoring for small QSA verification batches."""
+-
+-import importlib
+-from functools import lru_cache
+-
+-import torch
+-
+-from vllm.logger import init_logger
+-from vllm.platforms import current_platform
+-
+-logger = init_logger(__name__)
+-
+-
+-@lru_cache(maxsize=1)
+-def load_operator():
+-    try:
+-        importlib.import_module("vllm._sm70_qsa_indexer_C")
+-    except ImportError:
+-        return False
+-
+-    @torch.library.register_fake("vllm_sm70_qsa_indexer::run")
+-    def fake(
+-        scores,
+-        visible,
+-        q,
+-        cache,
+-        table,
+-        requests,
+-        positions,
+-        lengths,
+-        divisor,
+-        compress,
+-    ):
+-        return None
+-
+-    return True
+-
+-
+-def shared_key_reason(q, cache, table, requests, positions, lengths):
+-    if not current_platform.is_device_capability(70):
+-        return "requires_SM70"
+-    if q.dtype != torch.float16 or cache.dtype != torch.float16:
+-        return "requires_FP16_query_and_indexer_cache"
+-    if not (2 <= q.shape[0] <= 8 and q.shape[1:] == (4, 128)):
+-        return "requires_M2_8_H4_D128"
+-    if table.shape[0] != 1:
+-        return "multiple_requests"
+-    if not all(x.dtype == torch.int32 for x in (table, requests, lengths)):
+-        return "requires_int32_request_metadata"
+-    if positions.dtype not in (torch.int32, torch.int64):
+-        return "requires_integer_positions"
+-    if not all(x.is_contiguous() for x in (requests, positions, lengths)):
+-        return "noncontiguous_row_metadata"
+-    if not load_operator():
+-        return "native_extension_unavailable"
+-    return None
+-
+-
+-def maybe_shared_key_scores(
+-    q, cache, table, requests, positions, lengths, compress, columns, divisor
+-):
+-    reason = shared_key_reason(q, cache, table, requests, positions, lengths)
+-    if reason is not None:
+-        logger.info_once("SM70 QSA shared-key scorer fallback: %s.", reason)
+-        return None
+-    scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+-    visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+-    torch.ops.vllm_sm70_qsa_indexer.run(
+-        scores,
+-        visible,
+-        q,
+-        cache,
+-        table,
+-        requests,
+-        positions,
+-        lengths,
+-        float(divisor),
+-        compress,
+-    )
+-    logger.info_once("Using SM70 QSA shared-key indexer for M=%d.", q.shape[0])
+-    return scores, visible
++"""Compatibility imports for the shared attention QSA scoring provider."""
++
++from vllm.v1.attention.ops.sm70_qsa_shared_key import (
++    load_operator as load_operator,
++)
++from vllm.v1.attention.ops.sm70_qsa_shared_key import (
++    maybe_shared_key_scores as maybe_shared_key_scores,
++)
++from vllm.v1.attention.ops.sm70_qsa_shared_key import (
++    shared_key_reason as shared_key_reason,
++)
+diff --git a/vllm/sm70_profiles/acceleration.py b/vllm/sm70_profiles/acceleration.py
+index c7c03dd12b..199a6caeb9 100644
+--- a/vllm/sm70_profiles/acceleration.py
++++ b/vllm/sm70_profiles/acceleration.py
+@@ -612,7 +612,10 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
+         "enabled": shared_key_reason is None,
+         "reason": shared_key_reason,
+         "scope": "configured_native_capability",
+-        "runtime_guards": "one request; M2..8, H4, D128; FP16 Q and indexer K",
++        "runtime_guards": (
++            "one request; M>=2 within installed native row limit, H4, D128; "
++            "FP16 Q and indexer K; legacy binaries retain M<=8"
++        ),
+         "arithmetic": "FP16 MMA inputs; FP32 accumulation and scores",
+         "fallback": "paged Triton indexer; multiple requests and other shapes",
+     }
+diff --git a/vllm/v1/attention/ops/sm70_qsa_shared_key.py b/vllm/v1/attention/ops/sm70_qsa_shared_key.py
+new file mode 100644
+index 0000000000..995f792ca6
+--- /dev/null
++++ b/vllm/v1/attention/ops/sm70_qsa_shared_key.py
+@@ -0,0 +1,110 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Shared-key QSA scoring admitted by tensor and installed native capability.
++
++Models provide compressed FP16 keys, four query heads of width 128 and causal
++row metadata. The native provider tiles queries independently of model names,
++speculative width and context length. Unsupported inputs retain caller fallback.
++"""
++
++import importlib
++from functools import lru_cache
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++
++logger = init_logger(__name__)
++
++
++@lru_cache(maxsize=1)
++def load_operator():
++    try:
++        importlib.import_module("vllm._sm70_qsa_indexer_C")
++    except ImportError:
++        return False
++
++    @torch.library.register_fake("vllm_sm70_qsa_indexer::run")
++    def fake(
++        scores,
++        visible,
++        q,
++        cache,
++        table,
++        requests,
++        positions,
++        lengths,
++        divisor,
++        compress,
++    ):
++        return None
++
++    return True
++
++
++@lru_cache(maxsize=1)
++def _native_query_limit():
++    # Older packaged binaries implement a single query tile. Importing newer
++    # Python must not send additional rows to that ABI's M<=8 implementation.
++    native = importlib.import_module("vllm._sm70_qsa_indexer_C")
++    return native.MAX_QUERY_ROWS if hasattr(native, "MAX_QUERY_ROWS") else 8
++
++
++def shared_key_reason(q, cache, table, requests, positions, lengths):
++    if not current_platform.is_device_capability(70):
++        return "requires_SM70"
++    if q.dtype != torch.float16 or cache.dtype != torch.float16:
++        return "requires_FP16_query_and_indexer_cache"
++    if q.ndim != 3 or q.shape[1:] != (4, 128):
++        return "requires_H4_D128"
++    if q.shape[0] < 2:
++        return "requires_multiple_query_rows"
++    if cache.ndim != 4 or cache.shape[2:] != (1, 128):
++        return "requires_single_head_D128_cache"
++    if table.ndim != 2 or table.shape[0] != 1:
++        return "multiple_requests"
++    if not q.is_cuda or any(
++        x.device != q.device for x in (cache, table, requests, positions, lengths)
++    ):
++        return "requires_same_CUDA_device"
++    if not all(x.dtype == torch.int32 for x in (table, requests, lengths)):
++        return "requires_int32_request_metadata"
++    if positions.dtype not in (torch.int32, torch.int64):
++        return "requires_integer_positions"
++    if not all(x.is_contiguous() for x in (requests, positions, lengths)):
++        return "noncontiguous_row_metadata"
++    if requests.numel() < q.shape[0] or positions.numel() < q.shape[0]:
++        return "insufficient_row_metadata"
++    if lengths.numel() < 1:
++        return "missing_request_length"
++    if not load_operator():
++        return "native_extension_unavailable"
++    if q.shape[0] > _native_query_limit():
++        return "native_query_row_limit"
++    return None
++
++
++def maybe_shared_key_scores(
++    q, cache, table, requests, positions, lengths, compress, columns, divisor
++):
++    reason = shared_key_reason(q, cache, table, requests, positions, lengths)
++    if reason is not None:
++        logger.info_once("SM70 QSA shared-key scorer fallback: %s.", reason)
++        return None
++    scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
++    visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
++    torch.ops.vllm_sm70_qsa_indexer.run(
++        scores,
++        visible,
++        q,
++        cache,
++        table,
++        requests,
++        positions,
++        lengths,
++        float(divisor),
++        compress,
++    )
++    logger.info_once("Using SM70 QSA shared-key indexer for M=%d.", q.shape[0])
++    return scores, visible

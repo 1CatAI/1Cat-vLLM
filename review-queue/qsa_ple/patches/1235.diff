@@ -1,0 +1,548 @@
+diff --git a/csrc/ops.h b/csrc/ops.h
+index 2200318819..3d7e4279ac 100644
+--- a/csrc/ops.h
++++ b/csrc/ops.h
+@@ -965,12 +965,13 @@ void gguf_lattice_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
+ 
+ void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+                         int64_t shard_size, int64_t num_rows, int64_t row_bytes,
+-                        torch::Tensor out);
++                        torch::Tensor out, int64_t prefetch_window_bytes);
+ void ple_disk_cached_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+                                int64_t shard_size, int64_t num_rows,
+                                int64_t row_bytes, torch::Tensor out,
+                                torch::Tensor cache_ids,
+-                               torch::Tensor cache_rows);
++                               torch::Tensor cache_rows,
++                               int64_t prefetch_window_bytes);
+ 
+ int64_t ple_fast_lane_start(
+     torch::Tensor request, int64_t max_reqs, int64_t max_tokens,
+diff --git a/csrc/ple_disk_rows.cpp b/csrc/ple_disk_rows.cpp
+index df2cc5be09..4264c6ea5a 100644
+--- a/csrc/ple_disk_rows.cpp
++++ b/csrc/ple_disk_rows.cpp
+@@ -8,16 +8,76 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <limits>
++#include <numeric>
+ #include <vector>
+ 
+ #ifdef __linux__
+   #include <sys/mman.h>
+   #include <unistd.h>
++
++namespace {
++
++// Copies the rows in address order and advises only a bounded window of pages
++// ahead of the copy. Advising every page of a long request up front let
++// reclaim take the read-ahead pages, which enter the oldest LRU generation
++// untouched, before the copy reached them; the copy then read them back one
++// synchronous page at a time (2026-10-18: ~3,500 pages/s from the checkpoint
++// SSD). Only pages covering requested rows are considered, never the whole
++// table. Residency can change after mincore; memcpy remains the ordinary
++// file-backed read if a page is reclaimed anyway.
++void copy_rows_with_prefetch_window(const std::vector<const uint8_t*>& sources,
++                                    int64_t row_bytes,
++                                    int64_t prefetch_window_bytes,
++                                    uint8_t* destination) {
++  const auto system_page_size = sysconf(_SC_PAGE_SIZE);
++  TORCH_CHECK(system_page_size > 0,
++              "PLE disk gather cannot determine page size");
++  const auto page_size = static_cast<uintptr_t>(system_page_size);
++  const auto bytes = static_cast<uintptr_t>(row_bytes);
++  std::vector<size_t> order(sources.size());
++  std::iota(order.begin(), order.end(), size_t{0});
++  std::sort(order.begin(), order.end(),
++            [&](size_t a, size_t b) { return sources[a] < sources[b]; });
++  // Unique pages in copy order and, per copied row, one past its last page.
++  std::vector<uintptr_t> pages;
++  std::vector<size_t> pages_through_row(order.size());
++  for (size_t i = 0; i < order.size(); ++i) {
++    const auto address = reinterpret_cast<uintptr_t>(sources[order[i]]);
++    const auto last_page = (address + bytes - 1) / page_size * page_size;
++    for (auto page = address / page_size * page_size;; page += page_size) {
++      if (pages.empty() || pages.back() < page) pages.push_back(page);
++      if (page == last_page) break;
++    }
++    pages_through_row[i] = pages.size();
++  }
++  const auto window_pages =
++      (static_cast<uintptr_t>(prefetch_window_bytes) + page_size - 1) /
++      page_size;
++  size_t advised = 0;
++  for (size_t i = 0; i < order.size(); ++i) {
++    const auto target =
++        std::min(pages.size(), pages_through_row[i] + window_pages);
++    for (; advised < target; ++advised) {
++      auto* page = reinterpret_cast<void*>(pages[advised]);
++      unsigned char resident = 0;
++      const auto status = mincore(page, page_size, &resident);
++      TORCH_CHECK(status == 0 || errno != ENOMEM,
++                  "PLE disk row page is not mapped");
++      if (status == 0 && !(resident & 1)) {
++        // Advice failure affects performance only, not byte selection/order.
++        madvise(page, page_size, MADV_WILLNEED);
++      }
++    }
++    std::memcpy(destination + order[i] * bytes, sources[order[i]], bytes);
++  }
++}
++
++}  // namespace
+ #endif
+ 
+ void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+                         int64_t shard_size, int64_t num_rows, int64_t row_bytes,
+-                        torch::Tensor out) {
++                        torch::Tensor out, int64_t prefetch_window_bytes) {
+   TORCH_CHECK(ids.device().is_cpu() && pointers.device().is_cpu() &&
+                   out.device().is_cpu(),
+               "PLE disk gather requires CPU tensors");
+@@ -30,6 +90,8 @@ void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+       "PLE disk gather requires contiguous tensors");
+   TORCH_CHECK(shard_size > 0 && num_rows > 0 && row_bytes > 0,
+               "PLE disk gather geometry must be positive");
++  TORCH_CHECK(prefetch_window_bytes >= 0,
++              "PLE disk prefetch window must not be negative");
+   TORCH_CHECK(
+       out.numel() / row_bytes == ids.numel() && out.numel() % row_bytes == 0,
+       "PLE disk gather output size mismatch");
+@@ -42,13 +104,6 @@ void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+   auto* destination = out.data_ptr<uint8_t>();
+   std::vector<const uint8_t*> sources;
+   sources.reserve(ids.numel());
+-  std::vector<uintptr_t> pages;
+-#ifdef __linux__
+-  const auto system_page_size = sysconf(_SC_PAGE_SIZE);
+-  TORCH_CHECK(system_page_size > 0,
+-              "PLE disk gather cannot determine page size");
+-  const auto page_size = static_cast<uintptr_t>(system_page_size);
+-#endif
+   for (int64_t row = 0; row < ids.numel(); ++row) {
+     const auto index = indices[row];
+     TORCH_CHECK_INDEX(index >= 0 && index < num_rows,
+@@ -66,33 +121,14 @@ void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+         base <= std::numeric_limits<uintptr_t>::max() - offset &&
+             base + offset <= std::numeric_limits<uintptr_t>::max() - row_bytes,
+         "PLE disk row address overflow");
+-    const auto address = base + offset;
+-    sources.push_back(reinterpret_cast<const uint8_t*>(address));
+-#ifdef __linux__
+-    const auto last_page = (address + row_bytes - 1) / page_size * page_size;
+-    for (auto page = address / page_size * page_size;; page += page_size) {
+-      pages.push_back(page);
+-      if (page == last_page) break;
+-    }
+-#endif
++    sources.push_back(reinterpret_cast<const uint8_t*>(base + offset));
+   }
+ 
+ #ifdef __linux__
+-  // Only pages covering requested rows are considered. Never populate the
+-  // whole table. Residency can change after this snapshot; memcpy remains
+-  // the ordinary file-backed read if a page is subsequently reclaimed.
+-  std::sort(pages.begin(), pages.end());
+-  pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+-  for (const auto page : pages) {
+-    unsigned char resident = 0;
+-    const auto status =
+-        mincore(reinterpret_cast<void*>(page), page_size, &resident);
+-    TORCH_CHECK(status == 0 || errno != ENOMEM,
+-                "PLE disk row page is not mapped");
+-    if (status == 0 && !(resident & 1)) {
+-      // Advice failure affects performance only, not byte selection/order.
+-      madvise(reinterpret_cast<void*>(page), page_size, MADV_WILLNEED);
+-    }
++  if (prefetch_window_bytes > 0) {
++    copy_rows_with_prefetch_window(sources, row_bytes, prefetch_window_bytes,
++                                   destination);
++    return;
+   }
+ #endif
+   for (size_t row = 0; row < sources.size(); ++row) {
+@@ -104,7 +140,8 @@ void ple_disk_cached_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+                                int64_t shard_size, int64_t num_rows,
+                                int64_t row_bytes, torch::Tensor out,
+                                torch::Tensor cache_ids,
+-                               torch::Tensor cache_rows) {
++                               torch::Tensor cache_rows,
++                               int64_t prefetch_window_bytes) {
+   TORCH_CHECK(ids.device().is_cpu() && out.device().is_cpu() &&
+                   cache_ids.device().is_cpu() && cache_rows.device().is_cpu(),
+               "PLE cached gather requires CPU storage");
+@@ -148,7 +185,8 @@ void ple_disk_cached_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+   auto miss_ids = torch::tensor(misses, ids.options());
+   auto rows = torch::empty({static_cast<int64_t>(misses.size()), row_bytes},
+                            out.options());
+-  ple_disk_gather_u8(miss_ids, pointers, shard_size, num_rows, row_bytes, rows);
++  ple_disk_gather_u8(miss_ids, pointers, shard_size, num_rows, row_bytes, rows,
++                     prefetch_window_bytes);
+   const auto* data = rows.data_ptr<uint8_t>();
+   for (size_t i = 0; i < misses.size(); ++i) {
+     const auto slot = misses[i] % capacity;
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index 5751c1eba8..e01da11399 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -216,12 +216,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+ 
+   ops.def(
+       "ple_disk_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
+-      "int num_rows, int row_bytes, Tensor(a!) out) -> ()");
++      "int num_rows, int row_bytes, Tensor(a!) out, "
++      "int prefetch_window_bytes) -> ()");
+   ops.impl("ple_disk_gather_u8", torch::kCPU, &ple_disk_gather_u8);
+   ops.def(
+       "ple_disk_cached_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
+       "int num_rows, int row_bytes, Tensor(a!) out, Tensor(b!) cache_ids, "
+-      "Tensor(c!) cache_rows) -> ()");
++      "Tensor(c!) cache_rows, int prefetch_window_bytes) -> ()");
+   ops.impl("ple_disk_cached_gather_u8", torch::kCPU,
+            &ple_disk_cached_gather_u8);
+ 
+diff --git a/docs/design/architecture/runtime_reference.md b/docs/design/architecture/runtime_reference.md
+index c184519b4b..8ee1f6b21e 100644
+--- a/docs/design/architecture/runtime_reference.md
++++ b/docs/design/architecture/runtime_reference.md
+@@ -38,7 +38,7 @@ identify initialization/hash code; they do not evaluate its semantics.
+ | `vllm.config.gdn_state.GdnStateConfig` | kernel_config.gdn.state | resolve: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L39); graph_options: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L52) | [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L23) |
+ | `vllm.config.gdn_state.GdnStateTraceConfig` | observability_config.gdn_state | resolve: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L99); compile_ignored_aliases: [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L142) | [vllm/config/gdn_state.py](../../../vllm/config/gdn_state.py#L59) |
+ | `vllm.config.kernel.IrOpPriorityConfig` | kernel_config.ir_op_priority | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L84) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L67) |
+-| `vllm.config.kernel.KernelConfig` | kernel_config | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L1129) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L662) |
++| `vllm.config.kernel.KernelConfig` | kernel_config | compute_hash: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L1134) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L662) |
+ | `vllm.config.kernel.Sm70AwqConfig` | kernel_config.sm70_awq | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L338); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L317) |
+ | `vllm.config.kernel.Sm70Fp8Config` | kernel_config.sm70_fp8 | resolve: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L433); capture_inputs: [vllm/config/kernel.py](../../../vllm/config/kernel.py#L216) | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L369) |
+ | `vllm.config.kernel.Sm70GgufConfig` | kernel_config.sm70_gguf |  | [vllm/config/kernel.py](../../../vllm/config/kernel.py#L498) |
+@@ -83,7 +83,7 @@ identify initialization/hash code; they do not evaluate its semantics.
+ | `vllm.config.sm70_runtime.StepProfilerConfig` | observability_config.step_profiler | __post_init__: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L145); compile_ignored_aliases: [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L151) | [vllm/config/sm70_runtime.py](../../../vllm/config/sm70_runtime.py#L130) |
+ | `vllm.config.sm70_sparse.Sm70SparseConfig` | kernel_config.sm70_sparse | compute_hash: [vllm/config/sm70_sparse.py](../../../vllm/config/sm70_sparse.py#L170); resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L57); value: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L69) | [vllm/config/sm70_sparse.py](../../../vllm/config/sm70_sparse.py#L51) |
+ | `vllm.config.sm70_triton_attention.Sm70TritonAttentionPolicy` | attention_config.sm70_triton | resolve: [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L73); compute_hash: [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L110); value: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L69) | [vllm/config/sm70_triton_attention.py](../../../vllm/config/sm70_triton_attention.py#L36) |
+-| `vllm.config.speculative.SpeculativeConfig` | speculative_config | compute_hash: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L427); __post_init__: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L769) | [vllm/config/speculative.py](../../../vllm/config/speculative.py#L157) |
++| `vllm.config.speculative.SpeculativeConfig` | speculative_config | compute_hash: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L432); __post_init__: [vllm/config/speculative.py](../../../vllm/config/speculative.py#L774) | [vllm/config/speculative.py](../../../vllm/config/speculative.py#L157) |
+ | `vllm.config.speculative_sampling.SpeculativeSamplingPolicy` | speculative_config.sampling_policy | resolve_fields: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L109); resolve: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L142); compute_hash: [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L181) | [vllm/config/speculative_sampling.py](../../../vllm/config/speculative_sampling.py#L16) |
+ | `vllm.config.structured_outputs.StructuredOutputsConfig` | structured_outputs_config | compute_hash: [vllm/config/structured_outputs.py](../../../vllm/config/structured_outputs.py#L44) | [vllm/config/structured_outputs.py](../../../vllm/config/structured_outputs.py#L18) |
+ | `vllm.config.turboquant_runtime.TurboQuantDiagnostics` | observability_config.runtime_trace.turboquant | compile_ignored_aliases: [vllm/config/turboquant_runtime.py](../../../vllm/config/turboquant_runtime.py#L106); resolve: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L29); compute_hash: [vllm/config/execution_policy_base.py](../../../vllm/config/execution_policy_base.py#L37) | [vllm/config/turboquant_runtime.py](../../../vllm/config/turboquant_runtime.py#L72) |
+diff --git a/docs/design/flashnext_16gb_host_kv.md b/docs/design/flashnext_16gb_host_kv.md
+index 6d5088e6f3..55109a0e14 100644
+--- a/docs/design/flashnext_16gb_host_kv.md
++++ b/docs/design/flashnext_16gb_host_kv.md
+@@ -66,7 +66,10 @@ Startup requires at least 21 GiB of available host memory before loading.
+ the shared offload process. The cache stores original bytes, so misses and hits
+ use the same official dequantization. Direct-mapped collisions replace cache
+ entries without changing requested output order. Allocation is lazy; selected
+-cold pages are prefetched rather than faulting the entire table into RAM.
++cold pages are prefetched rather than faulting the entire table into RAM. The
++mapped row reader copies a request's rows in address order and prefetches only
++`ple_disk_prefetch_window_kib` ahead of the copy, so reclaim under memory
++pressure does not drop read-ahead pages before they are copied.
+ The profile uses a 512 MiB total CPU budget and an 8192-token GPU KV hot cache.
+ 
+ ## Validation status
+diff --git a/tests/kernels/ple/test_gguf_packed_embedding.py b/tests/kernels/ple/test_gguf_packed_embedding.py
+index b4c865bbab..e534b8aaf4 100644
+--- a/tests/kernels/ple/test_gguf_packed_embedding.py
++++ b/tests/kernels/ple/test_gguf_packed_embedding.py
+@@ -8,6 +8,8 @@
+ import pytest
+ import torch
+ 
++from vllm.config import KernelConfig
++
+ 
+ def packed_table(tmp_path):
+     rng = np.random.default_rng(950)
+@@ -31,7 +33,8 @@ def cpu_embedding(monkeypatch, tmp_path):
+     monkeypatch.setattr(vocab, "get_tensor_model_parallel_rank", lambda: 0)
+     monkeypatch.setattr(packed, "is_offload_process", lambda: True)
+     config = SimpleNamespace(
+-        compilation_config=SimpleNamespace(static_forward_context={})
++        compilation_config=SimpleNamespace(static_forward_context={}),
++        kernel_config=KernelConfig(),
+     )
+     monkeypatch.setattr(packed, "get_current_vllm_config", lambda: config)
+     method = packed.Qwen4ExpPLEGGUFEmbeddingMethod(GGUFConfig())
+@@ -68,6 +71,7 @@ def test_cpu_transport_preserves_row_order_and_output_dtype(
+     monkeypatch.setattr(ple_layer, "is_offload_process", lambda: True)
+     layer = object.__new__(ple_layer.Qwen4ExpNGramEmbedding)
+     torch.nn.Module.__init__(layer)
++    layer.layer_name = "ple.ngram"
+     layer.ngram_embedding = embedding
+     layer._packed_gguf = True
+     layer._cascade = cascade
+@@ -184,7 +188,8 @@ def test_gpu_packets_match_cpu_and_changed_graph_ids(monkeypatch, tmp_path, plac
+     monkeypatch.setattr(vocab, "get_tensor_model_parallel_rank", lambda: 0)
+     monkeypatch.setattr(packed, "is_offload_process", lambda: False)
+     config = SimpleNamespace(
+-        compilation_config=SimpleNamespace(static_forward_context={})
++        compilation_config=SimpleNamespace(static_forward_context={}),
++        kernel_config=KernelConfig(),
+     )
+     monkeypatch.setattr(packed, "get_current_vllm_config", lambda: config)
+     method = packed.Qwen4ExpPLEGGUFEmbeddingMethod(GGUFConfig())
+@@ -239,6 +244,7 @@ def test_local_hybrid_lookup_waits_only_for_cascade_rows(monkeypatch, cascade):
+     monkeypatch.setattr(ple_layer, "is_offload_process", lambda: True)
+     layer = object.__new__(ple_layer.Qwen4ExpNGramEmbedding)
+     torch.nn.Module.__init__(layer)
++    layer.layer_name = "ple.ngram"
+     layer._is_cpu_offloaded = True
+     if cascade is not None:
+         layer._cascade = cascade
+diff --git a/tests/kernels/test_ple_disk_rows.py b/tests/kernels/test_ple_disk_rows.py
+index 7a994a7773..23399588e6 100644
+--- a/tests/kernels/test_ple_disk_rows.py
++++ b/tests/kernels/test_ple_disk_rows.py
+@@ -15,9 +15,14 @@
+ )
+ 
+ 
++# No read-ahead, one page ahead, a window inside the request, the whole request.
++WINDOWS = [0, 1, 1 << 16, 1 << 30]
++
++
+ @pytest.mark.parametrize("m", [1, 5, 17, 33])
+ @pytest.mark.parametrize("row_bytes", [17, 160, 8193])
+-def test_mapped_shards_preserve_bytes_and_repeated_ids(tmp_path, m, row_bytes):
++@pytest.mark.parametrize("window", WINDOWS)
++def test_mapped_shards_preserve_bytes_and_repeated_ids(tmp_path, m, row_bytes, window):
+     shard_size, total = 97, 271
+     references, mapped, tensors = [], [], []
+     try:
+@@ -40,14 +45,14 @@ def test_mapped_shards_preserve_bytes_and_repeated_ids(tmp_path, m, row_bytes):
+         ids.reshape(-1)[:4] = torch.tensor([0, 96, 97, total - 1])
+         output = torch.empty((m, 16, row_bytes), dtype=torch.uint8)
+         torch.ops._C.ple_disk_gather_u8(
+-            ids, pointers, shard_size, total, row_bytes, output
++            ids, pointers, shard_size, total, row_bytes, output, window
+         )
+         expected = torch.cat(references)[ids.reshape(-1)].reshape_as(output)
+         torch.testing.assert_close(output, expected, rtol=0, atol=0)
+         # Reuse the same buffers with different IDs; no stale cache/generation.
+         ids.fill_(total - 1)
+         torch.ops._C.ple_disk_gather_u8(
+-            ids, pointers, shard_size, total, row_bytes, output
++            ids, pointers, shard_size, total, row_bytes, output, window
+         )
+         torch.testing.assert_close(
+             output, references[-1][-1].expand_as(output), rtol=0, atol=0
+@@ -61,25 +66,41 @@ def test_mapped_shards_preserve_bytes_and_repeated_ids(tmp_path, m, row_bytes):
+             region.close()
+ 
+ 
+-def test_invalid_rows_are_rejected_before_output_writes():
++@pytest.mark.parametrize("window", WINDOWS)
++def test_invalid_rows_are_rejected_before_output_writes(window):
+     table = torch.arange(48, dtype=torch.uint8).reshape(3, 16)
+     pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
+     output = torch.full((2, 16), 123, dtype=torch.uint8)
+     for invalid in (-1, 3):
+         with pytest.raises(IndexError, match="row id out of range"):
+             torch.ops._C.ple_disk_gather_u8(
+-                torch.tensor([0, invalid]), pointers, 3, 3, 16, output
++                torch.tensor([0, invalid]), pointers, 3, 3, 16, output, window
+             )
+         assert torch.all(output == 123)
+ 
+ 
++def test_negative_prefetch_window_is_rejected():
++    table = torch.arange(48, dtype=torch.uint8).reshape(3, 16)
++    pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
++    with pytest.raises(RuntimeError, match="prefetch window"):
++        torch.ops._C.ple_disk_gather_u8(
++            torch.tensor([0]),
++            pointers,
++            3,
++            3,
++            16,
++            torch.empty((1, 16), dtype=torch.uint8),
++            -1,
++        )
++
++
+ def test_strided_ids_do_not_silently_read_adjacent_storage():
+     table = torch.arange(64, dtype=torch.uint8).reshape(4, 16)
+     pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
+     ids = torch.arange(4)[::2]
+     with pytest.raises(RuntimeError, match="contiguous"):
+         torch.ops._C.ple_disk_gather_u8(
+-            ids, pointers, 4, 4, 16, torch.empty((2, 16), dtype=torch.uint8)
++            ids, pointers, 4, 4, 16, torch.empty((2, 16), dtype=torch.uint8), 0
+         )
+ 
+ 
+@@ -87,7 +108,8 @@ def test_strided_ids_do_not_silently_read_adjacent_storage():
+     not hasattr(torch.ops._C, "ple_disk_cached_gather_u8"),
+     reason="requires bounded native cache",
+ )
+-def test_row_cache_preserves_order_under_collisions_and_reuse():
++@pytest.mark.parametrize("window", WINDOWS)
++def test_row_cache_preserves_order_under_collisions_and_reuse(window):
+     table = (torch.arange(9 * 17) % 256).to(torch.uint8).reshape(9, 17)
+     pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
+     keys = torch.full((2,), -1, dtype=torch.int64)
+@@ -104,6 +126,7 @@ def test_row_cache_preserves_order_under_collisions_and_reuse():
+             output,
+             keys,
+             rows,
++            window,
+         )
+         torch.testing.assert_close(output, table[ids], rtol=0, atol=0)
+     output = torch.full((2, 17), 123, dtype=torch.uint8)
+@@ -117,5 +140,6 @@ def test_row_cache_preserves_order_under_collisions_and_reuse():
+             output,
+             keys,
+             rows,
++            window,
+         )
+     assert torch.all(output == 123)
+diff --git a/tests/models/qwen4_exp/test_ple.py b/tests/models/qwen4_exp/test_ple.py
+index 0015666714..05104aef74 100644
+--- a/tests/models/qwen4_exp/test_ple.py
++++ b/tests/models/qwen4_exp/test_ple.py
+@@ -17,7 +17,7 @@
+ import vllm.models.qwen4_exp.common.ple as ple_common
+ import vllm.models.qwen4_exp.nvidia.ple_layer as ple_module
+ from tests.utils import set_lazy_env
+-from vllm.config import VllmConfig, set_current_vllm_config
++from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+ from vllm.model_executor.model_loader.utils import device_loading_context
+ from vllm.models.qwen4_exp.common.ple import (
+@@ -884,6 +884,9 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
+     # to record the admission in.
+     module._kernel_config = None
+     module._disk_row_gather = True
++    module._disk_prefetch_window_bytes = (
++        KernelConfig().ple_disk_prefetch_window_kib << 10
++    )
+     module._disk_shard_size = 4
+     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
+     module.head_dim = 2
+diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
+index fa6e979a24..9b6d1b90dc 100644
+--- a/vllm/config/kernel.py
++++ b/vllm/config/kernel.py
+@@ -1017,6 +1017,11 @@ def gdn_spec_replay(self) -> bool:
+     ple_row_cache_mib: int = Field(default=1536, ge=0)
+     """Packed-row cache (MiB) for CPU-owned GGUF PLE: the native fast lane's
+     cache when it serves requests, otherwise the mapped row reader's."""
++    ple_disk_prefetch_window_kib: int = Field(default=4096, ge=0)
++    """Page-cache read-ahead (KiB) the mapped row reader keeps ahead of its
++    copy, which walks the rows in address order; 0 copies without read-ahead.
++    Advising a whole long request up front let reclaim drop the pages under
++    memory pressure before the copy reached them."""
+ 
+     ple_pinned_decode: bool = True
+     """Admit calibrated packed PLE decode rows from rank-local pinned storage."""
+@@ -1153,6 +1158,7 @@ def compute_hash(self) -> str:
+             "ple_input_preparations",
+             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
+             "ple_row_cache_mib",  # CPU-only reuse of bit-identical rows
++            "ple_disk_prefetch_window_kib",  # Page-cache advice; same rows
+             "ple_draft_prefetch",  # Page-cache readahead; results unchanged
+             "ple_fast_lane",  # Same packed rows through a native owner thread
+             "ple_disk_row_readers",
+diff --git a/vllm/model_executor/kernels/ple/disk_rows.py b/vllm/model_executor/kernels/ple/disk_rows.py
+index cb4fc98132..e0eea193f5 100644
+--- a/vllm/model_executor/kernels/ple/disk_rows.py
++++ b/vllm/model_executor/kernels/ple/disk_rows.py
+@@ -33,11 +33,13 @@ def __init__(
+         num_rows: int,
+         row_bytes: int,
+         cache_bytes: int = 0,
++        prefetch_window_bytes: int = 0,
+     ):
+         self.pointers = torch.tensor(pointers, dtype=torch.int64, device="cpu")
+         self.shard_size = shard_size
+         self.num_rows = num_rows
+         self.row_bytes = row_bytes
++        self.prefetch_window_bytes = prefetch_window_bytes
+         self.operator = torch.ops._C.ple_disk_gather_u8
+         self._apply_lock = threading.Lock()
+         self.cache_ids = self.cache_rows = None
+@@ -72,10 +74,17 @@ def apply(self, ids: torch.Tensor, output: torch.Tensor) -> None:
+                     output,
+                     self.cache_ids,
+                     self.cache_rows,
++                    self.prefetch_window_bytes,
+                 )
+             return
+         self.operator(
+-            ids, self.pointers, self.shard_size, self.num_rows, self.row_bytes, output
++            ids,
++            self.pointers,
++            self.shard_size,
++            self.num_rows,
++            self.row_bytes,
++            output,
++            self.prefetch_window_bytes,
+         )
+ 
+     def qualify(self) -> dict:
+@@ -129,6 +138,7 @@ def prepare_mapped_row_gather(
+     file_backed: bool,
+     enabled: bool,
+     cache_bytes: int = 0,
++    prefetch_window_bytes: int = 0,
+ ) -> tuple[MappedRowGatherKernel | None, dict]:
+     if not enabled:
+         return None, {"selected": None, "reason": "disabled_by_policy"}
+@@ -141,7 +151,7 @@ def prepare_mapped_row_gather(
+     if not hasattr(torch.ops._C, "ple_disk_gather_u8"):
+         return None, {"selected": None, "reason": "native_operator_unavailable"}
+     kernel = MappedRowGatherKernel(
+-        pointers, shard_size, num_rows, row_bytes, cache_bytes
++        pointers, shard_size, num_rows, row_bytes, cache_bytes, prefetch_window_bytes
+     )
+     try:
+         measurement = kernel.qualify()
+diff --git a/vllm/models/qwen4_exp/nvidia/gguf_embedding.py b/vllm/models/qwen4_exp/nvidia/gguf_embedding.py
+index 4e67065415..fc05b002be 100644
+--- a/vllm/models/qwen4_exp/nvidia/gguf_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/gguf_embedding.py
+@@ -271,6 +271,7 @@ def weight_loader(self, param, loaded_weight):
+                 enabled=policy.ple_disk_row_gather,
+                 # The native fast lane keeps its own row cache.
+                 cache_bytes=0 if policy.ple_fast_lane else self._row_cache_bytes,
++                prefetch_window_bytes=policy.ple_disk_prefetch_window_kib << 10,
+             )
+             policy.ple_disk_row_readers[self.layer_name] = admission
+             # The parameter and reader retain the mmap owner, with no table copy.
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index 38bdac6b17..09ad6a8564 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -1250,6 +1250,9 @@ def __init__(
+         self._disk_row_gather = bool(
+             getattr(self._kernel_config, "ple_disk_row_gather", True)
+         )
++        self._disk_prefetch_window_bytes = (
++            getattr(self._kernel_config, "ple_disk_prefetch_window_kib", 0) << 10
++        )
+         self._disk_executor: ThreadPoolExecutor | None = None
+         from .gguf_embedding import (
+             Qwen4ExpPackedGGUFEmbedding,
+@@ -1742,9 +1745,11 @@ def _release_mapped_pages(self, shard: torch.Tensor) -> None:
+     def _gather_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
+         """Read the given PLE rows from the mapped checkpoint shards.
+ 
+-        Short requests copy their rows straight from the retained mappings;
+-        longer ones read sorted unique ids per shard, which keeps the mmap
+-        reads local, and read the shards in parallel where a thread pool is
++        The native row gather copies the rows in address order and requests
++        missing pages a bounded window ahead of the copy. Without it, short
++        requests copy their rows straight from the retained mappings; longer
++        ones read sorted unique ids per shard, which keeps the mmap reads
++        local, and read the shards in parallel where a thread pool is
+         configured. Shared by the whole-table disk lane and by the cascade's
+         disk tier.
+         """
+@@ -2169,6 +2174,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+                 file_backed=bool(self._disk_mapped_paths),
+                 enabled=self._disk_row_gather,
+                 cache_bytes=getattr(self._kernel_config, "ple_row_cache_mib", 0) << 20,
++                prefetch_window_bytes=self._disk_prefetch_window_bytes,
+             )
+             if self._kernel_config is not None:
+                 self._kernel_config.ple_disk_row_readers[self.layer_name] = (
