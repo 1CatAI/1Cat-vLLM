@@ -36,6 +36,30 @@ class TestCpuOverflowKV(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(out_mixed, out_ref, atol=1e-3, rtol=1e-3))
 
+    def test_two_tier_free_queue_prefix_caching_wraparound(self):
+        from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
+
+        blocks = [KVCacheBlock(block_id=i) for i in range(1, 15)]  # 1..9 GPU, 10..14 CPU
+        q = FreeKVCacheBlockQueue(blocks, gpu_block_limit=10)
+        self.assertEqual(q.num_free_blocks, 14)
+
+        # 50 sequential prefix-cached requests (200 cumulative blocks > 9 GPU blocks)
+        # must never pop a CPU overflow block while GPU blocks are free in LRU.
+        for _ in range(50):
+            got = q.popleft_n(4)
+            self.assertEqual(len(got), 4)
+            self.assertTrue(all(b.block_id < 10 for b in got))
+            q.append_n(got)
+            self.assertEqual(q.num_free_blocks, 14)
+
+        # True burst (> 9 GPU blocks) spills into CPU blocks, then recovers cleanly.
+        burst = q.popleft_n(12)
+        self.assertEqual(sum(1 for b in burst if b.block_id < 10), 9)
+        self.assertEqual(sum(1 for b in burst if b.block_id >= 10), 3)
+        q.append_n(list(reversed(burst)))
+        after = q.popleft_n(5)
+        self.assertTrue(all(b.block_id < 10 for b in after))
+
 
 if __name__ == "__main__":
     unittest.main()
