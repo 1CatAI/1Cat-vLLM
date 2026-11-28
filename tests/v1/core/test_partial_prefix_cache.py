@@ -385,6 +385,271 @@ def test_circular_buffer_group_enables_partial_prefix_cache_and_cow():
     assert cm.block_pool.get_num_free_blocks() == free_initial
 
 
+def _kpool_tail_manager(ring_block_size: int):
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KpoolTailSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    full = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    # GLM-5.3's indexer keeps its in-progress kpool in one ring per request.
+    tail = KpoolTailSpec(
+        block_size=ring_block_size,
+        num_kv_heads=1,
+        head_size=4,
+        head_size_v=0,
+        dtype=torch.float16,
+        sliding_window=ring_block_size,
+    )
+    mamba = MambaSpec(
+        block_size=128,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        64,
+        [],
+        [
+            KVCacheGroupSpec(["mla"], full),
+            KVCacheGroupSpec(["tail"], tail),
+            KVCacheGroupSpec(["kda"], mamba),
+        ],
+    )
+    return KVCacheManager(config, 1024, 128, partial_prefix_cache=True)
+
+
+def _hash_128(req):
+    return [
+        BlockHash(bytes(x % 256 for x in req.all_token_ids[i : i + 128]))
+        for i in range(0, len(req.all_token_ids) // 128 * 128, 128)
+    ]
+
+
+def test_kpool_tail_group_enables_partial_prefix_cache_on_a_fresh_ring():
+    cm = _kpool_tail_manager(16)
+    # Before kpool-tail support the manager warned and kept block-aligned hits.
+    assert cm.partial_cache is not None
+    free_initial = cm.block_pool.get_num_free_blocks()
+
+    r1 = Request(
+        request_id="r1",
+        prompt_token_ids=list(range(100, 180)),
+        sampling_params=SamplingParams(
+            max_tokens=4, extra_args={"prefix_cache_boundaries": [64]}
+        ),
+        pooling_params=None,
+        block_hasher=_hash_128,
+    )
+    cm.new_step_starts()
+    assert cm.partial_prefix_stops(r1, 0, 80) == (64,)
+    assert cm.allocate_slots(r1, 64) is not None
+    r1.num_computed_tokens = 64
+    tail_mgr = cm.coordinator.single_type_managers[1]
+
+    # The snapshot copies the attention block and the recurrent state, not the
+    # ring: at 64 (a multiple of the ring) its in-progress pool is empty.
+    cm.new_step_starts()
+    snap_copies, snap_groups = cm.take_block_copies_with_groups()
+    assert snap_groups == [0, 2]
+    assert len(snap_copies) == 2
+    entry = next(iter(cm.partial_cache.entries.values()))
+    assert entry.length == 64
+    assert entry.blocks[1] == []
+    assert entry.copy_last == [True, False, True]
+
+    assert cm.allocate_slots(r1, 16) is not None
+    r1.num_computed_tokens = 80
+    cm.free(r1)
+
+    cm.new_step_starts()
+    r2 = Request(
+        request_id="r2",
+        prompt_token_ids=list(range(100, 164)) + [200, 201, 202, 203],
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=_hash_128,
+    )
+    comp_blocks, num_hit = cm.get_computed_blocks(r2)
+    assert num_hit == 64
+    assert comp_blocks.blocks[1] == []
+    assert cm.allocate_slots(r2, 4, num_hit, comp_blocks) is not None
+    cow_copies, cow_groups = cm.take_block_copies_with_groups()
+    assert cow_groups == [0, 2]
+    assert len(cow_copies) == 2
+    # r2 writes its own ring; nothing of the ring comes from the cache entry.
+    assert len(tail_mgr.req_to_blocks["r2"]) == 1
+    assert tail_mgr.req_to_blocks["r2"][0].ref_cnt == 1
+
+    cm.free(r2)
+    for _ in range(4):
+        cm.new_step_starts()
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_kpool_tail_ring_rejects_boundaries_inside_its_pool_span():
+    # A boundary that is not a multiple of the ring could leave an incomplete
+    # pool behind, which a fresh ring would lose: no entry is taken there.
+    cm = _kpool_tail_manager(128)
+    assert cm.partial_cache is not None
+    r1 = Request(
+        request_id="r1",
+        prompt_token_ids=list(range(100, 180)),
+        sampling_params=SamplingParams(
+            max_tokens=4, extra_args={"prefix_cache_boundaries": [64]}
+        ),
+        pooling_params=None,
+        block_hasher=_hash_128,
+    )
+    cm.new_step_starts()
+    assert cm.partial_prefix_stops(r1, 0, 80) == ()
+    # A chunk that happens to end on the rejected boundary takes no snapshot
+    # either.
+    assert cm.allocate_slots(r1, 64) is not None
+    assert cm._pending_snapshots == []
+    r1.num_computed_tokens = 64
+    cm.new_step_starts()
+    assert cm.take_block_copies_with_groups() == ([], [])
+    assert not cm.partial_cache.entries
+
+
+def _kpool_tail_decode_ckpt_manager(ring_block_size: int):
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KpoolTailSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    full = FullAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    tail = KpoolTailSpec(
+        block_size=ring_block_size,
+        num_kv_heads=1,
+        head_size=4,
+        head_size_v=0,
+        dtype=torch.float16,
+        sliding_window=ring_block_size,
+    )
+    mamba = MambaSpec(
+        block_size=256,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        64,
+        [],
+        [
+            KVCacheGroupSpec(["mla"], full),
+            KVCacheGroupSpec(["tail"], tail),
+            KVCacheGroupSpec(["kda"], mamba),
+        ],
+    )
+    return KVCacheManager(
+        config, 2048, 256, partial_prefix_cache=True, enable_decode_ckpt=True
+    )
+
+
+def _hash_256(req):
+    return [
+        BlockHash(bytes(x % 256 for x in req.all_token_ids[i : i + 256]))
+        for i in range(0, len(req.all_token_ids) // 256 * 256, 256)
+    ]
+
+
+def _decode_ckpt_turn(cm, request_id: str, num_computed: int) -> Request:
+    """A 90-token prompt decoded to ``num_computed`` tokens and finished."""
+    from vllm.v1.request import RequestStatus
+
+    request = Request(
+        request_id=request_id,
+        prompt_token_ids=list(range(10, 100)),
+        sampling_params=SamplingParams(max_tokens=256),
+        pooling_params=None,
+        block_hasher=_hash_256,
+    )
+    cm.new_step_starts()
+    assert cm.allocate_slots(request, 90) is not None
+    request.num_computed_tokens = 90
+    request.append_output_token_ids([500])
+    cm.new_step_starts()
+    assert cm.allocate_slots(request, 1) is not None
+    assert len(cm.take_decode_ckpt_mounts()) == 1
+    request.append_output_token_ids(list(range(501, 501 + num_computed - 90)))
+    request.num_computed_tokens = num_computed
+    request.status = RequestStatus.FINISHED_STOPPED
+    cm.free(request)
+    return request
+
+
+def test_decode_ckpt_with_kpool_tail_ring_promotes_without_ring_blocks():
+    # The checkpoint of a reply is promoted at a multiple of 64, which is a
+    # multiple of the ring: the entry keeps no ring block, and the next turn
+    # resumes there on a fresh ring of its own.
+    cm = _kpool_tail_decode_ckpt_manager(16)
+    assert cm.partial_cache is not None
+    free_initial = cm.block_pool.get_num_free_blocks()
+    t1 = _decode_ckpt_turn(cm, "t1", 149)
+
+    cm.new_step_starts()
+    t2_tokens = list(t1.all_token_ids[:149]) + list(range(700, 740))
+    t2 = Request(
+        request_id="t2",
+        prompt_token_ids=t2_tokens,
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=_hash_256,
+    )
+    comp_blocks, hit = cm.get_computed_blocks(t2)
+    assert hit == 128
+    entry = next(iter(cm.partial_cache.entries.values()))
+    assert entry.length == 128
+    assert entry.blocks[1] == []
+    assert comp_blocks.blocks[1] == []
+    assert cm.allocate_slots(t2, len(t2_tokens) - hit, hit, comp_blocks) is not None
+    tail_mgr = cm.coordinator.single_type_managers[1]
+    assert len(tail_mgr.req_to_blocks["t2"]) == 1
+    assert tail_mgr.req_to_blocks["t2"][0].ref_cnt == 1
+
+    cm.free(t2)
+    for _ in range(4):
+        cm.new_step_starts()
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_decode_ckpt_with_kpool_tail_ring_skips_boundaries_inside_the_ring():
+    # Decoded to 205 tokens, the checkpoint would be promoted at 192, which
+    # lies inside a ring of 128: nothing is cached, and no block leaks.
+    cm = _kpool_tail_decode_ckpt_manager(128)
+    assert cm.partial_cache is not None
+    free_initial = cm.block_pool.get_num_free_blocks()
+    _decode_ckpt_turn(cm, "t1", 205)
+    cm.new_step_starts()
+    cm.take_block_copies_with_groups()
+    assert not cm.partial_cache.entries
+
+    for _ in range(4):
+        cm.new_step_starts()
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
 def test_chat_boundaries_include_multi_turn_user_fork_boundary():
     tokenizer = _StrictUserQueryTokenizer()
     shared_history = [
