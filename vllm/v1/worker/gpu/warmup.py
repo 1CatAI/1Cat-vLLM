@@ -53,11 +53,13 @@ def _reserved_block_count(
     num_tokens: int,
     kv_cache_spec: KVCacheSpec,
     *,
+    dcp_size: int,
     num_lookahead_tokens: int,
     max_model_len: int,
     max_encoder_len: int,
 ) -> int:
     """Match the scheduler's block reservation in hand-built warmup batches."""
+    block_size = kv_cache_spec.global_block_size(dcp_size)
     if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
         specs = tuple(kv_cache_spec.kv_cache_specs.values())
         assert specs
@@ -76,7 +78,7 @@ def _reserved_block_count(
         if kv_cache_spec.mamba_cache_mode == "align":
             return cdiv(num_tokens, kv_cache_spec.block_size) + num_speculative_blocks
     num_tokens = min(num_tokens + num_lookahead_tokens, max_model_len)
-    return cdiv(num_tokens, kv_cache_spec.block_size) + num_speculative_blocks
+    return cdiv(num_tokens, block_size) + num_speculative_blocks
 
 
 def _warmup_block_counter(
@@ -86,6 +88,7 @@ def _warmup_block_counter(
         return _reserved_block_count(
             num_tokens,
             kv_cache_spec,
+            dcp_size=model_runner.dcp_size,
             num_lookahead_tokens=model_runner.vllm_config.num_lookahead_tokens,
             max_model_len=model_runner.max_model_len,
             max_encoder_len=getattr(model_runner.model_state, "max_encoder_len", 0),
