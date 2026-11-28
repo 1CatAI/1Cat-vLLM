@@ -7,7 +7,12 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
@@ -63,6 +68,25 @@ def mamba_state_slots(
     return min(num_token_blocks, requests_in_pool * states_per_request)
 
 
+def swa_tail_slots(
+    num_token_blocks: int,
+    sw_blocks: int,
+    ref_blocks: int,
+) -> int:
+    """Sliding-window tail slots needed alongside ``num_token_blocks`` full-attention slots.
+
+    Each cached prefix only needs its trailing ``sw_blocks`` blocks (plus a small
+    boundary/decode margin) to satisfy ``_sliding_window_lookup``. Sizing SWA pools
+    from the tail demand instead of 1:1 with full-attention blocks avoids wasting
+    host RAM on interior SWA blocks that are never read on reload.
+    """
+    if num_token_blocks <= 0:
+        return 0
+    per_request = sw_blocks + 2
+    requests_in_pool = max(4, cdiv(num_token_blocks, max(1, ref_blocks)))
+    return min(num_token_blocks, requests_in_pool * per_request)
+
+
 class CPUOffloadingSpec(OffloadingSpec):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
@@ -79,20 +103,42 @@ class CPUOffloadingSpec(OffloadingSpec):
             if group.kv_cache_spec.prefix_cacheable
         }
         mamba_specs = {}
+        swa_specs: dict[int, SlidingWindowSpec] = {}
+        full_groups: set[int] = set()
         for i, group in cacheable_groups.items():
             spec = group.kv_cache_spec
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = next(iter(spec.kv_cache_specs.values()))
             if isinstance(spec, MambaSpec):
                 mamba_specs[i] = spec
-        # Equal-sized Mamba/attention blocks need matching checkpoint coverage.
-        # Keep the existing layout for single groups and mixed block geometry.
-        self.partition_by_group = (
+            elif isinstance(spec, SlidingWindowSpec):
+                swa_specs[i] = spec
+            else:
+                full_groups.add(i)
+        self.swa_tail_only_offload: bool = bool(
+            self.extra_config.get("swa_tail_only_offload", True)
+        )
+        # Partition CPU pools per group for:
+        # 1. Equal-sized Mamba/attention hybrids (matching checkpoint coverage).
+        # 2. Full-attention + sliding-window hybrids (supporting mixed block
+        #    geometries such as conv-state + SWA + full-attention groups) when
+        #    tail-only SWA offloading is enabled.
+        self._mamba_partition = (
             kv_cache_config.num_blocks > 0
             and len(cacheable_groups) > 1
             and bool(mamba_specs)
             and len({self.gpu_block_size[i] for i in cacheable_groups}) == 1
         )
+        self._swa_partition = (
+            not self._mamba_partition
+            and not mamba_specs
+            and self.swa_tail_only_offload
+            and kv_cache_config.num_blocks > 0
+            and len(cacheable_groups) > 1
+            and bool(swa_specs)
+            and bool(full_groups)
+        )
+        self.partition_by_group = self._mamba_partition or self._swa_partition
         # Mamba state slots follow the prefix-cache retention policy (see
         # CacheConfig.prefix_cache_retention_interval): sparse retention keeps
         # only reachable boundary states, so the state pools are sized from the
@@ -110,11 +156,19 @@ class CPUOffloadingSpec(OffloadingSpec):
         )
         if self.state_slots_reference_tokens <= 0:
             raise ValueError("mamba_state_slots_reference_tokens must be positive")
+        self.swa_slots_reference_tokens = int(
+            self.extra_config.get(
+                "swa_slots_reference_tokens",
+                min(16384, vllm_config.model_config.max_model_len),
+            )
+        )
+        if self.swa_slots_reference_tokens <= 0:
+            raise ValueError("swa_slots_reference_tokens must be positive")
 
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
         world_size = vllm_config.parallel_config.world_size
-        if self.partition_by_group:
+        if self._mamba_partition:
             mamba_groups: set[int] = set()
             mamba_spec: MambaSpec | None = None
             for i, group in cacheable_groups.items():
@@ -191,6 +245,69 @@ class CPUOffloadingSpec(OffloadingSpec):
                 budget_per_worker,
                 self.retention_interval,
                 self.state_slots_reference_tokens,
+            )
+        elif self._swa_partition:
+            for i, group in cacheable_groups.items():
+                layer_names = set(group.layer_names)
+                page_size = sum(
+                    tensor.size // kv_cache_config.num_blocks
+                    for tensor in kv_cache_config.kv_cache_tensors
+                    if not layer_names.isdisjoint(tensor.shared_by)
+                )
+                self.cpu_group_page_sizes[i] = page_size * self.block_size_factor
+            self.cpu_page_size_per_worker = sum(self.cpu_group_page_sizes.values())
+            budget_per_worker = int(cpu_bytes_to_use) // world_size
+            full_block_size = (
+                max(self.gpu_block_size[i] for i in full_groups)
+                * self.block_size_factor
+            )
+            ref_blocks = max(1, cdiv(self.swa_slots_reference_tokens, full_block_size))
+            swa_win_blocks = {
+                i: cdiv(
+                    sp.sliding_window,
+                    self.gpu_block_size[i] * self.block_size_factor,
+                )
+                for i, sp in swa_specs.items()
+            }
+            full_page_sum = sum(self.cpu_group_page_sizes[i] for i in full_groups)
+
+            def swa_bytes_per_worker(n_full: int) -> int:
+                total = n_full * full_page_sum
+                for i, sw_b in swa_win_blocks.items():
+                    total += (
+                        swa_tail_slots(n_full, sw_b, ref_blocks)
+                        * self.cpu_group_page_sizes[i]
+                    )
+                return total
+
+            num_blocks = 0
+            if full_page_sum > 0:
+                lo, hi = 0, budget_per_worker // full_page_sum
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if swa_bytes_per_worker(mid) <= budget_per_worker:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                num_blocks = lo
+            self.num_blocks = num_blocks
+            for i in self.cpu_group_page_sizes:
+                self.cpu_group_num_blocks[i] = (
+                    swa_tail_slots(num_blocks, swa_win_blocks[i], ref_blocks)
+                    if i in swa_win_blocks
+                    else num_blocks
+                )
+            logger.info(
+                "Grouped SWA+Full CPU offload pool: %d full slots (%d tokens, "
+                "%d B/block/worker), %d SWA groups (slots=%s), budget %d B per "
+                "worker, swa reference tokens=%d.",
+                num_blocks,
+                num_blocks * full_block_size,
+                full_page_sum,
+                len(swa_win_blocks),
+                {i: self.cpu_group_num_blocks[i] for i in swa_win_blocks},
+                budget_per_worker,
+                self.swa_slots_reference_tokens,
             )
         else:
             total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
